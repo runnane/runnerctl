@@ -263,6 +263,50 @@ case_apply_unknown_profile() {
   expect_no_log '.'
 }
 
+# --- GHR-6: missing values on value flags, --flag=value, value validation ---
+case_apply_max_missing_value() {
+  run apply --max
+  expect_rc 1
+  expect_err '^runnerctl: --max needs a value$'
+  expect_no_log '.'
+}
+
+case_apply_profile_equals_form_reaches_deploy() {
+  run apply --profile=deploy
+  expect_rc 1
+  expect_err "EnvironmentFile $DEPLOY_ENV missing"
+  expect_log "^test -f $DEPLOY_ENV\$"
+  expect_no_log '^tee '
+}
+
+case_apply_max_and_restart_sec_equals_form() {
+  run apply --max=30G --restart-sec=5
+  expect_rc 0
+  expect_file "$DROPIN_DIR/$U1.d/10-runnerctl.conf" '^MemoryMax=30G$'
+  expect_file "$DROPIN_DIR/$U1.d/10-runnerctl.conf" '^RestartSec=5$'
+}
+
+case_apply_max_invalid_value_rejected() {
+  run apply --max lots
+  expect_rc 1
+  expect_err '^runnerctl: --max value .lots. is invalid'
+  expect_no_log '.'
+}
+
+case_apply_restart_sec_invalid_value_rejected() {
+  run apply --restart-sec soon
+  expect_rc 1
+  expect_err '^runnerctl: --restart-sec value .soon. is invalid'
+  expect_no_log '.'
+}
+
+case_upgrade_ref_missing_value() {
+  run upgrade --ref
+  expect_rc 1
+  expect_err '^runnerctl: --ref needs a value$'
+  expect_no_log '.'
+}
+
 case_scale_2() {
   run scale 2
   expect_rc 0
@@ -396,6 +440,12 @@ t "apply --restart with flag overrides: restart after reload"      case_apply_re
 t "apply --profile deploy: refuses without the env file"           case_apply_deploy_refuses_without_env_file
 t "apply --profile deploy: writes EnvironmentFile drop-ins"        case_apply_deploy_writes_with_env_file
 t "apply --profile nope: unknown profile"                          case_apply_unknown_profile
+t "apply --max: missing value dies cleanly, no privileged call"    case_apply_max_missing_value
+t "apply --profile=deploy: = form reaches the deploy profile"      case_apply_profile_equals_form_reaches_deploy
+t "apply --max=30G --restart-sec=5: = form writes both values"     case_apply_max_and_restart_sec_equals_form
+t "apply --max lots: invalid value rejected"                       case_apply_max_invalid_value_rejected
+t "apply --restart-sec soon: invalid value rejected"               case_apply_restart_sec_invalid_value_rejected
+t "upgrade --ref: missing value dies before any download"          case_upgrade_ref_missing_value
 t "scale 2: two drop-ins, enable 1-2, disable 3, one reload"       case_scale_2
 xfail GHR-5 "scale 2: daemon-reload before enable --now"           case_scale_reloads_before_enable
 t "scale 0: out of range"                                          case_scale_zero_rejected
