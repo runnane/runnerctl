@@ -460,6 +460,52 @@ case_restart_out_of_range() {
   expect_no_log '^systemctl restart'
 }
 
+# --- GHR-9: resolve accepts the short RUNNER name and unambiguous
+# prefixes/substrings of it as a target ---------------------------------------
+
+# actions.runner.<arg>.service: the short name exactly as `status` prints it.
+case_restart_by_short_name() {
+  run restart example.slot-2
+  expect_rc 0
+  expect_out '^restart done\.$'
+  expect_log_count '.' 1
+  expect_log "^systemctl restart $U2\$"
+}
+
+# Substring match on the short name, unambiguous (only slot-3 contains it).
+case_logs_by_substring() {
+  run logs slot-3
+  expect_rc 0
+  expect_log_count '.' 1
+  expect_log "^journalctl -u $U3 -n 100 --no-pager\$"
+}
+
+# The short name with ".service" appended: neither the literal unit name nor
+# "<arg>.service" match this (that would double the suffix) — it resolves
+# because the short name is a prefix of the arg, caught by the substring rule.
+case_enable_by_short_name_with_service_suffix() {
+  run enable example.slot-1.service
+  expect_rc 0
+  expect_log_count '.' 1
+  expect_log "^systemctl enable --now $U1\$"
+}
+
+case_restart_ambiguous_target() {
+  run restart slot
+  expect_rc 1
+  expect_err "ambiguous target 'slot' matches:"
+  expect_no_out 'done\.'
+  expect_no_log '^systemctl restart'
+}
+
+case_restart_no_match() {
+  run restart nope
+  expect_rc 1
+  expect_err "no runner slot matches 'nope' \\(have: 0\\.\\.2, example\\.slot-1 example\\.slot-2 example\\.slot-3\\)"
+  expect_no_out 'done\.'
+  expect_no_log '^systemctl restart'
+}
+
 # --- Registry -----------------------------------------------------------------
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
@@ -491,6 +537,11 @@ t "stop: every slot in discovery order"                            case_stop_all
 t "enable <unit>: full unit name passes through"                   case_enable_by_unit_name
 t "logs 2: journalctl on the third unit"                           case_logs_by_index
 t "restart 5: out of range exits 1 without a systemctl call"       case_restart_out_of_range
+t "restart example.slot-2: short RUNNER name resolves"             case_restart_by_short_name
+t "logs slot-3: unambiguous substring of the short name resolves"  case_logs_by_substring
+t "enable example.slot-1.service: short name + suffix resolves"    case_enable_by_short_name_with_service_suffix
+t "restart slot: ambiguous target, no systemctl call"               case_restart_ambiguous_target
+t "restart nope: no match, no systemctl call"                       case_restart_no_match
 
 # --- Summary ------------------------------------------------------------------
 echo
