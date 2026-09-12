@@ -186,7 +186,27 @@ case_status_table() {
   expect_out '^1 +example\.slot-2 +active/running +enabled '
   expect_out '^2 +example\.slot-3 +active/running +enabled '
   expect_no_out '^3 '
-  expect_no_log '.'   # status is read-only: no privileged call at all
+  # status is read-only: no privileged call at all (the `probe:` lines below
+  # are the stub logging its own unit_props hits, not a host mutation).
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test) '
+}
+
+case_status_one_unit_props_call_per_slot() {
+  run status
+  expect_rc 0
+  # One batched `unit_props` call per slot, not nine `prop` calls per slot.
+  expect_log_count '^probe:unit_props ' 3
+  expect_log_count '^probe:unit_props actions\.runner\.example\.slot-1\.service$' 1
+  expect_log_count '^probe:unit_props actions\.runner\.example\.slot-2\.service$' 1
+  expect_log_count '^probe:unit_props actions\.runner\.example\.slot-3\.service$' 1
+}
+
+case_status_envfile_value_with_embedded_equals() {
+  run status
+  expect_rc 0
+  # unit_props's slot-2 EnvironmentFiles value itself contains '=' — the
+  # ENVFILE column must carry the whole value, not just the part before it.
+  expect_out '^1 +example\.slot-2 .*/etc/x \(ignore_errors=no\) +idle$'
 }
 
 case_apply_ci() {
@@ -369,6 +389,8 @@ case_restart_out_of_range() {
 
 # --- Registry -----------------------------------------------------------------
 t "status: header and one row per discovered slot"                 case_status_table
+t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
+t "status: EnvironmentFiles value with embedded '=' survives"       case_status_envfile_value_with_embedded_equals
 t "apply: ci drop-in on every slot, then one daemon-reload"        case_apply_ci
 t "apply --restart with flag overrides: restart after reload"      case_apply_restart_flags
 t "apply --profile deploy: refuses without the env file"           case_apply_deploy_refuses_without_env_file
