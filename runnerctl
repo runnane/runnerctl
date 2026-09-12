@@ -51,7 +51,7 @@
 #   Old install:  runnerctl migrate   # lifts the inline values into the config
 set -euo pipefail
 
-RUNNERCTL_VERSION="0.4.2"
+RUNNERCTL_VERSION="0.4.3"
 
 # --- Defaults (all overridable from the config file) -------------------------
 # The BUILTIN_* copies stay untouched by the config so `migrate` can tell a
@@ -1124,6 +1124,30 @@ cmd_upgrade() {
   echo "Upgraded $RUNNERCTL_VERSION -> $new_ver at $self"
 }
 
+# Under sudo PATH is secure_path, so a runnerctl the invoking user runs from
+# ~/.local/bin or ~/bin is invisible to command -v — the usual shape of a
+# pre-config install. Look in those two directories of $SUDO_USER's home (of
+# $HOME without sudo) and set HOME_COPY / HOME_HOW for the caller, empty when
+# there is none. Their real PATH is not scanned: that needs a walk of
+# /proc/<pid>/environ, and the two conventional directories cover the real case.
+find_home_runnerctl() {
+  local home d
+  HOME_COPY=""; HOME_HOW=""
+  if [ -n "${SUDO_USER:-}" ]; then
+    home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+    HOME_HOW="in $SUDO_USER's home via \$SUDO_USER, not on PATH"
+  else
+    home="${HOME:-}"
+    HOME_HOW="in \$HOME, not on PATH"
+  fi
+  [ -n "$home" ] || return 0
+  for d in "$home/.local/bin" "$home/bin"; do
+    [ -f "$d/runnerctl" ] || continue
+    if looks_like_runnerctl "$d/runnerctl"; then HOME_COPY="$d/runnerctl"; return 0; fi
+    echo "note: $d/runnerctl ($HOME_HOW) is not a runnerctl script — ignoring it"
+  done
+}
+
 cmd_install() {
   local prefix="" ref="" migrate=true dry_run=false
   while [ $# -gt 0 ]; do
@@ -1151,9 +1175,13 @@ cmd_install() {
   fi
   new_ver="$(remote_version "$src")"
 
-  # Target: where runnerctl already is, else /usr/local/bin.
+  # Target: where runnerctl already is, else /usr/local/bin. A copy in the
+  # invoking user's home that PATH does not reach never moves the target —
+  # root-invoked tooling does not live in a home directory — but it is found.
   local existing target
   existing="$(command -v runnerctl 2>/dev/null || true)"
+  HOME_COPY=""; HOME_HOW=""
+  [ -n "$existing" ] || find_home_runnerctl
   if [ -z "$prefix" ]; then
     if [ -n "$existing" ]; then prefix="$(dirname "$(readlink -f "$existing")")"; else prefix="/usr/local/bin"; fi
   fi
@@ -1162,28 +1190,41 @@ cmd_install() {
   if needs_priv "$target"; then
     [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null || die "$prefix is not writable and there is no sudo — run as root"
   fi
+  if [ -n "$HOME_COPY" ] && [ -e "$target" ] && [ "$(readlink -f "$HOME_COPY")" = "$(readlink -f "$target")" ]; then
+    HOME_COPY=""   # --prefix pointed at it: it is simply the target
+  fi
 
   # What is there already decides the path: nothing, a pre-config install, or
-  # a versioned one.
-  local fresh=false
+  # a versioned one. When the target is missing, a home copy stands in for it
+  # — migrated or version-checked the same way — except that the new file
+  # lands at $target and the old one is renamed out of the way afterwards, so
+  # the user does not keep running it from a PATH entry ahead of $prefix.
+  local fresh=false old="" where="" retired=""
   if [ -e "$target" ]; then
     looks_like_runnerctl "$target" || die "$target exists but is not a runnerctl script — refusing to overwrite it"
-    if is_legacy_script "$target"; then
-      echo "existing: pre-config runnerctl (no RUNNERCTL_VERSION) at $target"
+    old="$target"; where="at $target"
+    [ -z "$HOME_COPY" ] || echo "note: another runnerctl at $HOME_COPY ($HOME_HOW) is left alone — remove it if it shadows $target"
+  elif [ -n "$HOME_COPY" ]; then
+    old="$HOME_COPY"; where="at $HOME_COPY ($HOME_HOW)"
+    if is_legacy_script "$old"; then retired="$old.legacy"; else retired="$old.retired"; fi
+  fi
+  if [ -n "$old" ]; then
+    if is_legacy_script "$old"; then
+      echo "existing: pre-config runnerctl (no RUNNERCTL_VERSION) $where"
       if ! $migrate; then
         echo "--no-migrate: its inline values will NOT be carried into $CONFIG_FILE."
-        echo "A copy is kept at $target.legacy so 'runnerctl migrate --from $target.legacy' can do it later."
+        echo "A copy is kept at $old.legacy so 'runnerctl migrate --from $old.legacy' can do it later."
       elif $dry_run; then
-        echo "would run: runnerctl migrate --from $target   (writes $CONFIG_FILE, verified against the live drop-ins)"
+        echo "would run: runnerctl migrate --from $old   (writes $CONFIG_FILE, verified against the live drop-ins)"
       else
         echo "--- migrate ---"
-        cmd_migrate --from "$target"   # dies on any failure, leaving $target untouched
+        cmd_migrate --from "$old"   # dies on any failure, leaving $old untouched
         echo "--- migrate done ---"
       fi
     else
-      local cur; cur="$(remote_version "$target")"
-      echo "existing: runnerctl $cur"
-      if cmp -s "$src" "$target"; then
+      local cur; cur="$(remote_version "$old")"
+      echo "existing: runnerctl $cur $where"
+      if [ -z "$retired" ] && cmp -s "$src" "$target"; then
         echo "Already up to date ($cur at $target)."
         "$target" version; return 0
       fi
@@ -1191,15 +1232,19 @@ cmd_install() {
         echo "Installed $cur is newer than $new_ver — not downgrading (pass --ref to force a version)."
         return 0
       fi
-      echo "upgrade: $cur -> $new_ver"
+      if [ -z "$retired" ]; then echo "upgrade: $cur -> $new_ver"; else echo "move: $cur at $old -> $new_ver at $target"; fi
     fi
   else
     fresh=true
     echo "existing: none — fresh install of $new_ver"
   fi
 
-  if $dry_run; then echo "(dry run — would install runnerctl $new_ver at $target; nothing changed)"; return 0; fi
-  if [ -e "$target" ] && is_legacy_script "$target" && ! $migrate; then
+  if $dry_run; then
+    echo "(dry run — would install runnerctl $new_ver at $target; nothing changed)"
+    [ -z "$retired" ] || echo "(dry run — would then retire $old as $retired)"
+    return 0
+  fi
+  if [ "$old" = "$target" ] && is_legacy_script "$target" && ! $migrate; then
     install_file "$target" "$target.legacy"
   fi
   local priv=()
@@ -1209,6 +1254,13 @@ cmd_install() {
   priv=(); ! needs_priv "$(dirname "$CONFIG_FILE")" || priv=(run_priv)
   "${priv[@]}" mkdir -p "$(dirname "$CONFIG_FILE")"
   echo "Installed runnerctl $new_ver at $target"
+  if [ -n "$retired" ]; then
+    # After the new file is in place, never before: a failure here leaves both
+    # copies rather than none.
+    priv=(); ! needs_priv "$(dirname "$old")" || priv=(run_priv)
+    "${priv[@]}" mv -f "$old" "$retired"
+    echo "Retired $old as $retired — $target is the one to run now."
+  fi
   if $fresh; then
     echo
     echo "Next:"

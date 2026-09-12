@@ -36,6 +36,15 @@ verify, so no site value is lost. `--no-migrate` skips that and keeps the old
 file as `runnerctl.legacy`; `--dry-run` reports what would happen;
 `--prefix DIR` picks the location.
 
+Under `sudo` the invoking user's `PATH` is not consulted (`secure_path`), so a
+copy living in their `~/.local/bin` or `~/bin` would go unnoticed. `install`
+looks in those two directories of `$SUDO_USER`'s home (of `$HOME` otherwise)
+when nothing is on `PATH`: a copy found there is migrated or version-checked
+like any existing install, the new file still lands at `/usr/local/bin`, and
+the old one is renamed `runnerctl.legacy` (pre-config) or `runnerctl.retired`
+(versioned) so it cannot keep shadowing the new one. `--dry-run` shows the
+found path and what would happen to it.
+
 Prefer to read before you run? Same thing in two steps:
 
 ```sh
