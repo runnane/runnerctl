@@ -1,9 +1,9 @@
 SHELL := bash
 SHELLCHECK ?= shellcheck
 
-.PHONY: gates lint example-drift smoke
+.PHONY: gates lint example-drift smoke migrate-test
 
-gates: lint example-drift smoke
+gates: lint example-drift smoke migrate-test
 
 lint:
 	$(SHELLCHECK) -S style runnerctl
@@ -21,3 +21,8 @@ smoke:
 	@./runnerctl --config config.example profiles | grep -q '^deploy .*config .*Prod deploy runner'
 	@./runnerctl bogus 2>/dev/null; test $$? -eq 1
 	@echo "smoke ok"
+
+# `migrate` against the sanitised legacy fixture and a fixture drop-in tree;
+# tests/migrate.config redirects discovery and SYSTEMD_DIR there.
+migrate-test:
+	@bash tests/migrate-test.sh

@@ -40,6 +40,7 @@ runnerctl logs [<unit|slot-index>]
 runnerctl remove-limits
 runnerctl profiles
 runnerctl config-example
+runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
 runnerctl upgrade [--check] [--ref <branch|tag>]
 runnerctl version
 ```
@@ -113,6 +114,35 @@ runnerctl profiles                                          # see what resolved
 [`config.example`](config.example) is the same output, checked in for browsing.
 Keep real hostnames, paths and secret names in the config on the host; keep
 the config out of any repository.
+
+### Migrating from an inline-configured runnerctl
+
+Earlier versions of this script carried the site values inline — the drop-in
+name, each profile's memory caps and env-file path, the secrets template — and
+had no config file or version. Overwriting such an install with the current
+script would silently replace those values with the generic built-ins.
+`migrate` lifts them out first:
+
+```sh
+runnerctl migrate --dry-run   # show the config it would write
+runnerctl migrate             # write /etc/runnerctl/config
+```
+
+It reads the installed script (`--from PATH` for a copy elsewhere), turns each
+inline profile into a `profile_<name>()` and the inline template into
+`env_template_<name>()`, and keeps the old `DROPIN_NAME` so the new script goes
+on managing the *same* drop-in file rather than adding a second one beside it.
+It then reads the drop-ins live under `/etc/systemd/system/<unit>.d/`, and
+where they disagree with the script — someone ran `apply --max 24G` once — the
+**live** value wins and the difference is printed. Any other drop-in in the
+same directory that sets the same keys is flagged.
+
+The last step is the proof: for every unit it renders the drop-in from the
+generated config and compares it with the live file (comments aside), and
+exits non-zero listing the differences if any unit does not reproduce. It never
+overwrites an existing config (it writes `config.migrated` beside it and shows
+the diff), never reads the secrets file itself — only its path moves — and is
+safe to run repeatedly.
 
 ### Self-upgrade
 

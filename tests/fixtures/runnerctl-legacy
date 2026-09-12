@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+# runnerctl — manage self-hosted GitHub Actions runner slots on this host.
+#
+# Runners are systemd services (actions.runner.<scope>.<name>.service) installed
+# by GitHub's svc.sh. This tool applies a role PROFILE (memory caps, restart
+# policy, on-device secrets) via systemd drop-in overrides — so the generated
+# unit files are never hand-edited and the config survives a runner reinstall —
+# plus reports status and scales the active pool.
+#
+# PROFILES (--profile, default: ci):
+#   ci      CI build/test pool on the app host (self-hosted-pool). Memory-capped
+#           + auto-restart.
+#   deploy  Dedicated prod deploy runner (example-prod) on a separate prod-network
+#           box. Long-lived, auto-restart, on-device secrets via a root-owned
+#           EnvironmentFile — NOT memory-capped.
+#
+# Nothing box-specific is hardcoded: runner units are discovered from systemd,
+# so this runs on any runner host. Privileged operations re-exec via sudo.
+#
+# Usage:
+#   ./runnerctl status
+#   ./runnerctl apply  [--profile ci|deploy] [--max 26G] [--high 22G] \
+#                      [--restart-sec N] [--env-file PATH] [--restart]
+#   ./runnerctl scale N [--profile ci] [--max 26G] [--high 22G]
+#   ./runnerctl env-init [--profile deploy] [--env-file PATH]
+#   ./runnerctl start|stop|restart [<unit|slot-index>]
+#   ./runnerctl enable|disable <unit|slot-index>
+#   ./runnerctl logs [<unit|slot-index>]
+#   ./runnerctl remove-limits
+#
+# Recommended baselines:
+#   CI host:      ./runnerctl scale 2 --max 26G --high 22G
+#   Deploy box:   ./runnerctl env-init --profile deploy   # then fill secrets
+#                 ./runnerctl apply --profile deploy --restart
+set -euo pipefail
+
+DROPIN_NAME="10-example-runner.conf"
+UNIT_GLOB='actions.runner.*.service'
+
+# Profile-provided config (populated by load_profile; flags override).
+PROFILE="ci"
+PROFILE_DESC=""
+MEM_MAX=""
+MEM_HIGH=""
+RESTART_SEC="10"
+ENV_FILE=""
+do_restart=false
+REMAINING=()
+
+run_priv() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
+die() { echo "runnerctl: $*" >&2; exit 1; }
+
+# Profiles are defined inline (this script is self-contained — no sidecar files).
+# Flags (--max/--high/--restart-sec/--env-file) override these per-invocation.
+load_profile() {
+  case "$PROFILE" in
+    ci)
+      # CI build/test pool (self-hosted-pool) on the app host. Memory-capped so
+      # parallel jobs can't OOM the shared box; auto-restart.
+      # 2 slots × 26G = 52G leaves headroom on a 60G box; bump on a bigger box.
+      PROFILE_DESC="CI build/test pool (self-hosted-pool) — memory-capped, auto-restart."
+      MEM_MAX="26G"; MEM_HIGH="22G"; RESTART_SEC="10"; ENV_FILE=""
+      ;;
+    deploy)
+      # Dedicated example-prod deploy runner on a separate prod-network box.
+      # Long-lived, auto-restart, uncapped (deploys are SSH/release-bound and a
+      # cap risks killing a mid-deploy step). Secrets come from a root-owned
+      # on-device EnvironmentFile, never GitHub secrets.
+      PROFILE_DESC="Prod deploy runner (example-prod) — on-device secrets, uncapped, auto-restart."
+      MEM_MAX=""; MEM_HIGH=""; RESTART_SEC="15"; ENV_FILE="/etc/example-prod/deploy.env"
+      ;;
+    *) die "unknown profile '$PROFILE' (known: ci, deploy)" ;;
+  esac
+}
+
+# On-device secrets/config template for the deploy runner's EnvironmentFile.
+# Placeholders only — the live file is filled in on the box and never committed.
+render_env_template() {
+  cat <<'TEMPLATE'
+# example-prod deploy runner — on-device secrets/config.
+#
+# Loaded by the runner's systemd unit (EnvironmentFile=) so deploy jobs inherit
+# these as environment variables.
+#
+# ┌─ RULES ────────────────────────────────────────────────────────────────┐
+# │ * PLACEHOLDERS ONLY here — never write real secrets and never commit it. │
+# │ * This file is root-owned, chmod 600, and lives ONLY on the device.      │
+# │ * Keep it out of GitHub Actions secrets — on-device is the whole point   │
+# │   (shrink blast radius of a prod-reaching runner).            │
+# └──────────────────────────────────────────────────────────────────────────┘
+
+# --- Registry / release publish ------------------------------------------
+GHCR_USERNAME=
+GHCR_TOKEN=
+NPM_TOKEN=
+
+# --- Target prod hosts (SSH aliases or docker contexts) -------------------
+# NOTE: systemd EnvironmentFile takes everything after `=` as the value and does
+# NOT strip inline `#` comments — so keep comments on their own line and values
+# BARE (no quotes, no trailing text). `KEY=host # note` makes the value
+# `host # note`, which ssh rejects with "hostname contains invalid characters".
+# app host (owns /opt/example-app, runs the deploy script)
+APP_SSH_HOST=
+# sql-proxy prod host
+SQL_PROXY_SSH_HOST=
+# job-handler prod host
+JOB_HANDLER_SSH_HOST=
+
+# --- Deploy targets on the remote hosts -----------------------------------
+APP_DIR=/opt/example-app
+
+# --- Optional: notifications ----------------------------------------------
+DEPLOY_SLACK_WEBHOOK_URL=
+TEMPLATE
+}
+
+# Pull --profile out of the arg list first so the profile loads before any
+# value flags, letting flags override the profile's defaults. Leaves the rest
+# of the args in the REMAINING array.
+extract_profile() {
+  REMAINING=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --profile) PROFILE="$2"; shift 2 ;;
+      *) REMAINING+=("$1"); shift ;;
+    esac
+  done
+}
+
+parse_opts() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --max)         MEM_MAX="$2"; shift 2 ;;
+      --high)        MEM_HIGH="$2"; shift 2 ;;
+      --restart-sec) RESTART_SEC="$2"; shift 2 ;;
+      --env-file)    ENV_FILE="$2"; shift 2 ;;
+      --restart)     do_restart=true; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+}
+
+discover() {
+  systemctl list-unit-files --no-legend "$UNIT_GLOB" 2>/dev/null | awk '{print $1}' | sort -V
+}
+
+require_runners() {
+  [ -n "$(discover)" ] || die "no '$UNIT_GLOB' units found on this host."
+}
+
+prop() { systemctl show "$1" -p "$2" --value 2>/dev/null; }
+
+# What is this runner currently working on? Read GITHUB_REPOSITORY / GITHUB_JOB
+# from the environment of the job's processes in the runner's systemd cgroup.
+# (GITHUB_JOB is the workflow job id, e.g. lint/typecheck/test/build.) Requires
+# read access to the processes — works when run as the runner's user (or root).
+job_info() {
+  local u="$1" cg f pid env repo job worker=""
+  cg="$(prop "$u" ControlGroup)"
+  f="/sys/fs/cgroup${cg}/cgroup.procs"
+  if [ -z "$cg" ] || [ ! -r "$f" ]; then echo "—"; return; fi
+  while read -r pid; do
+    if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q "Runner.Worker"; then
+      worker=1
+    fi
+    [ -r "/proc/$pid/environ" ] || continue
+    env="$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null || true)"
+    case "$env" in
+      *GITHUB_REPOSITORY=*) ;;
+      *) continue ;;
+    esac
+    repo="$(printf '%s\n' "$env" | grep -m1 '^GITHUB_REPOSITORY=' | cut -d= -f2- || true)"
+    job="$(printf '%s\n' "$env" | grep -m1 '^GITHUB_JOB=' | cut -d= -f2- || true)"
+    printf '%s:%s\n' "${repo##*/}" "${job:-?}"
+    return
+  done <"$f"
+  if [ -n "$worker" ]; then echo "(starting)"; else echo "idle"; fi
+}
+
+hbytes() {
+  local v="${1:-}"
+  case "$v" in
+    ''|infinity|max|18446744073709551615|'[not set]') echo "—"; return ;;
+  esac
+  [[ "$v" =~ ^[0-9]+$ ]] || { echo "$v"; return; }
+  awk -v b="$v" 'BEGIN{ if (b<1048576) printf "%.0fM", b/1048576; else printf "%.1fG", b/1073741824 }'
+}
+
+resolve() { # "unit or slot-index" -> unit name
+  local a="$1"
+  if [[ "$a" =~ ^[0-9]+$ ]]; then
+    mapfile -t units < <(discover)
+    [ "$a" -lt "${#units[@]}" ] || die "slot index $a out of range (0..$((${#units[@]}-1)))"
+    echo "${units[$a]}"
+  else
+    echo "$a"
+  fi
+}
+
+render_dropin() {
+  echo "# Managed by ops/runners/runnerctl (profile: $PROFILE) — DO NOT EDIT BY HAND."
+  [ -n "$PROFILE_DESC" ] && echo "# $PROFILE_DESC"
+  echo "# See ops/runners/README.md for details."
+  echo "[Unit]"
+  echo "# Don't let a crash-loop trip the start limiter and park the unit 'failed'."
+  echo "StartLimitIntervalSec=0"
+  echo
+  echo "[Service]"
+  echo "Restart=always"
+  echo "RestartSec=${RESTART_SEC}"
+  if [ -n "$ENV_FILE" ]; then
+    echo "# On-device secrets/config (root-owned, chmod 600). Never in GitHub."
+    echo "EnvironmentFile=${ENV_FILE}"
+  fi
+  if [ -n "$MEM_MAX" ]; then
+    echo "# MemoryHigh: soft reclaim/throttle before the hard cap."
+    echo "# MemoryMax:  hard — contains a runaway to its cgroup; Restart resurrects it."
+    echo "MemoryHigh=${MEM_HIGH}"
+    echo "MemoryMax=${MEM_MAX}"
+  fi
+}
+
+apply_to() {
+  local u="$1" dir="/etc/systemd/system/$1.d"
+  run_priv mkdir -p "$dir"
+  render_dropin | run_priv tee "$dir/$DROPIN_NAME" >/dev/null
+}
+
+# For the deploy profile the unit hard-fails to start without its
+# EnvironmentFile, so refuse to apply until it exists (run env-init first).
+guard_env_file() {
+  [ -n "$ENV_FILE" ] || return 0
+  run_priv test -f "$ENV_FILE" || die "EnvironmentFile $ENV_FILE missing — run: ./runnerctl env-init --profile $PROFILE"
+}
+
+cmd_status() {
+  require_runners
+  echo "Host: $(nproc) cores, $(free -h | awk '/^Mem:/{print $2" RAM, "$7" available"}')"
+  echo
+  printf '%-3s %-40s %-15s %-9s %-6s %-6s %-6s %-8s %-7s %s\n' \
+    IDX RUNNER ACTIVE ENABLED MAX HIGH USED RESTART ENVFILE WORKING-ON
+  local i=0 u
+  while read -r u; do
+    [ -n "$u" ] || continue
+    local short="${u#actions.runner.}"; short="${short%.service}"
+    local envf; envf="$(prop "$u" EnvironmentFiles)"; [ -n "$envf" ] || envf="—"
+    printf '%-3s %-40s %-15s %-9s %-6s %-6s %-6s %-8s %-7s %s\n' \
+      "$i" "$short" "$(prop "$u" ActiveState)/$(prop "$u" SubState)" \
+      "$(prop "$u" UnitFileState)" \
+      "$(hbytes "$(prop "$u" MemoryMax)")" "$(hbytes "$(prop "$u" MemoryHigh)")" \
+      "$(hbytes "$(prop "$u" MemoryCurrent)")" "$(prop "$u" Restart)" "$envf" \
+      "$(job_info "$u")"
+    i=$((i+1))
+  done < <(discover)
+}
+
+cmd_apply() {
+  extract_profile "$@"; load_profile; parse_opts ${REMAINING[@]+"${REMAINING[@]}"}
+  require_runners; guard_env_file
+  local u
+  while read -r u; do [ -n "$u" ] && { apply_to "$u"; echo "  wrote drop-in for $u"; }; done < <(discover)
+  run_priv systemctl daemon-reload
+  echo "Applied profile '$PROFILE': Restart=always RestartSec=$RESTART_SEC${MEM_MAX:+ MemoryMax=$MEM_MAX MemoryHigh=$MEM_HIGH}${ENV_FILE:+ EnvironmentFile=$ENV_FILE}"
+  if $do_restart; then
+    while read -r u; do [ -n "$u" ] && run_priv systemctl restart "$u"; done < <(discover)
+    echo "Restarted all runner slots (config active now)."
+  else
+    echo "Config takes effect on next (re)start. Run: ./runnerctl restart"
+  fi
+}
+
+cmd_scale() {
+  extract_profile "$@"
+  set -- ${REMAINING[@]+"${REMAINING[@]}"}
+  [ $# -ge 1 ] || die "scale needs N, e.g. 'scale 2 --max 26G'"
+  local n="$1"; shift
+  [[ "$n" =~ ^[0-9]+$ ]] || die "N must be an integer"
+  load_profile; parse_opts "$@"; require_runners; guard_env_file
+  mapfile -t units < <(discover)
+  local total=${#units[@]}
+  [ "$n" -ge 1 ] && [ "$n" -le "$total" ] || die "N must be 1..$total"
+  local i u
+  for i in "${!units[@]}"; do
+    u="${units[$i]}"
+    if [ "$i" -lt "$n" ]; then
+      apply_to "$u"; run_priv systemctl enable --now "$u" >/dev/null 2>&1 || true
+      echo "  [active] $u"
+    else
+      run_priv systemctl disable --now "$u" >/dev/null 2>&1 || true
+      echo "  [stopped] $u"
+    fi
+  done
+  run_priv systemctl daemon-reload
+  echo "Scaled to $n active runner(s), profile '$PROFILE'${MEM_MAX:+ @ MemoryMax=$MEM_MAX}."
+  echo "Note: stopped slots stay REGISTERED with GitHub (they show offline). Full"
+  echo "deregister = 'svc.sh uninstall' + './config.sh remove' in the runner's dir"
+  echo "(needs a GitHub removal token) — not automated: destructive, irreversible."
+}
+
+cmd_env_init() {
+  extract_profile "$@"; load_profile; parse_opts ${REMAINING[@]+"${REMAINING[@]}"}
+  [ -n "$ENV_FILE" ] || die "profile '$PROFILE' defines no EnvironmentFile (nothing to init)"
+  if run_priv test -f "$ENV_FILE"; then
+    echo "$ENV_FILE already exists — leaving it untouched (won't clobber secrets)."
+    return 0
+  fi
+  run_priv mkdir -p "$(dirname "$ENV_FILE")"
+  render_env_template | run_priv tee "$ENV_FILE" >/dev/null
+  run_priv chown root:root "$ENV_FILE"
+  run_priv chmod 600 "$ENV_FILE"
+  echo "Scaffolded $ENV_FILE (root:root, 600) from the inline template."
+  echo "Edit it ON THE BOX and fill in real values. NEVER commit real secrets."
+}
+
+cmd_ctl() { # start|stop|restart [target] (default: all)
+  local action="$1"; shift || true
+  require_runners
+  if [ $# -ge 1 ]; then
+    run_priv systemctl "$action" "$(resolve "$1")"
+  else
+    local u; while read -r u; do [ -n "$u" ] && run_priv systemctl "$action" "$u"; done < <(discover)
+  fi
+  echo "$action done."
+}
+
+cmd_toggle() { # enable|disable <target>
+  local action="$1"; shift || true
+  [ $# -ge 1 ] || die "$action needs a <unit|slot-index>"
+  run_priv systemctl "$action" --now "$(resolve "$1")"
+  echo "$action done."
+}
+
+cmd_logs() {
+  require_runners
+  run_priv journalctl -u "$(resolve "${1:-0}")" -n 100 --no-pager
+}
+
+cmd_remove_limits() {
+  require_runners
+  local u
+  while read -r u; do
+    [ -n "$u" ] || continue
+    run_priv rm -f "/etc/systemd/system/$u.d/$DROPIN_NAME"
+    echo "  removed drop-in for $u"
+  done < <(discover)
+  run_priv systemctl daemon-reload
+  echo "Removed managed drop-ins. Run './runnerctl restart' to revert running slots."
+}
+
+usage() { sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//'; }
+
+main() {
+  local cmd="${1:-status}"; shift || true
+  case "$cmd" in
+    status)             cmd_status "$@" ;;
+    apply)              cmd_apply "$@" ;;
+    scale)              cmd_scale "$@" ;;
+    env-init)           cmd_env_init "$@" ;;
+    start|stop|restart) cmd_ctl "$cmd" "$@" ;;
+    enable|disable)     cmd_toggle "$cmd" "$@" ;;
+    logs)               cmd_logs "$@" ;;
+    remove-limits)      cmd_remove_limits "$@" ;;
+    -h|--help|help)     usage ;;
+    *) die "unknown command '$cmd' (status apply scale env-init start stop restart enable disable logs remove-limits)" ;;
+  esac
+}
+
+main "$@"
