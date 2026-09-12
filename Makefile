@@ -1,9 +1,9 @@
 SHELL := bash
 SHELLCHECK ?= shellcheck
 
-.PHONY: gates lint example-drift smoke migrate-test install-test
+.PHONY: gates lint example-drift version-drift smoke migrate-test install-test
 
-gates: lint example-drift smoke migrate-test install-test
+gates: lint example-drift version-drift smoke migrate-test install-test
 
 lint:
 	$(SHELLCHECK) -S style runnerctl
@@ -11,6 +11,16 @@ lint:
 # config.example is generated from `runnerctl config-example`; keep them equal.
 example-drift:
 	@diff -u config.example <(./runnerctl config-example) && echo "config.example in sync"
+
+# release-please bumps RUNNERCTL_VERSION through the x-release-please-version
+# annotation and records the same version in the manifest; if the annotation
+# ever stops matching, the two disagree and this catches it before a tag.
+version-drift:
+	@script=$$(grep -m1 '^RUNNERCTL_VERSION=' runnerctl | cut -d'"' -f2); \
+	 manifest=$$(grep -o '"\.": *"[^"]*"' .release-please-manifest.json | cut -d'"' -f4); \
+	 test -n "$$script" && test "$$script" = "$$manifest" \
+	   && echo "version $$script in sync with .release-please-manifest.json" \
+	   || { echo "version drift: runnerctl=$$script manifest=$$manifest" >&2; exit 1; }
 
 # Commands that need neither systemd units nor root.
 smoke:
