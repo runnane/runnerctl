@@ -120,9 +120,14 @@ overwrites an existing file.
 ### Config file
 
 `runnerctl` reads `/etc/runnerctl/config` if present (override with
-`RUNNERCTL_CONFIG=` or `--config PATH`). It is plain bash and is sourced, so it
-must be root-owned and not world-writable — the script refuses a
-world-writable config.
+`RUNNERCTL_CONFIG=` or `--config PATH`). It is plain bash and is sourced, so
+the script enforces: owned by root or by the invoking user, not writable by
+any other group (unless that group is gid 0), and not world-writable. It also
+validates the config-settable knobs after sourcing — `DROPIN_NAME` must match
+`^[A-Za-z0-9_-]+\.conf$`, `UNIT_GLOB` must be non-empty and contain no `/`, and
+`DEFAULT_PROFILE` must match `^[A-Za-z0-9_]+$` — since a bad value here drives
+privileged commands (`sudo rm`, `sudo tee`) built from it. Anything that fails
+these checks is refused with the exact reason and the fix.
 
 The config can set any default (`DROPIN_NAME`, `DEFAULT_PROFILE`, `UPGRADE_URL`,
 `UNIT_GLOB`) and define profiles as functions. A `profile_<name>()` function
