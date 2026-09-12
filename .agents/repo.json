@@ -1,7 +1,7 @@
 {
   "repo": "runnane/runnerctl",
-  "trackerKey": null,
-  "trackerSlug": null,
+  "trackerKey": "GHR",
+  "trackerSlug": "runnerctl",
   "visibility": "public",
   "gates": {
     "all": "make gates",
