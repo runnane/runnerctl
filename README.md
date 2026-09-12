@@ -87,12 +87,13 @@ runnerctl version
 `status` shows each slot's state and how long it has been in it (`SINCE`),
 which profile it carries (`PROFILE`, read from its drop-in — `—` if it has
 none), memory cap/usage, restart policy, env file and the job it is currently
-working on, with how long that job has been running:
+working on, with how long that job has been running — or, for an idle slot,
+how long it has been idle and how many jobs it has finished since it started:
 
 ```
 IDX RUNNER                 PROFILE  ACTIVE          SINCE    ENABLED   MAX    HIGH   USED   RESTART  ENVFILE WORKING-ON
 0   org.host-1             ci       active/running  3d 4h    enabled   26.0G  22.0G  3.1G   always   —       my-app:test (12m)
-1   org.host-2             ci       active/running  41m      enabled   26.0G  22.0G  128M   always   —       idle
+1   org.host-2             ci       active/running  2d 7h    enabled   26.0G  22.0G  128M   always   —       idle 2h31m (7 jobs)
 2   org.host-3             deploy   inactive/dead   6d       disabled  —      —      —      always   —       —
 ```
 
@@ -106,10 +107,14 @@ slot that has never started).
 between steps and for container jobs. The repository prefix and the job
 runtime (the age of the slot's `Runner.Worker`, spawned once per job) are
 added from `/proc` when `status` runs as the runner's user or root;
-otherwise the cell is the job name alone, timed from the journal line. A
-running slot whose journal cannot be read shows `(no access)` with a
-one-line hint under the table — `—` means only that the slot is not
-running.
+otherwise the cell is the job name alone, timed from the journal line. An
+idle slot shows the time since its last `completed with result:` line and
+the number of jobs it has completed since the unit last started (`idle 2h31m
+(7 jobs)`), or the time since the unit started when it has not finished one
+yet (`idle 41m (no jobs yet)`) — the figure that says whether a pool is
+oversized. A running slot whose journal cannot be read shows `(no access)`,
+or `idle ?` when `/proc` is readable but the journal is not, with a one-line
+hint under the table — `—` means only that the slot is not running.
 
 `apply` and `remove-limits` can be pointed at one or more slots instead of
 every discovered one — `runnerctl apply --profile deploy 2` or `runnerctl
