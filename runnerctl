@@ -52,7 +52,7 @@
 #   Old install:  runnerctl migrate   # lifts the inline values into the config
 set -euo pipefail
 
-RUNNERCTL_VERSION="0.4.3"
+RUNNERCTL_VERSION="0.5.0"
 
 # --- Defaults (all overridable from the config file) -------------------------
 # The BUILTIN_* copies stay untouched by the config so `migrate` can tell a
@@ -273,6 +273,22 @@ journal_running_job() { # LINES
   printf '%s\t%s\n' "$name" "$ts"
 }
 
+# The idle side of the same lines: prints "<epoch second of the last
+# completion>\t<completed count>" — the count of `completed with result:`
+# lines, i.e. jobs finished in this invocation of the unit — nothing when no
+# job has completed since the unit started. Pure, like journal_running_job;
+# both read the one journal fetch job_info already makes (GHR-2).
+journal_idle_info() { # LINES
+  local line ts="" n=0
+  while IFS= read -r line; do
+    case "$line" in
+      *"completed with result: "*) n=$((n + 1)); ts="${line%% *}"; ts="${ts%%.*}" ;;
+    esac
+  done <<<"$1"
+  [ "$n" -gt 0 ] || return 0
+  printf '%s\t%s\n' "$ts" "$n"
+}
+
 # The /proc side: only the runner's user or root can read a slot's processes.
 # Three hooks, so a config can stub the walk without replacing job_info.
 cgroup_readable() { [ -n "${1:-}" ] && [ -r "/sys/fs/cgroup${1}/cgroup.procs" ]; }
@@ -308,10 +324,18 @@ proc_job_env() { # CGROUP
 # Epoch seconds; a config can shadow it to pin the journal-derived runtime.
 now_epoch() { date +%s; }
 
-# The WORKING-ON cell. Takes the cgroup and invocation id from the caller's
-# already-fetched unit_props (GHR-4) instead of fetching them itself.
+# The WORKING-ON cell. Takes the cgroup, invocation id and active-enter stamp
+# (µs since boot) from the caller's already-fetched unit_props (GHR-4)
+# instead of fetching them itself.
 #   —              the unit has no cgroup (not running)
-#   idle           the journal is readable and no job is in flight
+#   idle 2h31m (7 jobs)
+#                  the journal is readable and no job is in flight: time
+#                  since the last `completed with result:` line of this
+#                  invocation, and how many there are — jobs finished since
+#                  the unit started (GHR-2)
+#   idle 41m (no jobs yet)
+#                  idle, and nothing has completed since the unit started:
+#                  time since the active-enter stamp instead
 #   repo:job (12m) the journal names the job; the repo comes from the /proc
 #                  environ walk when that is readable (the job name alone
 #                  otherwise), the runtime from the Runner.Worker age, or from
@@ -321,14 +345,26 @@ now_epoch() { date +%s; }
 # survives only there: a live Runner.Worker with no GITHUB_* process is the
 # only signal of a job in /proc, and it cannot tell startup from between-steps
 # (the flicker GHR-10 removes for every reader with journal access).
-#   (no access)    neither the journal nor the cgroup can be read; cmd_status
-#                  prints a one-line hint under the table
-job_info() { # UNIT CGROUP [INVOCATION-ID]
-  local u="$1" cg="$2" lines rj name ts env repo job worker runtime=""
+#   idle ?         the cgroup is readable but the journal is not: /proc shows
+#                  no job, and the idle time and count are unknowable there
+#   (no access)    neither the journal nor the cgroup can be read
+# For the last two cmd_status prints a one-line hint under the table.
+job_info() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
+  local u="$1" cg="$2" lines rj ii name ts n env repo job worker runtime=""
   [ -n "$cg" ] || { echo "—"; return; }
   if lines="$(journal_job_lines "$u" "${3:-}")"; then
     rj="$(journal_running_job "$lines")"
-    [ -n "$rj" ] || { echo "idle"; return; }
+    if [ -z "$rj" ]; then
+      ii="$(journal_idle_info "$lines")"
+      if [ -n "$ii" ]; then
+        ts="${ii%%$'\t'*}"; n="${ii#*$'\t'}"
+        if [[ "$ts" =~ ^[0-9]+$ ]]; then runtime="$(fmt_dur $(( $(now_epoch) - ts )))"; else runtime="—"; fi
+        printf 'idle %s (%s job%s)\n' "$runtime" "$n" "$([ "$n" -eq 1 ] || echo s)"
+      else
+        echo "idle $(since_state active "${4:-}" "") (no jobs yet)"
+      fi
+      return
+    fi
     name="${rj%%$'\t'*}"; ts="${rj#*$'\t'}"
     repo="$(proc_job_env "$cg" | grep -m1 '^GITHUB_REPOSITORY=' | cut -d= -f2- || true)"
     worker="$(proc_worker_pid "$cg")"
@@ -351,7 +387,7 @@ job_info() { # UNIT CGROUP [INVOCATION-ID]
   elif [ -n "$worker" ]; then
     echo "(starting)"
   else
-    echo "idle"
+    echo "idle ?"
   fi
 }
 
@@ -556,8 +592,10 @@ cmd_status() {
       P[$k]="$v"
     done < <(unit_props "$u")
     local envf="${P[EnvironmentFiles]:-}"; [ -n "$envf" ] || envf="—"
-    job="$(job_info "$u" "${P[ControlGroup]:-}" "${P[InvocationID]:-}")"
-    [ "$job" != "(no access)" ] || no_access=true
+    job="$(job_info "$u" "${P[ControlGroup]:-}" "${P[InvocationID]:-}" "${P[ActiveEnterTimestampMonotonic]:-}")"
+    # `idle ?` is the /proc-only reader's idle: it knows the slot is idle but
+    # not for how long, which is the same missing journal access.
+    case "$job" in "(no access)"|"idle ?") no_access=true ;; esac
     status_row "$i" "$short" "$(slot_profile "$u")" "${P[ActiveState]:-}/${P[SubState]:-}" \
       "$(since_state "${P[ActiveState]:-}" "${P[ActiveEnterTimestampMonotonic]:-}" "${P[InactiveEnterTimestampMonotonic]:-}")" \
       "${P[UnitFileState]:-}" \

@@ -284,7 +284,7 @@ case_status_envfile_value_with_embedded_equals() {
   expect_rc 0
   # unit_props's slot-2 EnvironmentFiles value itself contains '=' — the
   # ENVFILE column must carry the whole value, not just the part before it.
-  expect_out '^1 +example\.slot-2 .*/etc/x \(ignore_errors=no\) +idle$'
+  expect_out '^1 +example\.slot-2 .*/etc/x \(ignore_errors=no\) +idle 2h31m \(2 jobs\)$'
 }
 
 case_apply_ci() {
@@ -612,7 +612,7 @@ case_status_job_runtime_in_working_on() {
   expect_rc 0
   # the runtime rides inside the WORKING-ON cell; the column count is unchanged
   expect_out '^0 +example\.slot-1 .* my-app:test \(12m\)$'
-  expect_out '^1 +example\.slot-2 .* idle$'
+  expect_out '^1 +example\.slot-2 .* idle 2h31m \(2 jobs\)$'
   expect_out '^2 +example\.slot-3 .* —$'
   expect_no_out '^IDX .*RUNTIME'
 }
@@ -769,7 +769,7 @@ case_status_working_on_from_journal() {
   # journal stamp (the worker pid is not visible under the stub) — exact.
   expect_out '^0 +example\.slot-1 .* my-app:test \(12m\)$'
   # slot-2: its last job completed → idle, never `build`
-  expect_out '^1 +example\.slot-2 .* idle$'
+  expect_out '^1 +example\.slot-2 .* idle 2h31m \(2 jobs\)$'
   expect_no_out '^1 +example\.slot-2 .* build'
   # slot-3: no cgroup → —, and the journal is not even asked
   expect_out '^2 +example\.slot-3 .* —$'
@@ -825,6 +825,105 @@ case_journal_running_job_idle_after_completion() {
   expect_no_out '.'
 }
 
+# --- GHR-2: idle time and jobs-since-start inside the idle WORKING-ON cell ---
+# Same journal fetch as GHR-10, read a second time by journal_idle_info: the
+# stub's slot-2 completed `lint` and `build`, the last one 2h31m before the
+# pinned now_epoch (see tests/stub.config). "no jobs yet" falls back to the
+# active-enter stamp (slot-2: 41m, slot-1: 3d 4h — the SINCE column's clock).
+
+case_status_idle_time_and_job_count() {
+  run status
+  expect_rc 0
+  # slot-2: time since the last completion, count of completions — exact,
+  # and plural
+  expect_out '^1 +example\.slot-2 .* idle 2h31m \(2 jobs\)$'
+  expect_no_out '^1 +example\.slot-2 .* idle$'
+  expect_no_out '\(1 job\)'
+  # the running slot and the stopped one are untouched by it
+  expect_out '^0 +example\.slot-1 .* my-app:test \(12m\)$'
+  expect_out '^2 +example\.slot-3 .* —$'
+  expect_no_out '^note: '
+  # still ONE journal read per running slot: the idle info is parsed from
+  # the same lines, not fetched again
+  expect_log_count '^probe:journal_job_lines ' 2
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test) '
+}
+
+case_status_idle_no_jobs_yet_since_active_enter() {
+  RUNNERCTL_STUB_JOURNAL_EMPTY=1 run status
+  expect_rc 0
+  # a readable journal with no completion since the unit started: idle since
+  # ActiveEnterTimestampMonotonic, said distinctly — slot-2 41m, slot-1 3d 4h
+  expect_out '^1 +example\.slot-2 .* idle 41m \(no jobs yet\)$'
+  expect_out '^0 +example\.slot-1 .* idle 3d 4h \(no jobs yet\)$'
+  expect_out '^2 +example\.slot-3 .* —$'
+  expect_no_out '\(0 jobs\)'
+  # readable journal → no access hint
+  expect_no_out '^note: '
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test) '
+}
+
+case_status_idle_unknown_without_journal() {
+  RUNNERCTL_STUB_JOURNAL_ACCESS=0 RUNNERCTL_STUB_CGROUP_READABLE=1 run status
+  expect_rc 0
+  # journal unreadable, cgroup readable (root / the runner user): the
+  # /proc-only reader sees slot-2 idle but cannot say for how long → `idle ?`,
+  # never a bare `idle`, never a fabricated duration
+  expect_out '^1 +example\.slot-2 .* idle \?$'
+  expect_no_out '^1 +example\.slot-2 .* idle$'
+  expect_no_out '^1 +example\.slot-2 .* idle [0-9]'
+  # slot-1 is still identified from /proc (GITHUB_* environ), slot-3 stays —
+  expect_out '^0 +example\.slot-1 .* my-app:test$'
+  expect_out '^2 +example\.slot-3 .* —$'
+  expect_no_out '\(no access\)'
+  # `idle ?` earns the same one-line hint `(no access)` does, once
+  _expect
+  local n
+  n="$(grep -Ec '^note: WORKING-ON needs journal read access \(systemd-journal group\) or root$' <<<"$OUT" || true)"
+  [ "$n" -eq 1 ] || FAILS+=("hint line: want exactly 1, got $n")
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test) '
+}
+
+# The idle parser alone, over a fixed transcript.
+case_journal_idle_info_last_completion_and_count() {
+  run_fn journal_idle_info "$(printf '%s\n' \
+    '1000000000.000000 runsvc.sh[1]: 2001-09-09 01:46:40Z: Running job: lint' \
+    '1000000100.000000 runsvc.sh[1]: 2001-09-09 01:48:20Z: Job lint completed with result: Failed' \
+    '1000000200.000000 runsvc.sh[1]: 2001-09-09 01:50:00Z: Running job: test (ubuntu, 3.12)' \
+    '1000000350.000000 runsvc.sh[1]: 2001-09-09 01:52:30Z: Job test (ubuntu, 3.12) completed with result: Succeeded')"
+  expect_rc 0
+  # the epoch second of the LAST completion (not the first, not a start
+  # line), and the number of completions regardless of their result
+  expect_out $'^1000000350\t2$'
+  expect_no_out '^1000000100'
+  expect_no_out '^1000000200'
+}
+
+case_journal_idle_info_none_completed() {
+  run_fn journal_idle_info "$(printf '%s\n' \
+    '1000000000.000000 runsvc.sh[1]: 2001-09-09 01:46:40Z: Running job: lint')"
+  expect_rc 0
+  expect_no_out '.'
+  run_fn journal_idle_info ''
+  expect_rc 0
+  expect_no_out '.'
+}
+
+case_journal_idle_info_single_job_is_singular() {
+  run_fn journal_idle_info "$(printf '%s\n' \
+    '1000000000.000000 runsvc.sh[1]: 2001-09-09 01:46:40Z: Running job: lint' \
+    '1000000100.000000 runsvc.sh[1]: 2001-09-09 01:48:20Z: Job lint completed with result: Canceled')"
+  expect_rc 0
+  expect_out $'^1000000100\t1$'
+  # and the cell says `1 job`, not `1 jobs`: job_info with its two journal
+  # sources overridden inline (the stub table has no one-job slot)
+  run_fn eval 'journal_job_lines() { echo "1000000100.000000 x: Job lint completed with result: Canceled"; }
+               now_epoch() { echo 1000000400; }
+               job_info u.service /system.slice/u.service inv 0'
+  expect_rc 0
+  expect_out '^idle 5m \(1 job\)$'
+}
+
 # --- Registry -----------------------------------------------------------------
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
@@ -869,6 +968,12 @@ t "status: WORKING-ON from the journal (running / idle / —)"        case_statu
 t "status: (no access) is distinct from —, hint printed once"        case_status_no_access_is_not_stopped
 t "journal_running_job: last Running job without a later completion" case_journal_running_job_last_uncompleted
 t "journal_running_job: nothing once the last job completed"         case_journal_running_job_idle_after_completion
+t "status: idle slot shows time since last completion and job count" case_status_idle_time_and_job_count
+t "status: idle with no completion yet is measured from active-enter"  case_status_idle_no_jobs_yet_since_active_enter
+t "status: idle ? without journal access, with the hint"              case_status_idle_unknown_without_journal
+t "journal_idle_info: last completion stamp and count"                case_journal_idle_info_last_completion_and_count
+t "journal_idle_info: nothing without a completion"                   case_journal_idle_info_none_completed
+t "journal_idle_info / job_info: one completion reads '1 job'"        case_journal_idle_info_single_job_is_singular
 t "fmt_dur 5: 5s"                                                   case_fmt_dur_seconds
 t "fmt_dur 0: 0s"                                                   case_fmt_dur_zero
 t "fmt_dur 2460: 41m"                                               case_fmt_dur_minutes
