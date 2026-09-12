@@ -7,6 +7,10 @@ cd "$(dirname "$0")/.."
 
 fail() { echo "migrate-test: FAIL: $*" >&2; exit 1; }
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+# Nothing under test may escalate: a fake sudo first on PATH turns any attempt
+# into a loud failure instead of a root-owned file in the temp dir.
+mkdir -p "$tmp/nosudo"; printf '#!/bin/sh\necho "TEST TRIED TO SUDO: $*" >&2; exit 97\n' >"$tmp/nosudo/sudo"; chmod +x "$tmp/nosudo/sudo"
+export PATH="$tmp/nosudo:$PATH"
 legacy=tests/fixtures/runnerctl-legacy
 cfg=tests/migrate.config
 
@@ -37,6 +41,13 @@ grep -qE "^ci\*[[:space:]]+config[[:space:]]+24G[[:space:]]+20G[[:space:]]+10[[:
 grep -qE "^deploy[[:space:]]+config[[:space:]]+-[[:space:]]+-[[:space:]]+15[[:space:]]+/etc/example-prod/deploy.env" "$tmp/profiles" \
   || fail "profiles does not show migrated deploy: $(cat "$tmp/profiles")"
 grep -q "^DROPIN_NAME='10-example-runner.conf'" "$tmp/config" || fail "DROPIN_NAME not carried over"
+
+# 2b. An output directory that does not exist yet under a writable parent is
+#     created without privilege (this once escalated to sudo).
+./runnerctl --config "$cfg" migrate --from "$legacy" --output "$tmp/etc/runnerctl/config" >"$tmp/out2b" 2>&1 \
+  || fail "write into a new directory exited $? — $(cat "$tmp/out2b")"
+[ -f "$tmp/etc/runnerctl/config" ] || fail "config not written into the new directory"
+[ "$(stat -c %U "$tmp/etc/runnerctl/config")" = "$(id -un)" ] || fail "config in new directory is not owned by the caller"
 
 # 3. Never overwrite: a second run writes <out>.migrated and shows a diff.
 ./runnerctl --config "$cfg" migrate --from "$legacy" --output "$tmp/config" >"$tmp/out3" 2>&1 \

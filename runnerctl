@@ -519,6 +519,15 @@ legacy_dump() {
 }
 
 sq() { printf "'%s'" "${1//\'/\'\\\'\'}"; } # single-quote a value for a sourced file
+
+# True when writing PATH (creating missing parents) needs root: the nearest
+# existing ancestor decides, so a not-yet-created directory under one the
+# caller owns does not escalate to sudo.
+needs_priv() {
+  local p="$1"
+  while [ ! -e "$p" ]; do p="$(dirname "$p")"; done
+  [ ! -w "$p" ]
+}
 strip_ini() { grep -vE '^[[:space:]]*(#|$)' "$@" || true; } # drop comments and blank lines
 
 # Parse one live drop-in into LIVE_* for the caller.
@@ -679,7 +688,7 @@ cmd_migrate() {
       out="$out.migrated"
     fi
     local priv=()
-    { [ -d "$(dirname "$out")" ] && [ -w "$(dirname "$out")" ]; } || priv=(run_priv)
+    ! needs_priv "$out" || priv=(run_priv)
     "${priv[@]}" mkdir -p "$(dirname "$out")"
     printf '%s\n' "$cfg" | "${priv[@]}" tee "$out" >/dev/null
     [ "${#priv[@]}" -eq 0 ] || run_priv chown root:root "$out"
