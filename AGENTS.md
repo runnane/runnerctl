@@ -8,5 +8,9 @@ generated `config.example`, and the gates.
   ticket keys, secret names beyond generic placeholders) goes in the script,
   the README or the example config. Site values live in each host's
   `/etc/runnerctl/config`, which is never committed anywhere.
-- Bump `RUNNERCTL_VERSION` in the same PR as any behaviour change — that is
-  what `runnerctl upgrade` compares.
+- Never bump `RUNNERCTL_VERSION` by hand. release-please does it in its own
+  release PR from the conventional-commit subjects (`feat:` → minor, `fix:` →
+  patch while < 1.0), so keep the commit type honest — it is the changelog
+  entry and the version bump. The `# x-release-please-version` annotation on
+  that line is what the bump matches; `make version-drift` fails if it and
+  `.release-please-manifest.json` disagree. Details: `.agents/gates.md`.

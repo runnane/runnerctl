@@ -7,7 +7,7 @@
     "all": "make gates",
     "quick": "make lint"
   },
-  "release": "none",
+  "release": "release-please",
   "ci": "github-hosted",
   "liveBoundary": "none",
   "worktreeSafe": true,
