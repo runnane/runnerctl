@@ -739,8 +739,13 @@ cmd_migrate() {
 # creates the install location, and migrates a pre-config install first.
 remote_version() { grep -m1 '^RUNNERCTL_VERSION=' "$1" | cut -d'"' -f2; }
 
-# True when bash is reading this script from stdin rather than a file.
-is_piped() { [ -z "${BASH_SOURCE[0]:-}" ] || [ "${BASH_SOURCE[0]}" = "bash" ]; }
+# True when bash is reading this script from stdin rather than a file. Inside
+# a function BASH_SOURCE[0] is then "main" (bash 5.2) or "bash" (5.3), and $0
+# is "bash" in both; a real file gives its path in both.
+is_piped() {
+  case "${BASH_SOURCE[0]:-}" in ''|main|bash) return 0 ;; esac
+  [ "$0" = "bash" ] || [ "$0" = "-bash" ] || [ "$0" = "sh" ]
+}
 
 # a < b in version order
 version_lt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]; }
