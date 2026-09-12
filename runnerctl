@@ -43,7 +43,7 @@
 #                 runnerctl apply --profile deploy --restart
 set -euo pipefail
 
-RUNNERCTL_VERSION="0.1.0"
+RUNNERCTL_VERSION="0.2.0"
 
 # --- Defaults (all overridable from the config file) -------------------------
 DROPIN_NAME="10-runnerctl.conf"

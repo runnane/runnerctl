@@ -152,11 +152,13 @@ token and is irreversible, so it stays a manual step.
 ## Development
 
 ```sh
-make gates   # shellcheck + config.example drift check + smoke tests
+make gates   # shellcheck + config.example drift check + smoke + stubbed-systemd sim
+make sim     # just the stubbed-systemd cases (tests/run.sh)
 ```
 
 See [`.agents/gates.md`](.agents/gates.md) for what each gate covers and how
-to exercise the systemd-touching commands locally without root.
+the stubbed-systemd harness exercises every systemd-touching command without
+root (and how to add a case).
 
 ## License
 
