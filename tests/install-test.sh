@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # `runnerctl install` end-to-end under a temp prefix: fresh, idempotent,
 # legacy-with-migrate, dry-run, --no-migrate, migrate-failure abort,
-# no-downgrade, refusal to overwrite a foreign file, and the piped form
-# (offline, via a file:// UPGRADE_URL). No systemd, no root, no network.
+# no-downgrade, refusal to overwrite a foreign file, the piped form (offline,
+# via a file:// UPGRADE_URL), and a copy in the invoking user's ~/.local/bin or
+# ~/bin that PATH does not reach (getent stubbed, HOME a temp dir). No
+# systemd, no root, no network.
 # Run from the repo root: bash tests/install-test.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -12,7 +14,13 @@ tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # Nothing under test may escalate: a fake sudo first on PATH turns any attempt
 # into a loud failure instead of a root-owned file in the temp dir.
 mkdir -p "$tmp/nosudo"; printf '#!/bin/sh\necho "TEST TRIED TO SUDO: $*" >&2; exit 97\n' >"$tmp/nosudo/sudo"; chmod +x "$tmp/nosudo/sudo"
-export PATH="$tmp/nosudo:$PATH"
+# PATH is pinned to what sudo's secure_path would leave, so `command -v
+# runnerctl` is empty whatever this box has installed, and HOME is a temp dir
+# so the home-directory lookup (cases 10-13) can never touch a real
+# ~/.local/bin/runnerctl. Both are asserted, not assumed.
+export PATH="$tmp/nosudo:/usr/bin:/bin"
+export HOME="$tmp/home"; mkdir -p "$HOME"; unset SUDO_USER
+[ -z "$(command -v runnerctl || true)" ] || fail "a runnerctl is on the pinned PATH: $(command -v runnerctl)"
 ver="$(grep -m1 '^RUNNERCTL_VERSION=' runnerctl | cut -d'"' -f2)"
 legacy=tests/fixtures/runnerctl-legacy
 
@@ -92,5 +100,72 @@ cat runnerctl | bash -s -- --config "$tmp/piped.config" install --prefix "$tmp/p
   || fail "piped install exited $? — $(cat "$tmp/out10")"
 grep -q "^source: file://" "$tmp/out10" || fail "piped install did not download its source"
 [ "$("$tmp/piped/runnerctl" version)" = "runnerctl $ver" ] || fail "piped install did not land $ver"
+
+# 10. Under sudo the invoking user's ~/.local/bin is off PATH: a legacy copy
+#     there is found via $SUDO_USER (getent stubbed to a temp home), migrated
+#     from, and retired as .legacy after the new file lands at the prefix.
+mkdir -p "$tmp/getent" "$tmp/home10/.local/bin"
+printf '#!/bin/sh\n[ "$1" = passwd ] && [ "$2" = someone ] && echo "someone:x:1234:1234::%s:/bin/sh"\n' "$tmp/home10" >"$tmp/getent/getent"
+chmod +x "$tmp/getent/getent"
+cp "$legacy" "$tmp/home10/.local/bin/runnerctl"; chmod 755 "$tmp/home10/.local/bin/runnerctl"
+SUDO_USER=someone PATH="$tmp/getent:$PATH" RUNNERCTL_CONFIG="$tmp/home10/etc/config" \
+  ./runnerctl install --prefix "$tmp/ulb10" >"$tmp/out11" 2>&1 \
+  || fail "sudo-shaped legacy install exited $? — $(cat "$tmp/out11")"
+grep -q "existing: pre-config runnerctl (no RUNNERCTL_VERSION) at $tmp/home10/.local/bin/runnerctl (in someone's home via \$SUDO_USER" "$tmp/out11" \
+  || fail "home copy not reported as found via SUDO_USER: $(cat "$tmp/out11")"
+grep -q "^target: $tmp/ulb10/runnerctl" "$tmp/out11" || fail "home copy moved the target"
+m="$(grep -n -- '--- migrate done ---' "$tmp/out11" | cut -d: -f1)"
+i="$(grep -n '^Installed runnerctl' "$tmp/out11" | cut -d: -f1)"
+[ -n "$m" ] && [ -n "$i" ] && [ "$m" -lt "$i" ] || fail "migrate did not run before the install: $(cat "$tmp/out11")"
+grep -q "^DROPIN_NAME='10-example-runner.conf'" "$tmp/home10/etc/config" || fail "migrated config lacks DROPIN_NAME"
+cmp -s runnerctl "$tmp/ulb10/runnerctl" || fail "new file did not land at the prefix"
+[ ! -e "$tmp/home10/.local/bin/runnerctl" ] || fail "home copy was left in place"
+cmp -s "$legacy" "$tmp/home10/.local/bin/runnerctl.legacy" || fail "home copy was not retired as .legacy"
+grep -q "^Retired $tmp/home10/.local/bin/runnerctl as $tmp/home10/.local/bin/runnerctl.legacy" "$tmp/out11" || fail "retirement not reported: $(cat "$tmp/out11")"
+[ "$(tail -1 "$tmp/out11")" = "runnerctl $ver" ] || fail "installed file does not report $ver"
+
+# 11. Same, dry run: the decision is shown, nothing moves, no config written.
+mkdir -p "$tmp/home11/.local/bin"; cp "$legacy" "$tmp/home11/.local/bin/runnerctl"
+sed -i "s|$tmp/home10|$tmp/home11|" "$tmp/getent/getent"
+SUDO_USER=someone PATH="$tmp/getent:$PATH" RUNNERCTL_CONFIG="$tmp/home11/etc/config" \
+  ./runnerctl install --prefix "$tmp/ulb11" --dry-run >"$tmp/out12" 2>&1 \
+  || fail "sudo-shaped dry run exited $? — $(cat "$tmp/out12")"
+grep -q "would run: runnerctl migrate --from $tmp/home11/.local/bin/runnerctl" "$tmp/out12" || fail "dry run did not name the home copy as the migrate source: $(cat "$tmp/out12")"
+grep -q "would then retire $tmp/home11/.local/bin/runnerctl as $tmp/home11/.local/bin/runnerctl.legacy" "$tmp/out12" || fail "dry run did not describe the retirement: $(cat "$tmp/out12")"
+cmp -s "$legacy" "$tmp/home11/.local/bin/runnerctl" || fail "dry run touched the home copy"
+[ ! -e "$tmp/ulb11" ] || fail "dry run created the prefix"
+[ ! -e "$tmp/home11/etc/config" ] || fail "dry run wrote a config"
+
+# 12. --no-migrate with a home legacy copy: still retired as .legacy, with the
+#     later-migrate hint pointing at that path, and no config written.
+mkdir -p "$tmp/home12/.local/bin"; cp "$legacy" "$tmp/home12/.local/bin/runnerctl"
+sed -i "s|$tmp/home11|$tmp/home12|" "$tmp/getent/getent"
+SUDO_USER=someone PATH="$tmp/getent:$PATH" RUNNERCTL_CONFIG="$tmp/home12/etc/config" \
+  ./runnerctl install --prefix "$tmp/ulb12" --no-migrate >"$tmp/out13" 2>&1 \
+  || fail "sudo-shaped --no-migrate exited $? — $(cat "$tmp/out13")"
+grep -q "runnerctl migrate --from $tmp/home12/.local/bin/runnerctl.legacy" "$tmp/out13" || fail "--no-migrate hint does not point at the retired copy: $(cat "$tmp/out13")"
+cmp -s "$legacy" "$tmp/home12/.local/bin/runnerctl.legacy" || fail "--no-migrate did not retire the home copy as .legacy"
+[ ! -e "$tmp/home12/.local/bin/runnerctl" ] || fail "--no-migrate left the home copy in place"
+grep -q '^RUNNERCTL_VERSION=' "$tmp/ulb12/runnerctl" || fail "--no-migrate did not install at the prefix"
+[ ! -e "$tmp/home12/etc/config" ] || fail "--no-migrate wrote a config"
+
+# 13. Not under sudo, versioned copy in ~/bin (the second directory): found
+#     via $HOME, its version is checked, it moves to the prefix and is retired
+#     as .retired.
+mkdir -p "$HOME/bin"; sed 's/^RUNNERCTL_VERSION=.*/RUNNERCTL_VERSION="0.0.1"/' runnerctl >"$HOME/bin/runnerctl"
+RUNNERCTL_CONFIG="$tmp/home/etc/config" ./runnerctl install --prefix "$tmp/ulb13" >"$tmp/out14" 2>&1 \
+  || fail "home-versioned install exited $? — $(cat "$tmp/out14")"
+grep -q "^existing: runnerctl 0.0.1 at $HOME/bin/runnerctl (in \$HOME, not on PATH)" "$tmp/out14" || fail "versioned home copy not reported: $(cat "$tmp/out14")"
+grep -q "^move: 0.0.1 at $HOME/bin/runnerctl -> $ver at $tmp/ulb13/runnerctl" "$tmp/out14" || fail "move not reported: $(cat "$tmp/out14")"
+cmp -s runnerctl "$tmp/ulb13/runnerctl" || fail "new file did not land at the prefix"
+[ ! -e "$HOME/bin/runnerctl" ] || fail "versioned home copy was left in place"
+grep -q '^RUNNERCTL_VERSION="0.0.1"' "$HOME/bin/runnerctl.retired" || fail "versioned home copy was not retired as .retired"
+# A newer home copy is not downgraded, and stays where it is.
+sed 's/^RUNNERCTL_VERSION=.*/RUNNERCTL_VERSION="9.9.9"/' runnerctl >"$HOME/bin/runnerctl"
+RUNNERCTL_CONFIG="$tmp/home/etc/config" ./runnerctl install --prefix "$tmp/ulb13b" >"$tmp/out15" 2>&1 \
+  || fail "newer-home-copy install exited $?"
+grep -q "not downgrading" "$tmp/out15" || fail "newer home copy was not refused: $(cat "$tmp/out15")"
+[ -e "$HOME/bin/runnerctl" ] && [ ! -e "$tmp/ulb13b" ] || fail "refused downgrade still moved something"
+rm -f "$HOME/bin/runnerctl"
 
 echo "install-test ok"
