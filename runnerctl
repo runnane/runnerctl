@@ -34,23 +34,36 @@
 #   runnerctl remove-limits
 #   runnerctl profiles
 #   runnerctl config-example
+#   runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
+#   runnerctl install [--prefix DIR] [--ref <branch|tag>] [--no-migrate] [--dry-run]
 #   runnerctl upgrade [--check] [--ref <branch|tag>]
 #   runnerctl version
+#
+# Install or upgrade any host (a pre-config install is migrated first):
+#   curl -fsSL https://raw.githubusercontent.com/runnane/runnerctl/main/runnerctl | sudo bash -s -- install
 #
 # Recommended baselines:
 #   CI host:      runnerctl scale 2 --max 26G --high 22G
 #   Deploy box:   runnerctl env-init --profile deploy   # then fill secrets
 #                 runnerctl apply --profile deploy --restart
+#   Old install:  runnerctl migrate   # lifts the inline values into the config
 set -euo pipefail
 
-RUNNERCTL_VERSION="0.2.5"
+RUNNERCTL_VERSION="0.3.6"
 
 # --- Defaults (all overridable from the config file) -------------------------
-DROPIN_NAME="10-runnerctl.conf"
-UNIT_GLOB='actions.runner.*.service'
-DEFAULT_PROFILE="ci"
+# The BUILTIN_* copies stay untouched by the config so `migrate` can tell a
+# migrated value from a default one.
+BUILTIN_DROPIN_NAME="10-runnerctl.conf"
+BUILTIN_UNIT_GLOB='actions.runner.*.service'
+BUILTIN_DEFAULT_PROFILE="ci"
+DROPIN_NAME="$BUILTIN_DROPIN_NAME"
+UNIT_GLOB="$BUILTIN_UNIT_GLOB"
+DEFAULT_PROFILE="$BUILTIN_DEFAULT_PROFILE"
 UPGRADE_URL="https://raw.githubusercontent.com/runnane/runnerctl/main/runnerctl"
 CONFIG_FILE="${RUNNERCTL_CONFIG:-/etc/runnerctl/config}"
+# Where unit drop-ins live. A test config points this at a fixture tree.
+SYSTEMD_DIR="/etc/systemd/system"
 
 # Profile-provided config (populated by load_profile; flags override).
 PROFILE=""
@@ -309,7 +322,7 @@ render_dropin() {
 }
 
 apply_to() {
-  local u="$1" dir="/etc/systemd/system/$1.d"
+  local u="$1" dir="$SYSTEMD_DIR/$1.d"
   run_priv mkdir -p "$dir"
   render_dropin | run_priv tee "$dir/$DROPIN_NAME" >/dev/null
 }
@@ -439,7 +452,7 @@ cmd_remove_limits() {
   local u
   while read -r u; do
     [ -n "$u" ] || continue
-    run_priv rm -f "/etc/systemd/system/$u.d/$DROPIN_NAME"
+    run_priv rm -f "$SYSTEMD_DIR/$u.d/$DROPIN_NAME"
     echo "  removed drop-in for $u"
   done < <(discover)
   run_priv systemctl daemon-reload
@@ -523,15 +536,321 @@ TEMPLATE
 EXAMPLE
 }
 
-# --- Self-upgrade -------------------------------------------------------------
-# Fetch the script from UPGRADE_URL (optionally a specific branch/tag), verify
-# it parses and carries a version, and replace the installed file in place.
-# The replacement is a rename, so the running copy keeps its old inode and is
-# unaffected mid-execution.
+# --- Migration from a pre-config runnerctl ------------------------------------
+# The predecessor of this script carried the site values inline: DROPIN_NAME
+# and UNIT_GLOB as top-level assignments, PROFILE="<default>", a load_profile()
+# whose case block set PROFILE_DESC/MEM_MAX/MEM_HIGH/RESTART_SEC/ENV_FILE per
+# profile, and one render_env_template() heredoc. It has no RUNNERCTL_VERSION,
+# which is how it is recognised. `migrate` lifts those values into a config
+# file, reconciles them against the drop-ins actually on the host (live wins,
+# every difference is reported), then proves the config renders each live
+# drop-in back byte-for-byte (comments aside).
+
+# --from is sourced, so refuse anything that is not recognisably a runnerctl
+# script before it gets that far (a README passed by mistake would run).
+looks_like_runnerctl() {
+  head -1 "$1" | grep -qE '^#!.*bash' && grep -q '^load_profile()' "$1" && grep -q '^render_dropin()' "$1"
+}
+is_legacy_script() { ! grep -q '^RUNNERCTL_VERSION=' "$1"; }
+
+# Source the old script minus its trailing `main "$@"` in a subshell — its
+# functions shadow ours only there — and dump what it defines, one record per
+# line, fields separated by \037 (a tab would collapse empty fields in read).
+legacy_dump() {
+  local stripped; stripped="$(mktemp)"
+  grep -vxE 'main "\$@"' "$1" >"$stripped"
+  (
+    set +e
+    # shellcheck disable=SC1090  # the path is only known at runtime, same as the config
+    . "$stripped" >/dev/null 2>&1 || exit 0
+    set +eu  # the old script turned -e back on; from here every failure is a partial dump, not an exit
+    declare -F load_profile >/dev/null || exit 0
+    printf 'DEFAULT_PROFILE\037%s\n' "${PROFILE:-}"
+    printf 'DROPIN_NAME\037%s\n' "${DROPIN_NAME:-}"
+    printf 'UNIT_GLOB\037%s\n' "${UNIT_GLOB:-}"
+    # bash reprints the function normalised, so the case labels are always
+    # `        name)` on their own line whatever the source formatting was.
+    local p
+    for p in $(declare -f load_profile | grep -E '^[[:space:]]+[A-Za-z0-9_]+\)$' | tr -d ' )'); do
+      PROFILE_DESC=""; MEM_MAX=""; MEM_HIGH=""; RESTART_SEC=""; ENV_FILE=""
+      PROFILE="$p"; load_profile
+      printf 'PROFILE\037%s\037%s\037%s\037%s\037%s\037%s\n' \
+        "$p" "$PROFILE_DESC" "$MEM_MAX" "$MEM_HIGH" "$RESTART_SEC" "$ENV_FILE"
+    done
+    if declare -F render_env_template >/dev/null; then
+      echo "TEMPLATE_BEGIN"; render_env_template; echo "TEMPLATE_END"
+    fi
+  )
+  rm -f "$stripped"
+}
+
+sq() { printf "'%s'" "${1//\'/\'\\\'\'}"; } # single-quote a value for a sourced file
+
+# True when writing PATH (creating missing parents) needs root: the nearest
+# existing ancestor decides, so a not-yet-created directory under one the
+# caller owns does not escalate to sudo.
+needs_priv() {
+  local p="$1"
+  while [ ! -e "$p" ]; do p="$(dirname "$p")"; done
+  [ ! -w "$p" ]
+}
+strip_ini() { grep -vE '^[[:space:]]*(#|$)' "$@" || true; } # drop comments and blank lines
+
+# Parse one live drop-in into LIVE_* for the caller.
+read_dropin() {
+  local f="$1" line
+  LIVE_PROFILE=""; LIVE_MAX=""; LIVE_HIGH=""; LIVE_RS=""; LIVE_ENV=""
+  while IFS= read -r line; do
+    case "$line" in
+      '#'*'(profile: '*')'*) LIVE_PROFILE="${line#*\(profile: }"; LIVE_PROFILE="${LIVE_PROFILE%%)*}" ;;
+      MemoryMax=*)        LIVE_MAX="${line#*=}" ;;
+      MemoryHigh=*)       LIVE_HIGH="${line#*=}" ;;
+      RestartSec=*)       LIVE_RS="${line#*=}" ;;
+      EnvironmentFile=*)  LIVE_ENV="${line#*=}" ;;
+    esac
+  done <"$f"
+}
+
+cmd_migrate() {
+  local from="" out="" dry_run=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --from)    [ $# -ge 2 ] || die "--from needs a path"; from="$2"; shift 2 ;;
+      --output)  [ $# -ge 2 ] || die "--output needs a path"; out="$2"; shift 2 ;;
+      --dry-run) dry_run=true; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  if [ -z "$from" ]; then
+    from="$(command -v runnerctl || true)"
+    [ -n "$from" ] || die "no installed runnerctl found — pass --from PATH"
+  fi
+  [ -f "$from" ] || die "$from: no such file"
+  looks_like_runnerctl "$from" || die "$from does not look like a runnerctl script (no bash shebang / load_profile / render_dropin) — refusing to source it"
+  is_legacy_script "$from" \
+    || die "$from is not a pre-config runnerctl (it carries $(grep -m1 '^RUNNERCTL_VERSION=' "$from")) — nothing to migrate"
+  [ -n "$out" ] || out="$CONFIG_FILE"
+
+  # 1. What the old script says.
+  declare -A DESC MAX HIGH RS ENV
+  local profiles=() l_default="" l_dropin="" l_glob="" template="" in_tpl=false line
+  local k v1 v2 v3 v4 v5 v6
+  while IFS= read -r line; do
+    if $in_tpl; then
+      [ "$line" = "TEMPLATE_END" ] && { in_tpl=false; continue; }
+      template+="$line"$'\n'; continue
+    fi
+    IFS=$'\037' read -r k v1 v2 v3 v4 v5 v6 <<<"$line"
+    case "$k" in
+      DEFAULT_PROFILE) l_default="$v1" ;;
+      DROPIN_NAME)     l_dropin="$v1" ;;
+      UNIT_GLOB)       l_glob="$v1" ;;
+      PROFILE) profiles+=("$v1"); DESC[$v1]="$v2"; MAX[$v1]="$v3"; HIGH[$v1]="$v4"; RS[$v1]="$v5"; ENV[$v1]="$v6" ;;
+      TEMPLATE_BEGIN)  in_tpl=true ;;
+    esac
+  done < <(legacy_dump "$from")
+  [ "${#profiles[@]}" -gt 0 ] || die "could not extract any profile from $from (no load_profile() case block?)"
+  [ -n "$l_dropin" ] || die "could not extract DROPIN_NAME from $from"
+  echo "Read $from: profiles ${profiles[*]}; drop-in $l_dropin; default profile ${l_default:-?}"
+
+  # 2. What the host is actually running. Live values win; every difference
+  #    is reported. Units are remembered for the render check at the end.
+  local units=() live_units=() u f d p key n_live=0
+  declare -A LIVE_FILE LIVE_PROF RECONCILED
+  mapfile -t units < <(discover)
+  if [ "${#units[@]}" -eq 0 ]; then
+    echo "No '$UNIT_GLOB' units on this host — config comes from the script alone; live check skipped."
+  fi
+  for u in "${units[@]}"; do
+    d="$SYSTEMD_DIR/$u.d"; f="$d/$l_dropin"
+    if [ ! -e "$f" ]; then echo "  $u: no managed drop-in ($f) — unmanaged slot, skipped"; continue; fi
+    if [ ! -r "$f" ]; then echo "  $u: $f not readable — run as root to reconcile it; skipped"; continue; fi
+    read_dropin "$f"
+    if [ -z "$LIVE_PROFILE" ]; then echo "  $u: $f names no profile in its header — skipped"; continue; fi
+    p="$LIVE_PROFILE"
+    if [ -z "${DESC[$p]+x}" ]; then
+      echo "  $u: drop-in profile '$p' is not in the script — adding it from the live values"
+      profiles+=("$p"); DESC[$p]="(recovered from $f)"; MAX[$p]="$LIVE_MAX"; HIGH[$p]="$LIVE_HIGH"; RS[$p]="$LIVE_RS"; ENV[$p]="$LIVE_ENV"
+    fi
+    for key in MAX HIGH RS ENV; do
+      local want live
+      case "$key" in
+        MAX)  want="${MAX[$p]}";  live="$LIVE_MAX" ;;
+        HIGH) want="${HIGH[$p]}"; live="$LIVE_HIGH" ;;
+        RS)   want="${RS[$p]}";   live="$LIVE_RS" ;;
+        ENV)  want="${ENV[$p]}";  live="$LIVE_ENV" ;;
+      esac
+      [ "$want" = "$live" ] && continue
+      if [ -n "${RECONCILED[$p.$key]+x}" ]; then
+        echo "  $u: profile '$p' $key is '$live' here but '$want' on ${RECONCILED[$p.$key]} — cannot be one profile; re-apply after migrating"
+        continue
+      fi
+      echo "  $u: profile '$p' $key: script says '${want:-<empty>}', live drop-in says '${live:-<empty>}' — taking the live value"
+      case "$key" in MAX) MAX[$p]="$live" ;; HIGH) HIGH[$p]="$live" ;; RS) RS[$p]="$live" ;; ENV) ENV[$p]="$live" ;; esac
+      RECONCILED[$p.$key]="$u"
+    done
+    # Anything else in the .d/ that sets the same keys would fight the managed
+    # drop-in — later-sorted wins in systemd, silently.
+    local other
+    for other in "$d"/*.conf; do
+      [ -e "$other" ] || continue
+      [ "$other" != "$f" ] || continue
+      if grep -qE '^(MemoryMax|MemoryHigh|RestartSec|EnvironmentFile|Restart)=' "$other" 2>/dev/null; then
+        echo "  $u: WARNING: $(basename "$other") also sets memory/restart keys — it will override $l_dropin if it sorts later"
+      fi
+    done
+    live_units+=("$u"); LIVE_FILE[$u]="$f"; LIVE_PROF[$u]="$p"; n_live=$((n_live+1))
+  done
+
+  # 3. Render the config.
+  local tpl_delim="RUNNERCTL_ENV_TEMPLATE"
+  case "$template" in *"$tpl_delim"*) die "env template contains the heredoc delimiter '$tpl_delim'" ;; esac
+  local cfg
+  cfg="$(
+    echo "# runnerctl config — generated by \`runnerctl migrate\` from $from on $(date +%F)."
+    echo "# Sourced as bash: keep it root-owned and not world-writable. Hand-edits are"
+    echo "# expected; \`runnerctl config-example\` documents every knob."
+    echo "# Values were lifted from the inline profiles of the pre-config runnerctl and"
+    echo "# reconciled against the drop-ins live on this host at migration time."
+    echo
+    echo "# The old script managed this drop-in name; keeping it means the new script"
+    echo "# keeps managing the same file instead of adding a second one beside it."
+    echo "DROPIN_NAME=$(sq "$l_dropin")"
+    [ -z "$l_default" ] || [ "$l_default" = "$BUILTIN_DEFAULT_PROFILE" ] || echo "DEFAULT_PROFILE=$(sq "$l_default")"
+    [ -z "$l_glob" ] || [ "$l_glob" = "$BUILTIN_UNIT_GLOB" ] || echo "UNIT_GLOB=$(sq "$l_glob")"
+    for p in "${profiles[@]}"; do
+      echo
+      echo "profile_$p() {"
+      echo "  PROFILE_DESC=$(sq "${DESC[$p]}")"
+      echo "  MEM_MAX=$(sq "${MAX[$p]}")"
+      echo "  MEM_HIGH=$(sq "${HIGH[$p]}")"
+      echo "  RESTART_SEC=$(sq "${RS[$p]}")"
+      echo "  ENV_FILE=$(sq "${ENV[$p]}")"
+      echo "}"
+    done
+    if [ -n "$template" ]; then
+      for p in "${profiles[@]}"; do
+        [ -n "${ENV[$p]}" ] || continue
+        echo
+        echo "# env-init template for '$p' (placeholders only; the live file stays on the box)."
+        echo "env_template_$p() {"
+        echo "  cat <<'$tpl_delim'"
+        printf '%s' "$template"
+        echo "$tpl_delim"
+        echo "}"
+      done
+    fi
+  )"
+
+  # 4. Write it (or show it).
+  local written
+  if $dry_run; then
+    written="$(mktemp)"; printf '%s\n' "$cfg" >"$written"
+    echo; printf '%s\n' "$cfg"; echo
+    echo "(dry run — nothing written; would go to $out)"
+  else
+    if [ -e "$out" ]; then
+      echo "$out already exists — not overwriting it; writing $out.migrated instead"
+      out="$out.migrated"
+    fi
+    local priv=()
+    ! needs_priv "$out" || priv=(run_priv)
+    "${priv[@]}" mkdir -p "$(dirname "$out")"
+    printf '%s\n' "$cfg" | "${priv[@]}" tee "$out" >/dev/null
+    [ "${#priv[@]}" -eq 0 ] || run_priv chown root:root "$out"
+    "${priv[@]}" chmod 644 "$out"
+    written="$out"
+    echo "Wrote $out"
+    case "$out" in *.migrated) echo; diff -u "${out%.migrated}" "$out" || true ;; esac
+  fi
+
+  # 5. Prove it: the generated config must render every live drop-in back.
+  if [ "$n_live" -eq 0 ]; then
+    echo "No live drop-ins to check against."
+  else
+    local bad=0 a b
+    a="$(mktemp)"; b="$(mktemp)"
+    for u in "${live_units[@]}"; do
+      (
+        # shellcheck disable=SC1090  # the file we just wrote
+        . "$written"
+        PROFILE="${LIVE_PROF[$u]}"; PROFILE_DESC=""; MEM_MAX=""; MEM_HIGH=""; RESTART_SEC="10"; ENV_FILE=""
+        load_profile; render_dropin
+      ) | strip_ini >"$a"
+      strip_ini "${LIVE_FILE[$u]}" >"$b"
+      if ! cmp -s "$a" "$b"; then
+        bad=$((bad+1))
+        echo "  $u: generated config does NOT reproduce ${LIVE_FILE[$u]}:"
+        diff "$b" "$a" | sed 's/^/    /' || true
+      fi
+    done
+    rm -f "$a" "$b"
+    [ "$bad" -eq 0 ] || { $dry_run && rm -f "$written"; die "$bad unit(s) differ — fix the profile in $out (or re-apply after migrating) and re-check"; }
+    echo "verified: $n_live unit(s) render identically from the generated config"
+  fi
+  $dry_run && rm -f "$written"
+  $dry_run || echo "Next: runnerctl --config $out profiles   # then install the new runnerctl and run: runnerctl status"
+}
+
+# --- Install / self-upgrade ---------------------------------------------------
+# Both fetch the script from UPGRADE_URL (optionally a specific branch/tag),
+# verify it parses and carries a version, and put it in place by staged copy +
+# rename, so a running copy keeps its old inode and is unaffected mid-execution.
+# `upgrade` replaces the file it is running from; `install` also works when
+# the script is being read from a pipe (curl … | bash -s -- install), finds or
+# creates the install location, and migrates a pre-config install first.
 remote_version() { grep -m1 '^RUNNERCTL_VERSION=' "$1" | cut -d'"' -f2; }
 
+# True when bash is reading this script from stdin rather than a file. Inside
+# a function BASH_SOURCE[0] is then "main" (bash 5.2) or "bash" (5.3), and $0
+# is "bash" in both; a real file gives its path in both.
+is_piped() {
+  case "${BASH_SOURCE[0]:-}" in ''|main|bash) return 0 ;; esac
+  [ "$0" = "bash" ] || [ "$0" = "-bash" ] || [ "$0" = "sh" ]
+}
+
+# a < b in version order
+version_lt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]; }
+
+# UPGRADE_URL with the branch/tag segment swapped for REF (empty REF: as is).
+resolve_url() {
+  local ref="$1" url="$UPGRADE_URL"
+  if [ -n "$ref" ]; then
+    [[ "$url" =~ ^(https://raw\.githubusercontent\.com/[^/]+/[^/]+/)[^/]+(/.*)$ ]] \
+      || die "--ref only works with a raw.githubusercontent.com UPGRADE_URL (have: $url)"
+    url="${BASH_REMATCH[1]}${ref}${BASH_REMATCH[2]}"
+  fi
+  echo "$url"
+}
+
+# Download URL to DEST and refuse anything that does not parse or has no version.
+fetch_script() {
+  command -v curl >/dev/null || die "curl is required to download from $1"
+  curl -fsSL --max-time 30 "$1" -o "$2" || die "download failed: $1"
+  bash -n "$2" || die "downloaded script does not parse — not installing"
+  [ -n "$(remote_version "$2")" ] || die "downloaded file carries no RUNNERCTL_VERSION — not installing"
+}
+
+# Put SRC at DEST atomically. An existing DEST keeps its owner and mode; a new
+# one is root:root 755 when it took sudo to write, 755 otherwise.
+install_file() {
+  local src="$1" dest="$2" dir staged
+  dir="$(dirname "$dest")"; staged="$dir/.$(basename "$dest").new.$$"
+  local priv=()
+  { [ -w "$dir" ] && { [ ! -e "$dest" ] || [ -w "$dest" ]; }; } || priv=(run_priv)
+  "${priv[@]}" cp "$src" "$staged"
+  if [ -e "$dest" ]; then
+    "${priv[@]}" chown --reference="$dest" "$staged"
+    "${priv[@]}" chmod --reference="$dest" "$staged"
+  else
+    [ "${#priv[@]}" -eq 0 ] || run_priv chown root:root "$staged"
+  fi
+  "${priv[@]}" chmod +x "$staged"
+  "${priv[@]}" mv -f "$staged" "$dest"
+}
+
 cmd_upgrade() {
-  local check=false ref="" url="$UPGRADE_URL"
+  local check=false ref=""
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     case "$1" in
@@ -540,45 +859,122 @@ cmd_upgrade() {
       *) die "unknown option: $1" ;;
     esac
   done
-  # A --ref swaps the branch/tag segment of a raw.githubusercontent.com URL.
-  if [ -n "$ref" ]; then
-    [[ "$url" =~ ^(https://raw\.githubusercontent\.com/[^/]+/[^/]+/)[^/]+(/.*)$ ]] \
-      || die "--ref only works with a raw.githubusercontent.com UPGRADE_URL (have: $url)"
-    url="${BASH_REMATCH[1]}${ref}${BASH_REMATCH[2]}"
-  fi
-
-  local self new_ver
+  local self url new_ver
   self="$(readlink -f "${BASH_SOURCE[0]}")"
-  UPGRADE_TMP="$(mktemp)"; trap 'rm -f "$UPGRADE_TMP"' EXIT
-  local tmp="$UPGRADE_TMP"
-  curl -fsSL --max-time 30 "$url" -o "$tmp" || die "download failed: $url"
-  bash -n "$tmp" || die "downloaded script does not parse — not installing"
-  new_ver="$(remote_version "$tmp")"
-  [ -n "$new_ver" ] || die "downloaded file carries no RUNNERCTL_VERSION — not installing"
+  url="$(resolve_url "$ref")"
+  DOWNLOAD_TMP="$(mktemp)"; trap 'rm -f "$DOWNLOAD_TMP"' EXIT
+  fetch_script "$url" "$DOWNLOAD_TMP"
+  new_ver="$(remote_version "$DOWNLOAD_TMP")"
 
   echo "installed: $RUNNERCTL_VERSION ($self)"
   echo "available: $new_ver ($url)"
-  if [ "$new_ver" = "$RUNNERCTL_VERSION" ] && cmp -s "$tmp" "$self"; then
+  if [ "$new_ver" = "$RUNNERCTL_VERSION" ] && cmp -s "$DOWNLOAD_TMP" "$self"; then
     echo "Already up to date."; return 0
   fi
-  if [ -z "$ref" ] && [ "$(printf '%s\n%s\n' "$new_ver" "$RUNNERCTL_VERSION" | sort -V | head -1)" = "$new_ver" ] \
-     && [ "$new_ver" != "$RUNNERCTL_VERSION" ]; then
+  if [ -z "$ref" ] && version_lt "$new_ver" "$RUNNERCTL_VERSION"; then
     echo "Remote is older than installed — not downgrading (pass --ref to force a specific version)."
     return 0
   fi
   if $check; then echo "Update available. Run: runnerctl upgrade"; return 0; fi
-
-  local dir staged
-  dir="$(dirname "$self")"
-  staged="$dir/.$(basename "$self").new.$$"
-  local priv=()
-  [ -w "$dir" ] && [ -w "$self" ] || priv=(run_priv)
-  "${priv[@]}" cp "$tmp" "$staged"
-  "${priv[@]}" chown --reference="$self" "$staged"
-  "${priv[@]}" chmod --reference="$self" "$staged"
-  "${priv[@]}" chmod +x "$staged"
-  "${priv[@]}" mv -f "$staged" "$self"
+  install_file "$DOWNLOAD_TMP" "$self"
   echo "Upgraded $RUNNERCTL_VERSION -> $new_ver at $self"
+}
+
+cmd_install() {
+  local prefix="" ref="" migrate=true dry_run=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prefix)     [ $# -ge 2 ] || die "--prefix needs a directory"; prefix="${2%/}"; shift 2 ;;
+      --ref)        [ $# -ge 2 ] || die "--ref needs a value"; ref="$2"; shift 2 ;;
+      --no-migrate) migrate=false; shift ;;
+      --dry-run)    dry_run=true; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  # Source of the new bytes: this very file when it is a real, versioned one
+  # (a checkout, a downloaded copy), else a download — always when piped.
+  local src new_ver
+  if ! is_piped && [ -z "$ref" ] && [ -n "$(remote_version "${BASH_SOURCE[0]}")" ]; then
+    src="$(readlink -f "${BASH_SOURCE[0]}")"
+    echo "source: $src (this file)"
+  else
+    local url; url="$(resolve_url "$ref")"
+    DOWNLOAD_TMP="$(mktemp)"; trap 'rm -f "$DOWNLOAD_TMP"' EXIT
+    fetch_script "$url" "$DOWNLOAD_TMP"
+    src="$DOWNLOAD_TMP"
+    echo "source: $url"
+  fi
+  new_ver="$(remote_version "$src")"
+
+  # Target: where runnerctl already is, else /usr/local/bin.
+  local existing target
+  existing="$(command -v runnerctl 2>/dev/null || true)"
+  if [ -z "$prefix" ]; then
+    if [ -n "$existing" ]; then prefix="$(dirname "$(readlink -f "$existing")")"; else prefix="/usr/local/bin"; fi
+  fi
+  target="$prefix/runnerctl"
+  echo "target: $target"
+  if needs_priv "$target"; then
+    [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null || die "$prefix is not writable and there is no sudo — run as root"
+  fi
+
+  # What is there already decides the path: nothing, a pre-config install, or
+  # a versioned one.
+  local fresh=false
+  if [ -e "$target" ]; then
+    looks_like_runnerctl "$target" || die "$target exists but is not a runnerctl script — refusing to overwrite it"
+    if is_legacy_script "$target"; then
+      echo "existing: pre-config runnerctl (no RUNNERCTL_VERSION) at $target"
+      if ! $migrate; then
+        echo "--no-migrate: its inline values will NOT be carried into $CONFIG_FILE."
+        echo "A copy is kept at $target.legacy so 'runnerctl migrate --from $target.legacy' can do it later."
+      elif $dry_run; then
+        echo "would run: runnerctl migrate --from $target   (writes $CONFIG_FILE, verified against the live drop-ins)"
+      else
+        echo "--- migrate ---"
+        cmd_migrate --from "$target"   # dies on any failure, leaving $target untouched
+        echo "--- migrate done ---"
+      fi
+    else
+      local cur; cur="$(remote_version "$target")"
+      echo "existing: runnerctl $cur"
+      if cmp -s "$src" "$target"; then
+        echo "Already up to date ($cur at $target)."
+        "$target" version; return 0
+      fi
+      if [ -z "$ref" ] && version_lt "$new_ver" "$cur"; then
+        echo "Installed $cur is newer than $new_ver — not downgrading (pass --ref to force a version)."
+        return 0
+      fi
+      echo "upgrade: $cur -> $new_ver"
+    fi
+  else
+    fresh=true
+    echo "existing: none — fresh install of $new_ver"
+  fi
+
+  if $dry_run; then echo "(dry run — would install runnerctl $new_ver at $target; nothing changed)"; return 0; fi
+  if [ -e "$target" ] && is_legacy_script "$target" && ! $migrate; then
+    install_file "$target" "$target.legacy"
+  fi
+  local priv=()
+  ! needs_priv "$prefix" || priv=(run_priv)
+  "${priv[@]}" mkdir -p "$prefix"
+  install_file "$src" "$target"
+  priv=(); ! needs_priv "$(dirname "$CONFIG_FILE")" || priv=(run_priv)
+  "${priv[@]}" mkdir -p "$(dirname "$CONFIG_FILE")"
+  echo "Installed runnerctl $new_ver at $target"
+  if $fresh; then
+    echo
+    echo "Next:"
+    echo "  runnerctl status"
+    echo "  runnerctl config-example | sudo tee $CONFIG_FILE   # then edit for this host"
+    echo "  runnerctl profiles"
+  fi
+  # The proof comes from the installed file, not from this process.
+  echo
+  "$target" version
 }
 
 usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}"; }
@@ -594,7 +990,14 @@ main() {
   fi
   load_config
   local cmd="${1:-status}"; shift || true
+  if is_piped; then
+    case "$cmd" in
+      install|version|--version) ;;
+      *) die "running from a pipe — only 'install' works that way. Install first: curl -fsSL $UPGRADE_URL | sudo bash -s -- install" ;;
+    esac
+  fi
   case "$cmd" in
+    install)            cmd_install "$@" ;;
     status)             cmd_status "$@" ;;
     apply)              cmd_apply "$@" ;;
     scale)              cmd_scale "$@" ;;
@@ -605,10 +1008,11 @@ main() {
     remove-limits)      cmd_remove_limits "$@" ;;
     profiles)           cmd_profiles "$@" ;;
     config-example)     cmd_config_example ;;
+    migrate)            cmd_migrate "$@" ;;
     upgrade)            cmd_upgrade "$@" ;;
     version|--version)  echo "runnerctl $RUNNERCTL_VERSION" ;;
     -h|--help|help)     usage ;;
-    *) die "unknown command '$cmd' (status apply scale env-init start stop restart enable disable logs remove-limits profiles config-example upgrade version)" ;;
+    *) die "unknown command '$cmd' (status apply scale env-init start stop restart enable disable logs remove-limits profiles config-example migrate install upgrade version)" ;;
   esac
 }
 
