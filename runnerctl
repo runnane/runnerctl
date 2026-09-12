@@ -375,7 +375,9 @@ cmd_ctl() { # start|stop|restart [target] (default: all)
   local action="$1"; shift || true
   require_runners
   if [ $# -ge 1 ]; then
-    run_priv systemctl "$action" "$(resolve "$1")"
+    # Resolve on its own line: a die inside "$(...)" only exits the subshell.
+    local u; u="$(resolve "$1")"
+    run_priv systemctl "$action" "$u"
   else
     local u; while read -r u; do [ -n "$u" ] && run_priv systemctl "$action" "$u"; done < <(discover)
   fi
@@ -385,13 +387,15 @@ cmd_ctl() { # start|stop|restart [target] (default: all)
 cmd_toggle() { # enable|disable <target>
   local action="$1"; shift || true
   [ $# -ge 1 ] || die "$action needs a <unit|slot-index>"
-  run_priv systemctl "$action" --now "$(resolve "$1")"
+  local u; u="$(resolve "$1")"
+  run_priv systemctl "$action" --now "$u"
   echo "$action done."
 }
 
 cmd_logs() {
   require_runners
-  run_priv journalctl -u "$(resolve "${1:-0}")" -n 100 --no-pager
+  local u; u="$(resolve "${1:-0}")"
+  run_priv journalctl -u "$u" -n 100 --no-pager
 }
 
 cmd_remove_limits() {
