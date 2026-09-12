@@ -61,7 +61,8 @@ runnerctl scale N [--profile NAME] [--max 26G] [--high 22G] \
 runnerctl env-init [--profile NAME] [--env-file PATH]
 runnerctl start|stop|restart [<unit|slot-index|name>]
 runnerctl enable|disable <unit|slot-index|name>
-runnerctl logs [<unit|slot-index|name>]
+runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
+               [--since WHEN] [-g PATTERN]
 runnerctl remove-limits
 runnerctl profiles
 runnerctl config-example

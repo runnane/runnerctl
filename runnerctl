@@ -31,7 +31,8 @@
 #   runnerctl env-init [--profile NAME] [--env-file PATH]
 #   runnerctl start|stop|restart [<unit|slot-index|name>]
 #   runnerctl enable|disable <unit|slot-index|name>
-#   runnerctl logs [<unit|slot-index|name>]
+#   runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
+#                  [--since WHEN] [-g PATTERN]
 #   runnerctl remove-limits
 #   runnerctl profiles
 #   runnerctl config-example
@@ -50,7 +51,7 @@
 #   Old install:  runnerctl migrate   # lifts the inline values into the config
 set -euo pipefail
 
-RUNNERCTL_VERSION="0.3.7"
+RUNNERCTL_VERSION="0.3.8"
 
 # --- Defaults (all overridable from the config file) -------------------------
 # The BUILTIN_* copies stay untouched by the config so `migrate` can tell a
@@ -463,8 +464,39 @@ cmd_toggle() { # enable|disable <target>
 
 cmd_logs() {
   require_runners
-  local u; u="$(resolve "${1:-0}")"
-  run_priv journalctl -u "$u" -n 100 --no-pager
+  local target="" follow=false n="" since="" grep_pat="" have_target=false u
+  while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    case "$1" in
+      -f|--follow) follow=true; shift ;;
+      -n|--lines)  need_val "$@"; [[ "$2" =~ ^[0-9]+$ ]] || die "-n value '$2' is invalid — want an integer"; n="$2"; shift 2 ;;
+      --since)     need_val "$@"; since="$2"; shift 2 ;;
+      -g|--grep)   need_val "$@"; grep_pat="$2"; shift 2 ;;
+      -*)          die "unknown option: $1" ;;
+      *)           $have_target && die "unknown option: $1"; target="$1"; have_target=true; shift ;;
+    esac
+  done
+
+  local jargs=()
+  if [ -n "$target" ]; then
+    u="$(resolve "$target")"
+    jargs+=(-u "$u")
+  else
+    while read -r u; do [ -n "$u" ] && jargs+=(-u "$u"); done < <(discover)
+  fi
+  if [ -n "$n" ]; then
+    jargs+=(-n "$n")
+  elif $follow; then
+    jargs+=(-n 50)
+  else
+    jargs+=(-n 100)
+  fi
+  $follow && jargs+=(-f)
+  [ -n "$since" ] && jargs+=(--since "$since")
+  [ -n "$grep_pat" ] && jargs+=(-g "$grep_pat")
+  jargs+=(--no-pager)
+
+  run_priv journalctl "${jargs[@]}"
 }
 
 cmd_remove_limits() {
