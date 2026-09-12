@@ -2,3 +2,5 @@
 /config
 *.env
 .claude/worktrees/
+# Tracker MCP config carries an internal hostname; local only.
+/.mcp.json
