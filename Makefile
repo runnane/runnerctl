@@ -1,9 +1,9 @@
 SHELL := bash
 SHELLCHECK ?= shellcheck
 
-.PHONY: gates lint example-drift smoke sim
+.PHONY: gates lint example-drift smoke sim migrate-test install-test
 
-gates: lint example-drift smoke sim
+gates: lint example-drift smoke sim migrate-test install-test
 
 # tests/stub.config has no shebang (it is sourced), hence -s bash for the set.
 lint:
@@ -29,3 +29,14 @@ smoke:
 # replaced by a call log). See tests/run.sh for how to add a case.
 sim:
 	@bash tests/run.sh
+
+# `migrate` against the sanitised legacy fixture and a fixture drop-in tree;
+# tests/migrate.config redirects discovery and SYSTEMD_DIR there.
+migrate-test:
+	@bash tests/migrate-test.sh
+
+# `install` under a temp prefix: fresh, upgrade, legacy+migrate, piped form
+# (offline via a file:// UPGRADE_URL). Never needs root; a fake sudo on PATH
+# makes any escalation a failure.
+install-test:
+	@bash tests/install-test.sh
