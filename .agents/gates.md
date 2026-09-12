@@ -40,9 +40,14 @@ the stub shadows `run_priv` (appends its argv to a log and does nothing),
 `discover` (three fixed `actions.runner.example.slot-N.service` units), `prop`
 (a fixed property table), `unit_props` (the batched per-unit table `status`
 reads into an associative array — logged with a `probe:` prefix so cases can
-count it without tripping the read-only/leak assertions) and `job_info`;
-`systemctl`, `journalctl` and `sudo` are shadowed too as a safety net, and a
-case whose log shows one of them was reached directly fails. Cases assert on stdout, stderr, the exit code, the
+count it without tripping the read-only/leak assertions; three distinct rows:
+slot-1 and slot-2 running, slot-3 stopped and disabled), `now_mono` (the
+µs-since-boot clock `status` subtracts systemd's `*TimestampMonotonic` stamps
+from, pinned at 10^12 so the `SINCE` column is fixed text) and `job_info`
+(replaced wholesale — the `/proc/<pid>` walk and the worker-runtime read
+inside it are not exercised by the gate); `systemctl`, `journalctl` and `sudo`
+are shadowed too as a safety net, and a case whose log shows one of them was
+reached directly fails. Cases assert on stdout, stderr, the exit code, the
 ordered list of privileged calls and the content `tee`d to each path. Plain
 bash, no framework — CI and a fresh worktree have nothing but shellcheck.
 
@@ -50,6 +55,14 @@ bash, no framework — CI and a fresh worktree have nothing but shellcheck.
 changed call order, a new refusal. A case is a function calling `run <args>`
 then `expect_*` helpers (listed at the top of `tests/run.sh`), registered at
 the bottom with `t "<name>" <fn>`. A case with no assertions fails.
+
+**Testing a helper directly.** The script's last line is
+`if [ "${RUNNERCTL_NO_MAIN:-}" != 1 ]; then main "$@"; fi`, so with
+`RUNNERCTL_NO_MAIN=1` it can be sourced to define its functions without
+running a command (or loading a config). `run_fn <function> <args>` in
+`tests/run.sh` does exactly that in a subshell and sets `OUT`/`ERR`/`RC`, for
+pure helpers no command exposes on their own (`fmt_dur`, `since_state`). It is
+a test hook, not a user-facing knob — do not document it in `usage`.
 
 **xfail convention.** A case that documents a known bug is registered with
 `xfail <ISSUE-KEY> "<name>" <fn>` instead of `t`. It prints `xfail` while it
@@ -68,6 +81,10 @@ Traps:
   (default: the file is absent). Prefix a single `run` to flip it:
   `RUNNERCTL_STUB_ENV_FILE_EXISTS=1 run apply --profile deploy`.
 - `status` calls `nproc` and `free` for real; only the runner rows are asserted.
+- The `SINCE` stamps in the stub are offsets from its pinned `now_mono`
+  (10^12 µs): slot-1 active 3d 4h, slot-2 active 41m (inactive 2h ago),
+  slot-3 inactive 6d (last active 8d ago, so the stamp choice is observable).
+  Change a stamp and the `status` rows in `tests/run.sh` change with it.
 
 ## migrate-test
 

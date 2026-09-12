@@ -46,16 +46,22 @@ runnerctl upgrade [--check] [--ref <branch|tag>]
 runnerctl version
 ```
 
-`status` shows each slot's state, memory cap/usage, restart policy, env file
-and — when run as the runner's user or root — the repository and job it is
-currently working on:
+`status` shows each slot's state and how long it has been in it (`SINCE`),
+memory cap/usage, restart policy, env file and — when run as the runner's
+user or root — the repository and job it is currently working on, with how
+long that job has been running:
 
 ```
-IDX RUNNER                 ACTIVE          ENABLED   MAX    HIGH   USED   RESTART  ENVFILE WORKING-ON
-0   org.host-1             active/running  enabled   26.0G  22.0G  3.1G   always   —       my-app:test
-1   org.host-2             active/running  enabled   26.0G  22.0G  128M   always   —       idle
-2   org.host-3             inactive/dead   disabled  —      —      —      always   —       —
+IDX RUNNER                 ACTIVE          SINCE    ENABLED   MAX    HIGH   USED   RESTART  ENVFILE WORKING-ON
+0   org.host-1             active/running  3d 4h    enabled   26.0G  22.0G  3.1G   always   —       my-app:test (12m)
+1   org.host-2             active/running  41m      enabled   26.0G  22.0G  128M   always   —       idle
+2   org.host-3             inactive/dead   6d       disabled  —      —      —      always   —       —
 ```
+
+`SINCE` is measured from systemd's active-enter timestamp for a running slot
+and from its inactive-enter timestamp for a stopped or failed one (`—` for a
+slot that has never started). The job runtime is the age of the slot's
+`Runner.Worker` process, which is spawned once per job.
 
 Slots are addressed by unit name, by the `IDX` column, or by the `RUNNER`
 column's short name — an unambiguous prefix or substring of it also works

@@ -18,6 +18,10 @@
 # Helpers (all patterns are `grep -E` regexes):
 #   run <args...>                  run ./runnerctl <args> against the stub;
 #                                  sets OUT ERR RC and the log/writes dir
+#   run_fn <function> <args...>    call one of runnerctl's own helpers (e.g.
+#                                  fmt_dur) directly: sources the script with
+#                                  RUNNERCTL_NO_MAIN=1, no config, no command;
+#                                  sets OUT ERR RC, the log stays empty
 #   expect_rc N                    exit code
 #   expect_out P / expect_no_out P some stdout line matches / none does
 #   expect_err P                   some stderr line matches
@@ -56,6 +60,17 @@ run() {
   RC=0
   OUT="$(RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
          "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
+  ERR="$(cat "$TMP/err")"
+}
+
+# Call a helper function of the script directly, for the ones no command
+# exposes on their own (fmt_dur, ...). RUNNERCTL_NO_MAIN=1 makes the script
+# define its functions and return instead of running main, so nothing is
+# sourced from a config and nothing touches the host.
+run_fn() {
+  : >"$LOG"
+  RC=0
+  OUT="$(RUNNERCTL_NO_MAIN=1 bash -c '. "$0" && "$@"' "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
   ERR="$(cat "$TMP/err")"
 }
 
@@ -181,10 +196,10 @@ DEPLOY_ENV="/etc/runnerctl/deploy.env"
 case_status_table() {
   run status
   expect_rc 0
-  expect_out '^IDX +RUNNER +ACTIVE +ENABLED +MAX +HIGH +USED +RESTART +ENVFILE +WORKING-ON$'
-  expect_out '^0 +example\.slot-1 +active/running +enabled +26\.0G +22\.0G +1\.0G +always +— +idle$'
-  expect_out '^1 +example\.slot-2 +active/running +enabled '
-  expect_out '^2 +example\.slot-3 +active/running +enabled '
+  expect_out '^IDX +RUNNER +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +RESTART +ENVFILE +WORKING-ON$'
+  expect_out '^0 +example\.slot-1 +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G +always +— +my-app:test \(12m\)$'
+  expect_out '^1 +example\.slot-2 +active/running +41m +enabled '
+  expect_out '^2 +example\.slot-3 +inactive/dead +6d +disabled +— +— +— +always +— +—$'
   expect_no_out '^3 '
   # status is read-only: no privileged call at all (the `probe:` lines below
   # are the stub logging its own unit_props hits, not a host mutation).
@@ -506,6 +521,55 @@ case_restart_no_match() {
   expect_no_log '^systemctl restart'
 }
 
+# --- GHR-1: status shows SINCE (time in state) and the running job's runtime --
+# The stub pins now_mono at 10^12 µs and stamps each slot relative to it (see
+# tests/stub.config); the worker-runtime read inside job_info is stubbed away
+# with the rest of job_info and is NOT covered here.
+
+case_status_since_active_slots() {
+  run status
+  expect_rc 0
+  # active slots: SINCE is measured from ActiveEnterTimestampMonotonic
+  expect_out '^0 +example\.slot-1 +active/running +3d 4h +enabled '
+  expect_out '^1 +example\.slot-2 +active/running +41m +enabled '
+}
+
+case_status_since_inactive_slot_uses_inactive_enter() {
+  run status
+  expect_rc 0
+  # slot-3 was last active 8d ago and went inactive 6d ago: an inactive slot
+  # is measured from InactiveEnterTimestampMonotonic, so 6d, never 8d.
+  expect_out '^2 +example\.slot-3 +inactive/dead +6d +disabled '
+  expect_no_out '^2 +example\.slot-3 +inactive/dead +8d '
+}
+
+case_status_job_runtime_in_working_on() {
+  run status
+  expect_rc 0
+  # the runtime rides inside the WORKING-ON cell; the column count is unchanged
+  expect_out '^0 +example\.slot-1 .* my-app:test \(12m\)$'
+  expect_out '^1 +example\.slot-2 .* idle$'
+  expect_out '^2 +example\.slot-3 .* —$'
+  expect_no_out '^IDX .*RUNTIME'
+}
+
+case_fmt_dur_seconds()       { run_fn fmt_dur 5;      expect_rc 0; expect_out '^5s$'; }
+case_fmt_dur_zero()          { run_fn fmt_dur 0;      expect_rc 0; expect_out '^0s$'; }
+case_fmt_dur_minutes()       { run_fn fmt_dur 2460;   expect_rc 0; expect_out '^41m$'; }
+case_fmt_dur_hours_minutes() { run_fn fmt_dur 11520;  expect_rc 0; expect_out '^3h12m$'; }
+case_fmt_dur_whole_hours()   { run_fn fmt_dur 7200;   expect_rc 0; expect_out '^2h$'; }
+case_fmt_dur_days_hours()    { run_fn fmt_dur 273600; expect_rc 0; expect_out '^3d 4h$'; }
+case_fmt_dur_whole_days()    { run_fn fmt_dur 518400; expect_rc 0; expect_out '^6d$'; }
+case_fmt_dur_empty()         { run_fn fmt_dur '';     expect_rc 0; expect_out '^—$'; }
+case_fmt_dur_negative()      { run_fn fmt_dur -30;    expect_rc 0; expect_out '^—$'; }
+case_fmt_dur_non_numeric()   { run_fn fmt_dur n/a;    expect_rc 0; expect_out '^—$'; }
+
+case_since_state_never_entered() {
+  # 0 / empty stamps mean the state was never entered: — rather than a huge age
+  run_fn since_state inactive 0 0;   expect_rc 0; expect_out '^—$'
+  run_fn since_state active '' '';   expect_rc 0; expect_out '^—$'
+}
+
 # --- Registry -----------------------------------------------------------------
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
@@ -542,6 +606,20 @@ t "logs slot-3: unambiguous substring of the short name resolves"  case_logs_by_
 t "enable example.slot-1.service: short name + suffix resolves"    case_enable_by_short_name_with_service_suffix
 t "restart slot: ambiguous target, no systemctl call"               case_restart_ambiguous_target
 t "restart nope: no match, no systemctl call"                       case_restart_no_match
+t "status: SINCE of active slots from ActiveEnterTimestampMonotonic" case_status_since_active_slots
+t "status: SINCE of an inactive slot from InactiveEnterTimestampMonotonic" case_status_since_inactive_slot_uses_inactive_enter
+t "status: job runtime inside the WORKING-ON cell"                  case_status_job_runtime_in_working_on
+t "fmt_dur 5: 5s"                                                   case_fmt_dur_seconds
+t "fmt_dur 0: 0s"                                                   case_fmt_dur_zero
+t "fmt_dur 2460: 41m"                                               case_fmt_dur_minutes
+t "fmt_dur 11520: 3h12m"                                            case_fmt_dur_hours_minutes
+t "fmt_dur 7200: 2h"                                                case_fmt_dur_whole_hours
+t "fmt_dur 273600: 3d 4h"                                           case_fmt_dur_days_hours
+t "fmt_dur 518400: 6d"                                              case_fmt_dur_whole_days
+t "fmt_dur '': —"                                                   case_fmt_dur_empty
+t "fmt_dur -30: —"                                                  case_fmt_dur_negative
+t "fmt_dur n/a: —"                                                  case_fmt_dur_non_numeric
+t "since_state: never-entered stamps give —"                        case_since_state_never_entered
 
 # --- Summary ------------------------------------------------------------------
 echo

@@ -46,7 +46,7 @@
 #   Old install:  runnerctl migrate   # lifts the inline values into the config
 set -euo pipefail
 
-RUNNERCTL_VERSION="0.2.6"
+RUNNERCTL_VERSION="0.3.0"
 
 # --- Defaults (all overridable from the config file) -------------------------
 # The BUILTIN_* copies stay untouched by the config so `migrate` can tell a
@@ -226,14 +226,21 @@ unit_props() {
 # read access to the processes — works when run as the runner's user (or root).
 # Takes the cgroup as $2 (from a caller's already-fetched unit_props) instead
 # of fetching it itself.
+# Runner.Worker is spawned once per job, so its age is the job's runtime; it
+# is appended to the cell as `repo:job (12m)`. The worker is found in a pass
+# of its own because the step process that carries GITHUB_* is a child of it
+# and cgroup.procs does not promise an order.
 job_info() {
-  local u="$1" cg="$2" f pid env repo job worker=""
+  local u="$1" cg="$2" f pid env repo job worker="" runtime=""
   f="/sys/fs/cgroup${cg}/cgroup.procs"
   if [ -z "$cg" ] || [ ! -r "$f" ]; then echo "—"; return; fi
   while read -r pid; do
     if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q "Runner.Worker"; then
-      worker=1
+      worker="$pid"; break
     fi
+  done <"$f"
+  if [ -n "$worker" ]; then runtime="$(proc_runtime "$worker")"; fi
+  while read -r pid; do
     [ -r "/proc/$pid/environ" ] || continue
     env="$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null || true)"
     case "$env" in
@@ -242,10 +249,81 @@ job_info() {
     esac
     repo="$(printf '%s\n' "$env" | grep -m1 '^GITHUB_REPOSITORY=' | cut -d= -f2- || true)"
     job="$(printf '%s\n' "$env" | grep -m1 '^GITHUB_JOB=' | cut -d= -f2- || true)"
-    printf '%s:%s\n' "${repo##*/}" "${job:-?}"
+    printf '%s:%s%s\n' "${repo##*/}" "${job:-?}" "${runtime:+ ($runtime)}"
     return
   done <"$f"
   if [ -n "$worker" ]; then echo "(starting)"; else echo "idle"; fi
+}
+
+# --- Durations ----------------------------------------------------------------
+# Seconds -> 12s / 41m / 3h12m / 3d 4h (a zero remainder is dropped: 6d, 2h).
+# Anything that is not a non-negative integer (empty, "n/a", a negative from
+# a clock that went backwards) -> —.
+fmt_dur() {
+  local s="${1:-}" r
+  [[ "$s" =~ ^[0-9]+$ ]] || { echo "—"; return; }
+  if [ "$s" -ge 86400 ]; then
+    r=$(((s % 86400) / 3600))
+    if [ "$r" -gt 0 ]; then echo "$((s / 86400))d ${r}h"; else echo "$((s / 86400))d"; fi
+  elif [ "$s" -ge 3600 ]; then
+    r=$(((s % 3600) / 60))
+    if [ "$r" -gt 0 ]; then echo "$((s / 3600))h${r}m"; else echo "$((s / 3600))h"; fi
+  elif [ "$s" -ge 60 ]; then
+    echo "$((s / 60))m"
+  else
+    echo "${s}s"
+  fi
+}
+
+# Microseconds since boot, from /proc/uptime — the same clock as systemd's
+# *TimestampMonotonic properties, so no date/locale/TZ parsing is needed.
+# Integer arithmetic only; a config can shadow this to make `status`
+# deterministic under test.
+now_mono() {
+  local up frac
+  read -r up _ </proc/uptime
+  frac="${up#*.}"; [ "$frac" != "$up" ] || frac=0
+  frac="${frac}000000"; frac="${frac:0:6}"   # pad/truncate to microseconds
+  echo $(( ${up%%.*} * 1000000 + 10#$frac ))
+}
+
+# How long a unit has been in its ActiveState: since the active-enter stamp
+# while active/activating/reloading, otherwise since the inactive-enter stamp
+# (StateChangeTimestamp also moves on sub-state changes, so it is not used).
+# Stamps are µs since boot; 0 or empty means the state was never entered.
+since_state() { # ACTIVE-STATE ACTIVE-ENTER-US INACTIVE-ENTER-US
+  local ts
+  case "$1" in
+    active|activating|reloading) ts="$2" ;;
+    *)                           ts="$3" ;;
+  esac
+  if [[ "$ts" =~ ^[0-9]+$ ]] && [ "$ts" -gt 0 ]; then
+    fmt_dur $(( ($(now_mono) - ts) / 1000000 ))
+  else
+    echo "—"
+  fi
+}
+
+# When PID started, in µs since boot: field 22 of /proc/PID/stat, in clock
+# ticks. (Not `stat -c %Y /proc/PID`: procfs stamps that directory when it is
+# first looked up, not when the process forked, so it reads as "now" for a
+# process nobody has inspected yet.) The comm field can contain spaces, so
+# split after its closing paren. Prints nothing if PID is gone.
+proc_start_mono() {
+  local st tck
+  st="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
+  read -ra st <<<"${st##*) }"          # fields 3.., so start time is index 19
+  [ "${#st[@]}" -gt 19 ] || return 0
+  tck="$(getconf CLK_TCK 2>/dev/null)" || tck=100
+  echo $(( st[19] * 1000000 / tck ))
+}
+
+# fmt_dur of how long PID has been alive; empty if PID cannot be read.
+proc_runtime() {
+  local start
+  start="$(proc_start_mono "$1")"
+  [ -n "$start" ] || return 0
+  fmt_dur $(( ($(now_mono) - start) / 1000000 ))
 }
 
 hbytes() {
@@ -336,8 +414,8 @@ cmd_status() {
   require_runners
   echo "Host: $(nproc) cores, $(free -h | awk '/^Mem:/{print $2" RAM, "$7" available"}')"
   echo
-  printf '%-3s %-40s %-15s %-9s %-6s %-6s %-6s %-8s %-7s %s\n' \
-    IDX RUNNER ACTIVE ENABLED MAX HIGH USED RESTART ENVFILE WORKING-ON
+  printf '%-3s %-40s %-15s %-8s %-9s %-6s %-6s %-6s %-8s %-7s %s\n' \
+    IDX RUNNER ACTIVE SINCE ENABLED MAX HIGH USED RESTART ENVFILE WORKING-ON
   local i=0 u
   while read -r u; do
     [ -n "$u" ] || continue
@@ -349,8 +427,9 @@ cmd_status() {
       P[$k]="$v"
     done < <(unit_props "$u")
     local envf="${P[EnvironmentFiles]:-}"; [ -n "$envf" ] || envf="—"
-    printf '%-3s %-40s %-15s %-9s %-6s %-6s %-6s %-8s %-7s %s\n' \
+    printf '%-3s %-40s %-15s %-8s %-9s %-6s %-6s %-6s %-8s %-7s %s\n' \
       "$i" "$short" "${P[ActiveState]:-}/${P[SubState]:-}" \
+      "$(since_state "${P[ActiveState]:-}" "${P[ActiveEnterTimestampMonotonic]:-}" "${P[InactiveEnterTimestampMonotonic]:-}")" \
       "${P[UnitFileState]:-}" \
       "$(hbytes "${P[MemoryMax]:-}")" "$(hbytes "${P[MemoryHigh]:-}")" \
       "$(hbytes "${P[MemoryCurrent]:-}")" "${P[Restart]:-}" "$envf" \
@@ -898,4 +977,6 @@ main() {
   esac
 }
 
-main "$@"
+# RUNNERCTL_NO_MAIN=1 lets tests/run.sh source the script and call a helper
+# (fmt_dur, ...) directly without running a command. Not a user-facing knob.
+if [ "${RUNNERCTL_NO_MAIN:-}" != 1 ]; then main "$@"; fi
