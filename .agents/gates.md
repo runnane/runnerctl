@@ -1,8 +1,14 @@
 # Gates
 
-`make gates` = `lint` + `example-drift` + `smoke` + `sim` + `migrate-test`. All
-five run without systemd runner units or root, so they are green on any dev box
-and in CI.
+`make gates` = `lint` + `example-drift` + `smoke` + `sim` + `migrate-test` +
+`install-test`. All six run without systemd runner units, root or network,
+so they are green on any dev box and in CI.
+
+**No test may escalate.** `migrate-test` and `install-test` put a fake `sudo`
+first on `PATH` that exits 97, so a code path that reaches for `run_priv` under
+a caller-owned temp prefix fails the test instead of leaving a root-owned file
+behind (which happened once, and needed a real `sudo rm` to clean up). Keep
+that tripwire in any new test that exercises a writing command.
 
 ## lint — shellcheck
 
@@ -90,6 +96,20 @@ asserts the render check goes red.
 
 `SYSTEMD_DIR` is a plain variable for exactly this reason; a config can
 override it like any other default.
+
+## install-test
+
+`bash tests/install-test.sh`. Runs `runnerctl install --prefix <tmp>` through
+its paths: fresh, idempotent rerun, legacy fixture (asserts `migrate` ran
+*before* the file was replaced, by line order in the output), `--dry-run`,
+`--no-migrate` (keeps `runnerctl.legacy`), a migrate that fails its render
+check aborting the install with the old file intact, no-downgrade against a
+copy stamped `9.9.9`, refusal to overwrite a non-runnerctl file, and the
+piped form. The piped case is offline: a temp config sets
+`UPGRADE_URL="file://$PWD/runnerctl"` and `cat runnerctl | bash -s -- --config
+<that> install --prefix <tmp>` exercises the real download path through
+`curl`'s `file://` support. `--ref` is not covered (it needs a
+raw.githubusercontent.com URL); verify it by hand.
 
 ## release
 

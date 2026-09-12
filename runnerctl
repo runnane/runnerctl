@@ -37,8 +37,12 @@
 #   runnerctl profiles
 #   runnerctl config-example
 #   runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
+#   runnerctl install [--prefix DIR] [--ref <branch|tag>] [--no-migrate] [--dry-run]
 #   runnerctl upgrade [--check] [--ref <branch|tag>]
 #   runnerctl version
+#
+# Install or upgrade any host (a pre-config install is migrated first):
+#   curl -fsSL https://raw.githubusercontent.com/runnane/runnerctl/main/runnerctl | sudo bash -s -- install
 #
 # Recommended baselines:
 #   CI host:      runnerctl scale 2 --max 26G --high 22G
@@ -47,7 +51,7 @@
 #   Old install:  runnerctl migrate   # lifts the inline values into the config
 set -euo pipefail
 
-RUNNERCTL_VERSION="0.3.1"
+RUNNERCTL_VERSION="0.3.8"
 
 # --- Defaults (all overridable from the config file) -------------------------
 # The BUILTIN_* copies stay untouched by the config so `migrate` can tell a
@@ -840,15 +844,65 @@ cmd_migrate() {
   $dry_run || echo "Next: runnerctl --config $out profiles   # then install the new runnerctl and run: runnerctl status"
 }
 
-# --- Self-upgrade -------------------------------------------------------------
-# Fetch the script from UPGRADE_URL (optionally a specific branch/tag), verify
-# it parses and carries a version, and replace the installed file in place.
-# The replacement is a rename, so the running copy keeps its old inode and is
-# unaffected mid-execution.
+# --- Install / self-upgrade ---------------------------------------------------
+# Both fetch the script from UPGRADE_URL (optionally a specific branch/tag),
+# verify it parses and carries a version, and put it in place by staged copy +
+# rename, so a running copy keeps its old inode and is unaffected mid-execution.
+# `upgrade` replaces the file it is running from; `install` also works when
+# the script is being read from a pipe (curl … | bash -s -- install), finds or
+# creates the install location, and migrates a pre-config install first.
 remote_version() { grep -m1 '^RUNNERCTL_VERSION=' "$1" | cut -d'"' -f2; }
 
+# True when bash is reading this script from stdin rather than a file. Inside
+# a function BASH_SOURCE[0] is then "main" (bash 5.2) or "bash" (5.3), and $0
+# is "bash" in both; a real file gives its path in both.
+is_piped() {
+  case "${BASH_SOURCE[0]:-}" in ''|main|bash) return 0 ;; esac
+  [ "$0" = "bash" ] || [ "$0" = "-bash" ] || [ "$0" = "sh" ]
+}
+
+# a < b in version order
+version_lt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$1" ]; }
+
+# UPGRADE_URL with the branch/tag segment swapped for REF (empty REF: as is).
+resolve_url() {
+  local ref="$1" url="$UPGRADE_URL"
+  if [ -n "$ref" ]; then
+    [[ "$url" =~ ^(https://raw\.githubusercontent\.com/[^/]+/[^/]+/)[^/]+(/.*)$ ]] \
+      || die "--ref only works with a raw.githubusercontent.com UPGRADE_URL (have: $url)"
+    url="${BASH_REMATCH[1]}${ref}${BASH_REMATCH[2]}"
+  fi
+  echo "$url"
+}
+
+# Download URL to DEST and refuse anything that does not parse or has no version.
+fetch_script() {
+  command -v curl >/dev/null || die "curl is required to download from $1"
+  curl -fsSL --max-time 30 "$1" -o "$2" || die "download failed: $1"
+  bash -n "$2" || die "downloaded script does not parse — not installing"
+  [ -n "$(remote_version "$2")" ] || die "downloaded file carries no RUNNERCTL_VERSION — not installing"
+}
+
+# Put SRC at DEST atomically. An existing DEST keeps its owner and mode; a new
+# one is root:root 755 when it took sudo to write, 755 otherwise.
+install_file() {
+  local src="$1" dest="$2" dir staged
+  dir="$(dirname "$dest")"; staged="$dir/.$(basename "$dest").new.$$"
+  local priv=()
+  { [ -w "$dir" ] && { [ ! -e "$dest" ] || [ -w "$dest" ]; }; } || priv=(run_priv)
+  "${priv[@]}" cp "$src" "$staged"
+  if [ -e "$dest" ]; then
+    "${priv[@]}" chown --reference="$dest" "$staged"
+    "${priv[@]}" chmod --reference="$dest" "$staged"
+  else
+    [ "${#priv[@]}" -eq 0 ] || run_priv chown root:root "$staged"
+  fi
+  "${priv[@]}" chmod +x "$staged"
+  "${priv[@]}" mv -f "$staged" "$dest"
+}
+
 cmd_upgrade() {
-  local check=false ref="" url="$UPGRADE_URL"
+  local check=false ref=""
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     case "$1" in
@@ -857,45 +911,122 @@ cmd_upgrade() {
       *) die "unknown option: $1" ;;
     esac
   done
-  # A --ref swaps the branch/tag segment of a raw.githubusercontent.com URL.
-  if [ -n "$ref" ]; then
-    [[ "$url" =~ ^(https://raw\.githubusercontent\.com/[^/]+/[^/]+/)[^/]+(/.*)$ ]] \
-      || die "--ref only works with a raw.githubusercontent.com UPGRADE_URL (have: $url)"
-    url="${BASH_REMATCH[1]}${ref}${BASH_REMATCH[2]}"
-  fi
-
-  local self new_ver
+  local self url new_ver
   self="$(readlink -f "${BASH_SOURCE[0]}")"
-  UPGRADE_TMP="$(mktemp)"; trap 'rm -f "$UPGRADE_TMP"' EXIT
-  local tmp="$UPGRADE_TMP"
-  curl -fsSL --max-time 30 "$url" -o "$tmp" || die "download failed: $url"
-  bash -n "$tmp" || die "downloaded script does not parse — not installing"
-  new_ver="$(remote_version "$tmp")"
-  [ -n "$new_ver" ] || die "downloaded file carries no RUNNERCTL_VERSION — not installing"
+  url="$(resolve_url "$ref")"
+  DOWNLOAD_TMP="$(mktemp)"; trap 'rm -f "$DOWNLOAD_TMP"' EXIT
+  fetch_script "$url" "$DOWNLOAD_TMP"
+  new_ver="$(remote_version "$DOWNLOAD_TMP")"
 
   echo "installed: $RUNNERCTL_VERSION ($self)"
   echo "available: $new_ver ($url)"
-  if [ "$new_ver" = "$RUNNERCTL_VERSION" ] && cmp -s "$tmp" "$self"; then
+  if [ "$new_ver" = "$RUNNERCTL_VERSION" ] && cmp -s "$DOWNLOAD_TMP" "$self"; then
     echo "Already up to date."; return 0
   fi
-  if [ -z "$ref" ] && [ "$(printf '%s\n%s\n' "$new_ver" "$RUNNERCTL_VERSION" | sort -V | head -1)" = "$new_ver" ] \
-     && [ "$new_ver" != "$RUNNERCTL_VERSION" ]; then
+  if [ -z "$ref" ] && version_lt "$new_ver" "$RUNNERCTL_VERSION"; then
     echo "Remote is older than installed — not downgrading (pass --ref to force a specific version)."
     return 0
   fi
   if $check; then echo "Update available. Run: runnerctl upgrade"; return 0; fi
-
-  local dir staged
-  dir="$(dirname "$self")"
-  staged="$dir/.$(basename "$self").new.$$"
-  local priv=()
-  [ -w "$dir" ] && [ -w "$self" ] || priv=(run_priv)
-  "${priv[@]}" cp "$tmp" "$staged"
-  "${priv[@]}" chown --reference="$self" "$staged"
-  "${priv[@]}" chmod --reference="$self" "$staged"
-  "${priv[@]}" chmod +x "$staged"
-  "${priv[@]}" mv -f "$staged" "$self"
+  install_file "$DOWNLOAD_TMP" "$self"
   echo "Upgraded $RUNNERCTL_VERSION -> $new_ver at $self"
+}
+
+cmd_install() {
+  local prefix="" ref="" migrate=true dry_run=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prefix)     [ $# -ge 2 ] || die "--prefix needs a directory"; prefix="${2%/}"; shift 2 ;;
+      --ref)        [ $# -ge 2 ] || die "--ref needs a value"; ref="$2"; shift 2 ;;
+      --no-migrate) migrate=false; shift ;;
+      --dry-run)    dry_run=true; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+
+  # Source of the new bytes: this very file when it is a real, versioned one
+  # (a checkout, a downloaded copy), else a download — always when piped.
+  local src new_ver
+  if ! is_piped && [ -z "$ref" ] && [ -n "$(remote_version "${BASH_SOURCE[0]}")" ]; then
+    src="$(readlink -f "${BASH_SOURCE[0]}")"
+    echo "source: $src (this file)"
+  else
+    local url; url="$(resolve_url "$ref")"
+    DOWNLOAD_TMP="$(mktemp)"; trap 'rm -f "$DOWNLOAD_TMP"' EXIT
+    fetch_script "$url" "$DOWNLOAD_TMP"
+    src="$DOWNLOAD_TMP"
+    echo "source: $url"
+  fi
+  new_ver="$(remote_version "$src")"
+
+  # Target: where runnerctl already is, else /usr/local/bin.
+  local existing target
+  existing="$(command -v runnerctl 2>/dev/null || true)"
+  if [ -z "$prefix" ]; then
+    if [ -n "$existing" ]; then prefix="$(dirname "$(readlink -f "$existing")")"; else prefix="/usr/local/bin"; fi
+  fi
+  target="$prefix/runnerctl"
+  echo "target: $target"
+  if needs_priv "$target"; then
+    [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null || die "$prefix is not writable and there is no sudo — run as root"
+  fi
+
+  # What is there already decides the path: nothing, a pre-config install, or
+  # a versioned one.
+  local fresh=false
+  if [ -e "$target" ]; then
+    looks_like_runnerctl "$target" || die "$target exists but is not a runnerctl script — refusing to overwrite it"
+    if is_legacy_script "$target"; then
+      echo "existing: pre-config runnerctl (no RUNNERCTL_VERSION) at $target"
+      if ! $migrate; then
+        echo "--no-migrate: its inline values will NOT be carried into $CONFIG_FILE."
+        echo "A copy is kept at $target.legacy so 'runnerctl migrate --from $target.legacy' can do it later."
+      elif $dry_run; then
+        echo "would run: runnerctl migrate --from $target   (writes $CONFIG_FILE, verified against the live drop-ins)"
+      else
+        echo "--- migrate ---"
+        cmd_migrate --from "$target"   # dies on any failure, leaving $target untouched
+        echo "--- migrate done ---"
+      fi
+    else
+      local cur; cur="$(remote_version "$target")"
+      echo "existing: runnerctl $cur"
+      if cmp -s "$src" "$target"; then
+        echo "Already up to date ($cur at $target)."
+        "$target" version; return 0
+      fi
+      if [ -z "$ref" ] && version_lt "$new_ver" "$cur"; then
+        echo "Installed $cur is newer than $new_ver — not downgrading (pass --ref to force a version)."
+        return 0
+      fi
+      echo "upgrade: $cur -> $new_ver"
+    fi
+  else
+    fresh=true
+    echo "existing: none — fresh install of $new_ver"
+  fi
+
+  if $dry_run; then echo "(dry run — would install runnerctl $new_ver at $target; nothing changed)"; return 0; fi
+  if [ -e "$target" ] && is_legacy_script "$target" && ! $migrate; then
+    install_file "$target" "$target.legacy"
+  fi
+  local priv=()
+  ! needs_priv "$prefix" || priv=(run_priv)
+  "${priv[@]}" mkdir -p "$prefix"
+  install_file "$src" "$target"
+  priv=(); ! needs_priv "$(dirname "$CONFIG_FILE")" || priv=(run_priv)
+  "${priv[@]}" mkdir -p "$(dirname "$CONFIG_FILE")"
+  echo "Installed runnerctl $new_ver at $target"
+  if $fresh; then
+    echo
+    echo "Next:"
+    echo "  runnerctl status"
+    echo "  runnerctl config-example | sudo tee $CONFIG_FILE   # then edit for this host"
+    echo "  runnerctl profiles"
+  fi
+  # The proof comes from the installed file, not from this process.
+  echo
+  "$target" version
 }
 
 usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}"; }
@@ -911,7 +1042,14 @@ main() {
   fi
   load_config
   local cmd="${1:-status}"; shift || true
+  if is_piped; then
+    case "$cmd" in
+      install|version|--version) ;;
+      *) die "running from a pipe — only 'install' works that way. Install first: curl -fsSL $UPGRADE_URL | sudo bash -s -- install" ;;
+    esac
+  fi
   case "$cmd" in
+    install)            cmd_install "$@" ;;
     status)             cmd_status "$@" ;;
     apply)              cmd_apply "$@" ;;
     scale)              cmd_scale "$@" ;;
@@ -926,7 +1064,7 @@ main() {
     upgrade)            cmd_upgrade "$@" ;;
     version|--version)  echo "runnerctl $RUNNERCTL_VERSION" ;;
     -h|--help|help)     usage ;;
-    *) die "unknown command '$cmd' (status apply scale env-init start stop restart enable disable logs remove-limits profiles config-example migrate upgrade version)" ;;
+    *) die "unknown command '$cmd' (status apply scale env-init start stop restart enable disable logs remove-limits profiles config-example migrate install upgrade version)" ;;
   esac
 }
 
