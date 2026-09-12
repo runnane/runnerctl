@@ -36,9 +36,11 @@ units is covered by `sim`.
 The config file is sourced after every function in the script is defined, so
 the stub shadows `run_priv` (appends its argv to a log and does nothing),
 `discover` (three fixed `actions.runner.example.slot-N.service` units), `prop`
-(a fixed property table) and `job_info`; `systemctl`, `journalctl` and `sudo`
-are shadowed too as a safety net, and a case whose log shows one of them was
-reached directly fails. Cases assert on stdout, stderr, the exit code, the
+(a fixed property table), `unit_props` (the batched per-unit table `status`
+reads into an associative array — logged with a `probe:` prefix so cases can
+count it without tripping the read-only/leak assertions) and `job_info`;
+`systemctl`, `journalctl` and `sudo` are shadowed too as a safety net, and a
+case whose log shows one of them was reached directly fails. Cases assert on stdout, stderr, the exit code, the
 ordered list of privileged calls and the content `tee`d to each path. Plain
 bash, no framework — CI and a fresh worktree have nothing but shellcheck.
 

@@ -202,13 +202,22 @@ require_runners() {
 
 prop() { systemctl show "$1" -p "$2" --value 2>/dev/null; }
 
+# One `systemctl show` call for every property `status` needs, instead of one
+# per column: prints KEY=VALUE lines (a value can itself contain '=', e.g.
+# EnvironmentFiles=/etc/x (ignore_errors=no) — callers must split on the
+# FIRST '=' only). A config can shadow this to stub `status` under test.
+unit_props() {
+  systemctl show "$1" -p ActiveState,SubState,UnitFileState,MemoryMax,MemoryHigh,MemoryCurrent,Restart,EnvironmentFiles,ControlGroup,ActiveEnterTimestampMonotonic,InactiveEnterTimestampMonotonic,NRestarts,Result 2>/dev/null
+}
+
 # What is this runner currently working on? Read GITHUB_REPOSITORY / GITHUB_JOB
 # from the environment of the job's processes in the runner's systemd cgroup.
 # (GITHUB_JOB is the workflow job id, e.g. lint/typecheck/test/build.) Requires
 # read access to the processes — works when run as the runner's user (or root).
+# Takes the cgroup as $2 (from a caller's already-fetched unit_props) instead
+# of fetching it itself.
 job_info() {
-  local u="$1" cg f pid env repo job worker=""
-  cg="$(prop "$u" ControlGroup)"
+  local u="$1" cg="$2" f pid env repo job worker=""
   f="/sys/fs/cgroup${cg}/cgroup.procs"
   if [ -z "$cg" ] || [ ! -r "$f" ]; then echo "—"; return; fi
   while read -r pid; do
@@ -297,13 +306,19 @@ cmd_status() {
   while read -r u; do
     [ -n "$u" ] || continue
     local short="${u#actions.runner.}"; short="${short%.service}"
-    local envf; envf="$(prop "$u" EnvironmentFiles)"; [ -n "$envf" ] || envf="—"
+    local -A P=()
+    local k v
+    while IFS='=' read -r k v; do
+      [ -n "$k" ] || continue
+      P[$k]="$v"
+    done < <(unit_props "$u")
+    local envf="${P[EnvironmentFiles]:-}"; [ -n "$envf" ] || envf="—"
     printf '%-3s %-40s %-15s %-9s %-6s %-6s %-6s %-8s %-7s %s\n' \
-      "$i" "$short" "$(prop "$u" ActiveState)/$(prop "$u" SubState)" \
-      "$(prop "$u" UnitFileState)" \
-      "$(hbytes "$(prop "$u" MemoryMax)")" "$(hbytes "$(prop "$u" MemoryHigh)")" \
-      "$(hbytes "$(prop "$u" MemoryCurrent)")" "$(prop "$u" Restart)" "$envf" \
-      "$(job_info "$u")"
+      "$i" "$short" "${P[ActiveState]:-}/${P[SubState]:-}" \
+      "${P[UnitFileState]:-}" \
+      "$(hbytes "${P[MemoryMax]:-}")" "$(hbytes "${P[MemoryHigh]:-}")" \
+      "$(hbytes "${P[MemoryCurrent]:-}")" "${P[Restart]:-}" "$envf" \
+      "$(job_info "$u" "${P[ControlGroup]:-}")"
     i=$((i+1))
   done < <(discover)
 }
@@ -370,7 +385,9 @@ cmd_ctl() { # start|stop|restart [target] (default: all)
   local action="$1"; shift || true
   require_runners
   if [ $# -ge 1 ]; then
-    run_priv systemctl "$action" "$(resolve "$1")"
+    # Resolve on its own line: a die inside "$(...)" only exits the subshell.
+    local u; u="$(resolve "$1")"
+    run_priv systemctl "$action" "$u"
   else
     local u; while read -r u; do [ -n "$u" ] && run_priv systemctl "$action" "$u"; done < <(discover)
   fi
@@ -380,13 +397,15 @@ cmd_ctl() { # start|stop|restart [target] (default: all)
 cmd_toggle() { # enable|disable <target>
   local action="$1"; shift || true
   [ $# -ge 1 ] || die "$action needs a <unit|slot-index>"
-  run_priv systemctl "$action" --now "$(resolve "$1")"
+  local u; u="$(resolve "$1")"
+  run_priv systemctl "$action" --now "$u"
   echo "$action done."
 }
 
 cmd_logs() {
   require_runners
-  run_priv journalctl -u "$(resolve "${1:-0}")" -n 100 --no-pager
+  local u; u="$(resolve "${1:-0}")"
+  run_priv journalctl -u "$u" -n 100 --no-pager
 }
 
 cmd_remove_limits() {
