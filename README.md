@@ -75,9 +75,8 @@ runnerctl version
 
 `status` shows each slot's state and how long it has been in it (`SINCE`),
 which profile it carries (`PROFILE`, read from its drop-in — `—` if it has
-none), memory cap/usage, restart policy, env file and — when run as the
-runner's user or root — the repository and job it is currently working on,
-with how long that job has been running:
+none), memory cap/usage, restart policy, env file and the job it is currently
+working on, with how long that job has been running:
 
 ```
 IDX RUNNER                 PROFILE  ACTIVE          SINCE    ENABLED   MAX    HIGH   USED   RESTART  ENVFILE WORKING-ON
@@ -88,8 +87,18 @@ IDX RUNNER                 PROFILE  ACTIVE          SINCE    ENABLED   MAX    HI
 
 `SINCE` is measured from systemd's active-enter timestamp for a running slot
 and from its inactive-enter timestamp for a stopped or failed one (`—` for a
-slot that has never started). The job runtime is the age of the slot's
-`Runner.Worker` process, which is spawned once per job.
+slot that has never started).
+
+`WORKING-ON` is read from the slot's journal — the runner's `Running job:` /
+`completed with result:` lines — so it needs journal read access (the
+`systemd-journal` group, or root); it is stable for the whole job, including
+between steps and for container jobs. The repository prefix and the job
+runtime (the age of the slot's `Runner.Worker`, spawned once per job) are
+added from `/proc` when `status` runs as the runner's user or root;
+otherwise the cell is the job name alone, timed from the journal line. A
+running slot whose journal cannot be read shows `(no access)` with a
+one-line hint under the table — `—` means only that the slot is not
+running.
 
 `apply` and `remove-limits` can be pointed at one or more slots instead of
 every discovered one — `runnerctl apply --profile deploy 2` or `runnerctl

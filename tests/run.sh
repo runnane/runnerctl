@@ -586,8 +586,9 @@ case_restart_no_match() {
 
 # --- GHR-1: status shows SINCE (time in state) and the running job's runtime --
 # The stub pins now_mono at 10^12 µs and stamps each slot relative to it (see
-# tests/stub.config); the worker-runtime read inside job_info is stubbed away
-# with the rest of job_info and is NOT covered here.
+# tests/stub.config). The WORKING-ON runtime here comes from the journal
+# stamp (GHR-10): the stub finds no Runner.Worker pid, so the /proc age read
+# (proc_worker_pid → proc_runtime) is NOT covered.
 
 case_status_since_active_slots() {
   run status
@@ -754,6 +755,76 @@ case_status_shows_profile_column() {
   expect_out '^2 +example\.slot-3 +deploy +inactive/dead '
 }
 
+# --- GHR-10: WORKING-ON from the journal; (no access) is not stopped ---------
+# job_info is the real function here: the stub shadows only journal_job_lines
+# (slot-1 `Running job: test` with no completion, slot-2 `build` completed),
+# now_epoch (12 min after slot-1's line) and the /proc hooks (no cgroup
+# readable, no worker pid, slot-1's environ names example/my-app). See
+# tests/stub.config.
+
+case_status_working_on_from_journal() {
+  run status
+  expect_rc 0
+  # slot-1: job name from the journal, repo from /proc, runtime from the
+  # journal stamp (the worker pid is not visible under the stub) — exact.
+  expect_out '^0 +example\.slot-1 .* my-app:test \(12m\)$'
+  # slot-2: its last job completed → idle, never `build`
+  expect_out '^1 +example\.slot-2 .* idle$'
+  expect_no_out '^1 +example\.slot-2 .* build'
+  # slot-3: no cgroup → —, and the journal is not even asked
+  expect_out '^2 +example\.slot-3 .* —$'
+  expect_no_out '\(starting\)'
+  expect_no_out '^note: '
+  # the journal hook gets the invocation id unit_props fetched, once per
+  # running slot; nothing reaches journalctl directly (the stub would log
+  # `direct:`, which fails the case on its own)
+  expect_log_count '^probe:journal_job_lines ' 2
+  expect_log '^probe:journal_job_lines actions\.runner\.example\.slot-1\.service 1111aaaa1111aaaa1111aaaa1111aaaa$'
+  expect_log '^probe:journal_job_lines actions\.runner\.example\.slot-2\.service 2222bbbb2222bbbb2222bbbb2222bbbb$'
+  expect_no_log '^probe:journal_job_lines actions\.runner\.example\.slot-3'
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test) '
+}
+
+case_status_no_access_is_not_stopped() {
+  RUNNERCTL_STUB_JOURNAL_ACCESS=0 run status
+  expect_rc 0
+  # journal unreadable → /proc fallback → cgroup unreadable → (no access),
+  # distinct from the stopped slot's —
+  expect_out '^0 +example\.slot-1 .* \(no access\)$'
+  expect_out '^1 +example\.slot-2 .* \(no access\)$'
+  expect_out '^2 +example\.slot-3 .* —$'
+  expect_no_out '^0 +example\.slot-1 .* —$'
+  # the hint: once, under the table, not in a row
+  _expect
+  local n
+  n="$(grep -Ec '^note: WORKING-ON needs journal read access \(systemd-journal group\) or root$' <<<"$OUT" || true)"
+  [ "$n" -eq 1 ] || FAILS+=("hint line: want exactly 1, got $n")
+  expect_no_out '^[0-9] .*note:'
+  # a failed journal read must not escalate: no sudo, no direct journalctl
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test) '
+}
+
+# The parser alone, over a fixed transcript: two jobs, the first completed.
+case_journal_running_job_last_uncompleted() {
+  run_fn journal_running_job "$(printf '%s\n' \
+    '1000000000.000000 runsvc.sh[1]: 2001-09-09 01:46:40Z: Running job: lint' \
+    '1000000100.000000 runsvc.sh[1]: 2001-09-09 01:48:20Z: Job lint completed with result: Succeeded' \
+    '1000000200.000000 runsvc.sh[1]: 2001-09-09 01:50:00Z: Running job: test (ubuntu, 3.12)')"
+  expect_rc 0
+  # name is everything after `Running job: ` (display names carry spaces and
+  # parens), the stamp is the leading epoch second of THAT line
+  expect_out $'^test \\(ubuntu, 3\\.12\\)\t1000000200$'
+  expect_no_out '^lint'
+}
+
+case_journal_running_job_idle_after_completion() {
+  run_fn journal_running_job "$(printf '%s\n' \
+    '1000000000.000000 runsvc.sh[1]: 2001-09-09 01:46:40Z: Running job: lint' \
+    '1000000100.000000 runsvc.sh[1]: 2001-09-09 01:48:20Z: Job lint completed with result: Failed')"
+  expect_rc 0
+  expect_no_out '.'
+}
+
 # --- Registry -----------------------------------------------------------------
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
@@ -794,6 +865,10 @@ t "status: SINCE of active slots from ActiveEnterTimestampMonotonic" case_status
 t "status: SINCE of an inactive slot from InactiveEnterTimestampMonotonic" case_status_since_inactive_slot_uses_inactive_enter
 t "status: — cells keep the columns aligned (character padding)"     case_status_dash_cells_keep_columns_aligned
 t "status: job runtime inside the WORKING-ON cell"                  case_status_job_runtime_in_working_on
+t "status: WORKING-ON from the journal (running / idle / —)"        case_status_working_on_from_journal
+t "status: (no access) is distinct from —, hint printed once"        case_status_no_access_is_not_stopped
+t "journal_running_job: last Running job without a later completion" case_journal_running_job_last_uncompleted
+t "journal_running_job: nothing once the last job completed"         case_journal_running_job_idle_after_completion
 t "fmt_dur 5: 5s"                                                   case_fmt_dur_seconds
 t "fmt_dur 0: 0s"                                                   case_fmt_dur_zero
 t "fmt_dur 2460: 41m"                                               case_fmt_dur_minutes
