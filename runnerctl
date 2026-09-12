@@ -28,9 +28,9 @@
 #                    [--restart-sec N] [--env-file PATH] [--restart]
 #   runnerctl scale N [--profile NAME] [--max 26G] [--high 22G]
 #   runnerctl env-init [--profile NAME] [--env-file PATH]
-#   runnerctl start|stop|restart [<unit|slot-index>]
-#   runnerctl enable|disable <unit|slot-index>
-#   runnerctl logs [<unit|slot-index>]
+#   runnerctl start|stop|restart [<unit|slot-index|name>]
+#   runnerctl enable|disable <unit|slot-index|name>
+#   runnerctl logs [<unit|slot-index|name>]
 #   runnerctl remove-limits
 #   runnerctl profiles
 #   runnerctl config-example
@@ -49,7 +49,7 @@
 #   Old install:  runnerctl migrate   # lifts the inline values into the config
 set -euo pipefail
 
-RUNNERCTL_VERSION="0.3.5"
+RUNNERCTL_VERSION="0.3.6"
 
 # --- Defaults (all overridable from the config file) -------------------------
 # The BUILTIN_* copies stay untouched by the config so `migrate` can tell a
@@ -260,15 +260,41 @@ hbytes() {
   awk -v b="$v" 'BEGIN{ if (b<1048576) printf "%.0fM", b/1048576; else printf "%.1fG", b/1073741824 }'
 }
 
-resolve() { # "unit or slot-index" -> unit name
+resolve() { # "unit, slot-index, or short RUNNER name" -> unit name
   local a="$1"
+  mapfile -t units < <(discover)
   if [[ "$a" =~ ^[0-9]+$ ]]; then
-    mapfile -t units < <(discover)
     [ "$a" -lt "${#units[@]}" ] || die "slot index $a out of range (0..$((${#units[@]}-1)))"
     echo "${units[$a]}"
-  else
-    echo "$a"
+    return
   fi
+  local u
+  # 1. the literal unit name.
+  for u in "${units[@]}"; do [ "$u" = "$a" ] && { echo "$u"; return; }; done
+  # 2. actions.runner.<arg>.service
+  for u in "${units[@]}"; do [ "$u" = "actions.runner.${a}.service" ] && { echo "$u"; return; }; done
+  # 3. <arg>.service
+  for u in "${units[@]}"; do [ "$u" = "${a}.service" ] && { echo "$u"; return; }; done
+  # 4. an unambiguous prefix or substring match on the short name (what
+  # `status` prints as RUNNER: the unit with "actions.runner." and ".service"
+  # stripped) — either direction, so "slot-1" matches "example.slot-1" and
+  # "example.slot-1.service" (typed with the suffix back on) also does.
+  local short shorts=() matches=()
+  for u in "${units[@]}"; do
+    short="${u#actions.runner.}"; short="${short%.service}"
+    shorts+=("$short")
+    [[ "$short" == *"$a"* || "$a" == *"$short"* ]] && matches+=("$short")
+  done
+  case "${#matches[@]}" in
+    1)
+      for u in "${units[@]}"; do
+        short="${u#actions.runner.}"; short="${short%.service}"
+        [ "$short" = "${matches[0]}" ] && { echo "$u"; return; }
+      done
+      ;;
+    0) die "no runner slot matches '$a' (have: 0..$((${#units[@]}-1)), ${shorts[*]})" ;;
+    *) die "ambiguous target '$a' matches: ${matches[*]}" ;;
+  esac
 }
 
 # --- Drop-in rendering --------------------------------------------------------
@@ -409,7 +435,7 @@ cmd_ctl() { # start|stop|restart [target] (default: all)
 
 cmd_toggle() { # enable|disable <target>
   local action="$1"; shift || true
-  [ $# -ge 1 ] || die "$action needs a <unit|slot-index>"
+  [ $# -ge 1 ] || die "$action needs a <unit|slot-index|name>"
   local u; u="$(resolve "$1")"
   run_priv systemctl "$action" --now "$u"
   echo "$action done."
