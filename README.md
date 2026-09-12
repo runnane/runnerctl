@@ -32,7 +32,8 @@ runnerctl [--config PATH] <command> [args]
 runnerctl status
 runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
                  [--restart-sec N] [--env-file PATH] [--restart]
-runnerctl scale N [--profile NAME] [--max 26G] [--high 22G]
+runnerctl scale N [--profile NAME] [--max 26G] [--high 22G] \
+                  [--restart]
 runnerctl env-init [--profile NAME] [--env-file PATH]
 runnerctl start|stop|restart [<unit|slot-index>]
 runnerctl enable|disable <unit|slot-index>
