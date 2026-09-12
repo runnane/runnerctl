@@ -357,8 +357,8 @@ case_logs_by_index() {
   expect_log "^journalctl -u $U3 -n 100 --no-pager\$"
 }
 
-# GHR-19: resolve() dies inside "$(...)", which only exits the subshell; the
-# script goes on to run `systemctl restart ""` and exits 0.
+# Callers resolve into a variable on its own line (GHR-19): a die inside
+# "$(...)" only exits the subshell, so the guard must run in the main shell.
 case_restart_out_of_range() {
   run restart 5
   expect_rc 1
@@ -387,7 +387,7 @@ t "restart 1: slot index resolves to the second unit"              case_restart_
 t "stop: every slot in discovery order"                            case_stop_all
 t "enable <unit>: full unit name passes through"                   case_enable_by_unit_name
 t "logs 2: journalctl on the third unit"                           case_logs_by_index
-xfail GHR-19 "restart 5: out of range exits 1 without a systemctl call" case_restart_out_of_range
+t "restart 5: out of range exits 1 without a systemctl call"       case_restart_out_of_range
 
 # --- Summary ------------------------------------------------------------------
 echo
