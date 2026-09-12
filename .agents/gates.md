@@ -46,7 +46,14 @@ the stub shadows `run_priv` (appends its argv to a log and does nothing),
 `discover` (three fixed `actions.runner.example.slot-N.service` units), `prop`
 (a fixed property table), `unit_props` (the batched per-unit table `status`
 reads into an associative array — logged with a `probe:` prefix so cases can
-count it without tripping the read-only/leak assertions) and `job_info`;
+count it without tripping the read-only/leak assertions), and the sources
+`job_info` reads rather than `job_info` itself: `journal_job_lines` (the
+Listener's `Running job:` / `completed with result:` lines per unit, also
+`probe:`-logged; `RUNNERCTL_STUB_JOURNAL_ACCESS=0` makes it fail like
+`journalctl --system` does for a user outside `systemd-journal`, which is
+the only way that failure is detectable — plain `journalctl -u` answers an
+empty journal and exit 0), `now_epoch`, and the `/proc` hooks
+`cgroup_readable` / `proc_worker_pid` / `proc_job_env`;
 `systemctl`, `journalctl` and `sudo` are shadowed too as a safety net, and a
 case whose log shows one of them was reached directly fails. Cases assert on stdout, stderr, the exit code, the
 ordered list of privileged calls and the content `tee`d to each path. Plain

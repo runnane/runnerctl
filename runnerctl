@@ -51,7 +51,7 @@
 #   Old install:  runnerctl migrate   # lifts the inline values into the config
 set -euo pipefail
 
-RUNNERCTL_VERSION="0.4.1"
+RUNNERCTL_VERSION="0.4.2"
 
 # --- Defaults (all overridable from the config file) -------------------------
 # The BUILTIN_* copies stay untouched by the config so `migrate` can tell a
@@ -222,42 +222,133 @@ prop() { systemctl show "$1" -p "$2" --value 2>/dev/null; }
 # EnvironmentFiles=/etc/x (ignore_errors=no) — callers must split on the
 # FIRST '=' only). A config can shadow this to stub `status` under test.
 unit_props() {
-  systemctl show "$1" -p ActiveState,SubState,UnitFileState,MemoryMax,MemoryHigh,MemoryCurrent,Restart,EnvironmentFiles,ControlGroup,ActiveEnterTimestampMonotonic,InactiveEnterTimestampMonotonic,NRestarts,Result 2>/dev/null
+  systemctl show "$1" -p ActiveState,SubState,UnitFileState,MemoryMax,MemoryHigh,MemoryCurrent,Restart,EnvironmentFiles,ControlGroup,ActiveEnterTimestampMonotonic,InactiveEnterTimestampMonotonic,NRestarts,Result,InvocationID 2>/dev/null
 }
 
-# What is this runner currently working on? Read GITHUB_REPOSITORY / GITHUB_JOB
-# from the environment of the job's processes in the runner's systemd cgroup.
-# (GITHUB_JOB is the workflow job id, e.g. lint/typecheck/test/build.) Requires
-# read access to the processes — works when run as the runner's user (or root).
-# Takes the cgroup as $2 (from a caller's already-fetched unit_props) instead
-# of fetching it itself.
-# Runner.Worker is spawned once per job, so its age is the job's runtime; it
-# is appended to the cell as `repo:job (12m)`. The worker is found in a pass
-# of its own because the step process that carries GITHUB_* is a child of it
-# and cgroup.procs does not promise an order.
-job_info() {
-  local u="$1" cg="$2" f pid env repo job worker="" runtime=""
-  f="/sys/fs/cgroup${cg}/cgroup.procs"
-  if [ -z "$cg" ] || [ ! -r "$f" ]; then echo "—"; return; fi
+# --- What is a runner working on? ---------------------------------------------
+# The Listener writes two lines to its stdout (the journal, via the svc.sh
+# unit) that bracket every job:
+#   <utc>: Running job: <job display name>
+#   <utc>: Job <job display name> completed with result: Succeeded|Failed|Canceled
+# The last `Running job:` line with no later `completed with result:` line is
+# the job the slot is on, for the whole job — stable between steps and for
+# container jobs, where the /proc environ walk below sees nothing — and it is
+# readable by anyone in the systemd-journal group, not only the runner user.
+# The strings are from the actions/runner source (Runner.Listener's
+# JobDispatcher), not yet verified against a host's journal.
+#
+# Prints the journal lines of UNIT's current invocation (scoped by
+# INVOCATION-ID when given, so a previous run's job cannot leak in) that
+# mention a job start or end, in `-o short-unix` form: the first field is the
+# epoch second the line was logged. Returns 1 and prints nothing when the
+# journal cannot be read. `--system` is load-bearing for that: without it a
+# user outside systemd-journal gets an EMPTY journal and exit 0 (probed on
+# systemd 261), indistinguishable from an idle slot; with it journalctl says
+# "insufficient permissions" and exits 1. Read-only and called directly, never
+# through run_priv — status must never prompt for sudo. A config can shadow
+# this to stub it.
+journal_job_lines() { # UNIT [INVOCATION-ID]
+  local out args=(--system -u "$1" -o short-unix --no-pager -q -n 400)
+  [ -n "${2:-}" ] && args+=("_SYSTEMD_INVOCATION_ID=$2")
+  out="$(journalctl "${args[@]}" 2>/dev/null)" || return 1
+  grep -E 'Running job: |completed with result: ' <<<"$out" || true
+}
+
+# Parse those lines: prints "<job name>\t<epoch second>" for the running job
+# (the last `Running job:` line with no later `completed with result:` line),
+# nothing when the slot is idle. Pure, so it is unit-testable (`run_fn`).
+journal_running_job() { # LINES
+  local line name="" ts=""
+  while IFS= read -r line; do
+    case "$line" in
+      *"completed with result: "*) name=""; ts="" ;;
+      *"Running job: "*)           name="${line##*Running job: }"; ts="${line%% *}"; ts="${ts%%.*}" ;;
+    esac
+  done <<<"$1"
+  [ -n "$name" ] || return 0
+  printf '%s\t%s\n' "$name" "$ts"
+}
+
+# The /proc side: only the runner's user or root can read a slot's processes.
+# Three hooks, so a config can stub the walk without replacing job_info.
+cgroup_readable() { [ -n "${1:-}" ] && [ -r "/sys/fs/cgroup${1}/cgroup.procs" ]; }
+
+# Runner.Worker is spawned once per job, so its age is the job's runtime.
+# Prints its pid; nothing when there is none or the cgroup cannot be read.
+proc_worker_pid() { # CGROUP
+  local pid
+  cgroup_readable "$1" || return 0
   while read -r pid; do
     if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q "Runner.Worker"; then
-      worker="$pid"; break
+      echo "$pid"; return 0
     fi
-  done <"$f"
-  if [ -n "$worker" ]; then runtime="$(proc_runtime "$worker")"; fi
+  done <"/sys/fs/cgroup${1}/cgroup.procs"
+}
+
+# GITHUB_REPOSITORY / GITHUB_JOB from the environment of the first process in
+# the cgroup that carries them (GITHUB_* is injected into the STEP processes,
+# not into Runner.Worker, so between steps and for container jobs there is
+# none). Prints the two KEY=VALUE lines; nothing otherwise.
+proc_job_env() { # CGROUP
+  local pid env
+  cgroup_readable "$1" || return 0
   while read -r pid; do
     [ -r "/proc/$pid/environ" ] || continue
     env="$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null || true)"
     case "$env" in
-      *GITHUB_REPOSITORY=*) ;;
-      *) continue ;;
+      *GITHUB_REPOSITORY=*) grep -E '^GITHUB_(REPOSITORY|JOB)=' <<<"$env"; return 0 ;;
     esac
-    repo="$(printf '%s\n' "$env" | grep -m1 '^GITHUB_REPOSITORY=' | cut -d= -f2- || true)"
-    job="$(printf '%s\n' "$env" | grep -m1 '^GITHUB_JOB=' | cut -d= -f2- || true)"
-    printf '%s:%s%s\n' "${repo##*/}" "${job:-?}" "${runtime:+ ($runtime)}"
+  done <"/sys/fs/cgroup${1}/cgroup.procs"
+}
+
+# Epoch seconds; a config can shadow it to pin the journal-derived runtime.
+now_epoch() { date +%s; }
+
+# The WORKING-ON cell. Takes the cgroup and invocation id from the caller's
+# already-fetched unit_props (GHR-4) instead of fetching them itself.
+#   —              the unit has no cgroup (not running)
+#   idle           the journal is readable and no job is in flight
+#   repo:job (12m) the journal names the job; the repo comes from the /proc
+#                  environ walk when that is readable (the job name alone
+#                  otherwise), the runtime from the Runner.Worker age, or from
+#                  the `Running job:` line's journal timestamp when the worker
+#                  cannot be seen
+# Without journal access the old /proc-only logic runs, and `(starting)`
+# survives only there: a live Runner.Worker with no GITHUB_* process is the
+# only signal of a job in /proc, and it cannot tell startup from between-steps
+# (the flicker GHR-10 removes for every reader with journal access).
+#   (no access)    neither the journal nor the cgroup can be read; cmd_status
+#                  prints a one-line hint under the table
+job_info() { # UNIT CGROUP [INVOCATION-ID]
+  local u="$1" cg="$2" lines rj name ts env repo job worker runtime=""
+  [ -n "$cg" ] || { echo "—"; return; }
+  if lines="$(journal_job_lines "$u" "${3:-}")"; then
+    rj="$(journal_running_job "$lines")"
+    [ -n "$rj" ] || { echo "idle"; return; }
+    name="${rj%%$'\t'*}"; ts="${rj#*$'\t'}"
+    repo="$(proc_job_env "$cg" | grep -m1 '^GITHUB_REPOSITORY=' | cut -d= -f2- || true)"
+    worker="$(proc_worker_pid "$cg")"
+    if [ -n "$worker" ]; then
+      runtime="$(proc_runtime "$worker")"
+    elif [[ "$ts" =~ ^[0-9]+$ ]]; then
+      runtime="$(fmt_dur $(( $(now_epoch) - ts )))"
+    fi
+    printf '%s%s%s\n' "${repo:+${repo##*/}:}" "$name" "${runtime:+ ($runtime)}"
     return
-  done <"$f"
-  if [ -n "$worker" ]; then echo "(starting)"; else echo "idle"; fi
+  fi
+  cgroup_readable "$cg" || { echo "(no access)"; return; }
+  worker="$(proc_worker_pid "$cg")"
+  [ -n "$worker" ] && runtime="$(proc_runtime "$worker")"
+  env="$(proc_job_env "$cg")"
+  if [ -n "$env" ]; then
+    repo="$(grep -m1 '^GITHUB_REPOSITORY=' <<<"$env" | cut -d= -f2- || true)"
+    job="$(grep -m1 '^GITHUB_JOB=' <<<"$env" | cut -d= -f2- || true)"
+    printf '%s:%s%s\n' "${repo##*/}" "${job:-?}" "${runtime:+ ($runtime)}"
+  elif [ -n "$worker" ]; then
+    echo "(starting)"
+  else
+    echo "idle"
+  fi
 }
 
 # --- Durations ----------------------------------------------------------------
@@ -438,7 +529,7 @@ cmd_status() {
   echo "Host: $(nproc) cores, $(free -h | awk '/^Mem:/{print $2" RAM, "$7" available"}')"
   echo
   status_row IDX RUNNER ACTIVE SINCE ENABLED MAX HIGH USED RESTART ENVFILE WORKING-ON
-  local i=0 u
+  local i=0 u job no_access=false
   while read -r u; do
     [ -n "$u" ] || continue
     local short="${u#actions.runner.}"; short="${short%.service}"
@@ -449,14 +540,20 @@ cmd_status() {
       P[$k]="$v"
     done < <(unit_props "$u")
     local envf="${P[EnvironmentFiles]:-}"; [ -n "$envf" ] || envf="—"
+    job="$(job_info "$u" "${P[ControlGroup]:-}" "${P[InvocationID]:-}")"
+    [ "$job" != "(no access)" ] || no_access=true
     status_row "$i" "$short" "${P[ActiveState]:-}/${P[SubState]:-}" \
       "$(since_state "${P[ActiveState]:-}" "${P[ActiveEnterTimestampMonotonic]:-}" "${P[InactiveEnterTimestampMonotonic]:-}")" \
       "${P[UnitFileState]:-}" \
       "$(hbytes "${P[MemoryMax]:-}")" "$(hbytes "${P[MemoryHigh]:-}")" \
       "$(hbytes "${P[MemoryCurrent]:-}")" "${P[Restart]:-}" "$envf" \
-      "$(job_info "$u" "${P[ControlGroup]:-}")"
+      "$job"
     i=$((i+1))
   done < <(discover)
+  # Once under the table, not per row, so the rows stay parseable.
+  if $no_access; then
+    echo "note: WORKING-ON needs journal read access (systemd-journal group) or root"
+  fi
 }
 
 cmd_apply() {
