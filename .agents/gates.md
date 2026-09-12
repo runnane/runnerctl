@@ -1,8 +1,14 @@
 # Gates
 
-`make gates` = `lint` + `example-drift` + `smoke` + `sim` + `migrate-test`. All
-five run without systemd runner units or root, so they are green on any dev box
-and in CI.
+`make gates` = `lint` + `example-drift` + `smoke` + `sim` + `migrate-test` +
+`install-test`. All six run without systemd runner units, root or network,
+so they are green on any dev box and in CI.
+
+**No test may escalate.** `migrate-test` and `install-test` put a fake `sudo`
+first on `PATH` that exits 97, so a code path that reaches for `run_priv` under
+a caller-owned temp prefix fails the test instead of leaving a root-owned file
+behind (which happened once, and needed a real `sudo rm` to clean up). Keep
+that tripwire in any new test that exercises a writing command.
 
 ## lint — shellcheck
 
@@ -14,9 +20,9 @@ or the static tarball from github.com/koalaman/shellcheck/releases). Point the
 Runs at `-S style` over `runnerctl`, `tests/run.sh` and `tests/stub.config`
 (the stub has no shebang because it is sourced, so the set is linted with
 `-s bash`), so info-level findings fail the gate. Fix the code rather than
-adding `disable` directives; the existing directives are all SC1090
-(sourcing a path only known at runtime) and inherent to the design — the config
-file, the legacy script `migrate` reads, and the config `migrate` just wrote.
+adding `disable` directives; the existing directives are all SC1090 (sourcing
+a path only known at runtime) and inherent to the design — the config file,
+the legacy script `migrate` reads, and the config `migrate` just wrote.
 
 ## example-drift
 
@@ -40,14 +46,9 @@ the stub shadows `run_priv` (appends its argv to a log and does nothing),
 `discover` (three fixed `actions.runner.example.slot-N.service` units), `prop`
 (a fixed property table), `unit_props` (the batched per-unit table `status`
 reads into an associative array — logged with a `probe:` prefix so cases can
-count it without tripping the read-only/leak assertions; three distinct rows:
-slot-1 and slot-2 running, slot-3 stopped and disabled), `now_mono` (the
-µs-since-boot clock `status` subtracts systemd's `*TimestampMonotonic` stamps
-from, pinned at 10^12 so the `SINCE` column is fixed text) and `job_info`
-(replaced wholesale — the `/proc/<pid>` walk and the worker-runtime read
-inside it are not exercised by the gate); `systemctl`, `journalctl` and `sudo`
-are shadowed too as a safety net, and a case whose log shows one of them was
-reached directly fails. Cases assert on stdout, stderr, the exit code, the
+count it without tripping the read-only/leak assertions) and `job_info`;
+`systemctl`, `journalctl` and `sudo` are shadowed too as a safety net, and a
+case whose log shows one of them was reached directly fails. Cases assert on stdout, stderr, the exit code, the
 ordered list of privileged calls and the content `tee`d to each path. Plain
 bash, no framework — CI and a fresh worktree have nothing but shellcheck.
 
@@ -55,14 +56,6 @@ bash, no framework — CI and a fresh worktree have nothing but shellcheck.
 changed call order, a new refusal. A case is a function calling `run <args>`
 then `expect_*` helpers (listed at the top of `tests/run.sh`), registered at
 the bottom with `t "<name>" <fn>`. A case with no assertions fails.
-
-**Testing a helper directly.** The script's last line is
-`if [ "${RUNNERCTL_NO_MAIN:-}" != 1 ]; then main "$@"; fi`, so with
-`RUNNERCTL_NO_MAIN=1` it can be sourced to define its functions without
-running a command (or loading a config). `run_fn <function> <args>` in
-`tests/run.sh` does exactly that in a subshell and sets `OUT`/`ERR`/`RC`, for
-pure helpers no command exposes on their own (`fmt_dur`, `since_state`). It is
-a test hook, not a user-facing knob — do not document it in `usage`.
 
 **xfail convention.** A case that documents a known bug is registered with
 `xfail <ISSUE-KEY> "<name>" <fn>` instead of `t`. It prints `xfail` while it
@@ -81,10 +74,6 @@ Traps:
   (default: the file is absent). Prefix a single `run` to flip it:
   `RUNNERCTL_STUB_ENV_FILE_EXISTS=1 run apply --profile deploy`.
 - `status` calls `nproc` and `free` for real; only the runner rows are asserted.
-- The `SINCE` stamps in the stub are offsets from its pinned `now_mono`
-  (10^12 µs): slot-1 active 3d 4h, slot-2 active 41m (inactive 2h ago),
-  slot-3 inactive 6d (last active 8d ago, so the stamp choice is observable).
-  Change a stamp and the `status` rows in `tests/run.sh` change with it.
 
 ## migrate-test
 
@@ -107,6 +96,20 @@ asserts the render check goes red.
 
 `SYSTEMD_DIR` is a plain variable for exactly this reason; a config can
 override it like any other default.
+
+## install-test
+
+`bash tests/install-test.sh`. Runs `runnerctl install --prefix <tmp>` through
+its paths: fresh, idempotent rerun, legacy fixture (asserts `migrate` ran
+*before* the file was replaced, by line order in the output), `--dry-run`,
+`--no-migrate` (keeps `runnerctl.legacy`), a migrate that fails its render
+check aborting the install with the old file intact, no-downgrade against a
+copy stamped `9.9.9`, refusal to overwrite a non-runnerctl file, and the
+piped form. The piped case is offline: a temp config sets
+`UPGRADE_URL="file://$PWD/runnerctl"` and `cat runnerctl | bash -s -- --config
+<that> install --prefix <tmp>` exercises the real download path through
+`curl`'s `file://` support. `--ref` is not covered (it needs a
+raw.githubusercontent.com URL); verify it by hand.
 
 ## release
 

@@ -15,14 +15,38 @@ secret-file paths and templates live in an optional config file on each host.
 
 ## Install
 
+One command, for a fresh host or one that already has any version of
+`runnerctl` on it:
+
 ```sh
-sudo curl -fsSL https://raw.githubusercontent.com/runnane/runnerctl/main/runnerctl \
-  -o /usr/local/bin/runnerctl && sudo chmod +x /usr/local/bin/runnerctl
-runnerctl version
+curl -fsSL https://raw.githubusercontent.com/runnane/runnerctl/main/runnerctl | sudo bash -s -- install
 ```
 
-Requirements: bash 4+, systemd, `curl` (for `upgrade`), and `sudo` for anything
-that writes under `/etc` or talks to `systemctl` (or run it as root).
+The script downloads itself, checks that the copy parses and carries a
+version, and puts it at the existing install's location (or
+`/usr/local/bin/runnerctl`) by staged copy and rename, so a running invocation
+is unaffected. Then it runs the installed file's `version` — the proof comes
+from the receiver. Rerunning it is the upgrade; it will not downgrade unless
+you pin a version with `--ref vX.Y.Z`; identical bytes are a no-op.
+
+If the existing file is an older, inline-configured `runnerctl` (no version
+line), `install` runs [`migrate`](#migrating-from-an-inline-configured-runnerctl)
+**first** and refuses to replace the old file if the migration does not
+verify, so no site value is lost. `--no-migrate` skips that and keeps the old
+file as `runnerctl.legacy`; `--dry-run` reports what would happen;
+`--prefix DIR` picks the location.
+
+Prefer to read before you run? Same thing in two steps:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/runnane/runnerctl/main/runnerctl -o runnerctl
+less runnerctl && sudo bash runnerctl install
+```
+
+Requirements: bash 4+, systemd, `curl` (for `install`/`upgrade`), and `sudo`
+for anything that writes under `/etc` or talks to `systemctl` (or run it as
+root). Only `install` works when the script is read from a pipe; every other
+command needs it installed.
 
 ## Usage
 
@@ -37,11 +61,13 @@ runnerctl scale N [--profile NAME] [--max 26G] [--high 22G] \
 runnerctl env-init [--profile NAME] [--env-file PATH]
 runnerctl start|stop|restart [<unit|slot-index|name>]
 runnerctl enable|disable <unit|slot-index|name>
-runnerctl logs [<unit|slot-index|name>]
+runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
+               [--since WHEN] [-g PATTERN]
 runnerctl remove-limits
 runnerctl profiles
 runnerctl config-example
 runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
+runnerctl install [--prefix DIR] [--ref <branch|tag>] [--no-migrate] [--dry-run]
 runnerctl upgrade [--check] [--ref <branch|tag>]
 runnerctl version
 ```
