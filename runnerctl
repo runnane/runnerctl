@@ -26,11 +26,13 @@
 #   runnerctl status
 #   runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
 #                    [--restart-sec N] [--env-file PATH] [--restart] \
-#                    [<unit|slot-index|name> ...]
+#                    [--when-idle] [--timeout N] [<unit|slot-index|name> ...]
 #   runnerctl scale N [--profile NAME] [--max 26G] [--high 22G] \
-#                     [--restart]
+#                     [--restart] [--when-idle] [--timeout N]
 #   runnerctl env-init [--profile NAME] [--env-file PATH]
-#   runnerctl start|stop|restart [<unit|slot-index|name>]
+#   runnerctl start|stop|restart [--when-idle] [--timeout N] \
+#                                [<unit|slot-index|name> ...]
+#   runnerctl drain [--timeout N] [<unit|slot-index|name> ...]
 #   runnerctl enable|disable <unit|slot-index|name>
 #   runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
 #                  [--since WHEN] [-g PATTERN]
@@ -45,10 +47,21 @@
 # Install or upgrade any host (a pre-config install is migrated first):
 #   curl -fsSL https://raw.githubusercontent.com/runnane/runnerctl/main/runnerctl | sudo bash -s -- install
 #
+# --when-idle (restart, stop, apply --restart, scale) waits for each targeted
+# slot to finish its job before acting on it, one slot at a time so the pool
+# keeps capacity; --timeout N (seconds, default 1800) gives up non-zero with
+# the still-busy slots listed and never force-kills. `drain` = `stop
+# --when-idle`. Best-effort: between the idle check and the systemctl call
+# the Listener can still pick up a new job (the window is a few hundred ms)
+# and the runner has no "stop accepting jobs" switch of its own — for a
+# guaranteed drain, change the runner's labels or disable it in GitHub first.
+#
 # Recommended baselines:
 #   CI host:      runnerctl scale 2 --max 26G --high 22G
 #   Deploy box:   runnerctl env-init --profile deploy   # then fill secrets
 #                 runnerctl apply --profile deploy --restart
+#   Host update:  runnerctl drain            # stop every slot once it is idle
+#   Profile roll: runnerctl apply --restart --when-idle
 #   Old install:  runnerctl migrate   # lifts the inline values into the config
 set -euo pipefail
 
@@ -67,6 +80,11 @@ UPGRADE_URL="https://raw.githubusercontent.com/runnane/runnerctl/main/runnerctl"
 CONFIG_FILE="${RUNNERCTL_CONFIG:-/etc/runnerctl/config}"
 # Where unit drop-ins live. A test config points this at a fixture tree.
 SYSTEMD_DIR="/etc/systemd/system"
+# --when-idle: seconds between idle polls, and the default --timeout. The
+# wait's clock advances by POLL_SEC per poll (not by wall time), so a config
+# that shadows `pause` to a no-op still reaches the timeout.
+POLL_SEC="5"
+WAIT_TIMEOUT="1800"
 
 # Profile-provided config (populated by load_profile; flags override).
 PROFILE=""
@@ -77,6 +95,7 @@ RESTART_SEC="10"
 ENV_FILE=""
 ENV_TEMPLATE=""
 do_restart=false
+when_idle=false
 REMAINING=()
 TARGETS=()
 
@@ -204,10 +223,18 @@ parse_opts() {
       --restart-sec) need_val "$@"; [[ "$2" =~ ^[0-9]+$ ]] || die "--restart-sec value '$2' is invalid — want an integer"; RESTART_SEC="$2"; shift 2 ;;
       --env-file)    need_val "$@"; ENV_FILE="$2"; shift 2 ;;
       --restart)     do_restart=true; shift ;;
+      --when-idle)   when_idle=true; shift ;;
+      --timeout)     need_val "$@"; set_timeout "$2"; shift 2 ;;
       -*)            die "unknown option: $1" ;;
       *)             TARGETS+=("$1"); shift ;;
     esac
   done
+}
+
+# --timeout N: whole seconds. Shared by parse_opts and cmd_ctl's own loop.
+set_timeout() {
+  [[ "$1" =~ ^[0-9]+$ ]] || die "--timeout value '$1' is invalid — want an integer number of seconds"
+  WAIT_TIMEOUT="$1"
 }
 
 # --- Runner discovery / inspection -------------------------------------------
@@ -353,6 +380,101 @@ job_info() { # UNIT CGROUP [INVOCATION-ID]
   else
     echo "idle"
   fi
+}
+
+# --- Waiting for a slot to go idle (GHR-11) -----------------------------------
+# Unit name -> what `status` prints as RUNNER.
+short_name() { local s="${1#actions.runner.}"; echo "${s%.service}"; }
+
+# `sleep`, behind a function so a test config can shadow it (the stub logs
+# the call and does not sleep).
+pause() { sleep "$1"; }
+
+# Is UNIT safe to restart/stop right now? One unit_props fetch, then the same
+# job_info cell `status` shows, left in SLOT_JOB for the caller's message.
+#   —, idle …      0 (not running, or running with no job in flight)
+#   (no access)    1 — cannot be proven idle; wait_idle refuses at once rather
+#                  than polling a condition that cannot change
+#   anything else  1 (a job, or (starting))
+SLOT_JOB=""
+slot_is_idle() { # UNIT
+  local cg="" inv="" k v
+  while IFS='=' read -r k v; do
+    case "$k" in ControlGroup) cg="$v" ;; InvocationID) inv="$v" ;; esac
+  done < <(unit_props "$1")
+  SLOT_JOB="$(job_info "$1" "$cg" "$inv")"
+  case "$SLOT_JOB" in
+    —|idle|idle\ *) return 0 ;;
+    *)              return 1 ;;
+  esac
+}
+
+# The job cell as prose: `my-app:test (12m)` -> `my-app:test, 12m`.
+job_desc() {
+  case "$1" in
+    *\ \(*\)) local d="${1% (*}, ${1##* (}"; echo "${d%)}" ;;
+    *)        echo "$1" ;;
+  esac
+}
+
+# Poll slot_is_idle every POLL_SEC until UNIT is idle. Prints a `waiting for`
+# line the first time it has to wait and every ~60 s after that. Elapsed time
+# is counted as polls × POLL_SEC — the time it *would* have slept — not read
+# from a clock, so a stubbed pause still reaches the timeout deterministically.
+#   0  idle (possibly immediately)
+#   1  still busy after TIMEOUT seconds
+#   2  (no access): refused without waiting
+wait_idle() { # UNIT TIMEOUT
+  local u="$1" timeout="$2" waited=0 last_said=-60 short
+  # A zero or junk interval would never advance the clock: refuse it.
+  [[ "$POLL_SEC" =~ ^[1-9][0-9]*$ ]] || die "POLL_SEC must be a positive integer (config sets '$POLL_SEC')"
+  short="$(short_name "$u")"
+  while ! slot_is_idle "$u"; do
+    [ "$SLOT_JOB" != "(no access)" ] || return 2
+    [ "$waited" -lt "$timeout" ] || return 1
+    if [ $((waited - last_said)) -ge 60 ]; then
+      echo "waiting for $short ($(job_desc "$SLOT_JOB")) …"
+      last_said=$waited
+    fi
+    pause "$POLL_SEC"
+    waited=$((waited + POLL_SEC))
+  done
+}
+
+# wait_idle failed for UNIT with RC: say why, what was already done (HANDLED,
+# space-separated units — those stay done) and what was not touched
+# (REMAINING), then exit 1. Nothing is ever force-killed.
+wait_failed() { # RC UNIT VERB HANDLED REMAINING
+  local rc="$1" u="$2" verb="$3" handled="$4" remaining="$5" short r busy idle=""
+  short="$(short_name "$u")"
+  case "$rc" in
+    2) echo "runnerctl: cannot tell whether $short is idle — --when-idle needs journal read access (systemd-journal group) or root" >&2 ;;
+    *) echo "runnerctl: timed out after ${WAIT_TIMEOUT}s waiting for $short ($(job_desc "$SLOT_JOB"))" >&2 ;;
+  esac
+  busy="$short"
+  for r in $remaining; do
+    if slot_is_idle "$r"; then idle+="${idle:+, }$(short_name "$r")"; else busy+=", $(short_name "$r")"; fi
+  done
+  echo "  already ${verb}: $(join_short "$handled")" >&2
+  echo "  busy or unreadable, not ${verb}: $busy" >&2
+  [ -z "$idle" ] || echo "  idle but not ${verb} (queued after the busy one): $idle" >&2
+  exit 1
+}
+
+# The per-slot gate every --when-idle command calls before its systemctl:
+# a no-op unless --when-idle was given, otherwise wait_idle, and on failure
+# wait_failed (which exits 1). HANDLED and REMAINING are space-separated.
+idle_gate() { # UNIT VERB HANDLED REMAINING
+  $when_idle || return 0
+  local rc=0; wait_idle "$1" "$WAIT_TIMEOUT" || rc=$?
+  [ "$rc" -eq 0 ] || wait_failed "$rc" "$@"
+}
+
+# Space-separated units -> "short-1, short-2" (or "none").
+join_short() {
+  local u out=""
+  for u in $1; do out+="${out:+, }$(short_name "$u")"; done
+  echo "${out:-none}"
 }
 
 # --- Durations ----------------------------------------------------------------
@@ -574,6 +696,9 @@ cmd_status() {
 
 cmd_apply() {
   extract_profile "$@"; load_profile; parse_opts ${REMAINING[@]+"${REMAINING[@]}"}
+  if $when_idle && ! $do_restart; then
+    die "--when-idle only applies to the restart: use 'apply --restart --when-idle' (apply alone just writes drop-ins)"
+  fi
   require_runners; guard_env_file
   local units=() u t short_list=""
   if [ "${#TARGETS[@]}" -gt 0 ]; then
@@ -596,7 +721,12 @@ cmd_apply() {
     echo "Applied profile '$PROFILE': Restart=always RestartSec=$RESTART_SEC${MEM_MAX:+ MemoryMax=$MEM_MAX MemoryHigh=$MEM_HIGH}${ENV_FILE:+ EnvironmentFile=$ENV_FILE}"
   fi
   if $do_restart; then
-    for u in "${units[@]}"; do run_priv systemctl restart "$u"; done
+    local i
+    for i in "${!units[@]}"; do
+      u="${units[$i]}"
+      idle_gate "$u" restarted "${units[*]:0:$i}" "${units[*]:$((i+1))}"
+      run_priv systemctl restart "$u"
+    done
     if [ "${#TARGETS[@]}" -gt 0 ]; then
       echo "Restarted ${#units[@]} slot(s) (config active now)."
     else
@@ -634,6 +764,9 @@ cmd_scale() {
       rc=0; run_priv systemctl enable --now "$u" || rc=$?
       if [ "$rc" -eq 0 ]; then echo "  [active] $u"; else echo "  [FAILED] $u"; failed+=("$u"); fi
     else
+      # --when-idle: a slot leaving the pool is stopped only once its job is
+      # done (the ones staying are enabled regardless — that never kills a job).
+      idle_gate "$u" stopped "${units[*]:$n:$((i - n))}" "${units[*]:$((i + 1))}"
       rc=0; run_priv systemctl disable --now "$u" || rc=$?
       if [ "$rc" -eq 0 ]; then echo "  [stopped] $u"; else echo "  [FAILED] $u"; failed+=("$u"); fi
     fi
@@ -648,7 +781,9 @@ cmd_scale() {
   echo "(needs a GitHub removal token) — not automated: destructive, irreversible."
   if $do_restart; then
     for i in "${!units[@]}"; do
-      [ "$i" -lt "$n" ] && run_priv systemctl restart "${units[$i]}"
+      [ "$i" -lt "$n" ] || break
+      idle_gate "${units[$i]}" restarted "${units[*]:0:$i}" "${units[*]:$((i + 1)):$((n - i - 1))}"
+      run_priv systemctl restart "${units[$i]}"
     done
     echo "Restarted $n active slot(s) (config active now)."
   else
@@ -671,16 +806,36 @@ cmd_env_init() {
   echo "Edit it ON THE BOX and fill in real values. NEVER commit real secrets."
 }
 
-cmd_ctl() { # start|stop|restart [target] (default: all)
+cmd_ctl() { # start|stop|restart [--when-idle] [--timeout N] [target ...] (default: all)
   local action="$1"; shift || true
+  local targets=() units=() u t i verb
+  while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    case "$1" in
+      --when-idle) when_idle=true; shift ;;
+      --timeout)   need_val "$@"; set_timeout "$2"; shift 2 ;;
+      -*)          die "unknown option: $1" ;;
+      *)           targets+=("$1"); shift ;;
+    esac
+  done
+  # Waiting for idle before a start is meaningless; accept the flag quietly.
+  [ "$action" != start ] || when_idle=false
   require_runners
-  if [ $# -ge 1 ]; then
-    # Resolve on its own line: a die inside "$(...)" only exits the subshell.
-    local u; u="$(resolve "$1")"
-    run_priv systemctl "$action" "$u"
+  if [ "${#targets[@]}" -gt 0 ]; then
+    for t in "${targets[@]}"; do
+      # Resolve on its own line: a die inside "$(...)" only exits the subshell.
+      u="$(resolve "$t")"
+      units+=("$u")
+    done
   else
-    local u; while read -r u; do [ -n "$u" ] && run_priv systemctl "$action" "$u"; done < <(discover)
+    mapfile -t units < <(discover)
   fi
+  case "$action" in stop) verb=stopped ;; *) verb="${action}ed" ;; esac
+  for i in "${!units[@]}"; do
+    u="${units[$i]}"
+    idle_gate "$u" "$verb" "${units[*]:0:$i}" "${units[*]:$((i + 1))}"
+    run_priv systemctl "$action" "$u"
+  done
   echo "$action done."
 }
 
@@ -791,6 +946,10 @@ cmd_config_example() {
 
 # Where `runnerctl upgrade` fetches the new script from (a fork, a pinned tag).
 #UPGRADE_URL="https://raw.githubusercontent.com/runnane/runnerctl/main/runnerctl"
+
+# --when-idle / drain: seconds between idle polls, and the default --timeout.
+#POLL_SEC="5"
+#WAIT_TIMEOUT="1800"
 
 # A profile is a function that sets these variables. Defining profile_ci or
 # profile_deploy replaces the built-in of the same name.
@@ -1353,6 +1512,7 @@ main() {
     scale)              cmd_scale "$@" ;;
     env-init)           cmd_env_init "$@" ;;
     start|stop|restart) cmd_ctl "$cmd" "$@" ;;
+    drain)              cmd_ctl stop --when-idle "$@" ;;
     enable|disable)     cmd_toggle "$cmd" "$@" ;;
     logs)               cmd_logs "$@" ;;
     remove-limits)      cmd_remove_limits "$@" ;;
@@ -1362,7 +1522,7 @@ main() {
     upgrade)            cmd_upgrade "$@" ;;
     version|--version)  echo "runnerctl $RUNNERCTL_VERSION" ;;
     -h|--help|help)     usage ;;
-    *) die "unknown command '$cmd' (status apply scale env-init start stop restart enable disable logs remove-limits profiles config-example migrate install upgrade version)" ;;
+    *) die "unknown command '$cmd' (status apply scale env-init start stop restart drain enable disable logs remove-limits profiles config-example migrate install upgrade version)" ;;
   esac
 }
 

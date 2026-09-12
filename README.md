@@ -65,11 +65,13 @@ runnerctl [--config PATH] <command> [args]
 runnerctl status
 runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
                  [--restart-sec N] [--env-file PATH] [--restart] \
-                 [<unit|slot-index|name> ...]
+                 [--when-idle] [--timeout N] [<unit|slot-index|name> ...]
 runnerctl scale N [--profile NAME] [--max 26G] [--high 22G] \
-                  [--restart]
+                  [--restart] [--when-idle] [--timeout N]
 runnerctl env-init [--profile NAME] [--env-file PATH]
-runnerctl start|stop|restart [<unit|slot-index|name>]
+runnerctl start|stop|restart [--when-idle] [--timeout N] \
+                             [<unit|slot-index|name> ...]
+runnerctl drain [--timeout N] [<unit|slot-index|name> ...]
 runnerctl enable|disable <unit|slot-index|name>
 runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
                [--since WHEN] [-g PATTERN]
@@ -118,6 +120,41 @@ drop-in. With no targets, both act on every slot, as before.
 Slots are addressed by unit name, by the `IDX` column, or by the `RUNNER`
 column's short name — an unambiguous prefix or substring of it also works
 (e.g. `slot-1` for `example.slot-1`).
+
+### Graceful restart and stop: `--when-idle` and `drain`
+
+A plain `restart`, `stop`, `apply --restart` or `scale` acts on every
+targeted slot immediately, and a slot mid-job fails that job on GitHub with
+"The runner has received a shutdown signal". `--when-idle` makes the same
+commands wait for each slot's `WORKING-ON` to read `idle` (or `—`, not
+running) before acting on it, one slot at a time, so the pool keeps capacity
+while a profile is rolled out:
+
+```sh
+runnerctl apply --profile ci --max 24G --restart --when-idle   # roll the pool
+runnerctl restart 0 --when-idle                                 # one slot
+runnerctl scale 1 --when-idle                                   # stop slot 2+ once idle
+runnerctl drain                       # = stop --when-idle: host maintenance
+runnerctl drain example.slot-2 --timeout 600
+```
+
+While a slot is busy it prints `waiting for example.slot-1 (my-app:test,
+12m) …` (again every minute) and polls every 5 seconds (`POLL_SEC` in the
+config). `--timeout N` (seconds, default 1800, `WAIT_TIMEOUT` in the config)
+gives up: the slot it was waiting on is left alone, nothing after it is
+touched, the slots already handled stay handled, and the command exits 1
+listing all three groups. Nothing is ever force-killed. `start` accepts
+`--when-idle` and ignores it. A slot whose journal cannot be read (`status`
+shows `(no access)`) cannot be proven idle, so `--when-idle` refuses at once
+with the same hint `status` gives — run it with journal read access or as
+root.
+
+**Best-effort, not a guarantee.** Between the idle check and the `systemctl`
+call the Listener can pick up a new job (the window is a few hundred
+milliseconds), and the runner has no "stop accepting jobs" switch short of
+the GitHub API or UI. For a guaranteed drain, first make GitHub stop routing
+work to the runner — change its labels to ones no workflow requests, or
+disable it in the organisation's runner settings — then `runnerctl drain`.
 
 ### Profiles
 

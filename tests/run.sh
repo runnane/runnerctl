@@ -825,6 +825,169 @@ case_journal_running_job_idle_after_completion() {
   expect_no_out '.'
 }
 
+# --- GHR-11: --when-idle / drain wait for each slot before acting ------------
+# The stub's `pause` is a no-op that logs `probe:pause N`; wait_idle counts
+# its clock in POLL_SEC (5) steps per poll, so the poll count is what a case
+# asserts. RUNNERCTL_STUB_BUSY_POLLS=N makes slot-1's journal report the job
+# as running for the first N journal reads of the run and completed after.
+# slot-2 is idle in the fixed picture, slot-3 is not running (—).
+
+# Three busy polls, then slot-1 restarts; slot-2 (idle) and slot-3 (—) follow
+# with no pause at all. The pool is rolled one slot at a time, in order.
+case_restart_when_idle_waits_then_rolls() {
+  RUNNERCTL_STUB_BUSY_POLLS=3 run restart --when-idle
+  expect_rc 0
+  expect_out '^waiting for example\.slot-1 \(my-app:test, 12m\) …$'
+  expect_out '^restart done\.$'
+  expect_log_count '^probe:pause 5$' 3
+  expect_log_order '^probe:pause 5$' '^probe:pause 5$' '^probe:pause 5$' \
+                   "^systemctl restart $U1\$" "^systemctl restart $U2\$" "^systemctl restart $U3\$"
+  expect_log_count '^systemctl restart ' 3
+  # slot-1 was polled four times (3 busy + the idle one); slot-2 once; slot-3
+  # has no cgroup so its journal is never asked
+  expect_log_count '^probe:journal_job_lines .*slot-1' 4
+  expect_log_count '^probe:journal_job_lines .*slot-2' 1
+  expect_no_log '^probe:journal_job_lines .*slot-3'
+}
+
+# Busy forever: polls at 0, 5 and 10 s (two pauses), then the timeout —
+# nothing is stopped, the busy slot is named on stderr, exit 1.
+case_stop_when_idle_times_out() {
+  RUNNERCTL_STUB_BUSY_POLLS=99 run stop 0 --when-idle --timeout 10
+  expect_rc 1
+  expect_err '^runnerctl: timed out after 10s waiting for example\.slot-1 \(my-app:test, 12m\)$'
+  expect_err '^  already stopped: none$'
+  expect_err '^  busy or unreadable, not stopped: example\.slot-1$'
+  expect_out '^waiting for example\.slot-1'
+  expect_no_out '^stop done'
+  expect_no_log '^systemctl stop '
+  expect_log_count '^probe:pause 5$' 2
+}
+
+# A slot that went busy again mid-roll: slot-1 is done, slot-2 idle, so the
+# summary must say what was already restarted and what was left queued.
+case_restart_when_idle_timeout_reports_handled_and_queued() {
+  # slot-1 stays busy; target order 1 (idle), 0 (busy), 2 (—): slot-2 is
+  # restarted first, the wait on slot-1 times out, slot-3 is never touched
+  RUNNERCTL_STUB_BUSY_POLLS=99 run restart 1 0 2 --when-idle --timeout=5
+  expect_rc 1
+  expect_log_order "^systemctl restart $U2\$" '^probe:pause 5$'
+  expect_log_count '^systemctl restart ' 1
+  expect_no_log "^systemctl restart $U1\$"
+  expect_no_log "^systemctl restart $U3\$"
+  expect_err '^  already restarted: example\.slot-2$'
+  expect_err '^  busy or unreadable, not restarted: example\.slot-1$'
+  expect_err '^  idle but not restarted \(queued after the busy one\): example\.slot-3$'
+}
+
+# drain = stop --when-idle: an idle slot is stopped at once, no pause.
+case_drain_idle_slot_stops_immediately() {
+  run drain 1
+  expect_rc 0
+  expect_out '^stop done\.$'
+  expect_no_out '^waiting for'
+  expect_no_log '^probe:pause '
+  expect_log "^systemctl stop $U2\$"
+  expect_log_count '^systemctl stop ' 1
+}
+
+# drain with no target stops every slot in order; --timeout is honoured.
+case_drain_all_waits_for_busy_slot() {
+  RUNNERCTL_STUB_BUSY_POLLS=1 run drain --timeout 60
+  expect_rc 0
+  expect_log_count '^probe:pause 5$' 1
+  expect_log_order '^probe:pause 5$' "^systemctl stop $U1\$" "^systemctl stop $U2\$" "^systemctl stop $U3\$"
+  expect_log_count '^systemctl stop ' 3
+}
+
+# (no access): idle cannot be proven and waiting cannot change that, so the
+# command refuses at once — no pause, no systemctl, a journal-access hint.
+case_restart_when_idle_no_access_refuses() {
+  RUNNERCTL_STUB_JOURNAL_ACCESS=0 run restart --when-idle
+  expect_rc 1
+  expect_err 'cannot tell whether example\.slot-1 is idle'
+  expect_err 'journal read access \(systemd-journal group\) or root'
+  expect_no_log '^probe:pause '
+  expect_no_log '^systemctl restart '
+  expect_no_out '^waiting for'
+}
+
+# apply --when-idle without --restart has nothing to wait for: die before
+# any drop-in is written.
+case_apply_when_idle_needs_restart() {
+  run apply --when-idle
+  expect_rc 1
+  expect_err '--when-idle only applies to the restart'
+  expect_no_log '.'
+}
+
+# apply --restart --when-idle: drop-ins and the reload happen first (they
+# kill nothing), then each restart waits for its slot.
+case_apply_restart_when_idle_waits_per_slot() {
+  RUNNERCTL_STUB_BUSY_POLLS=2 run apply --restart --when-idle
+  expect_rc 0
+  expect_log_count 'tee .*/10-runnerctl\.conf$' 3
+  expect_log_order '^systemctl daemon-reload$' '^probe:pause 5$' '^probe:pause 5$' \
+                   "^systemctl restart $U1\$" "^systemctl restart $U2\$" "^systemctl restart $U3\$"
+  expect_log_count '^probe:pause 5$' 2
+  expect_out 'Restarted all runner slots \(config active now\)\.'
+}
+
+# scale 1 --when-idle: slot-1 stays (enable --now, never waited on); slot-2
+# and slot-3 are stopped after an idle check each — slot-2 idle, slot-3 not
+# running, so no pause — and GHR-5's write → reload → enable/disable order
+# is unchanged.
+case_scale_when_idle_checks_before_each_stop() {
+  run scale 1 --when-idle
+  expect_rc 0
+  expect_log_order "tee .*/$U1\\.d/10-runnerctl\\.conf\$" '^systemctl daemon-reload$' \
+                   "^systemctl enable --now $U1\$" \
+                   "^probe:unit_props $U2\$" "^systemctl disable --now $U2\$" \
+                   "^probe:unit_props $U3\$" "^systemctl disable --now $U3\$"
+  expect_no_log '^probe:pause '
+  expect_no_log "^probe:unit_props $U1\$"
+  expect_out "^  \\[stopped\\] $U2\$"
+  expect_out "^  \\[stopped\\] $U3\$"
+  expect_out "^Scaled to 1 active runner\\(s\\)"
+}
+
+# scale 2 --when-idle --restart: the restart of the kept slots waits too.
+case_scale_when_idle_restart_waits() {
+  RUNNERCTL_STUB_BUSY_POLLS=2 run scale 2 --when-idle --restart
+  expect_rc 0
+  expect_log_order "^systemctl disable --now $U3\$" '^probe:pause 5$' '^probe:pause 5$' \
+                   "^systemctl restart $U1\$" "^systemctl restart $U2\$"
+  expect_log_count '^probe:pause 5$' 2
+  expect_log_count '^systemctl restart ' 2
+}
+
+# (scale's stop side can only wait on slot-2/3, both idle in the fixture, and
+# N>=1 always keeps slot-1 — so its timeout path is the shared wait_idle path
+# the stop/restart cases above already drive.)
+
+# --timeout must be an integer; start ignores --when-idle without complaint.
+case_restart_timeout_not_integer() {
+  run restart --timeout abc
+  expect_rc 1
+  expect_err "--timeout value 'abc' is invalid"
+  expect_no_log '.'
+}
+
+case_restart_timeout_missing_value() {
+  run restart 0 --timeout
+  expect_rc 1
+  expect_err '--timeout needs a value'
+  expect_no_log '.'
+}
+
+case_start_ignores_when_idle() {
+  run start --when-idle
+  expect_rc 0
+  expect_out '^start done\.$'
+  expect_no_log '^probe:'
+  expect_log_count '^systemctl start ' 3
+}
+
 # --- Registry -----------------------------------------------------------------
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
@@ -892,6 +1055,19 @@ t "apply nope: resolve error, no privileged call at all"            case_apply_t
 t "remove-limits 1: rm -f on slot-2 only, then daemon-reload"       case_remove_limits_targeted
 t "scale 2 extra: stray argument dies, no privileged call"          case_scale_rejects_stray_argument
 t "status: PROFILE column reads each slot's seeded drop-in"         case_status_shows_profile_column
+t "restart --when-idle: 3 busy polls, then slot-1, then 2 and 3"     case_restart_when_idle_waits_then_rolls
+t "stop 0 --when-idle --timeout 10: times out, stops nothing"        case_stop_when_idle_times_out
+t "restart 1 0 2 --when-idle: timeout lists done/busy/queued slots"  case_restart_when_idle_timeout_reports_handled_and_queued
+t "drain 1: idle slot stops at once, no pause"                       case_drain_idle_slot_stops_immediately
+t "drain --timeout 60: waits for slot-1, stops all in order"         case_drain_all_waits_for_busy_slot
+t "restart --when-idle: (no access) refuses, no wait, no restart"    case_restart_when_idle_no_access_refuses
+t "apply --when-idle: needs --restart, writes nothing"               case_apply_when_idle_needs_restart
+t "apply --restart --when-idle: reload first, then wait per slot"    case_apply_restart_when_idle_waits_per_slot
+t "scale 1 --when-idle: idle check before each disable, order kept"  case_scale_when_idle_checks_before_each_stop
+t "scale 2 --when-idle --restart: restarts wait too"                 case_scale_when_idle_restart_waits
+t "restart --timeout abc: not an integer"                            case_restart_timeout_not_integer
+t "restart 0 --timeout: missing value"                               case_restart_timeout_missing_value
+t "start --when-idle: flag ignored, no probes"                       case_start_ignores_when_idle
 
 # --- Summary ------------------------------------------------------------------
 echo
