@@ -506,6 +506,48 @@ case_restart_no_match() {
   expect_no_log '^systemctl restart'
 }
 
+# --- GHR-12: logs gains -f/-n/--since/-g and defaults to all slots ----------
+
+case_logs_all_slots_default() {
+  run logs
+  expect_rc 0
+  expect_log_count '.' 1
+  expect_log "^journalctl -u $U1 -u $U2 -u $U3 -n 100 --no-pager\$"
+}
+
+case_logs_follow_defaults_to_50() {
+  run logs 1 -f
+  expect_rc 0
+  expect_log "^journalctl -u $U2 -n 50 -f --no-pager\$"
+}
+
+case_logs_lines_since_grep() {
+  run logs 1 -n 20 --since '1 hour ago' -g 'Running job'
+  expect_rc 0
+  expect_log "^journalctl -u $U2 -n 20 --since 1 hour ago -g Running job --no-pager\$"
+}
+
+case_logs_lines_missing_value() {
+  run logs 1 -n
+  expect_rc 1
+  expect_err '\-n needs a value'
+  expect_no_log '.'
+}
+
+case_logs_unknown_flag() {
+  run logs 1 --bogus
+  expect_rc 1
+  expect_err 'unknown option: --bogus'
+  expect_no_log '.'
+}
+
+case_logs_no_match() {
+  run logs nope
+  expect_rc 1
+  expect_err "no runner slot matches 'nope'"
+  expect_no_log '.'
+}
+
 # --- Registry -----------------------------------------------------------------
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
@@ -542,6 +584,12 @@ t "logs slot-3: unambiguous substring of the short name resolves"  case_logs_by_
 t "enable example.slot-1.service: short name + suffix resolves"    case_enable_by_short_name_with_service_suffix
 t "restart slot: ambiguous target, no systemctl call"               case_restart_ambiguous_target
 t "restart nope: no match, no systemctl call"                       case_restart_no_match
+t "logs: no target logs all discovered slots"                       case_logs_all_slots_default
+t "logs 1 -f: follow defaults -n to 50"                              case_logs_follow_defaults_to_50
+t "logs 1 -n 20 --since -g: all pass through to journalctl"        case_logs_lines_since_grep
+t "logs 1 -n: missing value dies, no journalctl call"               case_logs_lines_missing_value
+t "logs 1 --bogus: unknown option dies, no journalctl call"         case_logs_unknown_flag
+t "logs nope: no match, no journalctl call"                          case_logs_no_match
 
 # --- Summary ------------------------------------------------------------------
 echo
