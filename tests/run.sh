@@ -36,6 +36,10 @@
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+# Cell padding in `status` counts characters, which needs a UTF-8 locale for
+# the `—` cells (GHR-21). Pin one where it exists so the run does not depend on
+# the caller's LANG; a box without it keeps its own locale.
+if locale -a 2>/dev/null | grep -qiE '^C\.utf-?8$'; then export LC_ALL=C.UTF-8; fi
 RUNNERCTL="${RUNNERCTL:-./runnerctl}"
 STUB="tests/stub.config"
 
@@ -612,6 +616,22 @@ case_logs_no_match() {
   expect_no_log '.'
 }
 
+# --- GHR-21: `—` cells are padded by characters, so columns stay aligned -----
+# A `—` is 3 bytes; printf's %-Ns padded it two short. Compare the character
+# offset of the last column on a row full of `—` cells with the header's.
+case_status_dash_cells_keep_columns_aligned() {
+  run status
+  expect_rc 0
+  local header row hpos rpos
+  header="$(grep -m1 '^IDX ' <<<"$OUT")"
+  row="$(grep -m1 '^2 ' <<<"$OUT")"          # slot-3: MAX/HIGH/USED/ENVFILE/WORKING-ON are all —
+  hpos="${header%%WORKING-ON*}"; hpos="${#hpos}"
+  rpos="${row%—}"; rpos="${#rpos}"             # offset of the final — (WORKING-ON cell)
+  _expect
+  [ "$hpos" -eq "$rpos" ] || FAILS+=("WORKING-ON column: header at $hpos, slot-3 row at $rpos")
+  expect_out '^2 +example\.slot-3 +inactive/dead +6d +disabled +— +— +— +always +— +—$'
+}
+
 # --- Registry -----------------------------------------------------------------
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
@@ -650,6 +670,7 @@ t "restart slot: ambiguous target, no systemctl call"               case_restart
 t "restart nope: no match, no systemctl call"                       case_restart_no_match
 t "status: SINCE of active slots from ActiveEnterTimestampMonotonic" case_status_since_active_slots
 t "status: SINCE of an inactive slot from InactiveEnterTimestampMonotonic" case_status_since_inactive_slot_uses_inactive_enter
+t "status: — cells keep the columns aligned (character padding)"     case_status_dash_cells_keep_columns_aligned
 t "status: job runtime inside the WORKING-ON cell"                  case_status_job_runtime_in_working_on
 t "fmt_dur 5: 5s"                                                   case_fmt_dur_seconds
 t "fmt_dur 0: 0s"                                                   case_fmt_dur_zero
