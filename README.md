@@ -34,9 +34,9 @@ runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
                  [--restart-sec N] [--env-file PATH] [--restart]
 runnerctl scale N [--profile NAME] [--max 26G] [--high 22G]
 runnerctl env-init [--profile NAME] [--env-file PATH]
-runnerctl start|stop|restart [<unit|slot-index>]
-runnerctl enable|disable <unit|slot-index>
-runnerctl logs [<unit|slot-index>]
+runnerctl start|stop|restart [<unit|slot-index|name>]
+runnerctl enable|disable <unit|slot-index|name>
+runnerctl logs [<unit|slot-index|name>]
 runnerctl remove-limits
 runnerctl profiles
 runnerctl config-example
@@ -55,7 +55,9 @@ IDX RUNNER                 ACTIVE          ENABLED   MAX    HIGH   USED   RESTAR
 2   org.host-3             inactive/dead   disabled  —      —      —      always   —       —
 ```
 
-Slots are addressed by unit name or by the `IDX` column.
+Slots are addressed by unit name, by the `IDX` column, or by the `RUNNER`
+column's short name — an unambiguous prefix or substring of it also works
+(e.g. `slot-1` for `example.slot-1`).
 
 ### Profiles
 
