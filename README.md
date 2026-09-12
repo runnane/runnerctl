@@ -32,11 +32,12 @@ runnerctl [--config PATH] <command> [args]
 runnerctl status
 runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
                  [--restart-sec N] [--env-file PATH] [--restart]
-runnerctl scale N [--profile NAME] [--max 26G] [--high 22G]
+runnerctl scale N [--profile NAME] [--max 26G] [--high 22G] \
+                  [--restart]
 runnerctl env-init [--profile NAME] [--env-file PATH]
-runnerctl start|stop|restart [<unit|slot-index>]
-runnerctl enable|disable <unit|slot-index>
-runnerctl logs [<unit|slot-index>]
+runnerctl start|stop|restart [<unit|slot-index|name>]
+runnerctl enable|disable <unit|slot-index|name>
+runnerctl logs [<unit|slot-index|name>]
 runnerctl remove-limits
 runnerctl profiles
 runnerctl config-example
@@ -56,7 +57,9 @@ IDX RUNNER                 ACTIVE          ENABLED   MAX    HIGH   USED   RESTAR
 2   org.host-3             inactive/dead   disabled  —      —      —      always   —       —
 ```
 
-Slots are addressed by unit name or by the `IDX` column.
+Slots are addressed by unit name, by the `IDX` column, or by the `RUNNER`
+column's short name — an unambiguous prefix or substring of it also works
+(e.g. `slot-1` for `example.slot-1`).
 
 ### Profiles
 
@@ -95,9 +98,14 @@ overwrites an existing file.
 ### Config file
 
 `runnerctl` reads `/etc/runnerctl/config` if present (override with
-`RUNNERCTL_CONFIG=` or `--config PATH`). It is plain bash and is sourced, so it
-must be root-owned and not world-writable — the script refuses a
-world-writable config.
+`RUNNERCTL_CONFIG=` or `--config PATH`). It is plain bash and is sourced, so
+the script enforces: owned by root or by the invoking user, not writable by
+any other group (unless that group is gid 0), and not world-writable. It also
+validates the config-settable knobs after sourcing — `DROPIN_NAME` must match
+`^[A-Za-z0-9_-]+\.conf$`, `UNIT_GLOB` must be non-empty and contain no `/`, and
+`DEFAULT_PROFILE` must match `^[A-Za-z0-9_]+$` — since a bad value here drives
+privileged commands (`sudo rm`, `sudo tee`) built from it. Anything that fails
+these checks is refused with the exact reason and the fix.
 
 The config can set any default (`DROPIN_NAME`, `DEFAULT_PROFILE`, `UPGRADE_URL`,
 `UNIT_GLOB`) and define profiles as functions. A `profile_<name>()` function
@@ -182,11 +190,13 @@ token and is irreversible, so it stays a manual step.
 ## Development
 
 ```sh
-make gates   # shellcheck + config.example drift check + smoke tests
+make gates   # shellcheck + config.example drift check + smoke + stubbed-systemd sim
+make sim     # just the stubbed-systemd cases (tests/run.sh)
 ```
 
 See [`.agents/gates.md`](.agents/gates.md) for what each gate covers and how
-to exercise the systemd-touching commands locally without root.
+the stubbed-systemd harness exercises every systemd-touching command without
+root (and how to add a case).
 
 ## License
 
