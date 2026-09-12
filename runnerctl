@@ -43,7 +43,7 @@
 #                 runnerctl apply --profile deploy --restart
 set -euo pipefail
 
-RUNNERCTL_VERSION="0.1.0"
+RUNNERCTL_VERSION="0.1.1"
 
 # --- Defaults (all overridable from the config file) -------------------------
 DROPIN_NAME="10-runnerctl.conf"
@@ -79,8 +79,15 @@ load_config() {
   # Refuse a config anyone could edit — it is executed, sometimes under sudo.
   local mode; mode="$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null || echo 0)"
   [ $((8#$mode & 8#002)) -eq 0 ] || die "$CONFIG_FILE is world-writable — refusing to source it"
+  local owner; owner="$(stat -c '%u' "$CONFIG_FILE" 2>/dev/null || echo -1)"
+  [ "$owner" = "0" ] || [ "$owner" = "$(id -u)" ] || die "$CONFIG_FILE is owned by uid $owner, not root or the invoking user (uid $(id -u)) — refusing to source it (fix: chown root:root $CONFIG_FILE; chmod 644 $CONFIG_FILE)"
+  local group; group="$(stat -c '%g' "$CONFIG_FILE" 2>/dev/null || echo -1)"
+  [ $((8#$mode & 8#020)) -eq 0 ] || [ "$group" = "0" ] || die "$CONFIG_FILE is group-writable by group $group, not root — refusing to source it (fix: chown root:root $CONFIG_FILE; chmod 644 $CONFIG_FILE)"
   # shellcheck disable=SC1090
   . "$CONFIG_FILE"
+  [[ "$DROPIN_NAME" =~ ^[A-Za-z0-9_-]+\.conf$ ]] || die "DROPIN_NAME '$DROPIN_NAME' set in $CONFIG_FILE is invalid — must match ^[A-Za-z0-9_-]+\\.conf\$"
+  [[ -n "$UNIT_GLOB" && "$UNIT_GLOB" != */* ]] || die "UNIT_GLOB '$UNIT_GLOB' set in $CONFIG_FILE is invalid — must be non-empty and contain no '/'"
+  [[ "$DEFAULT_PROFILE" =~ ^[A-Za-z0-9_]+$ ]] || die "DEFAULT_PROFILE '$DEFAULT_PROFILE' set in $CONFIG_FILE is invalid — must match ^[A-Za-z0-9_]+\$"
 }
 
 # Built-in profiles. Site-specific values belong in the config file; these are
