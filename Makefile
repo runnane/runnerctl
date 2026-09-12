@@ -1,9 +1,9 @@
 SHELL := bash
 SHELLCHECK ?= shellcheck
 
-.PHONY: gates lint example-drift smoke
+.PHONY: gates lint example-drift smoke migrate-test install-test
 
-gates: lint example-drift smoke
+gates: lint example-drift smoke migrate-test install-test
 
 lint:
 	$(SHELLCHECK) -S style runnerctl
@@ -23,3 +23,14 @@ smoke:
 	@d=$$(mktemp -d) && printf 'DROPIN_NAME="../x.conf"\n' > "$$d/config" && chmod 644 "$$d/config" && ( ./runnerctl --config "$$d/config" profiles >/dev/null 2>"$$d/err"; test "$$?" -eq 1 ) && grep -q "DROPIN_NAME" "$$d/err" && rm -rf "$$d"
 	@d=$$(mktemp -d) && printf '' > "$$d/config" && chmod 660 "$$d/config" && ( ./runnerctl --config "$$d/config" profiles >/dev/null 2>"$$d/err"; test "$$?" -eq 1 ) && grep -qi "group-writable" "$$d/err" && chmod 644 "$$d/config" && ./runnerctl --config "$$d/config" profiles | grep -q '^ci\*' && rm -rf "$$d"
 	@echo "smoke ok"
+
+# `migrate` against the sanitised legacy fixture and a fixture drop-in tree;
+# tests/migrate.config redirects discovery and SYSTEMD_DIR there.
+migrate-test:
+	@bash tests/migrate-test.sh
+
+# `install` under a temp prefix: fresh, upgrade, legacy+migrate, piped form
+# (offline via a file:// UPGRADE_URL). Never needs root; a fake sudo on PATH
+# makes any escalation a failure.
+install-test:
+	@bash tests/install-test.sh
