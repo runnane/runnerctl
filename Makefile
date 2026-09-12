@@ -1,9 +1,9 @@
 SHELL := bash
 SHELLCHECK ?= shellcheck
 
-.PHONY: gates lint example-drift smoke migrate-test
+.PHONY: gates lint example-drift smoke migrate-test install-test
 
-gates: lint example-drift smoke migrate-test
+gates: lint example-drift smoke migrate-test install-test
 
 lint:
 	$(SHELLCHECK) -S style runnerctl
@@ -26,3 +26,9 @@ smoke:
 # tests/migrate.config redirects discovery and SYSTEMD_DIR there.
 migrate-test:
 	@bash tests/migrate-test.sh
+
+# `install` under a temp prefix: fresh, upgrade, legacy+migrate, piped form
+# (offline via a file:// UPGRADE_URL). Never needs root; a fake sudo on PATH
+# makes any escalation a failure.
+install-test:
+	@bash tests/install-test.sh
