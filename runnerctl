@@ -26,7 +26,8 @@
 #   runnerctl status
 #   runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
 #                    [--restart-sec N] [--env-file PATH] [--restart]
-#   runnerctl scale N [--profile NAME] [--max 26G] [--high 22G]
+#   runnerctl scale N [--profile NAME] [--max 26G] [--high 22G] \
+#                     [--restart]
 #   runnerctl env-init [--profile NAME] [--env-file PATH]
 #   runnerctl start|stop|restart [<unit|slot-index|name>]
 #   runnerctl enable|disable <unit|slot-index|name>
@@ -49,7 +50,7 @@
 #   Old install:  runnerctl migrate   # lifts the inline values into the config
 set -euo pipefail
 
-RUNNERCTL_VERSION="0.3.6"
+RUNNERCTL_VERSION="0.3.7"
 
 # --- Defaults (all overridable from the config file) -------------------------
 # The BUILTIN_* copies stay untouched by the config so `migrate` can tell a
@@ -388,21 +389,40 @@ cmd_scale() {
   local total=${#units[@]}
   { [ "$n" -ge 1 ] && [ "$n" -le "$total" ]; } || die "N must be 1..$total"
   local i u
+  # Write every drop-in that will be needed, THEN reload, THEN start/stop —
+  # otherwise the first `enable --now` on a stopped slot races systemd's own
+  # unread unit cache and starts with the previous config (GHR-5).
+  for i in "${!units[@]}"; do
+    [ "$i" -lt "$n" ] && apply_to "${units[$i]}"
+  done
+  run_priv systemctl daemon-reload
+  local rc failed=()
   for i in "${!units[@]}"; do
     u="${units[$i]}"
     if [ "$i" -lt "$n" ]; then
-      apply_to "$u"; run_priv systemctl enable --now "$u" >/dev/null 2>&1 || true
-      echo "  [active] $u"
+      rc=0; run_priv systemctl enable --now "$u" || rc=$?
+      if [ "$rc" -eq 0 ]; then echo "  [active] $u"; else echo "  [FAILED] $u"; failed+=("$u"); fi
     else
-      run_priv systemctl disable --now "$u" >/dev/null 2>&1 || true
-      echo "  [stopped] $u"
+      rc=0; run_priv systemctl disable --now "$u" || rc=$?
+      if [ "$rc" -eq 0 ]; then echo "  [stopped] $u"; else echo "  [FAILED] $u"; failed+=("$u"); fi
     fi
   done
-  run_priv systemctl daemon-reload
+  if [ "${#failed[@]}" -gt 0 ]; then
+    echo "runnerctl: scale: ${#failed[@]} of $n slot(s) failed to start/stop: ${failed[*]}" >&2
+    exit 1
+  fi
   echo "Scaled to $n active runner(s), profile '$PROFILE'${MEM_MAX:+ @ MemoryMax=$MEM_MAX}."
   echo "Note: stopped slots stay REGISTERED with GitHub (they show offline). Full"
   echo "deregister = 'svc.sh uninstall' + './config.sh remove' in the runner's dir"
   echo "(needs a GitHub removal token) — not automated: destructive, irreversible."
+  if $do_restart; then
+    for i in "${!units[@]}"; do
+      [ "$i" -lt "$n" ] && run_priv systemctl restart "${units[$i]}"
+    done
+    echo "Restarted $n active slot(s) (config active now)."
+  else
+    echo "Config takes effect on next (re)start of already-running slots. Run: runnerctl restart"
+  fi
 }
 
 cmd_env_init() {

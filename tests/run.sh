@@ -314,6 +314,7 @@ case_scale_2() {
   expect_out "^  \\[active\\] $U2\$"
   expect_out "^  \\[stopped\\] $U3\$"
   expect_out "^Scaled to 2 active runner\\(s\\), profile 'ci' @ MemoryMax=26G\\.\$"
+  expect_out 'Config takes effect on next \(re\)start of already-running slots\. Run: runnerctl restart'
   expect_log_count 'tee .*/10-runnerctl\.conf$' 2
   expect_log "tee $DROPIN_DIR/$U1\\.d/10-runnerctl\\.conf\$"
   expect_log "tee $DROPIN_DIR/$U2\\.d/10-runnerctl\\.conf\$"
@@ -322,6 +323,7 @@ case_scale_2() {
   expect_log "^systemctl enable --now $U2\$"
   expect_log "^systemctl disable --now $U3\$"
   expect_log_count '^systemctl daemon-reload$' 1
+  expect_no_log '^systemctl restart '
 }
 
 # GHR-5: enable --now runs per slot BEFORE the single daemon-reload, so the
@@ -331,6 +333,33 @@ case_scale_reloads_before_enable() {
   expect_rc 0
   expect_log_order "tee .*/$U1\\.d/10-runnerctl\\.conf\$" "tee .*/$U2\\.d/10-runnerctl\\.conf\$" \
                    '^systemctl daemon-reload$' "^systemctl enable --now $U1\$" "^systemctl enable --now $U2\$"
+}
+
+# GHR-5: a slot that fails to enable/disable must be reported, not swallowed
+# as "[active]" — and every slot must still be processed.
+case_scale_start_failure_reported() {
+  RUNNERCTL_STUB_FAIL_UNITS='slot-2' run scale 2
+  expect_rc 1
+  expect_out "^  \\[active\\] $U1\$"
+  expect_out "^  \\[FAILED\\] $U2\$"
+  expect_out "^  \\[stopped\\] $U3\$"
+  expect_err '1 of 2 slot\(s\) failed'
+  expect_log "^systemctl enable --now $U1\$"
+  expect_log "^systemctl enable --now $U2\$"
+  expect_log "^systemctl disable --now $U3\$"
+  expect_no_out '^Scaled to'
+}
+
+# GHR-5: --restart restarts the slots that are now active, so the new caps
+# take effect immediately, after (not instead of) the enable/disable loop.
+case_scale_restart_flag_restarts_active_slots() {
+  run scale 2 --restart
+  expect_rc 0
+  expect_log_order "^systemctl enable --now $U1\$" "^systemctl enable --now $U2\$" \
+                   "^systemctl restart $U1\$" "^systemctl restart $U2\$"
+  expect_log_count '^systemctl restart ' 2
+  expect_no_log "^systemctl restart $U3\$"
+  expect_out 'Restarted 2 active slot\(s\) \(config active now\)\.'
 }
 
 case_scale_zero_rejected() {
@@ -493,7 +522,9 @@ t "apply --max lots: invalid value rejected"                       case_apply_ma
 t "apply --restart-sec soon: invalid value rejected"               case_apply_restart_sec_invalid_value_rejected
 t "upgrade --ref: missing value dies before any download"          case_upgrade_ref_missing_value
 t "scale 2: two drop-ins, enable 1-2, disable 3, one reload"       case_scale_2
-xfail GHR-5 "scale 2: daemon-reload before enable --now"           case_scale_reloads_before_enable
+t "scale 2: daemon-reload before enable --now"                     case_scale_reloads_before_enable
+t "scale 2: a failed slot is reported, not swallowed"              case_scale_start_failure_reported
+t "scale 2 --restart: restarts the now-active slots"               case_scale_restart_flag_restarts_active_slots
 t "scale 0: out of range"                                          case_scale_zero_rejected
 t "scale abc: not an integer"                                      case_scale_non_integer_rejected
 t "scale: N missing"                                               case_scale_missing_n
