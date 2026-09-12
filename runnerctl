@@ -25,13 +25,16 @@
 #
 #   runnerctl status
 #   runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
-#                    [--restart-sec N] [--env-file PATH] [--restart]
-#   runnerctl scale N [--profile NAME] [--max 26G] [--high 22G]
+#                    [--restart-sec N] [--env-file PATH] [--restart] \
+#                    [<unit|slot-index|name> ...]
+#   runnerctl scale N [--profile NAME] [--max 26G] [--high 22G] \
+#                     [--restart]
 #   runnerctl env-init [--profile NAME] [--env-file PATH]
-#   runnerctl start|stop|restart [<unit|slot-index>]
-#   runnerctl enable|disable <unit|slot-index>
-#   runnerctl logs [<unit|slot-index>]
-#   runnerctl remove-limits
+#   runnerctl start|stop|restart [<unit|slot-index|name>]
+#   runnerctl enable|disable <unit|slot-index|name>
+#   runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
+#                  [--since WHEN] [-g PATTERN]
+#   runnerctl remove-limits [<unit|slot-index|name> ...]
 #   runnerctl profiles
 #   runnerctl config-example
 #   runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
@@ -49,7 +52,7 @@
 #   Old install:  runnerctl migrate   # lifts the inline values into the config
 set -euo pipefail
 
-RUNNERCTL_VERSION="0.3.1" # x-release-please-version
+RUNNERCTL_VERSION="0.4.4" # x-release-please-version
 
 # --- Defaults (all overridable from the config file) -------------------------
 # The BUILTIN_* copies stay untouched by the config so `migrate` can tell a
@@ -75,9 +78,14 @@ ENV_FILE=""
 ENV_TEMPLATE=""
 do_restart=false
 REMAINING=()
+TARGETS=()
 
 run_priv() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
 die() { echo "runnerctl: $*" >&2; exit 1; }
+# Call as `need_val "$@"` right after matching a value flag in $1: dies with
+# "$1 needs a value" if no $2 is there to take it, instead of letting a bare
+# "$2" expansion under `set -u` crash with a raw bash diagnostic.
+need_val() { [ $# -ge 2 ] || die "$1 needs a value"; }
 
 # --- Config file --------------------------------------------------------------
 # The config file is plain bash and is sourced. It may set any of the defaults
@@ -174,22 +182,30 @@ TEMPLATE
 extract_profile() {
   REMAINING=()
   while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     case "$1" in
-      --profile) [ $# -ge 2 ] || die "--profile needs a value"; PROFILE="$2"; shift 2 ;;
+      --profile) need_val "$@"; PROFILE="$2"; shift 2 ;;
       *) REMAINING+=("$1"); shift ;;
     esac
   done
 }
 
+# A memory limit as systemd's MemoryMax=/MemoryHigh= accept it: a byte count
+# with an optional K/M/G/T suffix, or the literal "infinity".
+valid_mem() { [[ "$1" =~ ^[0-9]+[KMGT]?$ ]] || [ "$1" = infinity ]; }
+
 parse_opts() {
+  TARGETS=()
   while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     case "$1" in
-      --max)         MEM_MAX="$2"; shift 2 ;;
-      --high)        MEM_HIGH="$2"; shift 2 ;;
-      --restart-sec) RESTART_SEC="$2"; shift 2 ;;
-      --env-file)    ENV_FILE="$2"; shift 2 ;;
+      --max)         need_val "$@"; valid_mem "$2" || die "--max value '$2' is invalid — want an integer with an optional K/M/G/T suffix, or 'infinity'"; MEM_MAX="$2"; shift 2 ;;
+      --high)        need_val "$@"; valid_mem "$2" || die "--high value '$2' is invalid — want an integer with an optional K/M/G/T suffix, or 'infinity'"; MEM_HIGH="$2"; shift 2 ;;
+      --restart-sec) need_val "$@"; [[ "$2" =~ ^[0-9]+$ ]] || die "--restart-sec value '$2' is invalid — want an integer"; RESTART_SEC="$2"; shift 2 ;;
+      --env-file)    need_val "$@"; ENV_FILE="$2"; shift 2 ;;
       --restart)     do_restart=true; shift ;;
-      *) die "unknown option: $1" ;;
+      -*)            die "unknown option: $1" ;;
+      *)             TARGETS+=("$1"); shift ;;
     esac
   done
 }
@@ -205,31 +221,209 @@ require_runners() {
 
 prop() { systemctl show "$1" -p "$2" --value 2>/dev/null; }
 
-# What is this runner currently working on? Read GITHUB_REPOSITORY / GITHUB_JOB
-# from the environment of the job's processes in the runner's systemd cgroup.
-# (GITHUB_JOB is the workflow job id, e.g. lint/typecheck/test/build.) Requires
-# read access to the processes — works when run as the runner's user (or root).
-job_info() {
-  local u="$1" cg f pid env repo job worker=""
-  cg="$(prop "$u" ControlGroup)"
-  f="/sys/fs/cgroup${cg}/cgroup.procs"
-  if [ -z "$cg" ] || [ ! -r "$f" ]; then echo "—"; return; fi
+# One `systemctl show` call for every property `status` needs, instead of one
+# per column: prints KEY=VALUE lines (a value can itself contain '=', e.g.
+# EnvironmentFiles=/etc/x (ignore_errors=no) — callers must split on the
+# FIRST '=' only). A config can shadow this to stub `status` under test.
+unit_props() {
+  systemctl show "$1" -p ActiveState,SubState,UnitFileState,MemoryMax,MemoryHigh,MemoryCurrent,Restart,EnvironmentFiles,ControlGroup,ActiveEnterTimestampMonotonic,InactiveEnterTimestampMonotonic,NRestarts,Result,InvocationID 2>/dev/null
+}
+
+# --- What is a runner working on? ---------------------------------------------
+# The Listener writes two lines to its stdout (the journal, via the svc.sh
+# unit) that bracket every job:
+#   <utc>: Running job: <job display name>
+#   <utc>: Job <job display name> completed with result: Succeeded|Failed|Canceled
+# The last `Running job:` line with no later `completed with result:` line is
+# the job the slot is on, for the whole job — stable between steps and for
+# container jobs, where the /proc environ walk below sees nothing — and it is
+# readable by anyone in the systemd-journal group, not only the runner user.
+# The strings are from the actions/runner source (Runner.Listener's
+# JobDispatcher), not yet verified against a host's journal.
+#
+# Prints the journal lines of UNIT's current invocation (scoped by
+# INVOCATION-ID when given, so a previous run's job cannot leak in) that
+# mention a job start or end, in `-o short-unix` form: the first field is the
+# epoch second the line was logged. Returns 1 and prints nothing when the
+# journal cannot be read. `--system` is load-bearing for that: without it a
+# user outside systemd-journal gets an EMPTY journal and exit 0 (probed on
+# systemd 261), indistinguishable from an idle slot; with it journalctl says
+# "insufficient permissions" and exits 1. Read-only and called directly, never
+# through run_priv — status must never prompt for sudo. A config can shadow
+# this to stub it.
+journal_job_lines() { # UNIT [INVOCATION-ID]
+  local out args=(--system -u "$1" -o short-unix --no-pager -q -n 400)
+  [ -n "${2:-}" ] && args+=("_SYSTEMD_INVOCATION_ID=$2")
+  out="$(journalctl "${args[@]}" 2>/dev/null)" || return 1
+  grep -E 'Running job: |completed with result: ' <<<"$out" || true
+}
+
+# Parse those lines: prints "<job name>\t<epoch second>" for the running job
+# (the last `Running job:` line with no later `completed with result:` line),
+# nothing when the slot is idle. Pure, so it is unit-testable (`run_fn`).
+journal_running_job() { # LINES
+  local line name="" ts=""
+  while IFS= read -r line; do
+    case "$line" in
+      *"completed with result: "*) name=""; ts="" ;;
+      *"Running job: "*)           name="${line##*Running job: }"; ts="${line%% *}"; ts="${ts%%.*}" ;;
+    esac
+  done <<<"$1"
+  [ -n "$name" ] || return 0
+  printf '%s\t%s\n' "$name" "$ts"
+}
+
+# The /proc side: only the runner's user or root can read a slot's processes.
+# Three hooks, so a config can stub the walk without replacing job_info.
+cgroup_readable() { [ -n "${1:-}" ] && [ -r "/sys/fs/cgroup${1}/cgroup.procs" ]; }
+
+# Runner.Worker is spawned once per job, so its age is the job's runtime.
+# Prints its pid; nothing when there is none or the cgroup cannot be read.
+proc_worker_pid() { # CGROUP
+  local pid
+  cgroup_readable "$1" || return 0
   while read -r pid; do
     if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q "Runner.Worker"; then
-      worker=1
+      echo "$pid"; return 0
     fi
+  done <"/sys/fs/cgroup${1}/cgroup.procs"
+}
+
+# GITHUB_REPOSITORY / GITHUB_JOB from the environment of the first process in
+# the cgroup that carries them (GITHUB_* is injected into the STEP processes,
+# not into Runner.Worker, so between steps and for container jobs there is
+# none). Prints the two KEY=VALUE lines; nothing otherwise.
+proc_job_env() { # CGROUP
+  local pid env
+  cgroup_readable "$1" || return 0
+  while read -r pid; do
     [ -r "/proc/$pid/environ" ] || continue
     env="$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null || true)"
     case "$env" in
-      *GITHUB_REPOSITORY=*) ;;
-      *) continue ;;
+      *GITHUB_REPOSITORY=*) grep -E '^GITHUB_(REPOSITORY|JOB)=' <<<"$env"; return 0 ;;
     esac
-    repo="$(printf '%s\n' "$env" | grep -m1 '^GITHUB_REPOSITORY=' | cut -d= -f2- || true)"
-    job="$(printf '%s\n' "$env" | grep -m1 '^GITHUB_JOB=' | cut -d= -f2- || true)"
-    printf '%s:%s\n' "${repo##*/}" "${job:-?}"
+  done <"/sys/fs/cgroup${1}/cgroup.procs"
+}
+
+# Epoch seconds; a config can shadow it to pin the journal-derived runtime.
+now_epoch() { date +%s; }
+
+# The WORKING-ON cell. Takes the cgroup and invocation id from the caller's
+# already-fetched unit_props (GHR-4) instead of fetching them itself.
+#   —              the unit has no cgroup (not running)
+#   idle           the journal is readable and no job is in flight
+#   repo:job (12m) the journal names the job; the repo comes from the /proc
+#                  environ walk when that is readable (the job name alone
+#                  otherwise), the runtime from the Runner.Worker age, or from
+#                  the `Running job:` line's journal timestamp when the worker
+#                  cannot be seen
+# Without journal access the old /proc-only logic runs, and `(starting)`
+# survives only there: a live Runner.Worker with no GITHUB_* process is the
+# only signal of a job in /proc, and it cannot tell startup from between-steps
+# (the flicker GHR-10 removes for every reader with journal access).
+#   (no access)    neither the journal nor the cgroup can be read; cmd_status
+#                  prints a one-line hint under the table
+job_info() { # UNIT CGROUP [INVOCATION-ID]
+  local u="$1" cg="$2" lines rj name ts env repo job worker runtime=""
+  [ -n "$cg" ] || { echo "—"; return; }
+  if lines="$(journal_job_lines "$u" "${3:-}")"; then
+    rj="$(journal_running_job "$lines")"
+    [ -n "$rj" ] || { echo "idle"; return; }
+    name="${rj%%$'\t'*}"; ts="${rj#*$'\t'}"
+    repo="$(proc_job_env "$cg" | grep -m1 '^GITHUB_REPOSITORY=' | cut -d= -f2- || true)"
+    worker="$(proc_worker_pid "$cg")"
+    if [ -n "$worker" ]; then
+      runtime="$(proc_runtime "$worker")"
+    elif [[ "$ts" =~ ^[0-9]+$ ]]; then
+      runtime="$(fmt_dur $(( $(now_epoch) - ts )))"
+    fi
+    printf '%s%s%s\n' "${repo:+${repo##*/}:}" "$name" "${runtime:+ ($runtime)}"
     return
-  done <"$f"
-  if [ -n "$worker" ]; then echo "(starting)"; else echo "idle"; fi
+  fi
+  cgroup_readable "$cg" || { echo "(no access)"; return; }
+  worker="$(proc_worker_pid "$cg")"
+  [ -n "$worker" ] && runtime="$(proc_runtime "$worker")"
+  env="$(proc_job_env "$cg")"
+  if [ -n "$env" ]; then
+    repo="$(grep -m1 '^GITHUB_REPOSITORY=' <<<"$env" | cut -d= -f2- || true)"
+    job="$(grep -m1 '^GITHUB_JOB=' <<<"$env" | cut -d= -f2- || true)"
+    printf '%s:%s%s\n' "${repo##*/}" "${job:-?}" "${runtime:+ ($runtime)}"
+  elif [ -n "$worker" ]; then
+    echo "(starting)"
+  else
+    echo "idle"
+  fi
+}
+
+# --- Durations ----------------------------------------------------------------
+# Seconds -> 12s / 41m / 3h12m / 3d 4h (a zero remainder is dropped: 6d, 2h).
+# Anything that is not a non-negative integer (empty, "n/a", a negative from
+# a clock that went backwards) -> —.
+fmt_dur() {
+  local s="${1:-}" r
+  [[ "$s" =~ ^[0-9]+$ ]] || { echo "—"; return; }
+  if [ "$s" -ge 86400 ]; then
+    r=$(((s % 86400) / 3600))
+    if [ "$r" -gt 0 ]; then echo "$((s / 86400))d ${r}h"; else echo "$((s / 86400))d"; fi
+  elif [ "$s" -ge 3600 ]; then
+    r=$(((s % 3600) / 60))
+    if [ "$r" -gt 0 ]; then echo "$((s / 3600))h${r}m"; else echo "$((s / 3600))h"; fi
+  elif [ "$s" -ge 60 ]; then
+    echo "$((s / 60))m"
+  else
+    echo "${s}s"
+  fi
+}
+
+# Microseconds since boot, from /proc/uptime — the same clock as systemd's
+# *TimestampMonotonic properties, so no date/locale/TZ parsing is needed.
+# Integer arithmetic only; a config can shadow this to make `status`
+# deterministic under test.
+now_mono() {
+  local up frac
+  read -r up _ </proc/uptime
+  frac="${up#*.}"; [ "$frac" != "$up" ] || frac=0
+  frac="${frac}000000"; frac="${frac:0:6}"   # pad/truncate to microseconds
+  echo $(( ${up%%.*} * 1000000 + 10#$frac ))
+}
+
+# How long a unit has been in its ActiveState: since the active-enter stamp
+# while active/activating/reloading, otherwise since the inactive-enter stamp
+# (StateChangeTimestamp also moves on sub-state changes, so it is not used).
+# Stamps are µs since boot; 0 or empty means the state was never entered.
+since_state() { # ACTIVE-STATE ACTIVE-ENTER-US INACTIVE-ENTER-US
+  local ts
+  case "$1" in
+    active|activating|reloading) ts="$2" ;;
+    *)                           ts="$3" ;;
+  esac
+  if [[ "$ts" =~ ^[0-9]+$ ]] && [ "$ts" -gt 0 ]; then
+    fmt_dur $(( ($(now_mono) - ts) / 1000000 ))
+  else
+    echo "—"
+  fi
+}
+
+# When PID started, in µs since boot: field 22 of /proc/PID/stat, in clock
+# ticks. (Not `stat -c %Y /proc/PID`: procfs stamps that directory when it is
+# first looked up, not when the process forked, so it reads as "now" for a
+# process nobody has inspected yet.) The comm field can contain spaces, so
+# split after its closing paren. Prints nothing if PID is gone.
+proc_start_mono() {
+  local st tck
+  st="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
+  read -ra st <<<"${st##*) }"          # fields 3.., so start time is index 19
+  [ "${#st[@]}" -gt 19 ] || return 0
+  tck="$(getconf CLK_TCK 2>/dev/null)" || tck=100
+  echo $(( st[19] * 1000000 / tck ))
+}
+
+# fmt_dur of how long PID has been alive; empty if PID cannot be read.
+proc_runtime() {
+  local start
+  start="$(proc_start_mono "$1")"
+  [ -n "$start" ] || return 0
+  fmt_dur $(( ($(now_mono) - start) / 1000000 ))
 }
 
 hbytes() {
@@ -241,15 +435,41 @@ hbytes() {
   awk -v b="$v" 'BEGIN{ if (b<1048576) printf "%.0fM", b/1048576; else printf "%.1fG", b/1073741824 }'
 }
 
-resolve() { # "unit or slot-index" -> unit name
+resolve() { # "unit, slot-index, or short RUNNER name" -> unit name
   local a="$1"
+  mapfile -t units < <(discover)
   if [[ "$a" =~ ^[0-9]+$ ]]; then
-    mapfile -t units < <(discover)
     [ "$a" -lt "${#units[@]}" ] || die "slot index $a out of range (0..$((${#units[@]}-1)))"
     echo "${units[$a]}"
-  else
-    echo "$a"
+    return
   fi
+  local u
+  # 1. the literal unit name.
+  for u in "${units[@]}"; do [ "$u" = "$a" ] && { echo "$u"; return; }; done
+  # 2. actions.runner.<arg>.service
+  for u in "${units[@]}"; do [ "$u" = "actions.runner.${a}.service" ] && { echo "$u"; return; }; done
+  # 3. <arg>.service
+  for u in "${units[@]}"; do [ "$u" = "${a}.service" ] && { echo "$u"; return; }; done
+  # 4. an unambiguous prefix or substring match on the short name (what
+  # `status` prints as RUNNER: the unit with "actions.runner." and ".service"
+  # stripped) — either direction, so "slot-1" matches "example.slot-1" and
+  # "example.slot-1.service" (typed with the suffix back on) also does.
+  local short shorts=() matches=()
+  for u in "${units[@]}"; do
+    short="${u#actions.runner.}"; short="${short%.service}"
+    shorts+=("$short")
+    [[ "$short" == *"$a"* || "$a" == *"$short"* ]] && matches+=("$short")
+  done
+  case "${#matches[@]}" in
+    1)
+      for u in "${units[@]}"; do
+        short="${u#actions.runner.}"; short="${short%.service}"
+        [ "$short" = "${matches[0]}" ] && { echo "$u"; return; }
+      done
+      ;;
+    0) die "no runner slot matches '$a' (have: 0..$((${#units[@]}-1)), ${shorts[*]})" ;;
+    *) die "ambiguous target '$a' matches: ${matches[*]}" ;;
+  esac
 }
 
 # --- Drop-in rendering --------------------------------------------------------
@@ -289,38 +509,99 @@ guard_env_file() {
   run_priv test -f "$ENV_FILE" || die "EnvironmentFile $ENV_FILE missing — run: runnerctl env-init --profile $PROFILE"
 }
 
+# What profile (if any) manages this slot, read from the first line of its
+# drop-in (`# Managed by runnerctl (profile: NAME) — DO NOT EDIT BY HAND.`,
+# see render_dropin) — a plain read, no run_priv: the file is root-owned but
+# world-readable like the rest of /etc/systemd/system. "—" when the drop-in
+# is missing (never applied, or reverted by remove-limits) or unreadable.
+slot_profile() {
+  local line
+  line="$(head -n1 "$SYSTEMD_DIR/$1.d/$DROPIN_NAME" 2>/dev/null)" || { echo "—"; return; }
+  [[ "$line" =~ \(profile:\ ([^\)]+)\) ]] && { echo "${BASH_REMATCH[1]}"; return; }
+  echo "—"
+}
+
 # --- Commands -----------------------------------------------------------------
+# Column widths of the status table; the last column (WORKING-ON) is unpadded.
+STATUS_WIDTHS=(3 40 8 15 8 9 6 6 6 8 7)
+
+# Print one status row, padding each cell by CHARACTERS. Bash's printf counts
+# bytes for %-Ns, so the 3-byte `—` cell used for "no value" came out two
+# columns short and shifted everything after it (GHR-21). ${#v} counts
+# characters under a UTF-8 locale, which is the only kind where `—` renders.
+status_row() {
+  local w v out=""
+  for w in "${STATUS_WIDTHS[@]}"; do
+    v="$1"; shift
+    out+="$v"
+    if [ "${#v}" -lt "$w" ]; then printf -v v '%*s' $((w - ${#v})) ''; out+="$v"; fi
+    out+=" "
+  done
+  printf '%s%s\n' "$out" "$1"
+}
+
 cmd_status() {
   require_runners
   echo "Host: $(nproc) cores, $(free -h | awk '/^Mem:/{print $2" RAM, "$7" available"}')"
   echo
-  printf '%-3s %-40s %-15s %-9s %-6s %-6s %-6s %-8s %-7s %s\n' \
-    IDX RUNNER ACTIVE ENABLED MAX HIGH USED RESTART ENVFILE WORKING-ON
-  local i=0 u
+  status_row IDX RUNNER PROFILE ACTIVE SINCE ENABLED MAX HIGH USED RESTART ENVFILE WORKING-ON
+  local i=0 u job no_access=false
   while read -r u; do
     [ -n "$u" ] || continue
     local short="${u#actions.runner.}"; short="${short%.service}"
-    local envf; envf="$(prop "$u" EnvironmentFiles)"; [ -n "$envf" ] || envf="—"
-    printf '%-3s %-40s %-15s %-9s %-6s %-6s %-6s %-8s %-7s %s\n' \
-      "$i" "$short" "$(prop "$u" ActiveState)/$(prop "$u" SubState)" \
-      "$(prop "$u" UnitFileState)" \
-      "$(hbytes "$(prop "$u" MemoryMax)")" "$(hbytes "$(prop "$u" MemoryHigh)")" \
-      "$(hbytes "$(prop "$u" MemoryCurrent)")" "$(prop "$u" Restart)" "$envf" \
-      "$(job_info "$u")"
+    local -A P=()
+    local k v
+    while IFS='=' read -r k v; do
+      [ -n "$k" ] || continue
+      P[$k]="$v"
+    done < <(unit_props "$u")
+    local envf="${P[EnvironmentFiles]:-}"; [ -n "$envf" ] || envf="—"
+    job="$(job_info "$u" "${P[ControlGroup]:-}" "${P[InvocationID]:-}")"
+    [ "$job" != "(no access)" ] || no_access=true
+    status_row "$i" "$short" "$(slot_profile "$u")" "${P[ActiveState]:-}/${P[SubState]:-}" \
+      "$(since_state "${P[ActiveState]:-}" "${P[ActiveEnterTimestampMonotonic]:-}" "${P[InactiveEnterTimestampMonotonic]:-}")" \
+      "${P[UnitFileState]:-}" \
+      "$(hbytes "${P[MemoryMax]:-}")" "$(hbytes "${P[MemoryHigh]:-}")" \
+      "$(hbytes "${P[MemoryCurrent]:-}")" "${P[Restart]:-}" "$envf" \
+      "$job"
     i=$((i+1))
   done < <(discover)
+  # Once under the table, not per row, so the rows stay parseable.
+  if $no_access; then
+    echo "note: WORKING-ON needs journal read access (systemd-journal group) or root"
+  fi
 }
 
 cmd_apply() {
   extract_profile "$@"; load_profile; parse_opts ${REMAINING[@]+"${REMAINING[@]}"}
   require_runners; guard_env_file
-  local u
-  while read -r u; do [ -n "$u" ] && { apply_to "$u"; echo "  wrote drop-in for $u"; }; done < <(discover)
+  local units=() u t short_list=""
+  if [ "${#TARGETS[@]}" -gt 0 ]; then
+    for t in "${TARGETS[@]}"; do
+      u="$(resolve "$t")"
+      units+=("$u")
+    done
+  else
+    mapfile -t units < <(discover)
+  fi
+  for u in "${units[@]}"; do apply_to "$u"; echo "  wrote drop-in for $u"; done
   run_priv systemctl daemon-reload
-  echo "Applied profile '$PROFILE': Restart=always RestartSec=$RESTART_SEC${MEM_MAX:+ MemoryMax=$MEM_MAX MemoryHigh=$MEM_HIGH}${ENV_FILE:+ EnvironmentFile=$ENV_FILE}"
+  if [ "${#TARGETS[@]}" -gt 0 ]; then
+    for u in "${units[@]}"; do
+      t="${u#actions.runner.}"; t="${t%.service}"
+      short_list+="${short_list:+, }$t"
+    done
+    echo "Applied profile '$PROFILE' to ${#units[@]} slot(s): $short_list"
+  else
+    echo "Applied profile '$PROFILE': Restart=always RestartSec=$RESTART_SEC${MEM_MAX:+ MemoryMax=$MEM_MAX MemoryHigh=$MEM_HIGH}${ENV_FILE:+ EnvironmentFile=$ENV_FILE}"
+  fi
   if $do_restart; then
-    while read -r u; do [ -n "$u" ] && run_priv systemctl restart "$u"; done < <(discover)
-    echo "Restarted all runner slots (config active now)."
+    for u in "${units[@]}"; do run_priv systemctl restart "$u"; done
+    if [ "${#TARGETS[@]}" -gt 0 ]; then
+      echo "Restarted ${#units[@]} slot(s) (config active now)."
+    else
+      echo "Restarted all runner slots (config active now)."
+    fi
   else
     echo "Config takes effect on next (re)start. Run: runnerctl restart"
   fi
@@ -332,26 +613,47 @@ cmd_scale() {
   [ $# -ge 1 ] || die "scale needs N, e.g. 'scale 2 --max 26G'"
   local n="$1"; shift
   [[ "$n" =~ ^[0-9]+$ ]] || die "N must be an integer"
-  load_profile; parse_opts "$@"; require_runners; guard_env_file
+  load_profile; parse_opts "$@"
+  [ "${#TARGETS[@]}" -eq 0 ] || die "unexpected argument: ${TARGETS[*]}"
+  require_runners; guard_env_file
   mapfile -t units < <(discover)
   local total=${#units[@]}
   { [ "$n" -ge 1 ] && [ "$n" -le "$total" ]; } || die "N must be 1..$total"
   local i u
+  # Write every drop-in that will be needed, THEN reload, THEN start/stop —
+  # otherwise the first `enable --now` on a stopped slot races systemd's own
+  # unread unit cache and starts with the previous config (GHR-5).
+  for i in "${!units[@]}"; do
+    [ "$i" -lt "$n" ] && apply_to "${units[$i]}"
+  done
+  run_priv systemctl daemon-reload
+  local rc failed=()
   for i in "${!units[@]}"; do
     u="${units[$i]}"
     if [ "$i" -lt "$n" ]; then
-      apply_to "$u"; run_priv systemctl enable --now "$u" >/dev/null 2>&1 || true
-      echo "  [active] $u"
+      rc=0; run_priv systemctl enable --now "$u" || rc=$?
+      if [ "$rc" -eq 0 ]; then echo "  [active] $u"; else echo "  [FAILED] $u"; failed+=("$u"); fi
     else
-      run_priv systemctl disable --now "$u" >/dev/null 2>&1 || true
-      echo "  [stopped] $u"
+      rc=0; run_priv systemctl disable --now "$u" || rc=$?
+      if [ "$rc" -eq 0 ]; then echo "  [stopped] $u"; else echo "  [FAILED] $u"; failed+=("$u"); fi
     fi
   done
-  run_priv systemctl daemon-reload
+  if [ "${#failed[@]}" -gt 0 ]; then
+    echo "runnerctl: scale: ${#failed[@]} of $n slot(s) failed to start/stop: ${failed[*]}" >&2
+    exit 1
+  fi
   echo "Scaled to $n active runner(s), profile '$PROFILE'${MEM_MAX:+ @ MemoryMax=$MEM_MAX}."
   echo "Note: stopped slots stay REGISTERED with GitHub (they show offline). Full"
   echo "deregister = 'svc.sh uninstall' + './config.sh remove' in the runner's dir"
   echo "(needs a GitHub removal token) — not automated: destructive, irreversible."
+  if $do_restart; then
+    for i in "${!units[@]}"; do
+      [ "$i" -lt "$n" ] && run_priv systemctl restart "${units[$i]}"
+    done
+    echo "Restarted $n active slot(s) (config active now)."
+  else
+    echo "Config takes effect on next (re)start of already-running slots. Run: runnerctl restart"
+  fi
 }
 
 cmd_env_init() {
@@ -373,7 +675,9 @@ cmd_ctl() { # start|stop|restart [target] (default: all)
   local action="$1"; shift || true
   require_runners
   if [ $# -ge 1 ]; then
-    run_priv systemctl "$action" "$(resolve "$1")"
+    # Resolve on its own line: a die inside "$(...)" only exits the subshell.
+    local u; u="$(resolve "$1")"
+    run_priv systemctl "$action" "$u"
   else
     local u; while read -r u; do [ -n "$u" ] && run_priv systemctl "$action" "$u"; done < <(discover)
   fi
@@ -382,26 +686,75 @@ cmd_ctl() { # start|stop|restart [target] (default: all)
 
 cmd_toggle() { # enable|disable <target>
   local action="$1"; shift || true
-  [ $# -ge 1 ] || die "$action needs a <unit|slot-index>"
-  run_priv systemctl "$action" --now "$(resolve "$1")"
+  [ $# -ge 1 ] || die "$action needs a <unit|slot-index|name>"
+  local u; u="$(resolve "$1")"
+  run_priv systemctl "$action" --now "$u"
   echo "$action done."
 }
 
 cmd_logs() {
   require_runners
-  run_priv journalctl -u "$(resolve "${1:-0}")" -n 100 --no-pager
+  local target="" follow=false n="" since="" grep_pat="" have_target=false u
+  while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    case "$1" in
+      -f|--follow) follow=true; shift ;;
+      -n|--lines)  need_val "$@"; [[ "$2" =~ ^[0-9]+$ ]] || die "-n value '$2' is invalid — want an integer"; n="$2"; shift 2 ;;
+      --since)     need_val "$@"; since="$2"; shift 2 ;;
+      -g|--grep)   need_val "$@"; grep_pat="$2"; shift 2 ;;
+      -*)          die "unknown option: $1" ;;
+      *)           $have_target && die "unknown option: $1"; target="$1"; have_target=true; shift ;;
+    esac
+  done
+
+  local jargs=()
+  if [ -n "$target" ]; then
+    u="$(resolve "$target")"
+    jargs+=(-u "$u")
+  else
+    while read -r u; do [ -n "$u" ] && jargs+=(-u "$u"); done < <(discover)
+  fi
+  if [ -n "$n" ]; then
+    jargs+=(-n "$n")
+  elif $follow; then
+    jargs+=(-n 50)
+  else
+    jargs+=(-n 100)
+  fi
+  $follow && jargs+=(-f)
+  [ -n "$since" ] && jargs+=(--since "$since")
+  [ -n "$grep_pat" ] && jargs+=(-g "$grep_pat")
+  jargs+=(--no-pager)
+
+  run_priv journalctl "${jargs[@]}"
 }
 
 cmd_remove_limits() {
+  parse_opts "$@"
   require_runners
-  local u
-  while read -r u; do
-    [ -n "$u" ] || continue
+  local units=() u t short_list=""
+  if [ "${#TARGETS[@]}" -gt 0 ]; then
+    for t in "${TARGETS[@]}"; do
+      u="$(resolve "$t")"
+      units+=("$u")
+    done
+  else
+    mapfile -t units < <(discover)
+  fi
+  for u in "${units[@]}"; do
     run_priv rm -f "$SYSTEMD_DIR/$u.d/$DROPIN_NAME"
     echo "  removed drop-in for $u"
-  done < <(discover)
+  done
   run_priv systemctl daemon-reload
-  echo "Removed managed drop-ins. Run 'runnerctl restart' to revert running slots."
+  if [ "${#TARGETS[@]}" -gt 0 ]; then
+    for u in "${units[@]}"; do
+      t="${u#actions.runner.}"; t="${t%.service}"
+      short_list+="${short_list:+, }$t"
+    done
+    echo "Removed drop-in for ${#units[@]} slot(s): $short_list."
+  else
+    echo "Removed managed drop-ins. Run 'runnerctl restart' to revert running slots."
+  fi
 }
 
 cmd_profiles() {
@@ -797,9 +1150,10 @@ install_file() {
 cmd_upgrade() {
   local check=false ref=""
   while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     case "$1" in
       --check) check=true; shift ;;
-      --ref)   [ $# -ge 2 ] || die "--ref needs a value"; ref="$2"; shift 2 ;;
+      --ref)   need_val "$@"; ref="$2"; shift 2 ;;
       *) die "unknown option: $1" ;;
     esac
   done
@@ -822,6 +1176,30 @@ cmd_upgrade() {
   if $check; then echo "Update available. Run: runnerctl upgrade"; return 0; fi
   install_file "$DOWNLOAD_TMP" "$self"
   echo "Upgraded $RUNNERCTL_VERSION -> $new_ver at $self"
+}
+
+# Under sudo PATH is secure_path, so a runnerctl the invoking user runs from
+# ~/.local/bin or ~/bin is invisible to command -v — the usual shape of a
+# pre-config install. Look in those two directories of $SUDO_USER's home (of
+# $HOME without sudo) and set HOME_COPY / HOME_HOW for the caller, empty when
+# there is none. Their real PATH is not scanned: that needs a walk of
+# /proc/<pid>/environ, and the two conventional directories cover the real case.
+find_home_runnerctl() {
+  local home d
+  HOME_COPY=""; HOME_HOW=""
+  if [ -n "${SUDO_USER:-}" ]; then
+    home="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true)"
+    HOME_HOW="in $SUDO_USER's home via \$SUDO_USER, not on PATH"
+  else
+    home="${HOME:-}"
+    HOME_HOW="in \$HOME, not on PATH"
+  fi
+  [ -n "$home" ] || return 0
+  for d in "$home/.local/bin" "$home/bin"; do
+    [ -f "$d/runnerctl" ] || continue
+    if looks_like_runnerctl "$d/runnerctl"; then HOME_COPY="$d/runnerctl"; return 0; fi
+    echo "note: $d/runnerctl ($HOME_HOW) is not a runnerctl script — ignoring it"
+  done
 }
 
 cmd_install() {
@@ -851,9 +1229,13 @@ cmd_install() {
   fi
   new_ver="$(remote_version "$src")"
 
-  # Target: where runnerctl already is, else /usr/local/bin.
+  # Target: where runnerctl already is, else /usr/local/bin. A copy in the
+  # invoking user's home that PATH does not reach never moves the target —
+  # root-invoked tooling does not live in a home directory — but it is found.
   local existing target
   existing="$(command -v runnerctl 2>/dev/null || true)"
+  HOME_COPY=""; HOME_HOW=""
+  [ -n "$existing" ] || find_home_runnerctl
   if [ -z "$prefix" ]; then
     if [ -n "$existing" ]; then prefix="$(dirname "$(readlink -f "$existing")")"; else prefix="/usr/local/bin"; fi
   fi
@@ -862,28 +1244,41 @@ cmd_install() {
   if needs_priv "$target"; then
     [ "$(id -u)" -eq 0 ] || command -v sudo >/dev/null || die "$prefix is not writable and there is no sudo — run as root"
   fi
+  if [ -n "$HOME_COPY" ] && [ -e "$target" ] && [ "$(readlink -f "$HOME_COPY")" = "$(readlink -f "$target")" ]; then
+    HOME_COPY=""   # --prefix pointed at it: it is simply the target
+  fi
 
   # What is there already decides the path: nothing, a pre-config install, or
-  # a versioned one.
-  local fresh=false
+  # a versioned one. When the target is missing, a home copy stands in for it
+  # — migrated or version-checked the same way — except that the new file
+  # lands at $target and the old one is renamed out of the way afterwards, so
+  # the user does not keep running it from a PATH entry ahead of $prefix.
+  local fresh=false old="" where="" retired=""
   if [ -e "$target" ]; then
     looks_like_runnerctl "$target" || die "$target exists but is not a runnerctl script — refusing to overwrite it"
-    if is_legacy_script "$target"; then
-      echo "existing: pre-config runnerctl (no RUNNERCTL_VERSION) at $target"
+    old="$target"; where="at $target"
+    [ -z "$HOME_COPY" ] || echo "note: another runnerctl at $HOME_COPY ($HOME_HOW) is left alone — remove it if it shadows $target"
+  elif [ -n "$HOME_COPY" ]; then
+    old="$HOME_COPY"; where="at $HOME_COPY ($HOME_HOW)"
+    if is_legacy_script "$old"; then retired="$old.legacy"; else retired="$old.retired"; fi
+  fi
+  if [ -n "$old" ]; then
+    if is_legacy_script "$old"; then
+      echo "existing: pre-config runnerctl (no RUNNERCTL_VERSION) $where"
       if ! $migrate; then
         echo "--no-migrate: its inline values will NOT be carried into $CONFIG_FILE."
-        echo "A copy is kept at $target.legacy so 'runnerctl migrate --from $target.legacy' can do it later."
+        echo "A copy is kept at $old.legacy so 'runnerctl migrate --from $old.legacy' can do it later."
       elif $dry_run; then
-        echo "would run: runnerctl migrate --from $target   (writes $CONFIG_FILE, verified against the live drop-ins)"
+        echo "would run: runnerctl migrate --from $old   (writes $CONFIG_FILE, verified against the live drop-ins)"
       else
         echo "--- migrate ---"
-        cmd_migrate --from "$target"   # dies on any failure, leaving $target untouched
+        cmd_migrate --from "$old"   # dies on any failure, leaving $old untouched
         echo "--- migrate done ---"
       fi
     else
-      local cur; cur="$(remote_version "$target")"
-      echo "existing: runnerctl $cur"
-      if cmp -s "$src" "$target"; then
+      local cur; cur="$(remote_version "$old")"
+      echo "existing: runnerctl $cur $where"
+      if [ -z "$retired" ] && cmp -s "$src" "$target"; then
         echo "Already up to date ($cur at $target)."
         "$target" version; return 0
       fi
@@ -891,15 +1286,19 @@ cmd_install() {
         echo "Installed $cur is newer than $new_ver — not downgrading (pass --ref to force a version)."
         return 0
       fi
-      echo "upgrade: $cur -> $new_ver"
+      if [ -z "$retired" ]; then echo "upgrade: $cur -> $new_ver"; else echo "move: $cur at $old -> $new_ver at $target"; fi
     fi
   else
     fresh=true
     echo "existing: none — fresh install of $new_ver"
   fi
 
-  if $dry_run; then echo "(dry run — would install runnerctl $new_ver at $target; nothing changed)"; return 0; fi
-  if [ -e "$target" ] && is_legacy_script "$target" && ! $migrate; then
+  if $dry_run; then
+    echo "(dry run — would install runnerctl $new_ver at $target; nothing changed)"
+    [ -z "$retired" ] || echo "(dry run — would then retire $old as $retired)"
+    return 0
+  fi
+  if [ "$old" = "$target" ] && is_legacy_script "$target" && ! $migrate; then
     install_file "$target" "$target.legacy"
   fi
   local priv=()
@@ -909,6 +1308,13 @@ cmd_install() {
   priv=(); ! needs_priv "$(dirname "$CONFIG_FILE")" || priv=(run_priv)
   "${priv[@]}" mkdir -p "$(dirname "$CONFIG_FILE")"
   echo "Installed runnerctl $new_ver at $target"
+  if [ -n "$retired" ]; then
+    # After the new file is in place, never before: a failure here leaves both
+    # copies rather than none.
+    priv=(); ! needs_priv "$(dirname "$old")" || priv=(run_priv)
+    "${priv[@]}" mv -f "$old" "$retired"
+    echo "Retired $old as $retired — $target is the one to run now."
+  fi
   if $fresh; then
     echo
     echo "Next:"
@@ -924,8 +1330,11 @@ cmd_install() {
 usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}"; }
 
 main() {
+  if [ $# -gt 0 ]; then
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+  fi
   if [ "${1:-}" = "--config" ]; then
-    [ $# -ge 2 ] || die "--config needs a path"
+    need_val "$@"
     CONFIG_FILE="$2"; shift 2
     [ -f "$CONFIG_FILE" ] || die "config file $CONFIG_FILE not found"
   fi
@@ -957,4 +1366,6 @@ main() {
   esac
 }
 
-main "$@"
+# RUNNERCTL_NO_MAIN=1 lets tests/run.sh source the script and call a helper
+# (fmt_dur, ...) directly without running a command. Not a user-facing knob.
+if [ "${RUNNERCTL_NO_MAIN:-}" != 1 ]; then main "$@"; fi

@@ -36,6 +36,15 @@ verify, so no site value is lost. `--no-migrate` skips that and keeps the old
 file as `runnerctl.legacy`; `--dry-run` reports what would happen;
 `--prefix DIR` picks the location.
 
+Under `sudo` the invoking user's `PATH` is not consulted (`secure_path`), so a
+copy living in their `~/.local/bin` or `~/bin` would go unnoticed. `install`
+looks in those two directories of `$SUDO_USER`'s home (of `$HOME` otherwise)
+when nothing is on `PATH`: a copy found there is migrated or version-checked
+like any existing install, the new file still lands at `/usr/local/bin`, and
+the old one is renamed `runnerctl.legacy` (pre-config) or `runnerctl.retired`
+(versioned) so it cannot keep shadowing the new one. `--dry-run` shows the
+found path and what would happen to it.
+
 Prefer to read before you run? Same thing in two steps:
 
 ```sh
@@ -55,13 +64,16 @@ runnerctl [--config PATH] <command> [args]
 
 runnerctl status
 runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
-                 [--restart-sec N] [--env-file PATH] [--restart]
-runnerctl scale N [--profile NAME] [--max 26G] [--high 22G]
+                 [--restart-sec N] [--env-file PATH] [--restart] \
+                 [<unit|slot-index|name> ...]
+runnerctl scale N [--profile NAME] [--max 26G] [--high 22G] \
+                  [--restart]
 runnerctl env-init [--profile NAME] [--env-file PATH]
-runnerctl start|stop|restart [<unit|slot-index>]
-runnerctl enable|disable <unit|slot-index>
-runnerctl logs [<unit|slot-index>]
-runnerctl remove-limits
+runnerctl start|stop|restart [<unit|slot-index|name>]
+runnerctl enable|disable <unit|slot-index|name>
+runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
+               [--since WHEN] [-g PATTERN]
+runnerctl remove-limits [<unit|slot-index|name> ...]
 runnerctl profiles
 runnerctl config-example
 runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
@@ -70,18 +82,42 @@ runnerctl upgrade [--check] [--ref <branch|tag>]
 runnerctl version
 ```
 
-`status` shows each slot's state, memory cap/usage, restart policy, env file
-and — when run as the runner's user or root — the repository and job it is
-currently working on:
+`status` shows each slot's state and how long it has been in it (`SINCE`),
+which profile it carries (`PROFILE`, read from its drop-in — `—` if it has
+none), memory cap/usage, restart policy, env file and the job it is currently
+working on, with how long that job has been running:
 
 ```
-IDX RUNNER                 ACTIVE          ENABLED   MAX    HIGH   USED   RESTART  ENVFILE WORKING-ON
-0   org.host-1             active/running  enabled   26.0G  22.0G  3.1G   always   —       my-app:test
-1   org.host-2             active/running  enabled   26.0G  22.0G  128M   always   —       idle
-2   org.host-3             inactive/dead   disabled  —      —      —      always   —       —
+IDX RUNNER                 PROFILE  ACTIVE          SINCE    ENABLED   MAX    HIGH   USED   RESTART  ENVFILE WORKING-ON
+0   org.host-1             ci       active/running  3d 4h    enabled   26.0G  22.0G  3.1G   always   —       my-app:test (12m)
+1   org.host-2             ci       active/running  41m      enabled   26.0G  22.0G  128M   always   —       idle
+2   org.host-3             deploy   inactive/dead   6d       disabled  —      —      —      always   —       —
 ```
 
-Slots are addressed by unit name or by the `IDX` column.
+`SINCE` is measured from systemd's active-enter timestamp for a running slot
+and from its inactive-enter timestamp for a stopped or failed one (`—` for a
+slot that has never started).
+
+`WORKING-ON` is read from the slot's journal — the runner's `Running job:` /
+`completed with result:` lines — so it needs journal read access (the
+`systemd-journal` group, or root); it is stable for the whole job, including
+between steps and for container jobs. The repository prefix and the job
+runtime (the age of the slot's `Runner.Worker`, spawned once per job) are
+added from `/proc` when `status` runs as the runner's user or root;
+otherwise the cell is the job name alone, timed from the journal line. A
+running slot whose journal cannot be read shows `(no access)` with a
+one-line hint under the table — `—` means only that the slot is not
+running.
+
+`apply` and `remove-limits` can be pointed at one or more slots instead of
+every discovered one — `runnerctl apply --profile deploy 2` or `runnerctl
+apply 0 example.slot-2` — which is what lets one host run a `ci` pool and a
+`deploy` runner side by side without one profile clobbering the other's
+drop-in. With no targets, both act on every slot, as before.
+
+Slots are addressed by unit name, by the `IDX` column, or by the `RUNNER`
+column's short name — an unambiguous prefix or substring of it also works
+(e.g. `slot-1` for `example.slot-1`).
 
 ### Profiles
 
@@ -219,11 +255,13 @@ token and is irreversible, so it stays a manual step.
 ## Development
 
 ```sh
-make gates   # shellcheck + config.example drift check + smoke tests
+make gates   # shellcheck + config.example drift check + smoke + stubbed-systemd sim
+make sim     # just the stubbed-systemd cases (tests/run.sh)
 ```
 
 See [`.agents/gates.md`](.agents/gates.md) for what each gate covers and how
-to exercise the systemd-touching commands locally without root.
+the stubbed-systemd harness exercises every systemd-touching command without
+root (and how to add a case).
 
 ## License
 

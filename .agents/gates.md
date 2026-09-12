@@ -1,8 +1,8 @@
 # Gates
 
-`make gates` = `lint` + `example-drift` + `version-drift` + `smoke` +
-`migrate-test` + `install-test`. All six run without systemd runner units, root
-or network, so they are green on any dev box and in CI.
+`make gates` = `lint` + `example-drift` + `version-drift` + `smoke` + `sim` +
+`migrate-test` + `install-test`. All seven run without systemd runner units,
+root or network, so they are green on any dev box and in CI.
 
 **No test may escalate.** `migrate-test` and `install-test` put a fake `sudo`
 first on `PATH` that exits 97, so a code path that reaches for `run_priv` under
@@ -17,10 +17,12 @@ or the static tarball from github.com/koalaman/shellcheck/releases). Point the
 `SHELLCHECK` make variable at a non-PATH binary:
 `make lint SHELLCHECK=/path/to/shellcheck`.
 
-Runs at `-S style`, so info-level findings fail the gate. Fix the code rather
-than adding `disable` directives; the existing directives are all SC1090
-(sourcing a path only known at runtime) and inherent to the design — the config
-file, the legacy script `migrate` reads, and the config `migrate` just wrote.
+Runs at `-S style` over `runnerctl`, `tests/run.sh` and `tests/stub.config`
+(the stub has no shebang because it is sourced, so the set is linted with
+`-s bash`), so info-level findings fail the gate. Fix the code rather than
+adding `disable` directives; the existing directives are all SC1090 (sourcing
+a path only known at runtime) and inherent to the design — the config file,
+the legacy script `migrate` reads, and the config `migrate` just wrote.
 
 ## example-drift
 
@@ -40,11 +42,54 @@ annotation, never by editing either version by hand.
 ## smoke
 
 Only exercises commands that need neither systemd nor sudo (`version`, `help`,
-`profiles`, config loading, unknown-command exit code). Anything touching
-units (`apply`, `scale`, `env-init`) is verified by hand on a runner host — or
-locally by stubbing `run_priv`, `systemctl`, `discover` and `apply_to` in a
-throwaway config file, since the config is sourced after those functions are
-defined and so can shadow them.
+`profiles`, config loading, unknown-command exit code). Everything that touches
+units is covered by `sim`.
+
+## sim — stubbed systemd
+
+`make sim` runs `tests/run.sh`: every command that touches the host (`apply`,
+`scale`, `env-init`, `start/stop/restart`, `enable/disable`, `logs`,
+`remove-limits`, `status`) is run with `RUNNERCTL_CONFIG=tests/stub.config`.
+The config file is sourced after every function in the script is defined, so
+the stub shadows `run_priv` (appends its argv to a log and does nothing),
+`discover` (three fixed `actions.runner.example.slot-N.service` units), `prop`
+(a fixed property table), `unit_props` (the batched per-unit table `status`
+reads into an associative array — logged with a `probe:` prefix so cases can
+count it without tripping the read-only/leak assertions), and the sources
+`job_info` reads rather than `job_info` itself: `journal_job_lines` (the
+Listener's `Running job:` / `completed with result:` lines per unit, also
+`probe:`-logged; `RUNNERCTL_STUB_JOURNAL_ACCESS=0` makes it fail like
+`journalctl --system` does for a user outside `systemd-journal`, which is
+the only way that failure is detectable — plain `journalctl -u` answers an
+empty journal and exit 0), `now_epoch`, and the `/proc` hooks
+`cgroup_readable` / `proc_worker_pid` / `proc_job_env`;
+`systemctl`, `journalctl` and `sudo` are shadowed too as a safety net, and a
+case whose log shows one of them was reached directly fails. Cases assert on stdout, stderr, the exit code, the
+ordered list of privileged calls and the content `tee`d to each path. Plain
+bash, no framework — CI and a fresh worktree have nothing but shellcheck.
+
+**Add a case for every behaviour change that touches units** — a new flag, a
+changed call order, a new refusal. A case is a function calling `run <args>`
+then `expect_*` helpers (listed at the top of `tests/run.sh`), registered at
+the bottom with `t "<name>" <fn>`. A case with no assertions fails.
+
+**xfail convention.** A case that documents a known bug is registered with
+`xfail <ISSUE-KEY> "<name>" <fn>` instead of `t`. It prints `xfail` while it
+fails, and the run FAILS if it starts passing — so the PR that fixes the issue
+must flip the marker to `t` in the same change, and a fix can never land
+unnoticed by the gate. Write the case to assert the *correct* behaviour, not
+the current one.
+
+Traps:
+
+- `tests/stub.config` must stay mode `0644`: `load_config` refuses a
+  world-writable config, and the gate would fail on every case with the
+  refusal message. `git` preserves the mode; a `chmod` on the checkout would
+  not survive review.
+- The stub answers `run_priv test -f <path>` from `RUNNERCTL_STUB_ENV_FILE_EXISTS`
+  (default: the file is absent). Prefix a single `run` to flip it:
+  `RUNNERCTL_STUB_ENV_FILE_EXISTS=1 run apply --profile deploy`.
+- `status` calls `nproc` and `free` for real; only the runner rows are asserted.
 
 ## migrate-test
 
