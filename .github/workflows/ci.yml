@@ -4,6 +4,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   gates:
     runs-on: ubuntu-latest
@@ -13,3 +16,42 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y -q shellcheck
       - run: make gates
         shell: bash
+
+  # Release automation (release-please, conventional commits). On every push
+  # to main with green gates it opens or refreshes ONE release PR that bumps
+  # RUNNERCTL_VERSION (via the x-release-please-version annotation), writes
+  # CHANGELOG.md and .release-please-manifest.json. Merging that PR creates
+  # the vX.Y.Z tag and GitHub release; the script is then attached to the
+  # release so `runnerctl upgrade --ref vX.Y.Z` has a stable artifact.
+  #
+  # Feature PRs never touch the version line or the changelog, so they never
+  # conflict on either. Never bump RUNNERCTL_VERSION by hand.
+  #
+  # RELEASE_PLEASE_TOKEN (optional repo secret, a PAT with contents+PR
+  # write) makes the release PR trigger this workflow's gates like any other
+  # PR; with the default GITHUB_TOKEN, GitHub suppresses that, and the bumped
+  # script is only gated by the post-merge run on main.
+  release:
+    needs: gates
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+      - uses: actions/checkout@v4
+        if: ${{ steps.release.outputs.release_created }}
+      - name: Attach runnerctl to the release
+        if: ${{ steps.release.outputs.release_created }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.release.outputs.tag_name }}
+        run: |
+          ./runnerctl version | grep -qx "runnerctl ${TAG#v}"
+          gh release upload "$TAG" runnerctl --clobber

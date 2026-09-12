@@ -230,6 +230,13 @@ not downgrade unless `--ref` is given, and it uses `sudo` only when the install
 location is not writable. Point `UPGRADE_URL` at a fork or a mirror in the
 config file to upgrade from somewhere else.
 
+Versions are cut by [release-please](https://github.com/googleapis/release-please)
+from the conventional-commit history: each merge to `main` refreshes a release
+PR, and merging that PR bumps `RUNNERCTL_VERSION`, writes [`CHANGELOG.md`](CHANGELOG.md),
+tags `vX.Y.Z` and publishes a GitHub release with the script attached. Between
+releases `main` carries the next version's changes under the last version
+number; `--ref vX.Y.Z` pins a released one.
+
 ### What it writes
 
 One drop-in per runner unit, `/etc/systemd/system/<unit>.d/10-runnerctl.conf`:
