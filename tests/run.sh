@@ -18,10 +18,21 @@
 # Helpers (all patterns are `grep -E` regexes):
 #   run <args...>                  run ./runnerctl <args> against the stub;
 #                                  sets OUT ERR RC and the log/writes dir
+#                                  (resets LOG and WRITES first)
+#   run_keep <args...>             like `run`, but does not reset WRITES —
+#                                  for a case that seeds the writes-mirror
+#                                  tree (seed_dropin) before checking what a
+#                                  read-only command (status) sees there.
+#                                  LOG (and OUT/ERR/RC) are still reset.
 #   run_fn <function> <args...>    call one of runnerctl's own helpers (e.g.
 #                                  fmt_dur) directly: sources the script with
 #                                  RUNNERCTL_NO_MAIN=1, no config, no command;
 #                                  sets OUT ERR RC, the log stays empty
+#   seed_dropin UNIT PROFILE       write a drop-in for UNIT into the
+#                                  writes-mirror tree as if `apply --profile
+#                                  PROFILE` had already run for it — for
+#                                  status's PROFILE-column cases. Pair with
+#                                  run_keep, since a plain `run` would wipe it.
 #   expect_rc N                    exit code
 #   expect_out P / expect_no_out P some stdout line matches / none does
 #   expect_err P                   some stderr line matches
@@ -33,6 +44,14 @@
 #   expect_no_file PATH            nothing was written to PATH
 # Env knobs for a single run: prefix it, e.g.
 #   RUNNERCTL_STUB_ENV_FILE_EXISTS=1 run apply --profile deploy
+#
+# GHR-15: the stub points SYSTEMD_DIR at $RUNNERCTL_TEST_WRITES/etc/systemd/system
+# (see tests/stub.config), so a plain read of a unit's drop-in (status's
+# PROFILE column) and a run_priv-mediated write of one (apply/remove-limits)
+# resolve to the same place — the writes-mirror tree — without a separate
+# real-path-vs-mirror distinction. expect_file/expect_no_file/expect_file_lacks
+# and DROPIN_DIR below account for that: a path already under $WRITES is used
+# as-is instead of having $WRITES prepended again.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -65,6 +84,29 @@ run() {
   OUT="$(RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
          "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
   ERR="$(cat "$TMP/err")"
+}
+
+# Like `run`, but does not reset WRITES first (LOG still is) — for a case
+# that seeds the writes-mirror tree with seed_dropin before running a
+# read-only command that reads it back (status's PROFILE column).
+run_keep() {
+  : >"$LOG"
+  RC=0
+  OUT="$(RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
+         "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
+  ERR="$(cat "$TMP/err")"
+}
+
+# Write a drop-in for UNIT into the writes-mirror tree, first line rendered
+# exactly as render_dropin would for PROFILE, so status's plain read (no
+# run_priv) of $SYSTEMD_DIR/<unit>.d/$DROPIN_NAME finds it — bypasses
+# apply/run_priv/tee entirely, since a case using this calls run_keep, not
+# run (which would wipe it straight back out).
+seed_dropin() {
+  local u="$1" p="$2"
+  local dir="$WRITES/etc/systemd/system/$u.d"
+  mkdir -p "$dir"
+  echo "# Managed by runnerctl (profile: $p) — DO NOT EDIT BY HAND." >"$dir/10-runnerctl.conf"
 }
 
 # Call a helper function of the script directly, for the ones no command
@@ -132,21 +174,36 @@ expect_log_order() {
   done
 }
 
+# The real path P is normally mirrored at $WRITES$P (`tee /etc/x` -> stdin
+# stored at $WRITES/etc/x). SYSTEMD_DIR, though, is redirected by the stub to
+# live inside $WRITES already (GHR-15) so a plain read and a run_priv write
+# agree on one location — so a path already under $WRITES (e.g. built from
+# DROPIN_DIR below) is used as-is instead of getting $WRITES prepended again.
+_mirror_path() {
+  case "$1" in
+    "$WRITES"/*) printf '%s\n' "$1" ;;
+    *)           printf '%s\n' "$WRITES$1" ;;
+  esac
+}
+
 expect_file() {
   _expect
-  if [ ! -f "$WRITES$1" ]; then FAILS+=("nothing written to $1"); return 0; fi
-  grep -Eq -- "$2" "$WRITES$1" || FAILS+=("$1 has no line matching /$2/")
+  local p; p="$(_mirror_path "$1")"
+  if [ ! -f "$p" ]; then FAILS+=("nothing written to $1"); return 0; fi
+  grep -Eq -- "$2" "$p" || FAILS+=("$1 has no line matching /$2/")
 }
 
 expect_file_lacks() {
   _expect
-  if [ ! -f "$WRITES$1" ]; then FAILS+=("nothing written to $1"); return 0; fi
-  ! grep -Eq -- "$2" "$WRITES$1" || FAILS+=("$1 has a line matching /$2/")
+  local p; p="$(_mirror_path "$1")"
+  if [ ! -f "$p" ]; then FAILS+=("nothing written to $1"); return 0; fi
+  ! grep -Eq -- "$2" "$p" || FAILS+=("$1 has a line matching /$2/")
 }
 
 expect_no_file() {
   _expect
-  [ ! -e "$WRITES$1" ] || FAILS+=("$1 was written")
+  local p; p="$(_mirror_path "$1")"
+  [ ! -e "$p" ] || FAILS+=("$1 was written")
 }
 
 # --- Case runner --------------------------------------------------------------
@@ -194,16 +251,18 @@ xfail() { _case "$1" "${@:2}"; }
 U1="actions.runner.example.slot-1.service"
 U2="actions.runner.example.slot-2.service"
 U3="actions.runner.example.slot-3.service"
-DROPIN_DIR="/etc/systemd/system"
+# The stub redirects SYSTEMD_DIR under $WRITES (GHR-15) so apply/remove-limits'
+# writes land where status's plain read looks for them; see _mirror_path above.
+DROPIN_DIR="$WRITES/etc/systemd/system"
 DEPLOY_ENV="/etc/runnerctl/deploy.env"
 
 case_status_table() {
   run status
   expect_rc 0
-  expect_out '^IDX +RUNNER +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +RESTART +ENVFILE +WORKING-ON$'
-  expect_out '^0 +example\.slot-1 +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G +always +— +my-app:test \(12m\)$'
-  expect_out '^1 +example\.slot-2 +active/running +41m +enabled '
-  expect_out '^2 +example\.slot-3 +inactive/dead +6d +disabled +— +— +— +always +— +—$'
+  expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +RESTART +ENVFILE +WORKING-ON$'
+  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G +always +— +my-app:test \(12m\)$'
+  expect_out '^1 +example\.slot-2 +— +active/running +41m +enabled '
+  expect_out '^2 +example\.slot-3 +— +inactive/dead +6d +disabled +— +— +— +always +— +—$'
   expect_no_out '^3 '
   # status is read-only: no privileged call at all (the `probe:` lines below
   # are the stub logging its own unit_props hits, not a host mutation).
@@ -534,8 +593,8 @@ case_status_since_active_slots() {
   run status
   expect_rc 0
   # active slots: SINCE is measured from ActiveEnterTimestampMonotonic
-  expect_out '^0 +example\.slot-1 +active/running +3d 4h +enabled '
-  expect_out '^1 +example\.slot-2 +active/running +41m +enabled '
+  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled '
+  expect_out '^1 +example\.slot-2 +— +active/running +41m +enabled '
 }
 
 case_status_since_inactive_slot_uses_inactive_enter() {
@@ -543,7 +602,7 @@ case_status_since_inactive_slot_uses_inactive_enter() {
   expect_rc 0
   # slot-3 was last active 8d ago and went inactive 6d ago: an inactive slot
   # is measured from InactiveEnterTimestampMonotonic, so 6d, never 8d.
-  expect_out '^2 +example\.slot-3 +inactive/dead +6d +disabled '
+  expect_out '^2 +example\.slot-3 +— +inactive/dead +6d +disabled '
   expect_no_out '^2 +example\.slot-3 +inactive/dead +8d '
 }
 
@@ -629,7 +688,70 @@ case_status_dash_cells_keep_columns_aligned() {
   rpos="${row%—}"; rpos="${#rpos}"             # offset of the final — (WORKING-ON cell)
   _expect
   [ "$hpos" -eq "$rpos" ] || FAILS+=("WORKING-ON column: header at $hpos, slot-3 row at $rpos")
-  expect_out '^2 +example\.slot-3 +inactive/dead +6d +disabled +— +— +— +always +— +—$'
+  expect_out '^2 +example\.slot-3 +— +inactive/dead +6d +disabled +— +— +— +always +— +—$'
+}
+
+# --- GHR-15: apply/remove-limits take targets; status shows the PROFILE ------
+# each slot carries (read from its drop-in's first line, no run_priv).
+
+case_apply_targeted_single_slot_with_profile() {
+  RUNNERCTL_STUB_ENV_FILE_EXISTS=1 run apply --profile deploy 2
+  expect_rc 0
+  expect_out "^Applied profile 'deploy' to 1 slot\\(s\\): example\\.slot-3\$"
+  expect_log_count "tee $DROPIN_DIR/$U3\\.d/10-runnerctl\\.conf" 1
+  expect_log_count 'tee .*/10-runnerctl\.conf$' 1
+  expect_log_count '^systemctl daemon-reload$' 1
+  expect_no_log "tee $DROPIN_DIR/$U1\\.d/"
+  expect_no_log "tee $DROPIN_DIR/$U2\\.d/"
+  expect_file "$DROPIN_DIR/$U3.d/10-runnerctl.conf" "^EnvironmentFile=$DEPLOY_ENV\$"
+  expect_no_file "$DROPIN_DIR/$U1.d/10-runnerctl.conf"
+  expect_no_file "$DROPIN_DIR/$U2.d/10-runnerctl.conf"
+}
+
+case_apply_targeted_multiple_by_index_and_name() {
+  run apply 0 example.slot-2
+  expect_rc 0
+  expect_out "^Applied profile 'ci' to 2 slot\\(s\\): example\\.slot-1, example\\.slot-2\$"
+  expect_log_count 'tee .*/10-runnerctl\.conf$' 2
+  expect_log "tee $DROPIN_DIR/$U1\\.d/10-runnerctl\\.conf\$"
+  expect_log "tee $DROPIN_DIR/$U2\\.d/10-runnerctl\\.conf\$"
+  expect_no_log "tee $DROPIN_DIR/$U3\\.d/"
+}
+
+case_apply_target_no_match() {
+  run apply nope
+  expect_rc 1
+  expect_err "no runner slot matches 'nope'"
+  expect_no_log '.'
+}
+
+case_remove_limits_targeted() {
+  run remove-limits 1
+  expect_rc 0
+  expect_log_order "^rm -f $DROPIN_DIR/$U2\\.d/10-runnerctl\\.conf\$" '^systemctl daemon-reload$'
+  expect_log_count '^rm -f ' 1
+  expect_no_log "rm -f $DROPIN_DIR/$U1\\.d/"
+  expect_no_log "rm -f $DROPIN_DIR/$U3\\.d/"
+  expect_out "^Removed drop-in for 1 slot\\(s\\): example\\.slot-2\\.\$"
+}
+
+case_scale_rejects_stray_argument() {
+  run scale 2 extra
+  expect_rc 1
+  expect_err "^runnerctl: unexpected argument: extra\$"
+  expect_no_log '.'
+}
+
+case_status_shows_profile_column() {
+  run status   # establishes TMP/WRITES; nothing seeded yet on this call
+  seed_dropin "$U1" ci
+  seed_dropin "$U3" deploy
+  # slot-2 gets no drop-in seeded, so its PROFILE cell stays —
+  run_keep status
+  expect_rc 0
+  expect_out '^0 +example\.slot-1 +ci +active/running '
+  expect_out '^1 +example\.slot-2 +— +active/running '
+  expect_out '^2 +example\.slot-3 +deploy +inactive/dead '
 }
 
 # --- Registry -----------------------------------------------------------------
@@ -689,6 +811,12 @@ t "logs 1 -n 20 --since -g: all pass through to journalctl"        case_logs_lin
 t "logs 1 -n: missing value dies, no journalctl call"               case_logs_lines_missing_value
 t "logs 1 --bogus: unknown option dies, no journalctl call"         case_logs_unknown_flag
 t "logs nope: no match, no journalctl call"                          case_logs_no_match
+t "apply --profile deploy 2: writes only slot-3's drop-in"          case_apply_targeted_single_slot_with_profile
+t "apply 0 example.slot-2: index + short name, two drop-ins"        case_apply_targeted_multiple_by_index_and_name
+t "apply nope: resolve error, no privileged call at all"            case_apply_target_no_match
+t "remove-limits 1: rm -f on slot-2 only, then daemon-reload"       case_remove_limits_targeted
+t "scale 2 extra: stray argument dies, no privileged call"          case_scale_rejects_stray_argument
+t "status: PROFILE column reads each slot's seeded drop-in"         case_status_shows_profile_column
 
 # --- Summary ------------------------------------------------------------------
 echo

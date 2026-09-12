@@ -55,7 +55,8 @@ runnerctl [--config PATH] <command> [args]
 
 runnerctl status
 runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
-                 [--restart-sec N] [--env-file PATH] [--restart]
+                 [--restart-sec N] [--env-file PATH] [--restart] \
+                 [<unit|slot-index|name> ...]
 runnerctl scale N [--profile NAME] [--max 26G] [--high 22G] \
                   [--restart]
 runnerctl env-init [--profile NAME] [--env-file PATH]
@@ -63,7 +64,7 @@ runnerctl start|stop|restart [<unit|slot-index|name>]
 runnerctl enable|disable <unit|slot-index|name>
 runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
                [--since WHEN] [-g PATTERN]
-runnerctl remove-limits
+runnerctl remove-limits [<unit|slot-index|name> ...]
 runnerctl profiles
 runnerctl config-example
 runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
@@ -73,21 +74,28 @@ runnerctl version
 ```
 
 `status` shows each slot's state and how long it has been in it (`SINCE`),
-memory cap/usage, restart policy, env file and — when run as the runner's
-user or root — the repository and job it is currently working on, with how
-long that job has been running:
+which profile it carries (`PROFILE`, read from its drop-in — `—` if it has
+none), memory cap/usage, restart policy, env file and — when run as the
+runner's user or root — the repository and job it is currently working on,
+with how long that job has been running:
 
 ```
-IDX RUNNER                 ACTIVE          SINCE    ENABLED   MAX    HIGH   USED   RESTART  ENVFILE WORKING-ON
-0   org.host-1             active/running  3d 4h    enabled   26.0G  22.0G  3.1G   always   —       my-app:test (12m)
-1   org.host-2             active/running  41m      enabled   26.0G  22.0G  128M   always   —       idle
-2   org.host-3             inactive/dead   6d       disabled  —      —      —      always   —       —
+IDX RUNNER                 PROFILE  ACTIVE          SINCE    ENABLED   MAX    HIGH   USED   RESTART  ENVFILE WORKING-ON
+0   org.host-1             ci       active/running  3d 4h    enabled   26.0G  22.0G  3.1G   always   —       my-app:test (12m)
+1   org.host-2             ci       active/running  41m      enabled   26.0G  22.0G  128M   always   —       idle
+2   org.host-3             deploy   inactive/dead   6d       disabled  —      —      —      always   —       —
 ```
 
 `SINCE` is measured from systemd's active-enter timestamp for a running slot
 and from its inactive-enter timestamp for a stopped or failed one (`—` for a
 slot that has never started). The job runtime is the age of the slot's
 `Runner.Worker` process, which is spawned once per job.
+
+`apply` and `remove-limits` can be pointed at one or more slots instead of
+every discovered one — `runnerctl apply --profile deploy 2` or `runnerctl
+apply 0 example.slot-2` — which is what lets one host run a `ci` pool and a
+`deploy` runner side by side without one profile clobbering the other's
+drop-in. With no targets, both act on every slot, as before.
 
 Slots are addressed by unit name, by the `IDX` column, or by the `RUNNER`
 column's short name — an unambiguous prefix or substring of it also works

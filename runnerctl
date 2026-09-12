@@ -25,7 +25,8 @@
 #
 #   runnerctl status
 #   runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
-#                    [--restart-sec N] [--env-file PATH] [--restart]
+#                    [--restart-sec N] [--env-file PATH] [--restart] \
+#                    [<unit|slot-index|name> ...]
 #   runnerctl scale N [--profile NAME] [--max 26G] [--high 22G] \
 #                     [--restart]
 #   runnerctl env-init [--profile NAME] [--env-file PATH]
@@ -33,7 +34,7 @@
 #   runnerctl enable|disable <unit|slot-index|name>
 #   runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
 #                  [--since WHEN] [-g PATTERN]
-#   runnerctl remove-limits
+#   runnerctl remove-limits [<unit|slot-index|name> ...]
 #   runnerctl profiles
 #   runnerctl config-example
 #   runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
@@ -51,7 +52,7 @@
 #   Old install:  runnerctl migrate   # lifts the inline values into the config
 set -euo pipefail
 
-RUNNERCTL_VERSION="0.4.1"
+RUNNERCTL_VERSION="0.4.3"
 
 # --- Defaults (all overridable from the config file) -------------------------
 # The BUILTIN_* copies stay untouched by the config so `migrate` can tell a
@@ -77,6 +78,7 @@ ENV_FILE=""
 ENV_TEMPLATE=""
 do_restart=false
 REMAINING=()
+TARGETS=()
 
 run_priv() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
 die() { echo "runnerctl: $*" >&2; exit 1; }
@@ -193,6 +195,7 @@ extract_profile() {
 valid_mem() { [[ "$1" =~ ^[0-9]+[KMGT]?$ ]] || [ "$1" = infinity ]; }
 
 parse_opts() {
+  TARGETS=()
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     case "$1" in
@@ -201,7 +204,8 @@ parse_opts() {
       --restart-sec) need_val "$@"; [[ "$2" =~ ^[0-9]+$ ]] || die "--restart-sec value '$2' is invalid — want an integer"; RESTART_SEC="$2"; shift 2 ;;
       --env-file)    need_val "$@"; ENV_FILE="$2"; shift 2 ;;
       --restart)     do_restart=true; shift ;;
-      *) die "unknown option: $1" ;;
+      -*)            die "unknown option: $1" ;;
+      *)             TARGETS+=("$1"); shift ;;
     esac
   done
 }
@@ -414,9 +418,21 @@ guard_env_file() {
   run_priv test -f "$ENV_FILE" || die "EnvironmentFile $ENV_FILE missing — run: runnerctl env-init --profile $PROFILE"
 }
 
+# What profile (if any) manages this slot, read from the first line of its
+# drop-in (`# Managed by runnerctl (profile: NAME) — DO NOT EDIT BY HAND.`,
+# see render_dropin) — a plain read, no run_priv: the file is root-owned but
+# world-readable like the rest of /etc/systemd/system. "—" when the drop-in
+# is missing (never applied, or reverted by remove-limits) or unreadable.
+slot_profile() {
+  local line
+  line="$(head -n1 "$SYSTEMD_DIR/$1.d/$DROPIN_NAME" 2>/dev/null)" || { echo "—"; return; }
+  [[ "$line" =~ \(profile:\ ([^\)]+)\) ]] && { echo "${BASH_REMATCH[1]}"; return; }
+  echo "—"
+}
+
 # --- Commands -----------------------------------------------------------------
 # Column widths of the status table; the last column (WORKING-ON) is unpadded.
-STATUS_WIDTHS=(3 40 15 8 9 6 6 6 8 7)
+STATUS_WIDTHS=(3 40 8 15 8 9 6 6 6 8 7)
 
 # Print one status row, padding each cell by CHARACTERS. Bash's printf counts
 # bytes for %-Ns, so the 3-byte `—` cell used for "no value" came out two
@@ -437,7 +453,7 @@ cmd_status() {
   require_runners
   echo "Host: $(nproc) cores, $(free -h | awk '/^Mem:/{print $2" RAM, "$7" available"}')"
   echo
-  status_row IDX RUNNER ACTIVE SINCE ENABLED MAX HIGH USED RESTART ENVFILE WORKING-ON
+  status_row IDX RUNNER PROFILE ACTIVE SINCE ENABLED MAX HIGH USED RESTART ENVFILE WORKING-ON
   local i=0 u
   while read -r u; do
     [ -n "$u" ] || continue
@@ -449,7 +465,7 @@ cmd_status() {
       P[$k]="$v"
     done < <(unit_props "$u")
     local envf="${P[EnvironmentFiles]:-}"; [ -n "$envf" ] || envf="—"
-    status_row "$i" "$short" "${P[ActiveState]:-}/${P[SubState]:-}" \
+    status_row "$i" "$short" "$(slot_profile "$u")" "${P[ActiveState]:-}/${P[SubState]:-}" \
       "$(since_state "${P[ActiveState]:-}" "${P[ActiveEnterTimestampMonotonic]:-}" "${P[InactiveEnterTimestampMonotonic]:-}")" \
       "${P[UnitFileState]:-}" \
       "$(hbytes "${P[MemoryMax]:-}")" "$(hbytes "${P[MemoryHigh]:-}")" \
@@ -462,13 +478,33 @@ cmd_status() {
 cmd_apply() {
   extract_profile "$@"; load_profile; parse_opts ${REMAINING[@]+"${REMAINING[@]}"}
   require_runners; guard_env_file
-  local u
-  while read -r u; do [ -n "$u" ] && { apply_to "$u"; echo "  wrote drop-in for $u"; }; done < <(discover)
+  local units=() u t short_list=""
+  if [ "${#TARGETS[@]}" -gt 0 ]; then
+    for t in "${TARGETS[@]}"; do
+      u="$(resolve "$t")"
+      units+=("$u")
+    done
+  else
+    mapfile -t units < <(discover)
+  fi
+  for u in "${units[@]}"; do apply_to "$u"; echo "  wrote drop-in for $u"; done
   run_priv systemctl daemon-reload
-  echo "Applied profile '$PROFILE': Restart=always RestartSec=$RESTART_SEC${MEM_MAX:+ MemoryMax=$MEM_MAX MemoryHigh=$MEM_HIGH}${ENV_FILE:+ EnvironmentFile=$ENV_FILE}"
+  if [ "${#TARGETS[@]}" -gt 0 ]; then
+    for u in "${units[@]}"; do
+      t="${u#actions.runner.}"; t="${t%.service}"
+      short_list+="${short_list:+, }$t"
+    done
+    echo "Applied profile '$PROFILE' to ${#units[@]} slot(s): $short_list"
+  else
+    echo "Applied profile '$PROFILE': Restart=always RestartSec=$RESTART_SEC${MEM_MAX:+ MemoryMax=$MEM_MAX MemoryHigh=$MEM_HIGH}${ENV_FILE:+ EnvironmentFile=$ENV_FILE}"
+  fi
   if $do_restart; then
-    while read -r u; do [ -n "$u" ] && run_priv systemctl restart "$u"; done < <(discover)
-    echo "Restarted all runner slots (config active now)."
+    for u in "${units[@]}"; do run_priv systemctl restart "$u"; done
+    if [ "${#TARGETS[@]}" -gt 0 ]; then
+      echo "Restarted ${#units[@]} slot(s) (config active now)."
+    else
+      echo "Restarted all runner slots (config active now)."
+    fi
   else
     echo "Config takes effect on next (re)start. Run: runnerctl restart"
   fi
@@ -480,7 +516,9 @@ cmd_scale() {
   [ $# -ge 1 ] || die "scale needs N, e.g. 'scale 2 --max 26G'"
   local n="$1"; shift
   [[ "$n" =~ ^[0-9]+$ ]] || die "N must be an integer"
-  load_profile; parse_opts "$@"; require_runners; guard_env_file
+  load_profile; parse_opts "$@"
+  [ "${#TARGETS[@]}" -eq 0 ] || die "unexpected argument: ${TARGETS[*]}"
+  require_runners; guard_env_file
   mapfile -t units < <(discover)
   local total=${#units[@]}
   { [ "$n" -ge 1 ] && [ "$n" -le "$total" ]; } || die "N must be 1..$total"
@@ -595,15 +633,31 @@ cmd_logs() {
 }
 
 cmd_remove_limits() {
+  parse_opts "$@"
   require_runners
-  local u
-  while read -r u; do
-    [ -n "$u" ] || continue
+  local units=() u t short_list=""
+  if [ "${#TARGETS[@]}" -gt 0 ]; then
+    for t in "${TARGETS[@]}"; do
+      u="$(resolve "$t")"
+      units+=("$u")
+    done
+  else
+    mapfile -t units < <(discover)
+  fi
+  for u in "${units[@]}"; do
     run_priv rm -f "$SYSTEMD_DIR/$u.d/$DROPIN_NAME"
     echo "  removed drop-in for $u"
-  done < <(discover)
+  done
   run_priv systemctl daemon-reload
-  echo "Removed managed drop-ins. Run 'runnerctl restart' to revert running slots."
+  if [ "${#TARGETS[@]}" -gt 0 ]; then
+    for u in "${units[@]}"; do
+      t="${u#actions.runner.}"; t="${t%.service}"
+      short_list+="${short_list:+, }$t"
+    done
+    echo "Removed drop-in for ${#units[@]} slot(s): $short_list."
+  else
+    echo "Removed managed drop-ins. Run 'runnerctl restart' to revert running slots."
+  fi
 }
 
 cmd_profiles() {
