@@ -1,0 +1,549 @@
+#!/usr/bin/env bash
+# runnerctl — manage self-hosted GitHub Actions runner slots on this host.
+#
+# Runners are systemd services (actions.runner.<scope>.<name>.service) installed
+# by GitHub's svc.sh. This tool applies a role PROFILE (memory caps, restart
+# policy, on-device secrets) via systemd drop-in overrides — so the generated
+# unit files are never hand-edited and the config survives a runner reinstall —
+# plus reports status and scales the active pool.
+#
+# Built-in profiles (--profile, default: ci):
+#   ci      CI build/test pool. Memory-capped + auto-restart.
+#   deploy  Dedicated deploy runner. Long-lived, auto-restart, secrets from a
+#           root-owned on-device EnvironmentFile — NOT memory-capped.
+#
+# Site-specific settings (profile values, env templates, drop-in name) live in
+# an optional config file, never in this script:
+#   /etc/runnerctl/config            (or $RUNNERCTL_CONFIG, or --config PATH)
+# See `runnerctl config-example` for a starting point.
+#
+# Nothing box-specific is hardcoded: runner units are discovered from systemd,
+# so this runs on any runner host. Privileged operations re-exec via sudo.
+#
+# Usage:
+#   runnerctl [--config PATH] <command> [args]
+#
+#   runnerctl status
+#   runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
+#                    [--restart-sec N] [--env-file PATH] [--restart]
+#   runnerctl scale N [--profile NAME] [--max 26G] [--high 22G]
+#   runnerctl env-init [--profile NAME] [--env-file PATH]
+#   runnerctl start|stop|restart [<unit|slot-index>]
+#   runnerctl enable|disable <unit|slot-index>
+#   runnerctl logs [<unit|slot-index>]
+#   runnerctl remove-limits
+#   runnerctl profiles
+#   runnerctl config-example
+#   runnerctl upgrade [--check] [--ref <branch|tag>]
+#   runnerctl version
+#
+# Recommended baselines:
+#   CI host:      runnerctl scale 2 --max 26G --high 22G
+#   Deploy box:   runnerctl env-init --profile deploy   # then fill secrets
+#                 runnerctl apply --profile deploy --restart
+set -euo pipefail
+
+RUNNERCTL_VERSION="0.1.0"
+
+# --- Defaults (all overridable from the config file) -------------------------
+DROPIN_NAME="10-runnerctl.conf"
+UNIT_GLOB='actions.runner.*.service'
+DEFAULT_PROFILE="ci"
+UPGRADE_URL="https://raw.githubusercontent.com/runnane/runnerctl/main/runnerctl"
+CONFIG_FILE="${RUNNERCTL_CONFIG:-/etc/runnerctl/config}"
+
+# Profile-provided config (populated by load_profile; flags override).
+PROFILE=""
+PROFILE_DESC=""
+MEM_MAX=""
+MEM_HIGH=""
+RESTART_SEC="10"
+ENV_FILE=""
+ENV_TEMPLATE=""
+do_restart=false
+REMAINING=()
+
+run_priv() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
+die() { echo "runnerctl: $*" >&2; exit 1; }
+
+# --- Config file --------------------------------------------------------------
+# The config file is plain bash and is sourced. It may set any of the defaults
+# above and define profiles as functions:
+#
+#   profile_<name>()      sets PROFILE_DESC MEM_MAX MEM_HIGH RESTART_SEC ENV_FILE
+#   env_template_<name>() prints the EnvironmentFile template for env-init
+#
+# A config-defined profile shadows a built-in one of the same name.
+load_config() {
+  [ -f "$CONFIG_FILE" ] || return 0
+  # Refuse a config anyone could edit — it is executed, sometimes under sudo.
+  local mode; mode="$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null || echo 0)"
+  [ $((8#$mode & 8#002)) -eq 0 ] || die "$CONFIG_FILE is world-writable — refusing to source it"
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+}
+
+# Built-in profiles. Site-specific values belong in the config file; these are
+# sane, generic defaults so the tool works with no config at all.
+builtin_profile() {
+  case "$1" in
+    ci)
+      # Memory-capped so parallel jobs can't OOM a shared box; auto-restart.
+      # 2 slots × 26G leaves headroom on a 60G box; bump on a bigger box.
+      PROFILE_DESC="CI build/test pool — memory-capped, auto-restart."
+      MEM_MAX="26G"; MEM_HIGH="22G"; RESTART_SEC="10"; ENV_FILE=""
+      ;;
+    deploy)
+      # Long-lived, auto-restart, uncapped (deploys are SSH/release-bound and a
+      # cap risks killing a mid-deploy step). Secrets come from a root-owned
+      # on-device EnvironmentFile, never from GitHub Actions secrets.
+      PROFILE_DESC="Deploy runner — on-device secrets, uncapped, auto-restart."
+      MEM_MAX=""; MEM_HIGH=""; RESTART_SEC="15"; ENV_FILE="/etc/runnerctl/deploy.env"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+load_profile() {
+  [ -n "$PROFILE" ] || PROFILE="$DEFAULT_PROFILE"
+  [[ "$PROFILE" =~ ^[A-Za-z0-9_]+$ ]] || die "invalid profile name '$PROFILE'"
+  if declare -F "profile_$PROFILE" >/dev/null; then
+    "profile_$PROFILE"
+  elif ! builtin_profile "$PROFILE"; then
+    die "unknown profile '$PROFILE' (known: $(list_profiles | paste -sd" "))"
+  fi
+}
+
+list_profiles() {
+  { printf 'ci\ndeploy\n'; declare -F | awk '$3 ~ /^profile_/ {sub(/^profile_/, "", $3); print $3}'; } | sort -u
+}
+
+# EnvironmentFile template for env-init, in priority order: a config-defined
+# env_template_<profile> function, an ENV_TEMPLATE file path set by the
+# profile, else a generic placeholder header. The live file is filled in on the
+# box and never committed anywhere.
+render_env_template() {
+  if declare -F "env_template_$PROFILE" >/dev/null; then
+    "env_template_$PROFILE"
+  elif [ -n "$ENV_TEMPLATE" ]; then
+    [ -r "$ENV_TEMPLATE" ] || die "ENV_TEMPLATE $ENV_TEMPLATE not readable"
+    cat "$ENV_TEMPLATE"
+  else
+    cat <<TEMPLATE
+# $PROFILE runner — on-device secrets/config (scaffolded by runnerctl).
+#
+# Loaded by the runner's systemd unit (EnvironmentFile=) so jobs inherit these
+# as environment variables.
+#
+# * This file is root-owned, chmod 600, and lives ONLY on this device.
+# * Never commit it, and keep these values out of GitHub Actions secrets —
+#   on-device is the whole point (shrinks the blast radius of the runner).
+#
+# Define a site-specific template in the runnerctl config file with an
+# env_template_${PROFILE}() function, or point ENV_TEMPLATE at a file.
+
+# KEY=value
+TEMPLATE
+  fi
+}
+
+# --- Argument handling --------------------------------------------------------
+# Pull --profile out of the arg list first so the profile loads before any
+# value flags, letting flags override the profile's defaults. Leaves the rest
+# of the args in the REMAINING array.
+extract_profile() {
+  REMAINING=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --profile) [ $# -ge 2 ] || die "--profile needs a value"; PROFILE="$2"; shift 2 ;;
+      *) REMAINING+=("$1"); shift ;;
+    esac
+  done
+}
+
+parse_opts() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --max)         MEM_MAX="$2"; shift 2 ;;
+      --high)        MEM_HIGH="$2"; shift 2 ;;
+      --restart-sec) RESTART_SEC="$2"; shift 2 ;;
+      --env-file)    ENV_FILE="$2"; shift 2 ;;
+      --restart)     do_restart=true; shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+}
+
+# --- Runner discovery / inspection -------------------------------------------
+discover() {
+  systemctl list-unit-files --no-legend "$UNIT_GLOB" 2>/dev/null | awk '{print $1}' | sort -V
+}
+
+require_runners() {
+  [ -n "$(discover)" ] || die "no '$UNIT_GLOB' units found on this host."
+}
+
+prop() { systemctl show "$1" -p "$2" --value 2>/dev/null; }
+
+# What is this runner currently working on? Read GITHUB_REPOSITORY / GITHUB_JOB
+# from the environment of the job's processes in the runner's systemd cgroup.
+# (GITHUB_JOB is the workflow job id, e.g. lint/typecheck/test/build.) Requires
+# read access to the processes — works when run as the runner's user (or root).
+job_info() {
+  local u="$1" cg f pid env repo job worker=""
+  cg="$(prop "$u" ControlGroup)"
+  f="/sys/fs/cgroup${cg}/cgroup.procs"
+  if [ -z "$cg" ] || [ ! -r "$f" ]; then echo "—"; return; fi
+  while read -r pid; do
+    if [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -q "Runner.Worker"; then
+      worker=1
+    fi
+    [ -r "/proc/$pid/environ" ] || continue
+    env="$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null || true)"
+    case "$env" in
+      *GITHUB_REPOSITORY=*) ;;
+      *) continue ;;
+    esac
+    repo="$(printf '%s\n' "$env" | grep -m1 '^GITHUB_REPOSITORY=' | cut -d= -f2- || true)"
+    job="$(printf '%s\n' "$env" | grep -m1 '^GITHUB_JOB=' | cut -d= -f2- || true)"
+    printf '%s:%s\n' "${repo##*/}" "${job:-?}"
+    return
+  done <"$f"
+  if [ -n "$worker" ]; then echo "(starting)"; else echo "idle"; fi
+}
+
+hbytes() {
+  local v="${1:-}"
+  case "$v" in
+    ''|infinity|max|18446744073709551615|'[not set]') echo "—"; return ;;
+  esac
+  [[ "$v" =~ ^[0-9]+$ ]] || { echo "$v"; return; }
+  awk -v b="$v" 'BEGIN{ if (b<1048576) printf "%.0fM", b/1048576; else printf "%.1fG", b/1073741824 }'
+}
+
+resolve() { # "unit or slot-index" -> unit name
+  local a="$1"
+  if [[ "$a" =~ ^[0-9]+$ ]]; then
+    mapfile -t units < <(discover)
+    [ "$a" -lt "${#units[@]}" ] || die "slot index $a out of range (0..$((${#units[@]}-1)))"
+    echo "${units[$a]}"
+  else
+    echo "$a"
+  fi
+}
+
+# --- Drop-in rendering --------------------------------------------------------
+render_dropin() {
+  echo "# Managed by runnerctl (profile: $PROFILE) — DO NOT EDIT BY HAND."
+  [ -n "$PROFILE_DESC" ] && echo "# $PROFILE_DESC"
+  echo "# Re-apply with: runnerctl apply --profile $PROFILE"
+  echo "[Unit]"
+  echo "# Don't let a crash-loop trip the start limiter and park the unit 'failed'."
+  echo "StartLimitIntervalSec=0"
+  echo
+  echo "[Service]"
+  echo "Restart=always"
+  echo "RestartSec=${RESTART_SEC}"
+  if [ -n "$ENV_FILE" ]; then
+    echo "# On-device secrets/config (root-owned, chmod 600). Never in GitHub."
+    echo "EnvironmentFile=${ENV_FILE}"
+  fi
+  if [ -n "$MEM_MAX" ]; then
+    echo "# MemoryHigh: soft reclaim/throttle before the hard cap."
+    echo "# MemoryMax:  hard — contains a runaway to its cgroup; Restart resurrects it."
+    [ -n "$MEM_HIGH" ] && echo "MemoryHigh=${MEM_HIGH}"
+    echo "MemoryMax=${MEM_MAX}"
+  fi
+}
+
+apply_to() {
+  local u="$1" dir="/etc/systemd/system/$1.d"
+  run_priv mkdir -p "$dir"
+  render_dropin | run_priv tee "$dir/$DROPIN_NAME" >/dev/null
+}
+
+# A profile with an EnvironmentFile hard-fails to start without it, so refuse
+# to apply until it exists (run env-init first).
+guard_env_file() {
+  [ -n "$ENV_FILE" ] || return 0
+  run_priv test -f "$ENV_FILE" || die "EnvironmentFile $ENV_FILE missing — run: runnerctl env-init --profile $PROFILE"
+}
+
+# --- Commands -----------------------------------------------------------------
+cmd_status() {
+  require_runners
+  echo "Host: $(nproc) cores, $(free -h | awk '/^Mem:/{print $2" RAM, "$7" available"}')"
+  echo
+  printf '%-3s %-40s %-15s %-9s %-6s %-6s %-6s %-8s %-7s %s\n' \
+    IDX RUNNER ACTIVE ENABLED MAX HIGH USED RESTART ENVFILE WORKING-ON
+  local i=0 u
+  while read -r u; do
+    [ -n "$u" ] || continue
+    local short="${u#actions.runner.}"; short="${short%.service}"
+    local envf; envf="$(prop "$u" EnvironmentFiles)"; [ -n "$envf" ] || envf="—"
+    printf '%-3s %-40s %-15s %-9s %-6s %-6s %-6s %-8s %-7s %s\n' \
+      "$i" "$short" "$(prop "$u" ActiveState)/$(prop "$u" SubState)" \
+      "$(prop "$u" UnitFileState)" \
+      "$(hbytes "$(prop "$u" MemoryMax)")" "$(hbytes "$(prop "$u" MemoryHigh)")" \
+      "$(hbytes "$(prop "$u" MemoryCurrent)")" "$(prop "$u" Restart)" "$envf" \
+      "$(job_info "$u")"
+    i=$((i+1))
+  done < <(discover)
+}
+
+cmd_apply() {
+  extract_profile "$@"; load_profile; parse_opts ${REMAINING[@]+"${REMAINING[@]}"}
+  require_runners; guard_env_file
+  local u
+  while read -r u; do [ -n "$u" ] && { apply_to "$u"; echo "  wrote drop-in for $u"; }; done < <(discover)
+  run_priv systemctl daemon-reload
+  echo "Applied profile '$PROFILE': Restart=always RestartSec=$RESTART_SEC${MEM_MAX:+ MemoryMax=$MEM_MAX MemoryHigh=$MEM_HIGH}${ENV_FILE:+ EnvironmentFile=$ENV_FILE}"
+  if $do_restart; then
+    while read -r u; do [ -n "$u" ] && run_priv systemctl restart "$u"; done < <(discover)
+    echo "Restarted all runner slots (config active now)."
+  else
+    echo "Config takes effect on next (re)start. Run: runnerctl restart"
+  fi
+}
+
+cmd_scale() {
+  extract_profile "$@"
+  set -- ${REMAINING[@]+"${REMAINING[@]}"}
+  [ $# -ge 1 ] || die "scale needs N, e.g. 'scale 2 --max 26G'"
+  local n="$1"; shift
+  [[ "$n" =~ ^[0-9]+$ ]] || die "N must be an integer"
+  load_profile; parse_opts "$@"; require_runners; guard_env_file
+  mapfile -t units < <(discover)
+  local total=${#units[@]}
+  { [ "$n" -ge 1 ] && [ "$n" -le "$total" ]; } || die "N must be 1..$total"
+  local i u
+  for i in "${!units[@]}"; do
+    u="${units[$i]}"
+    if [ "$i" -lt "$n" ]; then
+      apply_to "$u"; run_priv systemctl enable --now "$u" >/dev/null 2>&1 || true
+      echo "  [active] $u"
+    else
+      run_priv systemctl disable --now "$u" >/dev/null 2>&1 || true
+      echo "  [stopped] $u"
+    fi
+  done
+  run_priv systemctl daemon-reload
+  echo "Scaled to $n active runner(s), profile '$PROFILE'${MEM_MAX:+ @ MemoryMax=$MEM_MAX}."
+  echo "Note: stopped slots stay REGISTERED with GitHub (they show offline). Full"
+  echo "deregister = 'svc.sh uninstall' + './config.sh remove' in the runner's dir"
+  echo "(needs a GitHub removal token) — not automated: destructive, irreversible."
+}
+
+cmd_env_init() {
+  extract_profile "$@"; load_profile; parse_opts ${REMAINING[@]+"${REMAINING[@]}"}
+  [ -n "$ENV_FILE" ] || die "profile '$PROFILE' defines no EnvironmentFile (nothing to init)"
+  if run_priv test -f "$ENV_FILE"; then
+    echo "$ENV_FILE already exists — leaving it untouched (won't clobber secrets)."
+    return 0
+  fi
+  run_priv mkdir -p "$(dirname "$ENV_FILE")"
+  render_env_template | run_priv tee "$ENV_FILE" >/dev/null
+  run_priv chown root:root "$ENV_FILE"
+  run_priv chmod 600 "$ENV_FILE"
+  echo "Scaffolded $ENV_FILE (root:root, 600)."
+  echo "Edit it ON THE BOX and fill in real values. NEVER commit real secrets."
+}
+
+cmd_ctl() { # start|stop|restart [target] (default: all)
+  local action="$1"; shift || true
+  require_runners
+  if [ $# -ge 1 ]; then
+    run_priv systemctl "$action" "$(resolve "$1")"
+  else
+    local u; while read -r u; do [ -n "$u" ] && run_priv systemctl "$action" "$u"; done < <(discover)
+  fi
+  echo "$action done."
+}
+
+cmd_toggle() { # enable|disable <target>
+  local action="$1"; shift || true
+  [ $# -ge 1 ] || die "$action needs a <unit|slot-index>"
+  run_priv systemctl "$action" --now "$(resolve "$1")"
+  echo "$action done."
+}
+
+cmd_logs() {
+  require_runners
+  run_priv journalctl -u "$(resolve "${1:-0}")" -n 100 --no-pager
+}
+
+cmd_remove_limits() {
+  require_runners
+  local u
+  while read -r u; do
+    [ -n "$u" ] || continue
+    run_priv rm -f "/etc/systemd/system/$u.d/$DROPIN_NAME"
+    echo "  removed drop-in for $u"
+  done < <(discover)
+  run_priv systemctl daemon-reload
+  echo "Removed managed drop-ins. Run 'runnerctl restart' to revert running slots."
+}
+
+cmd_profiles() {
+  local p
+  echo "Config: $CONFIG_FILE$([ -f "$CONFIG_FILE" ] || echo ' (not present — built-ins only)')"
+  echo
+  printf '%-12s %-9s %-6s %-6s %-8s %-30s %s\n' PROFILE SOURCE MAX HIGH RESTART ENVFILE DESCRIPTION
+  for p in $(list_profiles); do
+    PROFILE="$p"; PROFILE_DESC=""; MEM_MAX=""; MEM_HIGH=""; RESTART_SEC="10"; ENV_FILE=""  # same defaults as the top of the script
+    local src="builtin"; declare -F "profile_$p" >/dev/null && src="config"
+    load_profile
+    printf '%-12s %-9s %-6s %-6s %-8s %-30s %s\n' \
+      "$p$([ "$p" = "$DEFAULT_PROFILE" ] && echo '*')" "$src" "${MEM_MAX:--}" "${MEM_HIGH:--}" \
+      "${RESTART_SEC:--}" "${ENV_FILE:--}" "$PROFILE_DESC"
+  done
+  echo
+  echo "* = default profile"
+}
+
+cmd_config_example() {
+  cat <<'EXAMPLE'
+# runnerctl config — sourced as bash. Install as /etc/runnerctl/config
+# (root-owned, not world-writable) or point RUNNERCTL_CONFIG / --config at it.
+#
+# Everything here is optional. Site-specific values (memory caps sized for
+# your boxes, env-file paths, secret templates) belong here, never in the
+# runnerctl script itself.
+
+# Name of the managed drop-in under /etc/systemd/system/<unit>.d/
+#DROPIN_NAME="10-runnerctl.conf"
+
+# Profile used when --profile is omitted.
+#DEFAULT_PROFILE="ci"
+
+# Where `runnerctl upgrade` fetches the new script from (a fork, a pinned tag).
+#UPGRADE_URL="https://raw.githubusercontent.com/runnane/runnerctl/main/runnerctl"
+
+# A profile is a function that sets these variables. Defining profile_ci or
+# profile_deploy replaces the built-in of the same name.
+profile_ci() {
+  PROFILE_DESC="CI build/test pool — memory-capped, auto-restart."
+  MEM_MAX="26G"        # hard cap per slot (MemoryMax)
+  MEM_HIGH="22G"       # soft throttle point (MemoryHigh)
+  RESTART_SEC="10"
+  ENV_FILE=""          # no EnvironmentFile for CI slots
+}
+
+profile_deploy() {
+  PROFILE_DESC="Prod deploy runner — on-device secrets, uncapped, auto-restart."
+  MEM_MAX=""; MEM_HIGH=""
+  RESTART_SEC="15"
+  ENV_FILE="/etc/runnerctl/deploy.env"
+  # Optional: a file to copy as the env-init template instead of the
+  # env_template_deploy function below.
+  #ENV_TEMPLATE="/etc/runnerctl/deploy.env.example"
+}
+
+# Placeholder template written by `runnerctl env-init --profile deploy`.
+# PLACEHOLDERS ONLY — the live file is filled in on the box and never committed.
+env_template_deploy() {
+  cat <<'TEMPLATE'
+# deploy runner — on-device secrets/config. Root-owned, chmod 600, never committed.
+
+# --- Registry / release publish ------------------------------------------
+GHCR_USERNAME=
+GHCR_TOKEN=
+NPM_TOKEN=
+
+# --- Target hosts (SSH aliases or docker contexts) ------------------------
+APP_SSH_HOST=
+APP_DIR=/opt/myapp
+
+# --- Optional: notifications ----------------------------------------------
+DEPLOY_SLACK_WEBHOOK_URL=
+TEMPLATE
+}
+EXAMPLE
+}
+
+# --- Self-upgrade -------------------------------------------------------------
+# Fetch the script from UPGRADE_URL (optionally a specific branch/tag), verify
+# it parses and carries a version, and replace the installed file in place.
+# The replacement is a rename, so the running copy keeps its old inode and is
+# unaffected mid-execution.
+remote_version() { grep -m1 '^RUNNERCTL_VERSION=' "$1" | cut -d'"' -f2; }
+
+cmd_upgrade() {
+  local check=false ref="" url="$UPGRADE_URL"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --check) check=true; shift ;;
+      --ref)   [ $# -ge 2 ] || die "--ref needs a value"; ref="$2"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  # A --ref swaps the branch/tag segment of a raw.githubusercontent.com URL.
+  if [ -n "$ref" ]; then
+    [[ "$url" =~ ^(https://raw\.githubusercontent\.com/[^/]+/[^/]+/)[^/]+(/.*)$ ]] \
+      || die "--ref only works with a raw.githubusercontent.com UPGRADE_URL (have: $url)"
+    url="${BASH_REMATCH[1]}${ref}${BASH_REMATCH[2]}"
+  fi
+
+  local self new_ver
+  self="$(readlink -f "${BASH_SOURCE[0]}")"
+  UPGRADE_TMP="$(mktemp)"; trap 'rm -f "$UPGRADE_TMP"' EXIT
+  local tmp="$UPGRADE_TMP"
+  curl -fsSL --max-time 30 "$url" -o "$tmp" || die "download failed: $url"
+  bash -n "$tmp" || die "downloaded script does not parse — not installing"
+  new_ver="$(remote_version "$tmp")"
+  [ -n "$new_ver" ] || die "downloaded file carries no RUNNERCTL_VERSION — not installing"
+
+  echo "installed: $RUNNERCTL_VERSION ($self)"
+  echo "available: $new_ver ($url)"
+  if [ "$new_ver" = "$RUNNERCTL_VERSION" ] && cmp -s "$tmp" "$self"; then
+    echo "Already up to date."; return 0
+  fi
+  if [ -z "$ref" ] && [ "$(printf '%s\n%s\n' "$new_ver" "$RUNNERCTL_VERSION" | sort -V | head -1)" = "$new_ver" ] \
+     && [ "$new_ver" != "$RUNNERCTL_VERSION" ]; then
+    echo "Remote is older than installed — not downgrading (pass --ref to force a specific version)."
+    return 0
+  fi
+  if $check; then echo "Update available. Run: runnerctl upgrade"; return 0; fi
+
+  local dir staged
+  dir="$(dirname "$self")"
+  staged="$dir/.$(basename "$self").new.$$"
+  local priv=()
+  [ -w "$dir" ] && [ -w "$self" ] || priv=(run_priv)
+  "${priv[@]}" cp "$tmp" "$staged"
+  "${priv[@]}" chown --reference="$self" "$staged"
+  "${priv[@]}" chmod --reference="$self" "$staged"
+  "${priv[@]}" chmod +x "$staged"
+  "${priv[@]}" mv -f "$staged" "$self"
+  echo "Upgraded $RUNNERCTL_VERSION -> $new_ver at $self"
+}
+
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "${BASH_SOURCE[0]}"; }
+
+main() {
+  if [ "${1:-}" = "--config" ]; then
+    [ $# -ge 2 ] || die "--config needs a path"
+    CONFIG_FILE="$2"; shift 2
+    [ -f "$CONFIG_FILE" ] || die "config file $CONFIG_FILE not found"
+  fi
+  load_config
+  local cmd="${1:-status}"; shift || true
+  case "$cmd" in
+    status)             cmd_status "$@" ;;
+    apply)              cmd_apply "$@" ;;
+    scale)              cmd_scale "$@" ;;
+    env-init)           cmd_env_init "$@" ;;
+    start|stop|restart) cmd_ctl "$cmd" "$@" ;;
+    enable|disable)     cmd_toggle "$cmd" "$@" ;;
+    logs)               cmd_logs "$@" ;;
+    remove-limits)      cmd_remove_limits "$@" ;;
+    profiles)           cmd_profiles "$@" ;;
+    config-example)     cmd_config_example ;;
+    upgrade)            cmd_upgrade "$@" ;;
+    version|--version)  echo "runnerctl $RUNNERCTL_VERSION" ;;
+    -h|--help|help)     usage ;;
+    *) die "unknown command '$cmd' (status apply scale env-init start stop restart enable disable logs remove-limits profiles config-example upgrade version)" ;;
+  esac
+}
+
+main "$@"

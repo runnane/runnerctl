@@ -1,0 +1,163 @@
+# runnerctl
+
+Manage self-hosted GitHub Actions runner slots on a Linux host from one
+self-contained bash script.
+
+Runners installed with GitHub's `svc.sh` are plain systemd services
+(`actions.runner.<scope>.<name>.service`). `runnerctl` discovers them and applies
+a role **profile** — memory caps, restart policy, an on-device
+`EnvironmentFile` for secrets — as systemd drop-in overrides, so the generated
+unit files are never hand-edited and the settings survive a runner reinstall.
+It also reports what each slot is doing and scales the active pool up or down.
+
+Nothing site-specific is in the script: hostnames, memory sizes for your boxes,
+secret-file paths and templates live in an optional config file on each host.
+
+## Install
+
+```sh
+sudo curl -fsSL https://raw.githubusercontent.com/runnane/runnerctl/main/runnerctl \
+  -o /usr/local/bin/runnerctl && sudo chmod +x /usr/local/bin/runnerctl
+runnerctl version
+```
+
+Requirements: bash 4+, systemd, `curl` (for `upgrade`), and `sudo` for anything
+that writes under `/etc` or talks to `systemctl` (or run it as root).
+
+## Usage
+
+```
+runnerctl [--config PATH] <command> [args]
+
+runnerctl status
+runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
+                 [--restart-sec N] [--env-file PATH] [--restart]
+runnerctl scale N [--profile NAME] [--max 26G] [--high 22G]
+runnerctl env-init [--profile NAME] [--env-file PATH]
+runnerctl start|stop|restart [<unit|slot-index>]
+runnerctl enable|disable <unit|slot-index>
+runnerctl logs [<unit|slot-index>]
+runnerctl remove-limits
+runnerctl profiles
+runnerctl config-example
+runnerctl upgrade [--check] [--ref <branch|tag>]
+runnerctl version
+```
+
+`status` shows each slot's state, memory cap/usage, restart policy, env file
+and — when run as the runner's user or root — the repository and job it is
+currently working on:
+
+```
+IDX RUNNER                 ACTIVE          ENABLED   MAX    HIGH   USED   RESTART  ENVFILE WORKING-ON
+0   org.host-1             active/running  enabled   26.0G  22.0G  3.1G   always   —       my-app:test
+1   org.host-2             active/running  enabled   26.0G  22.0G  128M   always   —       idle
+2   org.host-3             inactive/dead   disabled  —      —      —      always   —       —
+```
+
+Slots are addressed by unit name or by the `IDX` column.
+
+### Profiles
+
+Two profiles are built in so the tool is usable with no config at all:
+
+| profile  | memory cap        | restart | EnvironmentFile             |
+| -------- | ----------------- | ------- | --------------------------- |
+| `ci`     | 26G max / 22G high| 10 s    | none                        |
+| `deploy` | none              | 15 s    | `/etc/runnerctl/deploy.env` |
+
+`ci` is a memory-capped build/test pool: a runaway job is contained to its own
+cgroup and `Restart=always` brings the slot back. `deploy` is an uncapped,
+long-lived runner whose secrets come from a root-owned file on the box rather
+than from GitHub Actions secrets — the point being to shrink the blast radius
+of a runner that can reach production.
+
+Flags (`--max`, `--high`, `--restart-sec`, `--env-file`) override a profile's
+values for one invocation.
+
+Typical baselines:
+
+```sh
+# CI host: two active slots, capped
+runnerctl scale 2 --max 26G --high 22G
+
+# Deploy box: scaffold the secrets file, fill it in, then apply
+runnerctl env-init --profile deploy
+sudoedit /etc/runnerctl/deploy.env
+runnerctl apply --profile deploy --restart
+```
+
+`apply` refuses to write a profile that names an `EnvironmentFile` which does
+not exist yet, because the unit would then fail to start. `env-init` never
+overwrites an existing file.
+
+### Config file
+
+`runnerctl` reads `/etc/runnerctl/config` if present (override with
+`RUNNERCTL_CONFIG=` or `--config PATH`). It is plain bash and is sourced, so it
+must be root-owned and not world-writable — the script refuses a
+world-writable config.
+
+The config can set any default (`DROPIN_NAME`, `DEFAULT_PROFILE`, `UPGRADE_URL`,
+`UNIT_GLOB`) and define profiles as functions. A `profile_<name>()` function
+sets `PROFILE_DESC`, `MEM_MAX`, `MEM_HIGH`, `RESTART_SEC`, `ENV_FILE` and
+optionally `ENV_TEMPLATE`; an `env_template_<name>()` function prints the
+placeholder file that `env-init` writes. A config-defined profile shadows a
+built-in of the same name, and new names become new profiles.
+
+```sh
+runnerctl config-example | sudo tee /etc/runnerctl/config   # then edit
+runnerctl profiles                                          # see what resolved
+```
+
+[`config.example`](config.example) is the same output, checked in for browsing.
+Keep real hostnames, paths and secret names in the config on the host; keep
+the config out of any repository.
+
+### Self-upgrade
+
+```sh
+runnerctl upgrade --check      # report installed vs available
+runnerctl upgrade              # install the latest from main
+runnerctl upgrade --ref v0.1.0 # pin a tag or branch
+```
+
+`upgrade` downloads the script from `UPGRADE_URL` (default: this repository's
+`main`), checks that it parses and carries a `RUNNERCTL_VERSION`, and replaces
+the installed file by rename — so a running invocation is unaffected. It will
+not downgrade unless `--ref` is given, and it uses `sudo` only when the install
+location is not writable. Point `UPGRADE_URL` at a fork or a mirror in the
+config file to upgrade from somewhere else.
+
+### What it writes
+
+One drop-in per runner unit, `/etc/systemd/system/<unit>.d/10-runnerctl.conf`:
+
+```ini
+# Managed by runnerctl (profile: ci) — DO NOT EDIT BY HAND.
+[Unit]
+StartLimitIntervalSec=0
+
+[Service]
+Restart=always
+RestartSec=10
+MemoryHigh=22G
+MemoryMax=26G
+```
+
+`remove-limits` deletes the managed drop-ins again. `scale` stops and disables
+slots beyond `N` but never deregisters them from GitHub — that needs a removal
+token and is irreversible, so it stays a manual step.
+
+## Development
+
+```sh
+make gates   # shellcheck + config.example drift check + smoke tests
+```
+
+See [`.agents/gates.md`](.agents/gates.md) for what each gate covers and how
+to exercise the systemd-touching commands locally without root.
+
+## License
+
+[MIT](LICENSE)

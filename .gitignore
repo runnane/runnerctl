@@ -1,0 +1,4 @@
+# Local config with real values never belongs in the repo.
+/config
+*.env
+.claude/worktrees/

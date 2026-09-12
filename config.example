@@ -1,0 +1,55 @@
+# runnerctl config — sourced as bash. Install as /etc/runnerctl/config
+# (root-owned, not world-writable) or point RUNNERCTL_CONFIG / --config at it.
+#
+# Everything here is optional. Site-specific values (memory caps sized for
+# your boxes, env-file paths, secret templates) belong here, never in the
+# runnerctl script itself.
+
+# Name of the managed drop-in under /etc/systemd/system/<unit>.d/
+#DROPIN_NAME="10-runnerctl.conf"
+
+# Profile used when --profile is omitted.
+#DEFAULT_PROFILE="ci"
+
+# Where `runnerctl upgrade` fetches the new script from (a fork, a pinned tag).
+#UPGRADE_URL="https://raw.githubusercontent.com/runnane/runnerctl/main/runnerctl"
+
+# A profile is a function that sets these variables. Defining profile_ci or
+# profile_deploy replaces the built-in of the same name.
+profile_ci() {
+  PROFILE_DESC="CI build/test pool — memory-capped, auto-restart."
+  MEM_MAX="26G"        # hard cap per slot (MemoryMax)
+  MEM_HIGH="22G"       # soft throttle point (MemoryHigh)
+  RESTART_SEC="10"
+  ENV_FILE=""          # no EnvironmentFile for CI slots
+}
+
+profile_deploy() {
+  PROFILE_DESC="Prod deploy runner — on-device secrets, uncapped, auto-restart."
+  MEM_MAX=""; MEM_HIGH=""
+  RESTART_SEC="15"
+  ENV_FILE="/etc/runnerctl/deploy.env"
+  # Optional: a file to copy as the env-init template instead of the
+  # env_template_deploy function below.
+  #ENV_TEMPLATE="/etc/runnerctl/deploy.env.example"
+}
+
+# Placeholder template written by `runnerctl env-init --profile deploy`.
+# PLACEHOLDERS ONLY — the live file is filled in on the box and never committed.
+env_template_deploy() {
+  cat <<'TEMPLATE'
+# deploy runner — on-device secrets/config. Root-owned, chmod 600, never committed.
+
+# --- Registry / release publish ------------------------------------------
+GHCR_USERNAME=
+GHCR_TOKEN=
+NPM_TOKEN=
+
+# --- Target hosts (SSH aliases or docker contexts) ------------------------
+APP_SSH_HOST=
+APP_DIR=/opt/myapp
+
+# --- Optional: notifications ----------------------------------------------
+DEPLOY_SLACK_WEBHOOK_URL=
+TEMPLATE
+}
