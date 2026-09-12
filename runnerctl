@@ -51,7 +51,7 @@
 #   Old install:  runnerctl migrate   # lifts the inline values into the config
 set -euo pipefail
 
-RUNNERCTL_VERSION="0.4.0"
+RUNNERCTL_VERSION="0.4.1"
 
 # --- Defaults (all overridable from the config file) -------------------------
 # The BUILTIN_* copies stay untouched by the config so `migrate` can tell a
@@ -415,12 +415,29 @@ guard_env_file() {
 }
 
 # --- Commands -----------------------------------------------------------------
+# Column widths of the status table; the last column (WORKING-ON) is unpadded.
+STATUS_WIDTHS=(3 40 15 8 9 6 6 6 8 7)
+
+# Print one status row, padding each cell by CHARACTERS. Bash's printf counts
+# bytes for %-Ns, so the 3-byte `—` cell used for "no value" came out two
+# columns short and shifted everything after it (GHR-21). ${#v} counts
+# characters under a UTF-8 locale, which is the only kind where `—` renders.
+status_row() {
+  local w v out=""
+  for w in "${STATUS_WIDTHS[@]}"; do
+    v="$1"; shift
+    out+="$v"
+    if [ "${#v}" -lt "$w" ]; then printf -v v '%*s' $((w - ${#v})) ''; out+="$v"; fi
+    out+=" "
+  done
+  printf '%s%s\n' "$out" "$1"
+}
+
 cmd_status() {
   require_runners
   echo "Host: $(nproc) cores, $(free -h | awk '/^Mem:/{print $2" RAM, "$7" available"}')"
   echo
-  printf '%-3s %-40s %-15s %-8s %-9s %-6s %-6s %-6s %-8s %-7s %s\n' \
-    IDX RUNNER ACTIVE SINCE ENABLED MAX HIGH USED RESTART ENVFILE WORKING-ON
+  status_row IDX RUNNER ACTIVE SINCE ENABLED MAX HIGH USED RESTART ENVFILE WORKING-ON
   local i=0 u
   while read -r u; do
     [ -n "$u" ] || continue
@@ -432,8 +449,7 @@ cmd_status() {
       P[$k]="$v"
     done < <(unit_props "$u")
     local envf="${P[EnvironmentFiles]:-}"; [ -n "$envf" ] || envf="—"
-    printf '%-3s %-40s %-15s %-8s %-9s %-6s %-6s %-6s %-8s %-7s %s\n' \
-      "$i" "$short" "${P[ActiveState]:-}/${P[SubState]:-}" \
+    status_row "$i" "$short" "${P[ActiveState]:-}/${P[SubState]:-}" \
       "$(since_state "${P[ActiveState]:-}" "${P[ActiveEnterTimestampMonotonic]:-}" "${P[InactiveEnterTimestampMonotonic]:-}")" \
       "${P[UnitFileState]:-}" \
       "$(hbytes "${P[MemoryMax]:-}")" "$(hbytes "${P[MemoryHigh]:-}")" \
