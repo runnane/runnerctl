@@ -72,6 +72,7 @@ runnerctl scale N [--profile NAME] [--max 26G] [--high 25G] \
                   [--restart] [--when-idle] [--timeout N]
 runnerctl env-init [--profile NAME] [--env-file PATH]
 runnerctl start|stop|restart [--when-idle] [--timeout N] \
+                             [--if-stalled] [--stall-after N] \
                              [<unit|slot-index|name> ...]
 runnerctl drain [--timeout N] [<unit|slot-index|name> ...]
 runnerctl enable|disable <unit|slot-index|name>
@@ -79,7 +80,7 @@ runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
                [--since WHEN] [-g PATTERN]
 runnerctl remove-limits [<unit|slot-index|name> ...]
 runnerctl reap [--dry-run] [<unit|slot-index|name> ...]
-runnerctl health [--quiet] [--max-restarts N] [--stall-after N]
+runnerctl health [--quiet] [--max-restarts N] [--stall-after N] [--restart-stalled]
 runnerctl profiles
 runnerctl config-example
 runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
@@ -137,15 +138,15 @@ oversized. A running slot whose journal cannot be read shows `(no access)`,
 or `idle ?` when `/proc` is readable but the journal is not, with a one-line
 hint under the table — `—` means only that the slot is not running.
 
-A job that has been running for `STALL_SEC` seconds or more — `21600` (6 h)
-by default, GitHub's own default `timeout-minutes`, so anything older has
-outlived what the service allows and the runner is wedged — is flagged in
-the cell (`my-app:build (12h33m) STALLED`) with one `note:` line under the
-table naming the threshold. Set `STALL_SEC` in the config for a pool whose
-jobs never legitimately run that long (`0` turns the flag off), or pass
-`--stall-after N` (seconds) for one run. Stall detection needs the job's
-runtime, so it has the same access needs as the runtime itself: the journal,
-or a visible `Runner.Worker`.
+A job that has been running for `STALL_SEC` seconds or more — `3600` (1 h)
+by default: no job on a build pool legitimately runs that long, so past it
+the runner is wedged, not slow — is flagged in the cell (`my-app:build
+(1h33m) STALLED`) with one `note:` line under the table naming the
+threshold. Raise `STALL_SEC` in the config for a pool with longer jobs (`0`
+turns the flag off), or pass `--stall-after N` (seconds) for one run. Stall
+detection needs the job's runtime, so it has the same access needs as the
+runtime itself: the journal, or a visible `Runner.Worker`. What to do about
+a stalled job is `restart --if-stalled`, below.
 
 An idle slot whose cgroup still holds processes that are not the runner's
 own — a dev server, a file watcher, a `node` child that ignored SIGTERM when
@@ -274,14 +275,14 @@ read). `host` carries `cores`
 closes that: exit 0 with `ok: N slot(s) healthy` when every enabled slot is
 `active`/`activating`/`reloading`, no slot has restarted `--max-restarts`
 times (default 5) or more since its last manual start, no job has been
-running for `--stall-after` seconds (default `STALL_SEC`, 6 h) or more, and
+running for `--stall-after` seconds (default `STALL_SEC`, 1 h) or more, and
 no idle slot has leaked processes; otherwise one line per problem on stdout
 and exit 1:
 
 ```
 example.slot-2: enabled but inactive/dead since 3d
 example.slot-1: 7 restarts since last start (oom-kill)
-example.slot-3: stalled — job my-app:build running 12h33m, longer than 6h (--stall-after 21600)
+example.slot-3: stalled — job my-app:build running 1h33m, longer than 1h (--stall-after 3600)
 example.slot-4: 2 leaked process(es) left by finished jobs (node, esbuild) — runnerctl reap 3
 ```
 
@@ -290,6 +291,17 @@ cron line like:
 
 ```sh
 runnerctl health --quiet || alert "runner pool unhealthy on $(hostname)"
+```
+
+`--restart-stalled` makes `health` act on the one problem it can fix on its
+own: a stalled slot is restarted on the spot (the same `systemctl restart`
+as `restart --if-stalled`, so it needs root or sudo) and its line ends
+`— restarted` (or `— restart FAILED`). The exit code is still 1, so a probe
+records the event once; the next run is clean. Everything else `health`
+does stays read-only. A root cron that self-heals the pool:
+
+```sh
+*/5 * * * *  runnerctl health --quiet --restart-stalled
 ```
 
 A disabled, scaled-down slot is not a problem — only an *enabled* slot that
@@ -341,6 +353,31 @@ milliseconds), and the runner has no "stop accepting jobs" switch short of
 the GitHub API or UI. For a guaranteed drain, first make GitHub stop routing
 work to the runner — change its labels to ones no workflow requests, or
 disable it in the organisation's runner settings — then `runnerctl drain`.
+
+### Killing a stalled job: `restart --if-stalled`
+
+`--when-idle` never force-kills, by design. `--if-stalled` is the opposite
+tool for the opposite situation: `runnerctl restart --if-stalled
+[--stall-after N] [<slot> ...]` acts on exactly the slots whose job is
+`STALLED` (running `STALL_SEC` seconds or more — the same fact `status`
+shows) and skips every other one with a line saying why:
+
+```
+$ runnerctl restart --if-stalled
+example.slot-1: stalled — my-app:build, 1h33m, longer than 1h — restarting
+example.slot-2: not stalled (idle 2h31m (7 jobs)) — skipped
+example.slot-3: not running — skipped
+restart done (1 stalled slot(s)).
+```
+
+It restarts the whole unit rather than signalling the job's processes: the
+cgroup goes as one, `Restart=always` brings the runner back in seconds, and
+GitHub marks the job failed — a partial kill would leave the Listener
+believing it is still busy. `stop --if-stalled` works the same way (the slot
+stays down); `start` refuses the flag, and so does combining it with
+`--when-idle`. With nothing stalled it prints `no stalled slot — nothing
+restarted.` and exits 0. A slot whose journal cannot be read is a refusal,
+not a guess — run it with journal access or as root.
 
 ### Profiles
 

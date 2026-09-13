@@ -35,6 +35,7 @@
 #                     [--restart] [--when-idle] [--timeout N]
 #   runnerctl env-init [--profile NAME] [--env-file PATH]
 #   runnerctl start|stop|restart [--when-idle] [--timeout N] \
+#                                [--if-stalled] [--stall-after N] \
 #                                [<unit|slot-index|name> ...]
 #   runnerctl drain [--timeout N] [<unit|slot-index|name> ...]
 #   runnerctl enable|disable <unit|slot-index|name>
@@ -42,7 +43,7 @@
 #                  [--since WHEN] [-g PATTERN]
 #   runnerctl remove-limits [<unit|slot-index|name> ...]
 #   runnerctl reap [--dry-run] [<unit|slot-index|name> ...]
-#   runnerctl health [--quiet] [--max-restarts N] [--stall-after N]
+#   runnerctl health [--quiet] [--max-restarts N] [--stall-after N] [--restart-stalled]
 #   runnerctl profiles
 #   runnerctl config-example
 #   runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
@@ -71,10 +72,17 @@
 # NO_COLOR in the environment turns it off, --color always/never override):
 # ACTIVE green/yellow/red, USED yellow then red as a slot reaches its HIGH
 # cap, WORKING-ON dim while idle and bold red when STALLED. A job that has
-# run for STALL_SEC seconds or more (config, default 21600 = 6 h, GitHub's
-# own default job timeout; --stall-after N overrides, 0 disables) is
-# STALLED: marked in the WORKING-ON cell, `"stalled":true` in --json, and a
-# problem for `health`.
+# run for STALL_SEC seconds or more (config, default 3600 = 1 h — a job
+# past an hour on a build pool is wedged, not slow; --stall-after N
+# overrides, 0 disables) is STALLED: marked in the WORKING-ON cell,
+# `"stalled":true` in --json, and a problem for `health`. The flag has an
+# action (GHR-30): `restart --if-stalled` (or `stop --if-stalled`) acts on
+# exactly the slots whose job is STALLED and skips every other one with a
+# line — the whole cgroup goes, Restart=always brings the runner back and
+# GitHub marks the job failed — and `health --restart-stalled` does the same
+# from cron, appending `— restarted` to the problem line (exit stays 1, so
+# a probe still records the event once). --if-stalled and --when-idle are
+# exclusive: one waits for an idle slot, the other acts on a wedged one.
 #
 # `status --json` prints the same facts as one JSON object — raw bytes, epoch
 # seconds, null where the table shows — — for monitoring and inventory
@@ -132,10 +140,11 @@ SYSTEMD_DIR="/etc/systemd/system"
 POLL_SEC="5"
 WAIT_TIMEOUT="1800"
 # A running job older than this many seconds is STALLED in status/watch,
-# `stalled` in --json and a problem for `health` (GHR-27). 6 h is GitHub's
-# own default job timeout-minutes, so a job past it has outlived what the
-# service allows and the runner is wedged. 0 turns the flag off.
-STALL_SEC="21600"
+# `stalled` in --json, a problem for `health` and what `--if-stalled` acts
+# on (GHR-27, GHR-30). 1 h: no job on a build pool legitimately runs that
+# long, so past it the runner is wedged, not slow. Raise it in the config
+# for a pool with longer jobs; 0 turns the flag off.
+STALL_SEC="3600"
 # `reap`: seconds between SIGTERM and SIGKILL for a leaked process (GHR-29).
 REAP_GRACE_SEC="5"
 
@@ -702,12 +711,19 @@ pause() { sleep "$1"; }
 #                  than polling a condition that cannot change
 #   anything else  1 (a job, or (starting))
 SLOT_JOB=""
-slot_is_idle() { # UNIT
-  local cg="" inv="" k v
+# One unit_props fetch, then job_facts on it: the JOB_* picture of UNIT for
+# a command that acts on one slot at a time (--when-idle, --if-stalled,
+# reap) rather than through collect_slot.
+slot_job_facts() { # UNIT
+  local cg="" inv="" ae="" k v
   while IFS='=' read -r k v; do
-    case "$k" in ControlGroup) cg="$v" ;; InvocationID) inv="$v" ;; esac
+    case "$k" in ControlGroup) cg="$v" ;; InvocationID) inv="$v" ;; ActiveEnterTimestampMonotonic) ae="$v" ;; esac
   done < <(unit_props "$1")
-  SLOT_JOB="$(job_info "$1" "$cg" "$inv")"
+  job_facts "$1" "$cg" "$inv" "$ae"
+}
+slot_is_idle() { # UNIT
+  slot_job_facts "$1"
+  SLOT_JOB="$(job_cell)"
   case "$SLOT_JOB" in
     —|idle|idle\ *) return 0 ;;
     *)              return 1 ;;
@@ -773,6 +789,28 @@ idle_gate() { # UNIT VERB HANDLED REMAINING
   $when_idle || return 0
   local rc=0; wait_idle "$1" "$WAIT_TIMEOUT" || rc=$?
   [ "$rc" -eq 0 ] || wait_failed "$rc" "$@"
+}
+
+# GHR-30: the per-slot gate of --if-stalled. Reads the same job_facts the
+# table reads and answers whether UNIT's job is STALLED right now:
+#   0  stalled — a line says what is about to be VERB-ed ("restarting")
+#   1  not stalled (idle, busy but young, or not running) — a skip line
+# A (no access) slot dies, as --when-idle does: the question cannot be
+# answered, and acting on a guess would kill a healthy job.
+stalled_gate() { # UNIT VERB-ING
+  local short
+  short="$(short_name "$1")"
+  slot_job_facts "$1"
+  case "$JOB_STATE" in
+    no-access) die "$short: cannot tell whether its job is stalled — --if-stalled needs journal read access (systemd-journal group) or root" ;;
+    none)      echo "$short: not running — skipped"; return 1 ;;
+  esac
+  if [ "$JOB_STALLED" = true ]; then
+    echo "$short: stalled — $(job_desc "${JOB_REPO:+$JOB_REPO:}${JOB_NAME:-?}${JOB_RUNTIME:+ ($JOB_RUNTIME)}"), longer than $(fmt_dur "$STALL_SEC") — $2"
+    return 0
+  fi
+  echo "$short: not stalled ($(job_cell)) — skipped"
+  return 1
 }
 
 # Space-separated units -> "short-1, short-2" (or "none").
@@ -1438,20 +1476,27 @@ cmd_env_init() {
   echo "Edit it ON THE BOX and fill in real values. NEVER commit real secrets."
 }
 
-cmd_ctl() { # start|stop|restart [--when-idle] [--timeout N] [target ...] (default: all)
+cmd_ctl() { # start|stop|restart [--when-idle] [--timeout N] [--if-stalled] [--stall-after N] [target ...] (default: all)
   local action="$1"; shift || true
-  local targets=() units=() u t i verb
+  local targets=() units=() u t i verb if_stalled=false acted=0
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     case "$1" in
-      --when-idle) when_idle=true; shift ;;
-      --timeout)   need_val "$@"; set_timeout "$2"; shift 2 ;;
-      -*)          die "unknown option: $1" ;;
-      *)           targets+=("$1"); shift ;;
+      --when-idle)   when_idle=true; shift ;;
+      --timeout)     need_val "$@"; set_timeout "$2"; shift 2 ;;
+      --if-stalled)  if_stalled=true; shift ;;
+      --stall-after) need_val "$@"; set_stall_after "$2"; shift 2 ;;
+      -*)            die "unknown option: $1" ;;
+      *)             targets+=("$1"); shift ;;
     esac
   done
   # Waiting for idle before a start is meaningless; accept the flag quietly.
   [ "$action" != start ] || when_idle=false
+  if $if_stalled; then
+    [ "$action" != start ] || die "--if-stalled only applies to stop and restart"
+    ! $when_idle || die "--if-stalled and --when-idle are exclusive: one acts on a wedged slot, the other waits for an idle one"
+    [ "$STALL_SEC" -gt 0 ] || die "--if-stalled needs a threshold: STALL_SEC is 0 (pass --stall-after N)"
+  fi
   require_runners
   if [ "${#targets[@]}" -gt 0 ]; then
     for t in "${targets[@]}"; do
@@ -1465,10 +1510,21 @@ cmd_ctl() { # start|stop|restart [--when-idle] [--timeout N] [target ...] (defau
   case "$action" in stop) verb=stopped ;; *) verb="${action}ed" ;; esac
   for i in "${!units[@]}"; do
     u="${units[$i]}"
-    idle_gate "$u" "$verb" "${units[*]:0:$i}" "${units[*]:$((i + 1))}"
+    if $if_stalled; then
+      stalled_gate "$u" "${verb%ed}ing" || continue
+      acted=$((acted + 1))
+    else
+      idle_gate "$u" "$verb" "${units[*]:0:$i}" "${units[*]:$((i + 1))}"
+    fi
     run_priv systemctl "$action" "$u"
   done
-  echo "$action done."
+  if $if_stalled && [ "$acted" -eq 0 ]; then
+    echo "no stalled slot — nothing $verb."
+  elif $if_stalled; then
+    echo "$action done ($acted stalled slot(s))."
+  else
+    echo "$action done."
+  fi
 }
 
 cmd_toggle() { # enable|disable <target>
@@ -1638,7 +1694,7 @@ cmd_remove_limits() {
 # through run_priv. Exit 1 only for a refusal (unreadable cgroup, no
 # journal); a busy or clean slot is a line, not a failure.
 cmd_reap() { # [--dry-run] [target ...] (default: all)
-  local dry_run=false targets=() units=() u t short cg inv ae k v pid survivors
+  local dry_run=false targets=() units=() u t short pid survivors
   while [ $# -gt 0 ]; do
     case "$1" in
       --dry-run) dry_run=true; shift ;;
@@ -1656,11 +1712,8 @@ cmd_reap() { # [--dry-run] [target ...] (default: all)
     mapfile -t units < <(discover)
   fi
   for u in "${units[@]}"; do
-    short="$(short_name "$u")" cg="" inv="" ae=""
-    while IFS='=' read -r k v; do
-      case "$k" in ControlGroup) cg="$v" ;; InvocationID) inv="$v" ;; ActiveEnterTimestampMonotonic) ae="$v" ;; esac
-    done < <(unit_props "$u")
-    job_facts "$u" "$cg" "$inv" "$ae"
+    short="$(short_name "$u")"
+    slot_job_facts "$u"
     case "$JOB_STATE" in
       none) echo "$short: not running — nothing to reap"; continue ;;
       no-access) die "$short: cannot tell whether the slot is idle — reap needs journal read access (systemd-journal group) or root" ;;
@@ -1709,15 +1762,19 @@ reap_list() {
 #     since the unit's last manual start, not "in the last hour" — there is no
 #     cheap way to bucket it by wall-clock time, so that is what this reports;
 #   - a job running for --stall-after seconds (default STALL_SEC) or more —
-#     needs the journal or a visible Runner.Worker, like the table's cell;
+#     needs the journal or a visible Runner.Worker, like the table's cell.
+#     With --restart-stalled (GHR-30) that slot is restarted on the spot
+#     (through run_priv — the one case health touches the host) and the
+#     line ends `— restarted`; the exit code is still 1, so a probe records
+#     the event once and the next run is clean;
 #   - an idle slot with leaked processes (GHR-29) — needs a readable cgroup,
 #     like the table's `+N leaked`.
 # No problems: exit 0, "ok: N slot(s) healthy" (suppressed by --quiet). Any
 # problem: one line each on stdout (suppressed by --quiet; the exit code is
 # not), exit 1. No units at all: require_runners' existing die (not
 # suppressed by --quiet — only cmd_health's own output is).
-cmd_health() { # [--quiet] [--max-restarts N] [--stall-after N]
-  local quiet=false max_restarts=5
+cmd_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart-stalled]
+  local quiet=false max_restarts=5 restart_stalled=false
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     case "$1" in
@@ -1730,6 +1787,8 @@ cmd_health() { # [--quiet] [--max-restarts N] [--stall-after N]
       --stall-after)
         need_val "$@"
         set_stall_after "$2"; shift 2 ;;
+      --restart-stalled)
+        restart_stalled=true; shift ;;
       *) die "unknown option: $1" ;;
     esac
   done
@@ -1756,7 +1815,12 @@ cmd_health() { # [--quiet] [--max-restarts N] [--stall-after N]
       problems+=("$line")
     fi
     if [ "${SLOT[job_stalled]}" = true ]; then
-      problems+=("$short: stalled — job ${SLOT[job_repo]:+${SLOT[job_repo]}:}${SLOT[job_name]:-?} running ${SLOT[job_runtime]}, longer than $(fmt_dur "$STALL_SEC") (--stall-after $STALL_SEC)")
+      line="$short: stalled — job ${SLOT[job_repo]:+${SLOT[job_repo]}:}${SLOT[job_name]:-?} running ${SLOT[job_runtime]}, longer than $(fmt_dur "$STALL_SEC") (--stall-after $STALL_SEC)"
+      # GHR-30: the only privileged call health ever makes, and only here.
+      if $restart_stalled; then
+        if run_priv systemctl restart "$u"; then line+=" — restarted"; else line+=" — restart FAILED"; fi
+      fi
+      problems+=("$line")
     fi
     if [[ "${SLOT[job_leaked]}" =~ ^[0-9]+$ ]] && [ "${SLOT[job_leaked]}" -gt 0 ]; then
       problems+=("$short: ${SLOT[job_leaked]} leaked process(es) left by finished jobs (${SLOT[job_leaked_comms]}) — runnerctl reap ${SLOT[idx]}")
@@ -1810,10 +1874,11 @@ cmd_config_example() {
 #WAIT_TIMEOUT="1800"
 
 # A job running this many seconds or more is STALLED in status/watch, a
-# problem for `health` and "stalled":true in `status --json`. Default 6 h —
-# GitHub's own default job timeout — so anything older has outlived what the
-# service allows. 0 turns the flag off; --stall-after N overrides per run.
-#STALL_SEC="21600"
+# problem for `health`, "stalled":true in `status --json`, and what
+# `restart --if-stalled` / `health --restart-stalled` act on. Default 1 h:
+# no job on a build pool legitimately runs that long. Raise it for a pool
+# with longer jobs; 0 turns the flag off; --stall-after N overrides per run.
+#STALL_SEC="3600"
 
 # `reap`: seconds a leaked process gets after SIGTERM before SIGKILL.
 #REAP_GRACE_SEC="5"

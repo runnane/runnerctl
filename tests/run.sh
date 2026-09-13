@@ -1524,7 +1524,8 @@ case_journal_job_args_without_invocation_id() {
 # --- GHR-27: colour, and the stalled-job flag --------------------------------
 # Colour is off for the whole run (NO_COLOR=1 above); slot-1's job has run
 # 12 minutes on the pinned clock, so `--stall-after 600` flags it and the
-# default 21600 does not (the exact-row cases above guard the latter).
+# default (3600 since GHR-30) does not (the exact-row cases above guard the
+# latter).
 ESC=$'\033'
 SGR="$ESC\[[0-9;]*m"
 
@@ -1858,6 +1859,107 @@ case_reap_unknown_option_and_bad_target() {
   expect_no_log '^kill '
 }
 
+# --- GHR-30: a 1 h default, and --if-stalled / --restart-stalled -------------
+# slot-1's job is 12 minutes old on the pinned clock: `--stall-after 600`
+# makes it STALLED, the default does not.
+case_stall_sec_default_is_one_hour() {
+  run_fn eval "echo \$STALL_SEC"
+  expect_rc 0
+  expect_out '^3600$'
+  # and the config example documents the same default
+  run config-example
+  expect_out '^#STALL_SEC="3600"$'
+}
+
+case_restart_if_stalled_restarts_only_the_stalled_slot() {
+  run restart --if-stalled --stall-after 600
+  expect_rc 0
+  expect_out '^example\.slot-1: stalled — my-app:test, 12m, longer than 10m — restarting$'
+  expect_out '^example\.slot-2: not stalled \(idle 2h31m \(2 jobs\)\) — skipped$'
+  expect_out '^example\.slot-3: not running — skipped$'
+  expect_out '^restart done \(1 stalled slot\(s\)\)\.$'
+  expect_log_count '^systemctl restart ' 1
+  expect_log "^systemctl restart $U1\$"
+  expect_no_log '^probe:pause '
+}
+
+case_restart_if_stalled_default_threshold_restarts_nothing() {
+  run restart --if-stalled
+  expect_rc 0
+  expect_out '^example\.slot-1: not stalled \(my-app:test \(12m\)\) — skipped$'
+  expect_out '^no stalled slot — nothing restarted\.$'
+  expect_no_log '^systemctl '
+}
+
+case_stop_if_stalled_targets_and_equals_form() {
+  run stop 0 2 --if-stalled --stall-after=600
+  expect_rc 0
+  expect_out '^example\.slot-1: stalled — my-app:test, 12m, longer than 10m — stopping$'
+  expect_out '^example\.slot-3: not running — skipped$'
+  expect_out '^stop done \(1 stalled slot\(s\)\)\.$'
+  expect_log_count '^systemctl ' 1
+  expect_log "^systemctl stop $U1\$"
+  expect_no_out 'slot-2'
+}
+
+case_if_stalled_refuses_when_idle_start_and_zero_threshold() {
+  run restart --if-stalled --when-idle
+  expect_rc 1
+  expect_err '^runnerctl: --if-stalled and --when-idle are exclusive'
+  expect_no_log '^systemctl '
+  run start --if-stalled
+  expect_rc 1
+  expect_err '^runnerctl: --if-stalled only applies to stop and restart$'
+  expect_no_log '^systemctl '
+  run restart --if-stalled --stall-after 0
+  expect_rc 1
+  expect_err '^runnerctl: --if-stalled needs a threshold: STALL_SEC is 0'
+  expect_no_log '^systemctl '
+}
+
+case_if_stalled_no_access_dies_before_acting() {
+  RUNNERCTL_STUB_JOURNAL_ACCESS=0 run restart --if-stalled --stall-after 600
+  expect_rc 1
+  expect_err '^runnerctl: example\.slot-1: cannot tell whether its job is stalled — --if-stalled needs journal read access'
+  expect_no_log '^systemctl '
+}
+
+case_health_restart_stalled_restarts_and_says_so() {
+  run health --restart-stalled --stall-after 600
+  expect_rc 1
+  expect_out '^example\.slot-1: stalled — job my-app:test running 12m, longer than 10m \(--stall-after 600\) — restarted$'
+  expect_out_count '^example\.slot-' 1
+  expect_log_count '^systemctl restart ' 1
+  expect_log "^systemctl restart $U1\$"
+  # --quiet keeps the exit code and the restart, drops the line
+  run health --quiet --restart-stalled --stall-after 600
+  expect_rc 1
+  expect_no_out '.'
+  expect_log_count "^systemctl restart $U1\$" 1
+}
+
+case_health_restart_stalled_healthy_pool_touches_nothing() {
+  run health --restart-stalled
+  expect_rc 0
+  expect_out '^ok: 3 slot\(s\) healthy$'
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+}
+
+case_health_restart_stalled_reports_a_failed_restart() {
+  RUNNERCTL_STUB_FAIL_UNITS='slot-1' run health --restart-stalled --stall-after 600
+  expect_rc 1
+  expect_out '^example\.slot-1: stalled — .* — restart FAILED$'
+  expect_log_count '^systemctl restart ' 1
+}
+
+case_health_without_restart_stalled_never_restarts() {
+  run health --stall-after 600
+  expect_rc 1
+  expect_out '^example\.slot-1: stalled — .*\(--stall-after 600\)$'
+  expect_no_out 'restarted'
+  expect_no_log '^systemctl '
+}
+
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
 t "status: EnvironmentFiles value with embedded '=' survives"       case_status_envfile_value_with_embedded_equals
@@ -2015,6 +2117,18 @@ t "reap 0: a busy slot is skipped, never signalled"                     case_rea
 t "reap 1: clean slot says nothing to reap"                             case_reap_nothing_to_reap
 t "reap 1: unreadable cgroup / no journal die with a hint"              case_reap_unreadable_cgroup_dies
 t "reap --bogus / reap nope: rejected"                                  case_reap_unknown_option_and_bad_target
+
+# --- GHR-30: 1 h stall default, --if-stalled, health --restart-stalled -------
+t "STALL_SEC defaults to 3600, config-example agrees"                   case_stall_sec_default_is_one_hour
+t "restart --if-stalled --stall-after 600: slot-1 only, others skipped"  case_restart_if_stalled_restarts_only_the_stalled_slot
+t "restart --if-stalled: default 1 h ignores a 12m job, no call"        case_restart_if_stalled_default_threshold_restarts_nothing
+t "stop 0 2 --if-stalled --stall-after=600: stop slot-1 only"           case_stop_if_stalled_targets_and_equals_form
+t "--if-stalled: refuses --when-idle, start, and a 0 threshold"         case_if_stalled_refuses_when_idle_start_and_zero_threshold
+t "restart --if-stalled: (no access) dies before any call"              case_if_stalled_no_access_dies_before_acting
+t "health --restart-stalled: restarts the stalled slot, says so, exit 1" case_health_restart_stalled_restarts_and_says_so
+t "health --restart-stalled: healthy pool, no privileged call"          case_health_restart_stalled_healthy_pool_touches_nothing
+t "health --restart-stalled: a failed restart is reported"              case_health_restart_stalled_reports_a_failed_restart
+t "health --stall-after 600 alone: reports, never restarts"             case_health_without_restart_stalled_never_restarts
 
 # --- Summary ------------------------------------------------------------------
 echo
