@@ -18,6 +18,12 @@
 #POLL_SEC="5"
 #WAIT_TIMEOUT="1800"
 
+# A job running this many seconds or more is STALLED in status/watch, a
+# problem for `health` and "stalled":true in `status --json`. Default 6 h —
+# GitHub's own default job timeout — so anything older has outlived what the
+# service allows. 0 turns the flag off; --stall-after N overrides per run.
+#STALL_SEC="21600"
+
 # A profile is a function that sets these variables. Defining profile_ci or
 # profile_deploy replaces the built-in of the same name.
 profile_ci() {

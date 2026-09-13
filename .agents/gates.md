@@ -99,6 +99,15 @@ Traps:
 - The stub answers `run_priv test -f <path>` from `RUNNERCTL_STUB_ENV_FILE_EXISTS`
   (default: the file is absent). Prefix a single `run` to flip it:
   `RUNNERCTL_STUB_ENV_FILE_EXISTS=1 run apply --profile deploy`.
+- `tests/run.sh` runs under `set -e`, so a command substitution that exits
+  non-zero inside an assignment — `FAILS+=("… $(diff a b)")`, `diff` exiting
+  1 on a difference — aborts the whole run with no summary line and no
+  `FAIL`, which reads as a pass if only the tail is checked. End such a
+  substitution with `; true` (GHR-27 found this with a mutation check).
+- Colour is off for the whole sim (`export NO_COLOR=1` at the top), because
+  the stub's `RUNNERCTL_STUB_TTY=1` would otherwise make `--color auto`
+  paint the `watch` frames. A case wanting colour passes `--color always`,
+  or `NO_COLOR=''` (empty = unset) to exercise the auto decision.
 - `status` calls `nproc` and `free` for real; only the runner rows are asserted.
   `status --json`'s `host` object comes from `host_facts`, which the stub pins.
 - The `status --json` case (GHR-16) asserts the parsed JSON through

@@ -68,6 +68,11 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # the `—` cells (GHR-21). Pin one where it exists so the run does not depend on
 # the caller's LANG; a box without it keeps its own locale.
 if locale -a 2>/dev/null | grep -qiE '^C\.utf-?8$'; then export LC_ALL=C.UTF-8; fi
+# Colour off for every run (GHR-27): with RUNNERCTL_STUB_TTY=1 `--color auto`
+# would otherwise paint the watch frames and the row regexes would stop
+# matching. The colour cases pass `--color always`, or `NO_COLOR=` (empty =
+# unset, per no-color.org) to exercise the auto decision.
+export NO_COLOR=1
 RUNNERCTL="${RUNNERCTL:-./runnerctl}"
 STUB="tests/stub.config"
 
@@ -1348,7 +1353,7 @@ case_status_json_parses_and_carries_the_slot_facts() {
   expect_json '[s["idx"] for s in d["slots"]] == [0, 1, 2]'
   expect_json 'd["slots"][0]["unit"] == "actions.runner.example.slot-1.service" and d["slots"][0]["name"] == "example.slot-1"'
   # slot-1: raw bytes, not 26.0G; the running job with its journal stamp.
-  expect_json 'd["slots"][0]["job"] == {"repo": "my-app", "name": "test", "since": 1000000000}'
+  expect_json 'd["slots"][0]["job"] == {"repo": "my-app", "name": "test", "since": 1000000000, "stalled": False}'
   expect_json 'd["slots"][0]["memory_max"] == 27917287424 and d["slots"][0]["memory_high"] == 23622320128'
   expect_json 'd["slots"][0]["memory_current"] == 1073741824 and d["slots"][0]["memory_peak"] == 26843545600'
   expect_json 'd["slots"][0]["env_file"] is None and d["slots"][0]["idle_since"] is None and d["slots"][0]["jobs_completed"] is None'
@@ -1406,7 +1411,8 @@ case_status_json_working_on_access_states() {
   expect_out '"name":"example.slot-3".*"working_on_access":"ok"'
   RUNNERCTL_STUB_JOURNAL_ACCESS=0 RUNNERCTL_STUB_CGROUP_READABLE=1 run status --json
   expect_rc 0
-  expect_out '"name":"example.slot-1".*"job":\{"repo":"my-app","name":"test","since":null\}.*"working_on_access":"no-journal"'
+  # no worker pid visible → no runtime → stalled is unknowable, null
+  expect_out '"name":"example.slot-1".*"job":\{"repo":"my-app","name":"test","since":null,"stalled":null\}.*"working_on_access":"no-journal"'
   expect_out '"name":"example.slot-2".*"job":null,"idle_since":null,"jobs_completed":null,"working_on_access":"no-journal"'
 }
 
@@ -1507,6 +1513,209 @@ case_journal_job_args_without_invocation_id() {
   expect_rc 0
   expect_out '^-g$'
   expect_no_out '^_SYSTEMD_INVOCATION_ID='
+}
+
+# --- GHR-27: colour, and the stalled-job flag --------------------------------
+# Colour is off for the whole run (NO_COLOR=1 above); slot-1's job has run
+# 12 minutes on the pinned clock, so `--stall-after 600` flags it and the
+# default 21600 does not (the exact-row cases above guard the latter).
+ESC=$'\033'
+SGR="$ESC\[[0-9;]*m"
+
+case_status_stall_after_flags_slot1() {
+  run status --stall-after 600
+  expect_rc 0
+  expect_out '^0 +example\.slot-1 .* my-app:test \(12m\) STALLED$'
+  expect_out '^1 +example\.slot-2 .* idle 2h31m \(2 jobs\)$'
+  expect_out '^2 +example\.slot-3 .* —$'
+  expect_out_count '^note: STALLED = a job running longer than 10m \(STALL_SEC=600\); .runnerctl logs <IDX>. shows what it is doing$' 1
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test) '
+}
+
+case_status_stall_after_equals_form_and_boundary() {
+  # 720 s is exactly the job's age: at the threshold counts as stalled
+  run status --stall-after=720
+  expect_rc 0
+  expect_out '^0 +example\.slot-1 .* my-app:test \(12m\) STALLED$'
+  # one second over the age: not stalled, no note
+  run status --stall-after 721
+  expect_rc 0
+  expect_out '^0 +example\.slot-1 .* my-app:test \(12m\)$'
+  expect_no_out 'STALLED'
+}
+
+case_status_stall_after_zero_disables() {
+  run status --stall-after 0
+  expect_rc 0
+  expect_out '^0 +example\.slot-1 .* my-app:test \(12m\)$'
+  expect_no_out 'STALLED'
+}
+
+case_status_stall_after_invalid_rejected() {
+  run status --stall-after soon
+  expect_rc 1
+  expect_err "^runnerctl: --stall-after value 'soon' is invalid — want a whole number of seconds \(0 disables the stalled flag\)$"
+  expect_no_out '.'
+  run status --stall-after
+  expect_rc 1
+  expect_err 'needs a value'
+}
+
+case_status_json_stalled_field() {
+  run status --stall-after 600 --json
+  expect_rc 0
+  expect_out '"name":"example.slot-1".*"job":\{"repo":"my-app","name":"test","since":1000000000,"stalled":true\}'
+  expect_out '"name":"example.slot-2".*"job":null'
+  expect_no_out 'STALLED'
+  expect_no_out "$SGR"
+}
+
+case_health_stalled_job_is_a_problem() {
+  run health --stall-after 600
+  expect_rc 1
+  expect_out '^example\.slot-1: stalled — job my-app:test running 12m, longer than 10m \(--stall-after 600\)$'
+  expect_out_count '^example\.slot-' 1
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test) '
+  # the same threshold in = form, and --quiet keeps only the exit code
+  run health --quiet --stall-after=600
+  expect_rc 1
+  expect_no_out '.'
+}
+
+case_health_default_threshold_ignores_a_12m_job() {
+  run health
+  expect_rc 0
+  expect_out '^ok: 3 slot\(s\) healthy$'
+  run health --stall-after 721
+  expect_rc 0
+  expect_out '^ok: 3 slot\(s\) healthy$'
+}
+
+case_health_reads_the_shared_collector() {
+  run health
+  expect_rc 0
+  # one batched unit_props per slot, the journal for the two running slots,
+  # the restart reason once (slot-2) — the table's fetches, no more
+  expect_log_count '^probe:unit_props ' 3
+  expect_log_count '^probe:journal_job_lines ' 2
+  expect_log_count '^probe:journal_restart_reason ' 1
+}
+
+case_health_stall_after_invalid_rejected() {
+  run health --stall-after 6h
+  expect_rc 1
+  expect_err "^runnerctl: --stall-after value '6h' is invalid"
+  expect_no_out '.'
+}
+
+case_watch_stalled_marker_in_frames() {
+  RUNNERCTL_STUB_TTY=1 run watch --iterations 2 --stall-after 600
+  expect_rc 0
+  expect_out_count '^0 +example\.slot-1 .* my-app:test \(12m\) STALLED$' 2
+  expect_out_count '^note: STALLED = a job running longer than 10m' 2
+}
+
+# --color always paints; the plain text of every cell is unchanged and the
+# columns still line up, because padding counts visible characters.
+case_status_color_always_paints_by_meaning() {
+  run status --color always --stall-after 600
+  expect_rc 0
+  # header bold; slot-1 ACTIVE green (no restarts); its stalled job bold red
+  expect_out "^$ESC\[1mIDX +RUNNER .* WORKING-ON$ESC\[0m$"
+  expect_out "^0 +example\.slot-1 +$ESC\[2m—$ESC\[0m +$ESC\[32mactive/running$ESC\[0m +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +always +— +$ESC\[1m$ESC\[31mmy-app:test \(12m\) STALLED$ESC\[0m$"
+  # slot-2: restarted → yellow ACTIVE; idle → dim WORKING-ON
+  expect_out "^1 +example\.slot-2 .* $ESC\[33mactive/running ↻3 \(last: oom-kill\)$ESC\[0m +41m +enabled .* $ESC\[2midle 2h31m \(2 jobs\)$ESC\[0m$"
+  # slot-3: inactive → red ACTIVE, disabled → dim ENABLED, WORKING-ON — → dim
+  expect_out "^2 +example\.slot-3 +$ESC\[2m—$ESC\[0m +$ESC\[31minactive/dead$ESC\[0m +6d +$ESC\[2mdisabled$ESC\[0m +— +— +— +always +— +$ESC\[2m—$ESC\[0m$"
+  expect_out "^$ESC\[31mnote: STALLED = .*$ESC\[0m$"
+  # the columns: with the SGR sequences stripped, the painted table is the
+  # plain one byte for byte (the GHR-21 padding invariant, now under colour)
+  _expect
+  local painted
+  painted="$(sed -E "s/$SGR//g" <<<"$OUT")"
+  run status --color never --stall-after 600
+  expect_rc 0
+  # `; true`: diff exits 1 on a difference, and under set -e a failing
+  # command substitution inside an assignment aborts the whole run silently
+  [ "$painted" = "$OUT" ] || FAILS+=("--color always stripped of SGR differs from --color never: $(diff <(echo "$painted") <(echo "$OUT") | head -5; true)")
+}
+
+case_status_color_never_and_default_are_plain() {
+  # a tty with NO_COLOR unset: auto paints
+  NO_COLOR='' RUNNERCTL_STUB_TTY=1 run status
+  expect_rc 0
+  expect_out "$SGR"
+  # the same tty with NO_COLOR set (the harness default): auto does not
+  RUNNERCTL_STUB_TTY=1 run status
+  expect_rc 0
+  expect_no_out "$SGR"
+  # no tty: auto does not, whatever NO_COLOR says
+  NO_COLOR='' run status
+  expect_rc 0
+  expect_no_out "$SGR"
+  # --color never beats a tty with NO_COLOR unset
+  NO_COLOR='' RUNNERCTL_STUB_TTY=1 run status --color never
+  expect_rc 0
+  expect_no_out "$SGR"
+  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +always +— +my-app:test \(12m\)$'
+}
+
+case_status_color_invalid_rejected() {
+  run status --color sometimes
+  expect_rc 1
+  expect_err "^runnerctl: --color value 'sometimes' is invalid — want auto, always or never$"
+  expect_no_out '.'
+  run status --color
+  expect_rc 1
+  expect_err 'needs a value'
+}
+
+case_status_json_never_paints() {
+  NO_COLOR='' RUNNERCTL_STUB_TTY=1 run status --json
+  expect_rc 0
+  expect_no_out "$SGR"
+  run status --json --color always
+  expect_rc 0
+  expect_no_out "$SGR"
+  expect_out '^ "slots":\[$'
+}
+
+case_health_never_paints() {
+  NO_COLOR='' RUNNERCTL_STUB_TTY=1 run health --stall-after 600
+  expect_rc 1
+  expect_no_out "$SGR"
+  expect_out '^example\.slot-1: stalled'
+}
+
+case_watch_color_always_paints_header_and_frames() {
+  RUNNERCTL_STUB_TTY=1 run watch --iterations 2 --color=always
+  expect_rc 0
+  expect_out_count "${FRAME_PREFIX}$ESC\[1mrunnerctl watch — [^ ]+ — [0-9]{2}:[0-9]{2}:[0-9]{2} — every 2s \(Ctrl-C to quit\)$ESC\[0m$" 2
+  expect_out_count "^0 +example\.slot-1 .* $ESC\[32mmy-app:test \(12m\)$ESC\[0m$" 2
+  # `status --watch --color always` reaches the same loop with the option
+  RUNNERCTL_STUB_TTY=1 run status --watch --color always --iterations 1
+  expect_rc 0
+  expect_out_count "^0 +example\.slot-1 .* $ESC\[32mmy-app:test \(12m\)$ESC\[0m$" 1
+}
+
+# The USED cell against MemoryHigh: 1.0G of 22G is plain; the stub cannot
+# vary MemoryCurrent, so the colour rule is asserted on the helper itself.
+case_status_used_color_thresholds() {
+  run_fn eval 'color_setup always; status_used_color 1073741824 23622320128'   # 1G of 22G
+  expect_rc 0
+  expect_no_out '.'
+  run_fn eval 'color_setup always; status_used_color 21260088115 23622320128'  # one byte under 90 %
+  expect_rc 0
+  expect_no_out '.'
+  run_fn eval 'color_setup always; status_used_color 21260088116 23622320128'  # 90 %
+  expect_rc 0
+  expect_out "^$ESC\[33m$"
+  run_fn eval 'color_setup always; status_used_color 23622320128 23622320128'  # at MemoryHigh
+  expect_rc 0
+  expect_out "^$ESC\[31m$"
+  run_fn eval 'color_setup always; status_used_color 5 infinity'
+  expect_rc 0
+  expect_no_out '.'
 }
 
 # --- Registry -----------------------------------------------------------------
@@ -1628,6 +1837,23 @@ t "json_str: escapes backslash, quote, newline, control chars"         case_json
 # --- GHR-26: journal fetch filters with -g ------------------------------------
 t "journal_job_args: -g with the job pattern, invocation scope, no -n"  case_journal_job_args_use_grep_not_a_window
 t "journal_job_args: no invocation id -> no scope argument"             case_journal_job_args_without_invocation_id
+t "status --stall-after 600: a 12m job is STALLED, note once"          case_status_stall_after_flags_slot1
+t "status --stall-after: = form, and the threshold is inclusive"       case_status_stall_after_equals_form_and_boundary
+t "status --stall-after 0: the flag is off"                            case_status_stall_after_zero_disables
+t "status --stall-after soon: rejected, missing value dies"            case_status_stall_after_invalid_rejected
+t "status --json: job.stalled true/false/null, never the marker"       case_status_json_stalled_field
+t "health --stall-after 600: a stalled job is a problem, exit 1"       case_health_stalled_job_is_a_problem
+t "health: the default threshold ignores a 12m job"                    case_health_default_threshold_ignores_a_12m_job
+t "health: reads collect_slot — the table's fetches, no more"          case_health_reads_the_shared_collector
+t "health --stall-after 6h: rejected"                                  case_health_stall_after_invalid_rejected
+t "watch --stall-after 600: STALLED in every frame"                    case_watch_stalled_marker_in_frames
+t "status --color always: cells painted by meaning, columns aligned"   case_status_color_always_paints_by_meaning
+t "status --color: auto = tty and NO_COLOR unset; never wins"          case_status_color_never_and_default_are_plain
+t "status --color sometimes: rejected, missing value dies"             case_status_color_invalid_rejected
+t "status --json: never painted, even with --color always"             case_status_json_never_paints
+t "health: never painted"                                              case_health_never_paints
+t "watch --color=always: bold header, painted rows, via status -w too" case_watch_color_always_paints_header_and_frames
+t "status_used_color: plain, yellow at 90 %, red at MemoryHigh"        case_status_used_color_thresholds
 
 # --- GHR-14: health command for cron/uptime probes --------------------------
 t "health: default stub is healthy, read-only, no privileged call"    case_health_default_stub_is_healthy

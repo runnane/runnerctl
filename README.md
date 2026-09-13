@@ -62,8 +62,9 @@ command needs it installed.
 ```
 runnerctl [--config PATH] <command> [args]
 
-runnerctl status [--json] [--watch|-w] [--interval N] [--once]
-runnerctl watch  [--interval N]
+runnerctl status [--json] [--watch|-w] [--interval N] [--once] \
+                 [--color auto|always|never] [--stall-after N]
+runnerctl watch  [--interval N] [--color auto|always|never] [--stall-after N]
 runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
                  [--restart-sec N] [--env-file PATH] [--restart] \
                  [--when-idle] [--timeout N] [<unit|slot-index|name> ...]
@@ -77,7 +78,7 @@ runnerctl enable|disable <unit|slot-index|name>
 runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
                [--since WHEN] [-g PATTERN]
 runnerctl remove-limits [<unit|slot-index|name> ...]
-runnerctl health [--quiet] [--max-restarts N]
+runnerctl health [--quiet] [--max-restarts N] [--stall-after N]
 runnerctl profiles
 runnerctl config-example
 runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
@@ -135,6 +136,31 @@ oversized. A running slot whose journal cannot be read shows `(no access)`,
 or `idle ?` when `/proc` is readable but the journal is not, with a one-line
 hint under the table — `—` means only that the slot is not running.
 
+A job that has been running for `STALL_SEC` seconds or more — `21600` (6 h)
+by default, GitHub's own default `timeout-minutes`, so anything older has
+outlived what the service allows and the runner is wedged — is flagged in
+the cell (`my-app:build (12h33m) STALLED`) with one `note:` line under the
+table naming the threshold. Set `STALL_SEC` in the config for a pool whose
+jobs never legitimately run that long (`0` turns the flag off), or pass
+`--stall-after N` (seconds) for one run. Stall detection needs the job's
+runtime, so it has the same access needs as the runtime itself: the journal,
+or a visible `Runner.Worker`.
+
+### Colour
+
+When stdout is a terminal the table is coloured by meaning, so a wedged or
+throttled slot stands out of a `watch` at a glance: `ACTIVE` green while
+running cleanly, yellow when active but restarted (or with a non-`success`
+result, or still `activating`), red when not active; `ENABLED` dimmed for a
+disabled slot; `USED` yellow from 90 % of `HIGH` and red once the slot has
+reached it (it is being throttled); `WORKING-ON` dimmed while idle, green
+while a job runs and bold red when `STALLED`; the `note:` lines yellow or
+red. `--color auto` is the default — colour iff stdout is a tty and
+`NO_COLOR` is unset or empty ([no-color.org](https://no-color.org)) —
+`--color always` keeps it through a pipe (`| less -R`) and `--color never`
+drops it. Padding counts visible characters, so a painted table and a plain
+one line up identically; `status --json` and `health` are never coloured.
+
 `apply` and `remove-limits` can be pointed at one or more slots instead of
 every discovered one — `runnerctl apply --profile deploy 2` or `runnerctl
 apply 0 example.slot-2` — which is what lets one host run a `ci` pool and a
@@ -179,7 +205,7 @@ rendered from one collector, so they cannot disagree on a value:
    "memory_max":27917287424,"memory_high":23622320128,"memory_current":3328599552,"memory_peak":26743545600,
    "restart":"always","env_file":null,"since":1757622000,
    "restarts":0,"result":"success","last_restart_reason":null,"profile":"ci",
-   "job":{"repo":"my-app","name":"test","since":1757707200},
+   "job":{"repo":"my-app","name":"test","since":1757707200,"stalled":false},
    "idle_since":null,"jobs_completed":null,"working_on_access":"ok"}
 ]}
 ```
@@ -193,8 +219,10 @@ value), `since` (epoch second the slot entered its current state — what
 invocation's `Result`), `last_restart_reason` (`oom-kill` / `exit-code N` /
 `signal NAME`, looked up under the same condition as the table's
 `(last: …)`, null otherwise), `profile` (from the drop-in), `job` — `{"repo",
-"name", "since"}` while a job is in flight, any of the three null when
-unknown, null when idle or stopped — `idle_since` and `jobs_completed`
+"name", "since", "stalled"}` while a job is in flight (`repo`, `name` and
+`since` null when unknown; `stalled` true or false against `STALL_SEC` /
+`--stall-after`, null when the runtime is unknown), null when idle or
+stopped — `idle_since` and `jobs_completed`
 (epoch second of the last completion and the count since the unit started,
 0 and the unit's own start when nothing has finished yet; null while busy or
 stopped), and `working_on_access`: `"ok"`, `"no-journal"` (only `/proc`
@@ -207,13 +235,15 @@ could be read, so `job` may be present but `idle_since` never is) or
 `runnerctl status` always exits 0, so nothing on the host can notice "slot
 2 has been `inactive/dead` since Tuesday" without parsing the table. `health`
 closes that: exit 0 with `ok: N slot(s) healthy` when every enabled slot is
-`active`/`activating`/`reloading` and no slot has restarted `--max-restarts`
-times (default 5) or more since its last manual start; otherwise one line
-per problem on stdout and exit 1:
+`active`/`activating`/`reloading`, no slot has restarted `--max-restarts`
+times (default 5) or more since its last manual start, and no job has been
+running for `--stall-after` seconds (default `STALL_SEC`, 6 h) or more;
+otherwise one line per problem on stdout and exit 1:
 
 ```
 example.slot-2: enabled but inactive/dead since 3d
 example.slot-1: 7 restarts since last start (oom-kill)
+example.slot-3: stalled — job my-app:build running 12h33m, longer than 6h (--stall-after 21600)
 ```
 
 `--quiet` drops the output either way and keeps just the exit code, for a
@@ -231,9 +261,12 @@ way to bucket it by wall-clock time without walking the journal for every
 slot, so this reports what `systemctl show` already tracks. When a restart
 count trips the threshold and the journal knows why the *last* one happened,
 the reason (`oom-kill`, `exit-code N`, `signal NAME`) is appended, same as
-the `ACTIVE` column in `status`. A host with no runner units at all still
-gets the usual `no 'actions.runner.*.service' units found` error (exit 1,
-not suppressed by `--quiet`).
+the `ACTIVE` column in `status`. The stall check reads the same journal
+`status` does, so a `health` run without journal access (or a visible
+`Runner.Worker`) cannot see a stalled job — run it as root or in the
+`systemd-journal` group. A host with no runner units at all still gets the
+usual `no 'actions.runner.*.service' units found` error (exit 1, not
+suppressed by `--quiet`).
 
 ### Graceful restart and stop: `--when-idle` and `drain`
 

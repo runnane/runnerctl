@@ -32,6 +32,7 @@ smoke:
 	@./runnerctl --config config.example profiles | grep -q '^deploy .*config .*Prod deploy runner'
 	@./runnerctl bogus 2>/dev/null; test $$? -eq 1
 	@d=$$(mktemp -d) && printf 'DROPIN_NAME="../x.conf"\n' > "$$d/config" && chmod 644 "$$d/config" && ( ./runnerctl --config "$$d/config" profiles >/dev/null 2>"$$d/err"; test "$$?" -eq 1 ) && grep -q "DROPIN_NAME" "$$d/err" && rm -rf "$$d"
+	@d=$$(mktemp -d) && printf 'STALL_SEC="6h"\n' > "$$d/config" && chmod 644 "$$d/config" && ( ./runnerctl --config "$$d/config" profiles >/dev/null 2>"$$d/err"; test "$$?" -eq 1 ) && grep -q "STALL_SEC '6h'" "$$d/err" && rm -rf "$$d"
 	@d=$$(mktemp -d) && printf '' > "$$d/config" && chmod 660 "$$d/config" && ( ./runnerctl --config "$$d/config" profiles >/dev/null 2>"$$d/err"; test "$$?" -eq 1 ) && grep -qi "group-writable" "$$d/err" && chmod 644 "$$d/config" && ./runnerctl --config "$$d/config" profiles | grep -q '^ci\*' && rm -rf "$$d"
 	@echo "smoke ok"
 

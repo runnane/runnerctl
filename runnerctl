@@ -23,8 +23,9 @@
 # Usage:
 #   runnerctl [--config PATH] <command> [args]
 #
-#   runnerctl status [--json] [--watch|-w] [--interval N] [--once]
-#   runnerctl watch  [--interval N]
+#   runnerctl status [--json] [--watch|-w] [--interval N] [--once] \
+#                    [--color auto|always|never] [--stall-after N]
+#   runnerctl watch  [--interval N] [--color auto|always|never] [--stall-after N]
 #   runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
 #                    [--restart-sec N] [--env-file PATH] [--restart] \
 #                    [--when-idle] [--timeout N] [<unit|slot-index|name> ...]
@@ -38,7 +39,7 @@
 #   runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
 #                  [--since WHEN] [-g PATTERN]
 #   runnerctl remove-limits [<unit|slot-index|name> ...]
-#   runnerctl health [--quiet] [--max-restarts N]
+#   runnerctl health [--quiet] [--max-restarts N] [--stall-after N]
 #   runnerctl profiles
 #   runnerctl config-example
 #   runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
@@ -63,14 +64,24 @@
 # roll or a slot approaching its memory cap; it needs a terminal, and the
 # journal-derived WORKING-ON cells refresh every 10th redraw.
 #
+# The table is coloured by meaning when stdout is a terminal (--color auto;
+# NO_COLOR in the environment turns it off, --color always/never override):
+# ACTIVE green/yellow/red, USED yellow then red as a slot reaches its HIGH
+# cap, WORKING-ON dim while idle and bold red when STALLED. A job that has
+# run for STALL_SEC seconds or more (config, default 21600 = 6 h, GitHub's
+# own default job timeout; --stall-after N overrides, 0 disables) is
+# STALLED: marked in the WORKING-ON cell, `"stalled":true` in --json, and a
+# problem for `health`.
+#
 # `status --json` prints the same facts as one JSON object — raw bytes, epoch
 # seconds, null where the table shows — — for monitoring and inventory
 # tooling; the keys are listed in the README. It is one-shot: poll it rather
 # than --watch it.
 # `health` is a yes/no for cron or an uptime monitor's push endpoint: exit 0
-# ("ok: N slot(s) healthy") when every enabled slot is running and no slot has
-# restarted --max-restarts times (default 5) or more, else one line per
-# problem and exit 1; --quiet drops the output and keeps the exit code, for
+# ("ok: N slot(s) healthy") when every enabled slot is running, no slot has
+# restarted --max-restarts times (default 5) or more and no job is STALLED,
+# else one line per problem and exit 1; --quiet drops the output and keeps
+# the exit code, for
 # `runnerctl health --quiet || alert`. NRestarts is systemd's count since the
 # unit's last manual start, not a rolling "in the last hour" window — there is
 # no cheap way to bucket it by wall-clock time, so that is what gets reported.
@@ -85,6 +96,9 @@
 #   Profile roll: runnerctl apply --restart --when-idle
 #   Old install:  runnerctl migrate   # lifts the inline values into the config
 set -euo pipefail
+# status_row pads on visible width by stripping SGR sequences with a bounded
+# `*([0-9;])` (GHR-27); extglob is what makes that pattern legal.
+shopt -s extglob
 
 RUNNERCTL_VERSION="0.5.0" # x-release-please-version
 
@@ -106,6 +120,11 @@ SYSTEMD_DIR="/etc/systemd/system"
 # that shadows `pause` to a no-op still reaches the timeout.
 POLL_SEC="5"
 WAIT_TIMEOUT="1800"
+# A running job older than this many seconds is STALLED in status/watch,
+# `stalled` in --json and a problem for `health` (GHR-27). 6 h is GitHub's
+# own default job timeout-minutes, so a job past it has outlived what the
+# service allows and the runner is wedged. 0 turns the flag off.
+STALL_SEC="21600"
 
 # Profile-provided config (populated by load_profile; flags override).
 PROFILE=""
@@ -149,6 +168,7 @@ load_config() {
   [[ "$DROPIN_NAME" =~ ^[A-Za-z0-9_-]+\.conf$ ]] || die "DROPIN_NAME '$DROPIN_NAME' set in $CONFIG_FILE is invalid — must match ^[A-Za-z0-9_-]+\\.conf\$"
   [[ -n "$UNIT_GLOB" && "$UNIT_GLOB" != */* ]] || die "UNIT_GLOB '$UNIT_GLOB' set in $CONFIG_FILE is invalid — must be non-empty and contain no '/'"
   [[ "$DEFAULT_PROFILE" =~ ^[A-Za-z0-9_]+$ ]] || die "DEFAULT_PROFILE '$DEFAULT_PROFILE' set in $CONFIG_FILE is invalid — must match ^[A-Za-z0-9_]+\$"
+  [[ "$STALL_SEC" =~ ^[0-9]+$ ]] || die "STALL_SEC '$STALL_SEC' set in $CONFIG_FILE is invalid — want a whole number of seconds (0 disables the stalled flag)"
 }
 
 # Built-in profiles. Site-specific values belong in the config file; these are
@@ -466,6 +486,8 @@ now_epoch() { date +%s; }
 #   idle 41m (no jobs yet)
 #                  idle, and nothing has completed since the unit started:
 #                  time since the active-enter stamp instead
+#   repo:job (7h2m) STALLED
+#                  the job has run for STALL_SEC seconds or more (GHR-27)
 #   repo:job (12m) the journal names the job; the repo comes from the /proc
 #                  environ walk when that is readable (the job name alone
 #                  otherwise), the runtime from the Runner.Worker age, or from
@@ -494,15 +516,24 @@ now_epoch() { date +%s; }
 #               start when it can be seen, else the `Running job:` line's
 #               stamp; empty when neither is known
 #   JOB_RUNTIME the running job's age as the cell prints it, empty when unknown
+#   JOB_STALLED true when the running job's age is STALL_SEC or more, false
+#               when it is known and under, empty when the age is unknown
+#               or STALL_SEC is 0 (GHR-27)
 #   JOB_IDLE_SINCE / JOB_DONE
 #               epoch second of the last completion (or of the unit's start
 #               for idle-fresh) and the completed count (0 for idle-fresh)
 #   JOB_ACCESS  ok | no-journal | no-access — what could be read: `no-journal`
 #               is the /proc-only picture, `no-access` neither source
-JOB_STATE="" JOB_NAME="" JOB_REPO="" JOB_SINCE="" JOB_RUNTIME="" JOB_IDLE_SINCE="" JOB_DONE="" JOB_ACCESS=""
+JOB_STATE="" JOB_NAME="" JOB_REPO="" JOB_SINCE="" JOB_RUNTIME="" JOB_STALLED="" JOB_IDLE_SINCE="" JOB_DONE="" JOB_ACCESS=""
+# JOB_STALLED from the running job's age (seconds), per the contract above.
+job_stall_check() { # AGE-SECONDS
+  JOB_STALLED=""
+  [[ "${1:-}" =~ ^[0-9]+$ ]] && [ "$STALL_SEC" -gt 0 ] || return 0
+  if [ "$1" -ge "$STALL_SEC" ]; then JOB_STALLED=true; else JOB_STALLED=false; fi
+}
 job_facts() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
-  local u="$1" cg="$2" lines rj ii ts env worker age
-  JOB_STATE=none JOB_NAME="" JOB_REPO="" JOB_SINCE="" JOB_RUNTIME="" JOB_IDLE_SINCE="" JOB_DONE="" JOB_ACCESS=ok
+  local u="$1" cg="$2" lines rj ii ts env worker age=""
+  JOB_STATE=none JOB_NAME="" JOB_REPO="" JOB_SINCE="" JOB_RUNTIME="" JOB_STALLED="" JOB_IDLE_SINCE="" JOB_DONE="" JOB_ACCESS=ok
   [ -n "$cg" ] || return 0
   if lines="$(journal_job_lines_cached "$u" "${3:-}")"; then
     rj="$(journal_running_job "$lines")"
@@ -527,8 +558,10 @@ job_facts() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
       age="$(proc_age "$worker")"
       if [ -n "$age" ]; then JOB_RUNTIME="$(fmt_dur "$age")"; JOB_SINCE="$(age_to_epoch "$age")"; fi
     elif [[ "$ts" =~ ^[0-9]+$ ]]; then
-      JOB_SINCE="$ts"; JOB_RUNTIME="$(fmt_dur $(( $(now_epoch) - ts )))"
+      age=$(( $(now_epoch) - ts ))
+      JOB_SINCE="$ts"; JOB_RUNTIME="$(fmt_dur "$age")"
     fi
+    job_stall_check "$age"
     return 0
   fi
   cgroup_readable "$cg" || { JOB_STATE="no-access" JOB_ACCESS="no-access"; return 0; }
@@ -544,6 +577,7 @@ job_facts() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
     JOB_REPO="$(grep -m1 '^GITHUB_REPOSITORY=' <<<"$env" | cut -d= -f2- || true)"
     JOB_REPO="${JOB_REPO##*/}"
     JOB_NAME="$(grep -m1 '^GITHUB_JOB=' <<<"$env" | cut -d= -f2- || true)"
+    job_stall_check "$age"
   elif [ -n "$worker" ]; then
     JOB_STATE=starting
   else
@@ -555,7 +589,8 @@ job_facts() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
 job_cell() {
   case "$JOB_STATE" in
     none)         echo "—" ;;
-    running)      printf '%s%s%s\n' "${JOB_REPO:+$JOB_REPO:}" "${JOB_NAME:-?}" "${JOB_RUNTIME:+ ($JOB_RUNTIME)}" ;;
+    running)      printf '%s%s%s%s\n' "${JOB_REPO:+$JOB_REPO:}" "${JOB_NAME:-?}" "${JOB_RUNTIME:+ ($JOB_RUNTIME)}" \
+                    "$([ "$JOB_STALLED" != true ] || echo " STALLED")" ;;
     idle)         printf 'idle %s (%s job%s)\n' "$(fmt_dur "$([ -z "$JOB_IDLE_SINCE" ] || echo $(( $(now_epoch) - JOB_IDLE_SINCE )))")" \
                     "$JOB_DONE" "$([ "$JOB_DONE" -eq 1 ] || echo s)" ;;
     idle-fresh)   echo "idle $(fmt_dur "$([ -z "$JOB_IDLE_SINCE" ] || echo $(( $(now_epoch) - JOB_IDLE_SINCE )))") (no jobs yet)" ;;
@@ -885,6 +920,54 @@ slot_profile() {
   return 0
 }
 
+# --- Colour (GHR-27) ---------------------------------------------------------
+# The table's cells are painted by meaning — ACTIVE green/yellow/red, USED
+# turning red as a slot reaches its MemoryHigh, WORKING-ON dim while idle and
+# bold red when STALLED — and only when someone is looking: --color auto (the
+# default) paints when stdout is a terminal and NO_COLOR is unset or empty
+# (no-color.org); always/never override. The C_* codes stay empty while
+# colour is off, so paint() is a plain echo there and every renderer can call
+# it unconditionally. --json and health never paint.
+COLOR_MODE="auto"
+C_RESET="" C_BOLD="" C_DIM="" C_RED="" C_GREEN="" C_YELLOW=""
+color_setup() { # auto|always|never
+  local on=false
+  case "$1" in
+    always) on=true ;;
+    never)  on=false ;;
+    auto)   [ -n "${NO_COLOR:-}" ] || ! stdout_is_tty || on=true ;;
+    *)      die "--color value '$1' is invalid — want auto, always or never" ;;
+  esac
+  if $on; then
+    C_RESET=$'\e[0m' C_BOLD=$'\e[1m' C_DIM=$'\e[2m' C_RED=$'\e[31m' C_GREEN=$'\e[32m' C_YELLOW=$'\e[33m'
+  else
+    C_RESET="" C_BOLD="" C_DIM="" C_RED="" C_GREEN="" C_YELLOW=""
+  fi
+}
+# TEXT wrapped in an SGR code (one or more C_* values; nothing when empty).
+paint() { # SGR TEXT
+  printf '%s%s%s\n' "$1" "$2" "${1:+$C_RESET}"
+}
+# Options `status` and `watch` share: --color WHEN and --stall-after N. Sets
+# VIEW_SHIFT to the argv words consumed, 0 when $1 is neither.
+VIEW_SHIFT=0
+set_stall_after() { # SECONDS
+  [[ "$1" =~ ^[0-9]+$ ]] || die "--stall-after value '$1' is invalid — want a whole number of seconds (0 disables the stalled flag)"
+  STALL_SEC="$1"
+}
+view_opt() { # ARGS...
+  VIEW_SHIFT=0
+  case "$1" in
+    --color)
+      need_val "$@"
+      case "$2" in auto|always|never) ;; *) die "--color value '$2' is invalid — want auto, always or never" ;; esac
+      COLOR_MODE="$2"; VIEW_SHIFT=2 ;;
+    --stall-after)
+      need_val "$@"
+      set_stall_after "$2"; VIEW_SHIFT=2 ;;
+  esac
+}
+
 # --- Commands -----------------------------------------------------------------
 # Column widths of the status table; the last column (WORKING-ON) is unpadded.
 STATUS_WIDTHS=(3 40 8 19 8 9 6 6 12 8 7)
@@ -893,15 +976,45 @@ STATUS_WIDTHS=(3 40 8 19 8 9 6 6 12 8 7)
 # bytes for %-Ns, so the 3-byte `—` cell used for "no value" came out two
 # columns short and shifted everything after it (GHR-21). ${#v} counts
 # characters under a UTF-8 locale, which is the only kind where `—` renders.
+# A painted cell is measured without its SGR sequences (GHR-27), so colour
+# never shifts a column either.
 status_row() {
-  local w v out=""
+  local w v n out=""
   for w in "${STATUS_WIDTHS[@]}"; do
     v="$1"; shift
     out+="$v"
-    if [ "${#v}" -lt "$w" ]; then printf -v v '%*s' $((w - ${#v})) ''; out+="$v"; fi
+    n="${v//$'\e['*([0-9;])m/}"
+    if [ "${#n}" -lt "$w" ]; then printf -v v '%*s' $((w - ${#n})) ''; out+="$v"; fi
     out+=" "
   done
   printf '%s%s\n' "$out" "$1"
+}
+
+# The SGR code for a cell, by what it says (GHR-27). Empty = plain.
+status_active_color() { # ACTIVE-STATE NRESTARTS RESULT
+  case "$1" in
+    active)
+      if { [[ "${2:-0}" =~ ^[0-9]+$ ]] && [ "${2:-0}" -gt 0 ]; } || [ "${3:-success}" != success ]; then
+        echo "$C_YELLOW"
+      else
+        echo "$C_GREEN"
+      fi ;;
+    activating|reloading) echo "$C_YELLOW" ;;
+    *)                    echo "$C_RED" ;;
+  esac
+}
+# USED against MemoryHigh: red from the throttle point, yellow from 90 % of
+# it; plain when either side is not a number (no accounting, infinity).
+status_used_color() { # CURRENT HIGH
+  [[ "${1:-}" =~ ^[0-9]+$ && "${2:-}" =~ ^[0-9]+$ ]] && [ "$2" -gt 0 ] || return 0
+  if [ "$1" -ge "$2" ]; then echo "$C_RED"; elif [ $(( $1 * 10 )) -ge $(( $2 * 9 )) ]; then echo "$C_YELLOW"; fi
+}
+status_job_color() { # JOB-STATE JOB-STALLED
+  case "$1" in
+    running)              if [ "${2:-}" = true ]; then echo "$C_BOLD$C_RED"; else echo "$C_GREEN"; fi ;;
+    none|idle|idle-fresh) echo "$C_DIM" ;;
+    *)                    echo "$C_YELLOW" ;;
+  esac
 }
 
 # --- One collector, two renderers (GHR-16) -----------------------------------
@@ -963,7 +1076,7 @@ collect_slot() { # UNIT IDX
   fi
   job_facts "$u" "${SLOT[cgroup]}" "${SLOT[invocation]}" "${SLOT[active_enter]}"
   SLOT[job_state]="$JOB_STATE" SLOT[job_name]="$JOB_NAME" SLOT[job_repo]="$JOB_REPO"
-  SLOT[job_since]="$JOB_SINCE" SLOT[job_runtime]="$JOB_RUNTIME"
+  SLOT[job_since]="$JOB_SINCE" SLOT[job_runtime]="$JOB_RUNTIME" SLOT[job_stalled]="$JOB_STALLED"
   SLOT[job_idle_since]="$JOB_IDLE_SINCE" SLOT[job_done]="$JOB_DONE" SLOT[job_access]="$JOB_ACCESS"
 }
 
@@ -973,26 +1086,34 @@ render_status() {
   require_runners
   echo "Host: $(nproc) cores, $(free -h | awk '/^Mem:/{print $2" RAM, "$7" available"}')"
   echo
-  status_row IDX RUNNER PROFILE ACTIVE SINCE ENABLED MAX HIGH USED RESTART ENVFILE WORKING-ON
-  local i=0 u no_access=false
+  paint "$C_BOLD" "$(status_row IDX RUNNER PROFILE ACTIVE SINCE ENABLED MAX HIGH USED RESTART ENVFILE WORKING-ON)"
+  local i=0 u no_access=false stalled=false
   while read -r u; do
     [ -n "$u" ] || continue
     collect_slot "$u" "$i"
     # `idle ?` is the /proc-only reader's idle: it knows the slot is idle but
     # not for how long, which is the same missing journal access.
     case "${SLOT[job_state]}" in no-access|idle-unknown) no_access=true ;; esac
-    status_row "$i" "${SLOT[name]}" "${SLOT[profile]:-—}" \
-      "$(status_active_cell "${SLOT[active]}" "${SLOT[sub]}" "${SLOT[restarts]:-0}" "${SLOT[result]:-success}" "${SLOT[last_restart_reason]}")" \
-      "$(if [ -n "${SLOT[since_age]}" ]; then fmt_dur "${SLOT[since_age]}"; else echo "—"; fi)" \
-      "${SLOT[enabled]}" \
+    [ "${SLOT[job_stalled]}" != true ] || stalled=true
+    status_row "$i" "${SLOT[name]}" \
+      "$(if [ -n "${SLOT[profile]}" ]; then echo "${SLOT[profile]}"; else paint "$C_DIM" "—"; fi)" \
+      "$(paint "$(status_active_color "${SLOT[active]}" "${SLOT[restarts]:-0}" "${SLOT[result]:-success}")" \
+               "$(status_active_cell "${SLOT[active]}" "${SLOT[sub]}" "${SLOT[restarts]:-0}" "${SLOT[result]:-success}" "${SLOT[last_restart_reason]}")")" \
+      "$(if [ -n "${SLOT[since_age]}" ]; then fmt_dur "${SLOT[since_age]}"; else paint "$C_DIM" "—"; fi)" \
+      "$(paint "$([ "${SLOT[enabled]}" = enabled ] || echo "$C_DIM")" "${SLOT[enabled]}")" \
       "$(hbytes "${SLOT[memory_max]}")" "$(hbytes "${SLOT[memory_high]}")" \
-      "$(status_used_cell "${SLOT[memory_current]}" "${SLOT[memory_peak]}")" "${SLOT[restart]}" "${SLOT[env_file]:-—}" \
-      "$(job_cell)"
+      "$(paint "$(status_used_color "${SLOT[memory_current]}" "${SLOT[memory_high]}")" \
+               "$(status_used_cell "${SLOT[memory_current]}" "${SLOT[memory_peak]}")")" \
+      "${SLOT[restart]}" "${SLOT[env_file]:-—}" \
+      "$(paint "$(status_job_color "${SLOT[job_state]}" "${SLOT[job_stalled]}")" "$(job_cell)")"
     i=$((i+1))
   done < <(discover)
   # Once under the table, not per row, so the rows stay parseable.
   if $no_access; then
-    echo "note: WORKING-ON needs journal read access (systemd-journal group) or root"
+    paint "$C_YELLOW" "note: WORKING-ON needs journal read access (systemd-journal group) or root"
+  fi
+  if $stalled; then
+    paint "$C_RED" "note: STALLED = a job running longer than $(fmt_dur "$STALL_SEC") (STALL_SEC=$STALL_SEC); 'runnerctl logs <IDX>' shows what it is doing"
   fi
 }
 
@@ -1028,6 +1149,9 @@ json_strn() { if [ -n "${1:-}" ]; then json_str "$1"; else echo null; fi; }
 # otherwise — a stamp that was never set, a count that is missing.
 json_num() { if [[ "${1:-}" =~ ^[0-9]+$ ]]; then echo "$1"; else echo null; fi; }
 
+# A JSON boolean from "true"/"false", null for anything else (unknown).
+json_bool() { case "${1:-}" in true|false) echo "$1" ;; *) echo null ;; esac; }
+
 # A JSON byte count from a systemd memory property: null where hbytes prints
 # — (unset, infinity, [not set]), the number otherwise, and any other
 # string as a string so nothing is silently dropped.
@@ -1058,8 +1182,10 @@ host_facts() {
 #   idx unit name active sub enabled memory_max memory_high memory_current
 #   memory_peak restart env_file since restarts result last_restart_reason
 #   profile job idle_since jobs_completed working_on_access
-# `job` is {"repo","name","since"} while a job is in flight (any of the
-# three null when unknown), null when idle or not running; `idle_since` and
+# `job` is {"repo","name","since","stalled"} while a job is in flight (repo,
+# name and since null when unknown; `stalled` true/false against STALL_SEC,
+# null when the runtime is unknown — GHR-27), null when idle or not running;
+# `idle_since` and
 # `jobs_completed` are set while the slot is idle with a readable journal
 # (`jobs_completed` 0 when nothing has finished since the unit started);
 # `working_on_access` is "ok", "no-journal" (only /proc could be read) or
@@ -1075,7 +1201,7 @@ render_status_json() {
     collect_slot "$u" "$i"
     case "${SLOT[job_state]}" in
       running|starting)
-        job="{\"repo\":$(json_strn "${SLOT[job_repo]}"),\"name\":$(json_strn "${SLOT[job_name]}"),\"since\":$(json_num "${SLOT[job_since]}")}" ;;
+        job="{\"repo\":$(json_strn "${SLOT[job_repo]}"),\"name\":$(json_strn "${SLOT[job_name]}"),\"since\":$(json_num "${SLOT[job_since]}"),\"stalled\":$(json_bool "${SLOT[job_stalled]}")}" ;;
       *) job=null ;;
     esac
     case "${SLOT[job_state]}" in
@@ -1296,9 +1422,13 @@ cmd_logs() {
 # watch back into a single print; the last of --watch/--once wins. --json
 # (GHR-16) prints the same facts as one JSON object instead of the table; it
 # is a one-shot format, so it refuses --watch rather than streaming frames.
-cmd_status() { # [--json] [--watch|-w] [--once] [--interval N]
+# --color and --stall-after (GHR-27) are parsed here for both shapes.
+cmd_status() { # [--json] [--watch|-w] [--once] [--interval N] [--color WHEN] [--stall-after N]
   local watch=false json=false args=()
   while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    view_opt "$@"
+    if [ "$VIEW_SHIFT" -gt 0 ]; then shift "$VIEW_SHIFT"; continue; fi
     case "$1" in
       --watch|-w) watch=true; shift ;;
       --once)     watch=false; shift ;;
@@ -1311,7 +1441,7 @@ cmd_status() { # [--json] [--watch|-w] [--once] [--interval N]
     cmd_watch ${args[@]+"${args[@]}"}
   else
     [ "${#args[@]}" -eq 0 ] || die "unknown option: ${args[0]}"
-    if $json; then render_status_json; else render_status; fi
+    if $json; then render_status_json; else color_setup "$COLOR_MODE"; render_status; fi
   fi
 }
 
@@ -1333,10 +1463,12 @@ term_cursor() { # hide|show
 # (home + clear + frame), so the redraw is atomic and does not flicker.
 # --iterations N (test-only, undocumented) stops after N redraws so the sim
 # can run the loop with its no-op `pause`.
-cmd_watch() { # [--interval N] [--iterations N]
+cmd_watch() { # [--interval N] [--iterations N] [--color WHEN] [--stall-after N]
   local interval=2 iterations="" tick=0 out header
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    view_opt "$@"
+    if [ "$VIEW_SHIFT" -gt 0 ]; then shift "$VIEW_SHIFT"; continue; fi
     case "$1" in
       --interval)
         need_val "$@"
@@ -1351,6 +1483,7 @@ cmd_watch() { # [--interval N] [--iterations N]
   done
   stdout_is_tty || die "watch needs a terminal (stdout is not a tty); use 'runnerctl status'"
   require_runners
+  color_setup "$COLOR_MODE"
   JOURNAL_MEMO_DIR="$(mktemp -d)"
   # Ctrl-C exits 0 through the EXIT trap, which restores the cursor either way.
   trap 'term_cursor show; rm -rf "$JOURNAL_MEMO_DIR"' EXIT
@@ -1360,7 +1493,7 @@ cmd_watch() { # [--interval N] [--iterations N]
     # A fresh journal read every JOURNAL_CACHE_TTL ticks, starting with the first.
     [ $((tick % JOURNAL_CACHE_TTL)) -ne 0 ] || rm -f -- "$JOURNAL_MEMO_DIR"/*
     out="$(render_status)"
-    header="runnerctl watch — ${HOSTNAME:-$(uname -n)} — $(date +%H:%M:%S) — every ${interval}s (Ctrl-C to quit)"
+    header="$(paint "$C_BOLD" "runnerctl watch — ${HOSTNAME:-$(uname -n)} — $(date +%H:%M:%S) — every ${interval}s (Ctrl-C to quit)")"
     printf '\033[H\033[2J%s\n%s\n' "$header" "$out"
     pause "$interval"
     tick=$((tick + 1))
@@ -1398,22 +1531,24 @@ cmd_remove_limits() {
 
 # GHR-14: a yes/no for cron/uptime probes — nothing on the host can currently
 # notice "slot has been inactive/dead since Tuesday" without parsing `status`.
-# Reuses unit_props (GHR-4) and journal_restart_reason (GHR-8); does not touch
-# render_status, which a parallel PR is refactoring — this reads unit_props
-# itself instead of sharing its collector.
+# Reads the same collect_slot the table and --json read (GHR-16), so the
+# three surfaces cannot disagree on what a slot is doing (GHR-27).
 #
 # A problem is:
 #   - UnitFileState=enabled and not active/activating/reloading (a disabled,
 #     scaled-down slot is healthy on purpose — not a problem);
 #   - NRestarts >= --max-restarts (default 5), plus the journal's last-known
-#     reason when journal_restart_reason has one. NRestarts is systemd's count
+#     reason when journal_restart_reason has one, or the current invocation's
+#     own Result when that is not success. NRestarts is systemd's count
 #     since the unit's last manual start, not "in the last hour" — there is no
-#     cheap way to bucket it by wall-clock time, so that is what this reports.
+#     cheap way to bucket it by wall-clock time, so that is what this reports;
+#   - a job running for --stall-after seconds (default STALL_SEC) or more —
+#     needs the journal or a visible Runner.Worker, like the table's cell.
 # No problems: exit 0, "ok: N slot(s) healthy" (suppressed by --quiet). Any
 # problem: one line each on stdout (suppressed by --quiet; the exit code is
 # not), exit 1. No units at all: require_runners' existing die (not
 # suppressed by --quiet — only cmd_health's own output is).
-cmd_health() { # [--quiet] [--max-restarts N]
+cmd_health() { # [--quiet] [--max-restarts N] [--stall-after N]
   local quiet=false max_restarts=5
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
@@ -1424,36 +1559,36 @@ cmd_health() { # [--quiet] [--max-restarts N]
         need_val "$@"
         [[ "$2" =~ ^[0-9]+$ ]] || die "--max-restarts value '$2' is invalid — want an integer"
         max_restarts="$2"; shift 2 ;;
+      --stall-after)
+        need_val "$@"
+        set_stall_after "$2"; shift 2 ;;
       *) die "unknown option: $1" ;;
     esac
   done
   require_runners
-  local u short n=0 problems=()
+  local u short n=0 problems=() nrestarts reason line
   while read -r u; do
     [ -n "$u" ] || continue
+    collect_slot "$u" "$n"
     n=$((n + 1))
-    short="${u#actions.runner.}"; short="${short%.service}"
-    local -A P=()
-    local k v
-    while IFS='=' read -r k v; do
-      [ -n "$k" ] || continue
-      P[$k]="$v"
-    done < <(unit_props "$u")
-    local active="${P[ActiveState]:-}" sub="${P[SubState]:-}"
-    local enabled="${P[UnitFileState]:-}" nrestarts="${P[NRestarts]:-0}"
-    case "$active" in
+    short="${SLOT[name]}" nrestarts="${SLOT[restarts]:-0}"
+    case "${SLOT[active]}" in
       active | activating | reloading) ;;
       *)
-        if [ "$enabled" = enabled ]; then
-          problems+=("$short: enabled but $active/$sub since $(since_state "$active" "${P[ActiveEnterTimestampMonotonic]:-}" "${P[InactiveEnterTimestampMonotonic]:-}")")
+        if [ "${SLOT[enabled]}" = enabled ]; then
+          problems+=("$short: enabled but ${SLOT[active]}/${SLOT[sub]} since $(since_state "${SLOT[active]}" "${SLOT[active_enter]}" "${SLOT[inactive_enter]}")")
         fi
         ;;
     esac
     if [[ "$nrestarts" =~ ^[0-9]+$ ]] && [ "$nrestarts" -ge "$max_restarts" ]; then
-      local reason line="$short: $nrestarts restarts since last start"
-      reason="$(journal_restart_reason "$u")"
+      line="$short: $nrestarts restarts since last start"
+      reason="${SLOT[last_restart_reason]}"
+      [ -n "$reason" ] || [ "${SLOT[result]:-success}" = success ] || reason="${SLOT[result]}"
       [ -n "$reason" ] && line+=" ($reason)"
       problems+=("$line")
+    fi
+    if [ "${SLOT[job_stalled]}" = true ]; then
+      problems+=("$short: stalled — job ${SLOT[job_repo]:+${SLOT[job_repo]}:}${SLOT[job_name]:-?} running ${SLOT[job_runtime]}, longer than $(fmt_dur "$STALL_SEC") (--stall-after $STALL_SEC)")
     fi
   done < <(discover)
   if [ "${#problems[@]}" -eq 0 ]; then
@@ -1502,6 +1637,12 @@ cmd_config_example() {
 # --when-idle / drain: seconds between idle polls, and the default --timeout.
 #POLL_SEC="5"
 #WAIT_TIMEOUT="1800"
+
+# A job running this many seconds or more is STALLED in status/watch, a
+# problem for `health` and "stalled":true in `status --json`. Default 6 h —
+# GitHub's own default job timeout — so anything older has outlived what the
+# service allows. 0 turns the flag off; --stall-after N overrides per run.
+#STALL_SEC="21600"
 
 # A profile is a function that sets these variables. Defining profile_ci or
 # profile_deploy replaces the built-in of the same name.
