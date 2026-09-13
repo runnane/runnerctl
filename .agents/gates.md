@@ -182,11 +182,25 @@ is green (`release-please-config.json`, `.release-please-manifest.json`):
 
 Two things the automation cannot do for you:
 
-- With the default `GITHUB_TOKEN`, GitHub suppresses workflow runs on the PRs
-  it creates, so the release PR shows no checks and the bumped script is
-  gated only by the `push` run on `main` after the merge (where a red `gates`
-  also blocks the tag: `release` needs `gates`). A `RELEASE_PLEASE_TOKEN`
-  repository secret (PAT, contents + pull-requests write) lifts that.
+- The release PR is authored by `github-actions[bot]` (the action runs with
+  the default `GITHUB_TOKEN`; there is no `RELEASE_PLEASE_TOKEN` secret). Its
+  `pull_request` runs are **not** suppressed — every refresh of the release
+  branch creates one — but the repository's Actions approval policy decides
+  whether they run: under *Require approval for first-time contributors*
+  (`approval_policy: first_time_contributors`) GitHub treats the bot as a
+  first-time contributor on every PR, so each run sat `action_required`
+  behind a "1 workflow awaiting approval" banner (GHR-35, three runs in one
+  evening). The policy is now *first-time contributors who are new to
+  GitHub* (`first_time_contributors_new_to_github`, set 2026-09-13 with
+  `gh api -X PUT repos/runnane/runnerctl/actions/permissions/fork-pr-contributor-approval
+  -f approval_policy=first_time_contributors_new_to_github`), which still
+  gates brand-new accounts opening fork PRs and lets the bot's runs start;
+  read the current value with `gh api` on the same path. Whatever the
+  release PR's checks show, the bumped script is gated by the `push` run on
+  `main` after the merge, which needs no approval and where a red `gates`
+  blocks the tag (`release` needs `gates`). If a bot-authored PR still trips
+  the policy, a `RELEASE_PLEASE_TOKEN` repository secret (PAT, contents +
+  pull-requests write) makes the PR yours and its runs ordinary.
 - The repository setting *Settings → Actions → General → Workflow permissions
   → Allow GitHub Actions to create and approve pull requests* must be on, or
   the action fails with `GitHub Actions is not permitted to create or approve
