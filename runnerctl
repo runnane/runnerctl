@@ -41,6 +41,7 @@
 #   runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
 #                  [--since WHEN] [-g PATTERN]
 #   runnerctl remove-limits [<unit|slot-index|name> ...]
+#   runnerctl reap [--dry-run] [<unit|slot-index|name> ...]
 #   runnerctl health [--quiet] [--max-restarts N] [--stall-after N]
 #   runnerctl profiles
 #   runnerctl config-example
@@ -79,6 +80,14 @@
 # seconds, null where the table shows — — for monitoring and inventory
 # tooling; the keys are listed in the README. It is one-shot: poll it rather
 # than --watch it.
+# An idle slot whose cgroup still holds processes that are not the runner's
+# own — a dev server or watcher a finished job left behind — shows `+N
+# leaked` in WORKING-ON, `leaked_procs` in --json and a `health` problem;
+# they count against MemoryMax until the slot restarts. `reap [--dry-run]
+# [target ...]` kills exactly those (SIGTERM, REAP_GRACE_SEC, SIGKILL for
+# what is left) without touching the Listener; a busy slot is skipped, since
+# a running job's processes cannot be told from leaks. Needs to see the
+# cgroup: root or the runner user (GHR-29).
 # `health` is a yes/no for cron or an uptime monitor's push endpoint: exit 0
 # ("ok: N slot(s) healthy") when every enabled slot is running, no slot has
 # restarted --max-restarts times (default 5) or more and no job is STALLED,
@@ -127,6 +136,8 @@ WAIT_TIMEOUT="1800"
 # own default job timeout-minutes, so a job past it has outlived what the
 # service allows and the runner is wedged. 0 turns the flag off.
 STALL_SEC="21600"
+# `reap`: seconds between SIGTERM and SIGKILL for a leaked process (GHR-29).
+REAP_GRACE_SEC="5"
 
 # Profile-provided config (populated by load_profile; flags override).
 PROFILE=""
@@ -171,6 +182,7 @@ load_config() {
   [[ -n "$UNIT_GLOB" && "$UNIT_GLOB" != */* ]] || die "UNIT_GLOB '$UNIT_GLOB' set in $CONFIG_FILE is invalid — must be non-empty and contain no '/'"
   [[ "$DEFAULT_PROFILE" =~ ^[A-Za-z0-9_]+$ ]] || die "DEFAULT_PROFILE '$DEFAULT_PROFILE' set in $CONFIG_FILE is invalid — must match ^[A-Za-z0-9_]+\$"
   [[ "$STALL_SEC" =~ ^[0-9]+$ ]] || die "STALL_SEC '$STALL_SEC' set in $CONFIG_FILE is invalid — want a whole number of seconds (0 disables the stalled flag)"
+  [[ "$REAP_GRACE_SEC" =~ ^[0-9]+$ ]] || die "REAP_GRACE_SEC '$REAP_GRACE_SEC' set in $CONFIG_FILE is invalid — want a whole number of seconds"
 }
 
 # Built-in profiles. Site-specific values belong in the config file; these are
@@ -476,6 +488,40 @@ proc_job_env() { # CGROUP
   done <"/sys/fs/cgroup${1}/cgroup.procs"
 }
 
+# GHR-29: the processes in the cgroup that are not the runner's own — what a
+# finished job left behind (a dev server, a watcher, a node child that
+# ignored SIGTERM). Prints `pid<TAB>comm` per process; nothing when the
+# cgroup cannot be read. Only meaningful while the slot is idle: during a
+# job every step process is "not the runner's own" too, so job_facts asks
+# only then. The runner's own tree, as svc.sh installs it: runsvc.sh ->
+# node RunnerService.js -> Runner.Listener, which spawns Runner.Worker per
+# job and Runner.PluginHost for its own plugins. A config can extend the
+# pattern (RUNNER_OWN_PATTERN) for a runner image that wraps it differently.
+# Processes in a job's own docker containers live under the docker daemon,
+# not here — neither the cap nor this walk sees them.
+RUNNER_OWN_PATTERN='runsvc\.sh|RunnerService\.js|Runner\.(Listener|Worker|PluginHost)'
+proc_leaked() { # CGROUP
+  local pid cmd comm
+  cgroup_readable "$1" || return 0
+  while read -r pid; do
+    [ -r "/proc/$pid/cmdline" ] || continue
+    cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+    # An empty cmdline is a zombie or a kernel thread: nothing to kill.
+    [ -n "$cmd" ] || continue
+    [[ "$cmd" =~ $RUNNER_OWN_PATTERN ]] && continue
+    comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo '?')"
+    printf '%s\t%s\n' "$pid" "$comm"
+  done <"/sys/fs/cgroup${1}/cgroup.procs"
+}
+
+# Is PID still around (and not a zombie)? Behind a function so a test
+# config can answer for `reap`'s survivors.
+pid_alive() { # PID
+  local s
+  s="$(awk '/^State:/{print $2}' "/proc/$1/status" 2>/dev/null)" || return 1
+  [ -n "$s" ] && [ "$s" != Z ]
+}
+
 # Epoch seconds; a config can shadow it to pin the journal-derived runtime.
 now_epoch() { date +%s; }
 
@@ -529,7 +575,27 @@ now_epoch() { date +%s; }
 #               for idle-fresh) and the completed count (0 for idle-fresh)
 #   JOB_ACCESS  ok | no-journal | no-access — what could be read: `no-journal`
 #               is the /proc-only picture, `no-access` neither source
+#   JOB_LEAKED / JOB_LEAKED_PIDS / JOB_LEAKED_COMMS
+#               while idle with a readable cgroup: how many processes a
+#               finished job left in it, their pids (space-separated) and
+#               their comms (comma-separated); JOB_LEAKED empty when the
+#               slot is busy or the cgroup cannot be read (GHR-29)
 JOB_STATE="" JOB_NAME="" JOB_REPO="" JOB_SINCE="" JOB_RUNTIME="" JOB_STALLED="" JOB_IDLE_SINCE="" JOB_DONE="" JOB_ACCESS=""
+JOB_LEAKED="" JOB_LEAKED_PIDS="" JOB_LEAKED_COMMS=""
+# The JOB_LEAKED_* facts from one proc_leaked walk of CGROUP, per the
+# contract above. Only called on an idle slot.
+job_leak_check() { # CGROUP
+  local line pid comm
+  JOB_LEAKED="" JOB_LEAKED_PIDS="" JOB_LEAKED_COMMS=""
+  cgroup_readable "$1" || return 0
+  JOB_LEAKED=0
+  while IFS=$'\t' read -r pid comm; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    JOB_LEAKED=$((JOB_LEAKED + 1))
+    JOB_LEAKED_PIDS+="${JOB_LEAKED_PIDS:+ }$pid"
+    JOB_LEAKED_COMMS+="${JOB_LEAKED_COMMS:+, }${comm:-?}"
+  done < <(proc_leaked "$1")
+}
 # JOB_STALLED from the running job's age (seconds), per the contract above.
 job_stall_check() { # AGE-SECONDS
   JOB_STALLED=""
@@ -539,6 +605,7 @@ job_stall_check() { # AGE-SECONDS
 job_facts() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
   local u="$1" cg="$2" lines rj ii ts env worker age=""
   JOB_STATE=none JOB_NAME="" JOB_REPO="" JOB_SINCE="" JOB_RUNTIME="" JOB_STALLED="" JOB_IDLE_SINCE="" JOB_DONE="" JOB_ACCESS=ok
+  JOB_LEAKED="" JOB_LEAKED_PIDS="" JOB_LEAKED_COMMS=""
   [ -n "$cg" ] || return 0
   if lines="$(journal_job_lines_cached "$u" "${3:-}")"; then
     rj="$(journal_running_job "$lines")"
@@ -552,6 +619,7 @@ job_facts() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
         JOB_STATE="idle-fresh" JOB_DONE=0
         JOB_IDLE_SINCE="$(age_to_epoch "$(state_age active "${4:-}" "")")"
       fi
+      job_leak_check "$cg"
       return 0
     fi
     JOB_STATE=running
@@ -587,6 +655,7 @@ job_facts() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
     JOB_STATE=starting
   else
     JOB_STATE="idle-unknown"
+    job_leak_check "$cg"
   fi
 }
 
@@ -596,13 +665,20 @@ job_cell() {
     none)         echo "—" ;;
     running)      printf '%s%s%s%s\n' "${JOB_REPO:+$JOB_REPO:}" "${JOB_NAME:-?}" "${JOB_RUNTIME:+ ($JOB_RUNTIME)}" \
                     "$([ "$JOB_STALLED" != true ] || echo " STALLED")" ;;
-    idle)         printf 'idle %s (%s job%s)\n' "$(fmt_dur "$([ -z "$JOB_IDLE_SINCE" ] || echo $(( $(now_epoch) - JOB_IDLE_SINCE )))")" \
-                    "$JOB_DONE" "$([ "$JOB_DONE" -eq 1 ] || echo s)" ;;
-    idle-fresh)   echo "idle $(fmt_dur "$([ -z "$JOB_IDLE_SINCE" ] || echo $(( $(now_epoch) - JOB_IDLE_SINCE )))") (no jobs yet)" ;;
+    idle)         printf 'idle %s (%s job%s)%s\n' "$(fmt_dur "$([ -z "$JOB_IDLE_SINCE" ] || echo $(( $(now_epoch) - JOB_IDLE_SINCE )))")" \
+                    "$JOB_DONE" "$([ "$JOB_DONE" -eq 1 ] || echo s)" "$(leaked_suffix)" ;;
+    idle-fresh)   echo "idle $(fmt_dur "$([ -z "$JOB_IDLE_SINCE" ] || echo $(( $(now_epoch) - JOB_IDLE_SINCE )))") (no jobs yet)$(leaked_suffix)" ;;
     starting)     echo "(starting)" ;;
-    idle-unknown) echo "idle ?" ;;
+    idle-unknown) echo "idle ?$(leaked_suffix)" ;;
     no-access)    echo "(no access)" ;;
   esac
+}
+
+# ` +N leaked` for an idle cell when a finished job left processes behind
+# (GHR-29); nothing when there are none or it cannot be known.
+leaked_suffix() {
+  [[ "$JOB_LEAKED" =~ ^[0-9]+$ ]] && [ "$JOB_LEAKED" -gt 0 ] || return 0
+  echo " +$JOB_LEAKED leaked"
 }
 
 # Facts and cell in one call, for a caller that only wants the text.
@@ -1024,10 +1100,10 @@ status_used_color() { # CURRENT HIGH
   [[ "${1:-}" =~ ^[0-9]+$ && "${2:-}" =~ ^[0-9]+$ ]] && [ "$2" -gt 0 ] || return 0
   if [ "$1" -ge "$2" ]; then echo "$C_RED"; elif [ $(( $1 * 10 )) -ge $(( $2 * 9 )) ]; then echo "$C_YELLOW"; fi
 }
-status_job_color() { # JOB-STATE JOB-STALLED
+status_job_color() { # JOB-STATE JOB-STALLED [LEAKED]
   case "$1" in
     running)              if [ "${2:-}" = true ]; then echo "$C_BOLD$C_RED"; else echo "$C_GREEN"; fi ;;
-    none|idle|idle-fresh) echo "$C_DIM" ;;
+    none|idle|idle-fresh) if [[ "${3:-}" =~ ^[0-9]+$ ]] && [ "${3:-0}" -gt 0 ]; then echo "$C_YELLOW"; else echo "$C_DIM"; fi ;;
     *)                    echo "$C_YELLOW" ;;
   esac
 }
@@ -1056,6 +1132,8 @@ status_job_color() { # JOB-STATE JOB-STALLED
 #                              when NRestarts > 0 and Result is success (the
 #                              ACTIVE cell's condition), empty otherwise
 #   job_*                      the JOB_* facts of job_facts, same names
+#                              (job_leaked / job_leaked_pids / job_leaked_comms
+#                              included, GHR-29)
 declare -A SLOT=()
 collect_slot() { # UNIT IDX
   local u="$1" k v n
@@ -1093,6 +1171,7 @@ collect_slot() { # UNIT IDX
   SLOT[job_state]="$JOB_STATE" SLOT[job_name]="$JOB_NAME" SLOT[job_repo]="$JOB_REPO"
   SLOT[job_since]="$JOB_SINCE" SLOT[job_runtime]="$JOB_RUNTIME" SLOT[job_stalled]="$JOB_STALLED"
   SLOT[job_idle_since]="$JOB_IDLE_SINCE" SLOT[job_done]="$JOB_DONE" SLOT[job_access]="$JOB_ACCESS"
+  SLOT[job_leaked]="$JOB_LEAKED" SLOT[job_leaked_pids]="$JOB_LEAKED_PIDS" SLOT[job_leaked_comms]="$JOB_LEAKED_COMMS"
 }
 
 # The status table itself, printed once to stdout. `status` calls it once;
@@ -1102,7 +1181,7 @@ render_status() {
   echo "Host: $(nproc) cores, $(free -h | awk '/^Mem:/{print $2" RAM, "$7" available"}')"
   echo
   paint "$C_BOLD" "$(status_row IDX RUNNER PROFILE ACTIVE SINCE ENABLED MAX HIGH USED RESTART ENVFILE WORKING-ON)"
-  local i=0 u no_access=false stalled=false
+  local i=0 u no_access=false stalled=false leaked=false
   while read -r u; do
     [ -n "$u" ] || continue
     collect_slot "$u" "$i"
@@ -1110,6 +1189,7 @@ render_status() {
     # not for how long, which is the same missing journal access.
     case "${SLOT[job_state]}" in no-access|idle-unknown) no_access=true ;; esac
     [ "${SLOT[job_stalled]}" != true ] || stalled=true
+    { [[ "${SLOT[job_leaked]}" =~ ^[0-9]+$ ]] && [ "${SLOT[job_leaked]}" -gt 0 ]; } && leaked=true
     status_row "$i" "${SLOT[name]}" \
       "$(if [ -n "${SLOT[profile]}" ]; then echo "${SLOT[profile]}"; else paint "$C_DIM" "—"; fi)" \
       "$(paint "$(status_active_color "${SLOT[active]}" "${SLOT[restarts]:-0}" "${SLOT[result]:-success}")" \
@@ -1120,7 +1200,7 @@ render_status() {
       "$(paint "$(status_used_color "${SLOT[memory_current]}" "${SLOT[memory_high]}")" \
                "$(status_used_cell "${SLOT[memory_current]}" "${SLOT[memory_peak]}")")" \
       "${SLOT[restart]}" "${SLOT[env_file]:-—}" \
-      "$(paint "$(status_job_color "${SLOT[job_state]}" "${SLOT[job_stalled]}")" "$(job_cell)")"
+      "$(paint "$(status_job_color "${SLOT[job_state]}" "${SLOT[job_stalled]}" "${SLOT[job_leaked]}")" "$(job_cell)")"
     i=$((i+1))
   done < <(discover)
   # Once under the table, not per row, so the rows stay parseable.
@@ -1129,6 +1209,9 @@ render_status() {
   fi
   if $stalled; then
     paint "$C_RED" "note: STALLED = a job running longer than $(fmt_dur "$STALL_SEC") (STALL_SEC=$STALL_SEC); 'runnerctl logs <IDX>' shows what it is doing"
+  fi
+  if $leaked; then
+    paint "$C_YELLOW" "note: +N leaked = processes a finished job left in the slot's cgroup, counting against MemoryMax; 'runnerctl reap <IDX>' kills them"
   fi
 }
 
@@ -1204,7 +1287,9 @@ host_facts() {
 # `jobs_completed` are set while the slot is idle with a readable journal
 # (`jobs_completed` 0 when nothing has finished since the unit started);
 # `working_on_access` is "ok", "no-journal" (only /proc could be read) or
-# "no-access" — the note under the table, per slot.
+# "no-access" — the note under the table, per slot; `leaked_procs` is the
+# count of processes a finished job left in an idle slot's cgroup, null
+# while busy or when the cgroup cannot be read (GHR-29).
 render_status_json() {
   require_runners
   local cores mem_total mem_avail i=0 u sep="" job idle_since completed
@@ -1233,8 +1318,8 @@ render_status_json() {
       "$(json_strn "${SLOT[restart]}")" "$(json_strn "${SLOT[env_file]}")" \
       "$(json_num "$(age_to_epoch "${SLOT[since_age]}")")" "$(json_num "${SLOT[restarts]}")" \
       "$(json_strn "${SLOT[result]}")" "$(json_strn "${SLOT[last_restart_reason]}")" "$(json_strn "${SLOT[profile]}")"
-    printf ',"job":%s,"idle_since":%s,"jobs_completed":%s,"working_on_access":%s}' \
-      "$job" "$idle_since" "$completed" "$(json_str "${SLOT[job_access]}")"
+    printf ',"job":%s,"idle_since":%s,"jobs_completed":%s,"working_on_access":%s,"leaked_procs":%s}' \
+      "$job" "$idle_since" "$completed" "$(json_str "${SLOT[job_access]}")" "$(json_num "${SLOT[job_leaked]}")"
     sep=","
     i=$((i+1))
   done < <(discover)
@@ -1544,6 +1629,72 @@ cmd_remove_limits() {
   fi
 }
 
+# GHR-29: kill what a finished job left in an idle slot's cgroup, and only
+# that — the Listener keeps running, no restart, no re-registration blip.
+# Reads the same job_facts the table reads, so a slot the table shows busy
+# is skipped here: a running job's processes are not leaks. SIGTERM first,
+# REAP_GRACE_SEC later SIGKILL for whatever pid_alive still sees. The walk
+# is a plain read (root or the runner user can do it); only the kills go
+# through run_priv. Exit 1 only for a refusal (unreadable cgroup, no
+# journal); a busy or clean slot is a line, not a failure.
+cmd_reap() { # [--dry-run] [target ...] (default: all)
+  local dry_run=false targets=() units=() u t short cg inv ae k v pid survivors
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry_run=true; shift ;;
+      -*)        die "unknown option: $1" ;;
+      *)         targets+=("$1"); shift ;;
+    esac
+  done
+  require_runners
+  if [ "${#targets[@]}" -gt 0 ]; then
+    for t in "${targets[@]}"; do
+      u="$(resolve "$t")"
+      units+=("$u")
+    done
+  else
+    mapfile -t units < <(discover)
+  fi
+  for u in "${units[@]}"; do
+    short="$(short_name "$u")" cg="" inv="" ae=""
+    while IFS='=' read -r k v; do
+      case "$k" in ControlGroup) cg="$v" ;; InvocationID) inv="$v" ;; ActiveEnterTimestampMonotonic) ae="$v" ;; esac
+    done < <(unit_props "$u")
+    job_facts "$u" "$cg" "$inv" "$ae"
+    case "$JOB_STATE" in
+      none) echo "$short: not running — nothing to reap"; continue ;;
+      no-access) die "$short: cannot tell whether the slot is idle — reap needs journal read access (systemd-journal group) or root" ;;
+      idle|idle-fresh|idle-unknown) ;;
+      *) echo "$short: busy ($(job_desc "$(job_cell)")) — skipped, a running job's processes are not leaks"; continue ;;
+    esac
+    [ -n "$JOB_LEAKED" ] || die "$short: cannot read the slot's processes — run reap as root or the runner user"
+    if [ "$JOB_LEAKED" -eq 0 ]; then echo "$short: nothing to reap"; continue; fi
+    if $dry_run; then
+      echo "$short: would kill $JOB_LEAKED leaked process(es): $(reap_list)"
+      continue
+    fi
+    # shellcheck disable=SC2086  # the pids are one argument each on purpose
+    run_priv kill -TERM $JOB_LEAKED_PIDS
+    pause "$REAP_GRACE_SEC"
+    survivors=""
+    for pid in $JOB_LEAKED_PIDS; do
+      ! pid_alive "$pid" || survivors+="${survivors:+ }$pid"
+    done
+    # shellcheck disable=SC2086
+    [ -z "$survivors" ] || run_priv kill -KILL $survivors
+    echo "$short: reaped $JOB_LEAKED leaked process(es): $(reap_list)${survivors:+ — SIGKILL needed for pid ${survivors// /, }}"
+  done
+}
+
+# `pid/comm, pid/comm` from the JOB_LEAKED_* facts, for reap's lines.
+reap_list() {
+  local out="" pids comms i
+  read -ra pids <<<"$JOB_LEAKED_PIDS"
+  IFS=',' read -ra comms <<<"${JOB_LEAKED_COMMS// /}"
+  for i in "${!pids[@]}"; do out+="${out:+, }${pids[$i]}/${comms[$i]:-?}"; done
+  echo "$out"
+}
+
 # GHR-14: a yes/no for cron/uptime probes — nothing on the host can currently
 # notice "slot has been inactive/dead since Tuesday" without parsing `status`.
 # Reads the same collect_slot the table and --json read (GHR-16), so the
@@ -1558,7 +1709,9 @@ cmd_remove_limits() {
 #     since the unit's last manual start, not "in the last hour" — there is no
 #     cheap way to bucket it by wall-clock time, so that is what this reports;
 #   - a job running for --stall-after seconds (default STALL_SEC) or more —
-#     needs the journal or a visible Runner.Worker, like the table's cell.
+#     needs the journal or a visible Runner.Worker, like the table's cell;
+#   - an idle slot with leaked processes (GHR-29) — needs a readable cgroup,
+#     like the table's `+N leaked`.
 # No problems: exit 0, "ok: N slot(s) healthy" (suppressed by --quiet). Any
 # problem: one line each on stdout (suppressed by --quiet; the exit code is
 # not), exit 1. No units at all: require_runners' existing die (not
@@ -1604,6 +1757,9 @@ cmd_health() { # [--quiet] [--max-restarts N] [--stall-after N]
     fi
     if [ "${SLOT[job_stalled]}" = true ]; then
       problems+=("$short: stalled — job ${SLOT[job_repo]:+${SLOT[job_repo]}:}${SLOT[job_name]:-?} running ${SLOT[job_runtime]}, longer than $(fmt_dur "$STALL_SEC") (--stall-after $STALL_SEC)")
+    fi
+    if [[ "${SLOT[job_leaked]}" =~ ^[0-9]+$ ]] && [ "${SLOT[job_leaked]}" -gt 0 ]; then
+      problems+=("$short: ${SLOT[job_leaked]} leaked process(es) left by finished jobs (${SLOT[job_leaked_comms]}) — runnerctl reap ${SLOT[idx]}")
     fi
   done < <(discover)
   if [ "${#problems[@]}" -eq 0 ]; then
@@ -1658,6 +1814,13 @@ cmd_config_example() {
 # GitHub's own default job timeout — so anything older has outlived what the
 # service allows. 0 turns the flag off; --stall-after N overrides per run.
 #STALL_SEC="21600"
+
+# `reap`: seconds a leaked process gets after SIGTERM before SIGKILL.
+#REAP_GRACE_SEC="5"
+
+# Processes matching this ERE are the runner's own and never counted as
+# leaked or reaped. Extend it for an image that wraps the runner differently.
+#RUNNER_OWN_PATTERN='runsvc\.sh|RunnerService\.js|Runner\.(Listener|Worker|PluginHost)'
 
 # A profile is a function that sets these variables. Defining profile_ci or
 # profile_deploy replaces the built-in of the same name.
@@ -2232,6 +2395,7 @@ main() {
     enable|disable)     cmd_toggle "$cmd" "$@" ;;
     logs)               cmd_logs "$@" ;;
     remove-limits)      cmd_remove_limits "$@" ;;
+    reap)               cmd_reap "$@" ;;
     health)             cmd_health "$@" ;;
     profiles)           cmd_profiles "$@" ;;
     config-example)     cmd_config_example ;;
@@ -2239,7 +2403,7 @@ main() {
     upgrade)            cmd_upgrade "$@" ;;
     version|--version)  echo "runnerctl $RUNNERCTL_VERSION" ;;
     -h|--help|help)     usage ;;
-    *) die "unknown command '$cmd' (status watch health apply scale env-init start stop restart drain enable disable logs remove-limits profiles config-example migrate install upgrade version)" ;;
+    *) die "unknown command '$cmd' (status watch health apply scale env-init start stop restart drain enable disable logs remove-limits reap profiles config-example migrate install upgrade version)" ;;
   esac
 }
 

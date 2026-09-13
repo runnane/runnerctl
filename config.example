@@ -24,6 +24,13 @@
 # service allows. 0 turns the flag off; --stall-after N overrides per run.
 #STALL_SEC="21600"
 
+# `reap`: seconds a leaked process gets after SIGTERM before SIGKILL.
+#REAP_GRACE_SEC="5"
+
+# Processes matching this ERE are the runner's own and never counted as
+# leaked or reaped. Extend it for an image that wraps the runner differently.
+#RUNNER_OWN_PATTERN='runsvc\.sh|RunnerService\.js|Runner\.(Listener|Worker|PluginHost)'
+
 # A profile is a function that sets these variables. Defining profile_ci or
 # profile_deploy replaces the built-in of the same name.
 profile_ci() {
