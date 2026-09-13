@@ -308,6 +308,9 @@ case_status_table() {
   expect_rc 0
   # GHR-32: the header leads with the version this script carries
   expect_out_count '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: [0-9]+ cores, ' 1
+  # GHR-34: host_line() is stubbed, so the fragment after "Host: " is exact,
+  # not just shaped — this is what made the --color always diff case flake.
+  expect_out '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: 16 cores, 64Gi RAM, 48Gi available$'
   expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$'
   # slot-1 also carries MemoryPeak (GHR-8), so USED is current/peak; PRESS
   # is — until the stub answers cgroup_memory_facts (GHR-31).
@@ -1216,8 +1219,10 @@ case_watch_three_iterations_redraw_frames() {
   expect_out_count "$FRAME_PREFIX" 3
   expect_out_count '^runnerctl watch —' 0
   expect_out_count '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$' 3
-  # every frame carries the version header too (GHR-32)
+  # every frame carries the version header too (GHR-32), with the same
+  # pinned host_line() fragment as `status` on every redraw (GHR-34)
   expect_out_count '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: ' 3
+  expect_out_count '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: 16 cores, 64Gi RAM, 48Gi available$' 3
   expect_out_count '^0 +example\.slot-1 .* my-app:test \(12m\)$' 3
   expect_log_count '^probe:pause 1$' 3
   expect_log_count '^probe:unit_props ' 9

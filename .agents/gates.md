@@ -108,8 +108,10 @@ Traps:
   the stub's `RUNNERCTL_STUB_TTY=1` would otherwise make `--color auto`
   paint the `watch` frames. A case wanting colour passes `--color always`,
   or `NO_COLOR=''` (empty = unset) to exercise the auto decision.
-- `status` calls `nproc` and `free` for real; only the runner rows are asserted.
-  `status --json`'s `host` object comes from `host_facts`, which the stub pins.
+- `status`'s header fragment after "Host: " comes from `host_line`, which the
+  stub pins (GHR-34: `free -h`'s real rounding differed between the two runs
+  the `--color always` case diffs, and flaked it). `status --json`'s `host`
+  object comes from the separate `host_facts`, pinned the same way.
 - The `status --json` case (GHR-16) asserts the parsed JSON through
   `python3` (`expect_json`): where python3 is absent the case keeps its
   exit-code, shape and read-only assertions, prints a `skip` notice for the
