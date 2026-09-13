@@ -260,8 +260,12 @@ case_status_table() {
   run status
   expect_rc 0
   expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +RESTART +ENVFILE +WORKING-ON$'
-  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G +always +— +my-app:test \(12m\)$'
-  expect_out '^1 +example\.slot-2 +— +active/running +41m +enabled '
+  # slot-1 also carries MemoryPeak (GHR-8), so USED is current/peak.
+  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +always +— +my-app:test \(12m\)$'
+  # slot-2 has restarted (GHR-8): the ACTIVE cell carries ↻3 and the
+  # journal-derived reason, so the plain "active/running" is followed by
+  # that annotation before SINCE, not by spaces straight to 41m.
+  expect_out '^1 +example\.slot-2 +— +active/running .* +41m +enabled '
   expect_out '^2 +example\.slot-3 +— +inactive/dead +6d +disabled +— +— +— +always +— +—$'
   expect_no_out '^3 '
   # status is read-only: no privileged call at all (the `probe:` lines below
@@ -595,7 +599,8 @@ case_status_since_active_slots() {
   expect_rc 0
   # active slots: SINCE is measured from ActiveEnterTimestampMonotonic
   expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled '
-  expect_out '^1 +example\.slot-2 +— +active/running +41m +enabled '
+  # slot-2 restarted (GHR-8): ACTIVE carries ↻3 (last: ...) before SINCE.
+  expect_out '^1 +example\.slot-2 +— +active/running .* +41m +enabled '
 }
 
 case_status_since_inactive_slot_uses_inactive_enter() {
@@ -1087,6 +1092,83 @@ case_journal_idle_info_single_job_is_singular() {
   expect_out '^idle 5m \(1 job\)$'
 }
 
+# --- GHR-8: status shows restart count, last exit reason and peak memory ----
+# The stub's slot-2 has NRestarts=3 with Result=success (unit_props) and
+# journal_restart_reason stubbed to answer "oom-kill" for it only; slot-1 has
+# NRestarts=0 but carries MemoryPeak (25.0G); slot-3 has neither. See
+# tests/stub.config.
+
+case_status_active_cell_shows_restart_count_and_reason() {
+  run status
+  expect_rc 0
+  # exact ACTIVE cell: ActiveState/SubState, ↻N, and the journal's reason —
+  # only reached because Result is success (nothing else says why already).
+  expect_out '^1 +example\.slot-2 +— +active/running ↻3 \(last: oom-kill\) +41m '
+}
+
+case_status_no_restarts_keeps_active_cell_plain() {
+  run status
+  expect_rc 0
+  # slot-1 has NRestarts=0: no ↻, no journal consulted, no annotation at all.
+  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h '
+  expect_no_out '^0 +example\.slot-1 .*↻'
+}
+
+case_status_used_shows_current_over_peak_when_present() {
+  run status
+  expect_rc 0
+  # slot-1 carries MemoryPeak: USED is current/peak, both `hbytes`-formatted.
+  expect_out '^0 +example\.slot-1 .* +1\.0G/25\.0G +always '
+}
+
+case_status_used_stays_current_only_without_peak() {
+  run status
+  expect_rc 0
+  # slot-2 has no MemoryPeak: USED is unchanged, current only, no slash.
+  expect_out '^1 +example\.slot-2 .* +1\.0G +always '
+  expect_no_out '^1 +example\.slot-2 .* +1\.0G/'
+}
+
+case_status_journal_restart_reason_consulted_once_and_only_for_restarted_slot() {
+  run status
+  expect_rc 0
+  # one extra journalctl fork per slot, only when NRestarts > 0: slot-2 alone.
+  expect_log_count '^probe:journal_restart_reason ' 1
+  expect_log '^probe:journal_restart_reason actions\.runner\.example\.slot-2\.service$'
+  expect_no_log '^probe:journal_restart_reason actions\.runner\.example\.slot-1'
+  expect_no_log '^probe:journal_restart_reason actions\.runner\.example\.slot-3'
+}
+
+# The normaliser alone, over fixed journal lines (systemd's own strings, not
+# yet verified against a host's journal — see journal_restart_reason).
+case_journal_restart_reason_line_oom_kill() {
+  run_fn journal_restart_reason_line \
+    'Sep 12 10:00:00 host systemd[1]: actions.runner.example.slot-2.service: A process of this unit has been killed by the OOM killer.'
+  expect_rc 0
+  expect_out '^oom-kill$'
+}
+
+case_journal_restart_reason_line_exit_code() {
+  run_fn journal_restart_reason_line \
+    'Sep 12 10:00:00 host systemd[1]: actions.runner.example.slot-2.service: Main process exited, code=exited, status=137/n/a'
+  expect_rc 0
+  expect_out '^exit-code 137$'
+}
+
+case_journal_restart_reason_line_signal() {
+  run_fn journal_restart_reason_line \
+    'Sep 12 10:00:00 host systemd[1]: actions.runner.example.slot-2.service: Main process exited, code=killed, status=9/KILL'
+  expect_rc 0
+  expect_out '^signal KILL$'
+}
+
+case_journal_restart_reason_line_no_match() {
+  run_fn journal_restart_reason_line \
+    'Sep 12 10:00:00 host systemd[1]: actions.runner.example.slot-2.service: Started.'
+  expect_rc 0
+  expect_no_out '.'
+}
+
 # --- Registry -----------------------------------------------------------------
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
@@ -1173,6 +1255,17 @@ t "scale 2 --when-idle --restart: restarts wait too"                 case_scale_
 t "restart --timeout abc: not an integer"                            case_restart_timeout_not_integer
 t "restart 0 --timeout: missing value"                               case_restart_timeout_missing_value
 t "start --when-idle: flag ignored, no probes"                       case_start_ignores_when_idle
+
+# --- GHR-8: restart count, last exit reason and peak memory in status -------
+t "status: ACTIVE cell shows ↻N and the journal's last-restart reason" case_status_active_cell_shows_restart_count_and_reason
+t "status: no restarts leaves ACTIVE plain, no ↻, no journal call"    case_status_no_restarts_keeps_active_cell_plain
+t "status: USED is current/peak when MemoryPeak is present"           case_status_used_shows_current_over_peak_when_present
+t "status: USED stays current-only without MemoryPeak"                case_status_used_stays_current_only_without_peak
+t "status: journal_restart_reason asked once, only for the restarted slot" case_status_journal_restart_reason_consulted_once_and_only_for_restarted_slot
+t "journal_restart_reason_line: OOM killer sentence -> oom-kill"      case_journal_restart_reason_line_oom_kill
+t "journal_restart_reason_line: code=exited,status=137 -> exit-code 137" case_journal_restart_reason_line_exit_code
+t "journal_restart_reason_line: code=killed,status=9/KILL -> signal KILL" case_journal_restart_reason_line_signal
+t "journal_restart_reason_line: unrelated line -> nothing"            case_journal_restart_reason_line_no_match
 
 # --- Summary ------------------------------------------------------------------
 echo
