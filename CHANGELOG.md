@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.7.0](https://github.com/runnane/runnerctl/compare/v0.6.0...v0.7.0) (2026-09-13)
+
+
+### Features
+
+* count leaked processes on an idle slot, and `reap` to kill them (GHR-29) ([8d6dad0](https://github.com/runnane/runnerctl/commit/8d6dad036de1df5b7ed6e5b94d25f4ef01b8c599))
+* count leaked processes on an idle slot, and reap to kill them (GHR-29) ([b387118](https://github.com/runnane/runnerctl/commit/b387118e630f091993c6ad79c281f98d01316a92))
+* OOMPolicy=continue and MemorySwapMax=0 in every drop-in, ci MemoryHigh 25G (GHR-28) ([783737c](https://github.com/runnane/runnerctl/commit/783737c8c054aae621e38a450d3ff11bb8eb6a49))
+* OOMPolicy=continue and MemorySwapMax=0 in every drop-in, ci MemoryHigh 25G (GHR-28) ([530432a](https://github.com/runnane/runnerctl/commit/530432ae73743c0087c5059003e9490b6fb53b60))
+* PRESS column and memory.events per slot, in --json and health (GHR-31) ([5a57b48](https://github.com/runnane/runnerctl/commit/5a57b48b63e5ce98eec19749c597b65eb283d903))
+* PRESS column and memory.events per slot, in --json and health (GHR-31) ([a656c87](https://github.com/runnane/runnerctl/commit/a656c87492b5edd1a733119d3cb1f54c96cdebeb))
+* STALLED after 1 h, restart/stop --if-stalled, health --restart-stalled (GHR-30) ([f7c5417](https://github.com/runnane/runnerctl/commit/f7c5417163ae0a43dd3be3c97b38349e236ee9fb))
+* STALLED after 1 h, restart/stop --if-stalled, health --restart-stalled (GHR-30) ([1543a0a](https://github.com/runnane/runnerctl/commit/1543a0a06fc39fbf7baabafccb681ffc3ad8d762))
+* status header and --json carry the runnerctl version (GHR-32) ([a13b316](https://github.com/runnane/runnerctl/commit/a13b3163692efe8373a78222ca9831642a23d4b9))
+* status header and --json carry the runnerctl version (GHR-32) ([487663f](https://github.com/runnane/runnerctl/commit/487663fc4cd55f0e926fc1d5eae66ccf8dcccc3c))
+
 ## [0.6.0](https://github.com/runnane/runnerctl/compare/v0.5.0...v0.6.0) (2026-09-13)
 
 
