@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.0](https://github.com/runnane/runnerctl/compare/v0.5.0...v0.6.0) (2026-09-13)
+
+
+### Features
+
+* colour status/watch by meaning and flag stalled jobs (GHR-27) ([aeebbda](https://github.com/runnane/runnerctl/commit/aeebbda3bbb9025a3447aedd4c5981e22566657a))
+* colour status/watch by meaning and flag stalled jobs (GHR-27) ([a6b540c](https://github.com/runnane/runnerctl/commit/a6b540cbe0749cd476e25eb4b46b55a43084f4a0))
+
 ## [0.5.0](https://github.com/runnane/runnerctl/compare/v0.4.4...v0.5.0) (2026-09-13)
 
 
