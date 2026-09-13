@@ -64,9 +64,18 @@
 # guaranteed drain, change the runner's labels or disable it in GitHub first.
 #
 # `watch` (= `status --watch`) redraws the status table in place every N
-# seconds (default 2) until Ctrl-C, for keeping an eye on a drain, a profile
-# roll or a slot approaching its memory cap; it needs a terminal, and the
-# journal-derived WORKING-ON cells refresh every 10th redraw.
+# seconds (default 2) until q or Ctrl-C, for keeping an eye on a drain, a
+# profile roll or a slot approaching its memory cap; it needs a terminal, and
+# the journal-derived WORKING-ON cells refresh every 10th redraw. It is
+# interactive (GHR-33): ↑/↓ (or j/k) move the cursor over the slot rows and
+# a key acts on the selected slot, each after a y/n confirm line that names
+# the exact command — K kills the running job (systemctl restart; the
+# cgroup goes, Restart=always brings the runner back, GitHub marks the job
+# failed — for a STALLED row), R restarts the service (warned when a job is
+# in flight), S/T stop/start it, P reaps its `+N leaked` processes, L opens
+# `logs <slot> -n 50` in $PAGER. Privileged keys go through sudo like the
+# commands do. Too narrow a terminal drops MAX, HIGH and ENVFILE from the
+# table, never WORKING-ON.
 #
 # The table is coloured by meaning when stdout is a terminal (--color auto;
 # NO_COLOR in the environment turns it off, --color always/never override):
@@ -1143,10 +1152,17 @@ STATUS_WIDTHS=(3 40 8 19 8 9 6 6 12 6 8 7)
 # characters under a UTF-8 locale, which is the only kind where `—` renders.
 # A painted cell is measured without its SGR sequences (GHR-27), so colour
 # never shifts a column either.
+# STATUS_DROP (GHR-33): space-separated 0-based column indices to leave out
+# of every row — `watch` drops MAX, HIGH and ENVFILE (6 7 11) when the table
+# is wider than the terminal, so WORKING-ON never has to go. Empty for
+# `status`, which is what keeps its rows byte-identical.
+STATUS_DROP=""
 status_row() {
-  local w v n out=""
+  local w v n c=0 out=""
   for w in "${STATUS_WIDTHS[@]}"; do
     v="$1"; shift
+    if [[ " $STATUS_DROP " == *" $c "* ]]; then c=$((c + 1)); continue; fi
+    c=$((c + 1))
     out+="$v"
     n="${v//$'\e['*([0-9;])m/}"
     if [ "${#n}" -lt "$w" ]; then printf -v v '%*s' $((w - ${#n})) ''; out+="$v"; fi
@@ -1713,15 +1729,237 @@ term_cursor() { # hide|show
   case "$1" in hide) tput civis ;; show) tput cnorm ;; esac 2>/dev/null || true
 }
 
+# The terminal's width in columns, 0 when unknown (no tput, no TERM). Behind
+# a function so a test config can pin it.
+term_cols() {
+  local c=""
+  if command -v tput >/dev/null 2>&1; then c="$(tput cols 2>/dev/null || true)"; fi
+  if [[ "$c" =~ ^[0-9]+$ ]]; then echo "$c"; else echo 0; fi
+}
+
+# --- Interactive watch (GHR-33) -----------------------------------------------
+# One keystroke from the terminal into KEY_CHAR (empty for Enter): 0 with a
+# key, 1 when TIMEOUT seconds passed without one. `read -n1` puts the tty in
+# non-canonical, no-echo mode for the duration of the read only and restores
+# it after, so between two reads the terminal is normal: an action (and the
+# sudo prompt run_priv may raise) runs outside any read and needs no raw-mode
+# bookkeeping. Without a terminal on stdin the loop is view-only and this is
+# a plain `pause`, so a closed or redirected stdin cannot spin the redraw.
+# Behind a function so a test config can feed keys (RUNNERCTL_STUB_KEYS).
+tty_read_char() { # TIMEOUT
+  local rc=0
+  KEY_CHAR=""
+  if [ -t 0 ]; then
+    IFS= read -rsn1 -t "$1" KEY_CHAR || rc=$?
+    [ "$rc" -ne 0 ] || return 0
+    [ "$rc" -le 128 ] || return 1 # timed out: the interval has elapsed
+  fi
+  pause "$1"
+  return 1
+}
+# One key into KEY: `up` / `down` for the arrows (ESC [ A, ESC O A, …), `esc`
+# for a lone Escape, `enter`, otherwise the character itself. 1 on timeout.
+# The rest of an arrow's sequence is already buffered when the ESC arrives,
+# so a short second read tells the two apart.
+read_key() { # TIMEOUT
+  KEY=""
+  tty_read_char "$1" || return 1
+  case "$KEY_CHAR" in
+    $'\e')
+      if tty_read_char 0.05 && [[ "$KEY_CHAR" == [\[O] ]] && tty_read_char 0.05; then
+        case "$KEY_CHAR" in A) KEY=up ;; B) KEY=down ;; *) KEY=other ;; esac
+      else
+        KEY=esc
+      fi ;;
+    "") KEY=enter ;;
+    *)  KEY="$KEY_CHAR" ;;
+  esac
+}
+# A pager for `L` (logs): $PAGER, less, or cat where neither exists. Behind
+# a function so a test config can replace it.
+page() {
+  local pager
+  read -ra pager <<<"${PAGER:-less}"
+  if command -v "${pager[0]}" >/dev/null 2>&1; then "${pager[@]}"; else cat; fi
+}
+WATCH_LEGEND="↑↓/jk select  K kill job  R restart  S stop  T start  P reap  L logs  q quit"
+
+# The cursor row: reverse video over the whole line, re-applied after every
+# reset a painted cell ends with, so a coloured cell does not cut it short.
+# Always an SGR sequence, whatever --color says: watch needs a terminal and
+# the cursor is structure, not colour. NAME is the RUNNER cell (short_name).
+watch_highlight() { # TABLE NAME
+  local line rev=$'\e[7m' reset=$'\e[0m'
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^[0-9]+\ +"$2"\ + ]]; then
+      printf '%s%s%s\n' "$rev" "${line//"$reset"/$reset$rev}" "$reset"
+    else
+      printf '%s\n' "$line"
+    fi
+  done <<<"$1"
+}
+# The widest table row (header or slot row) in TABLE, in characters with the
+# SGR sequences stripped — the note lines are long by design and do not count.
+watch_table_width() { # TABLE
+  local line n w=0
+  while IFS= read -r line; do
+    n="${line//$'\e['*([0-9;])m/}"
+    ! [[ "$n" =~ ^(IDX|[0-9]+)\  ]] || [ "${#n}" -le "$w" ] || w="${#n}"
+  done <<<"$1"
+  echo "$w"
+}
+# The table for one frame, into WATCH_TABLE (not stdout: STATUS_DROP has to
+# outlive the call). Narrower than the terminal, or MAX/HIGH/ENVFILE are
+# dropped (STATUS_DROP) and it is rendered again — once, on the transition,
+# and back when the terminal is wide enough for all of them again. A width
+# of 0 (unknown) never drops anything.
+WATCH_TABLE=""
+watch_table() {
+  local cols
+  WATCH_TABLE="$(render_status)"
+  cols="$(term_cols)"
+  [ "$cols" -gt 0 ] || return 0
+  if [ -z "$STATUS_DROP" ] && [ "$(watch_table_width "$WATCH_TABLE")" -gt "$cols" ]; then
+    STATUS_DROP="6 7 11"
+    WATCH_TABLE="$(render_status)"
+  elif [ -n "$STATUS_DROP" ] && [ $(( $(watch_table_width "$WATCH_TABLE") + 22 )) -le "$cols" ]; then
+    STATUS_DROP=""
+    WATCH_TABLE="$(render_status)"
+  fi
+}
+
+# The facts an action decides on, fresh: the memoised journal for UNIT is
+# dropped first so a job that just ended (or started) is not acted on from
+# a cell up to JOURNAL_CACHE_TTL ticks old, then collect_slot fills SLOT.
+watch_slot_facts() { # UNIT
+  [ -z "$JOURNAL_MEMO_DIR" ] || rm -f -- "$JOURNAL_MEMO_DIR/$1".*
+  collect_slot "$1" 0
+}
+# The `warning:` line R and S carry when a job is in flight.
+watch_job_warning() {
+  [ "${SLOT[job_state]}" = running ] || return 0
+  printf '\nwarning: a job is running (%s) — it will be killed and GitHub marks it failed; runnerctl %s --when-idle waits for it instead' "$(job_cell)" "$1"
+}
+# A key on the selected slot: either WATCH_NOTICE (a refusal or a result, no
+# command runs) or WATCH_PROMPT + WATCH_ACTION (a confirm line stating the
+# exact command, run on `y`). L runs at once — reading logs changes nothing.
+#   WATCH_ACTION   ctl:restart|ctl:stop|ctl:start|reap  (+ the unit in WATCH_UNIT)
+watch_key_action() { # KEY UNIT
+  local u="$2" short
+  short="$(short_name "$u")"
+  WATCH_NOTICE="" WATCH_PROMPT="" WATCH_ACTION="" WATCH_UNIT="$u"
+  case "$1" in
+    L)
+      # The pager owns the screen until it quits; the next frame repaints.
+      term_cursor show
+      cmd_logs "$u" -n 50 | page
+      term_cursor hide
+      return ;;
+  esac
+  watch_slot_facts "$u"
+  case "$1" in
+    K)
+      case "${SLOT[job_state]}" in
+        running)   WATCH_ACTION="ctl:restart"
+                   WATCH_PROMPT="Kill the job on $short ($(job_cell))? runs: systemctl restart $u  [y/n]" ;;
+        no-access) WATCH_NOTICE="$short: cannot tell whether a job is running — needs journal read access (systemd-journal group) or root" ;;
+        none)      WATCH_NOTICE="$short: not running — nothing to kill" ;;
+        *)         WATCH_NOTICE="$short: no job running — nothing to kill" ;;
+      esac ;;
+    R)
+      case "${SLOT[active]}" in
+        active|activating|reloading)
+          WATCH_ACTION="ctl:restart"
+          WATCH_PROMPT="Restart $short? runs: systemctl restart $u  [y/n]$(watch_job_warning restart)" ;;
+        *) WATCH_NOTICE="$short: not active (${SLOT[active]:-unknown}) — T starts it" ;;
+      esac ;;
+    S)
+      case "${SLOT[active]}" in
+        active|activating|reloading)
+          WATCH_ACTION="ctl:stop"
+          WATCH_PROMPT="Stop $short? runs: systemctl stop $u  [y/n]$(watch_job_warning stop)" ;;
+        *) WATCH_NOTICE="$short: already stopped (${SLOT[active]:-unknown})" ;;
+      esac ;;
+    T)
+      case "${SLOT[active]}" in
+        active|activating|reloading) WATCH_NOTICE="$short: already active — R restarts it" ;;
+        *) WATCH_ACTION="ctl:start"
+           WATCH_PROMPT="Start $short? runs: systemctl start $u  [y/n]" ;;
+      esac ;;
+    P)
+      if [[ "${SLOT[job_leaked]}" =~ ^[0-9]+$ ]] && [ "${SLOT[job_leaked]}" -gt 0 ]; then
+        WATCH_ACTION="reap"
+        WATCH_PROMPT="Reap ${SLOT[job_leaked]} leaked process(es) on $short ($(reap_list))? runs: kill -TERM ${SLOT[job_leaked_pids]}, then kill -KILL what is still alive after ${REAP_GRACE_SEC}s  [y/n]"
+      elif [ "${SLOT[job_state]}" = running ]; then
+        WATCH_NOTICE="$short: busy ($(job_cell)) — a running job's processes are not leaks"
+      else
+        WATCH_NOTICE="$short: no leaked processes shown — nothing to reap"
+      fi ;;
+  esac
+}
+# The confirmed action. Runs outside any `read`, so the terminal is in its
+# normal mode for a sudo prompt; the cursor is shown for it and the command
+# is named on the line above, and the output's last line becomes the notice
+# on the next frame. A `die` inside only ends the subshell, so a refused or
+# failed action is reported, never fatal to the watch.
+watch_run_action() {
+  local out short
+  short="$(short_name "$WATCH_UNIT")"
+  term_cursor show
+  case "$WATCH_ACTION" in
+    ctl:*)
+      printf '\nrunning: systemctl %s %s\n' "${WATCH_ACTION#ctl:}" "$WATCH_UNIT"
+      out="$(cmd_ctl "${WATCH_ACTION#ctl:}" "$WATCH_UNIT" 2>&1)" || true
+      WATCH_NOTICE="$short: ${out##*$'\n'}" ;;
+    reap)
+      printf '\nrunning: reap %s\n' "$short"
+      out="$(cmd_reap "$WATCH_UNIT" 2>&1)" || true
+      WATCH_NOTICE="${out##*$'\n'}" ;;
+  esac
+  term_cursor hide
+  WATCH_ACTION="" WATCH_PROMPT=""
+}
+# One key against the watch state. Returns 1 on `q` (quit). The cursor is
+# the unit's name in WATCH_CURSOR, so it stays on the same slot when the
+# pool is scaled and the row numbers shift; UNITS is the current order.
+WATCH_CURSOR="" WATCH_NOTICE="" WATCH_PROMPT="" WATCH_ACTION="" WATCH_UNIT=""
+watch_handle_key() { # KEY UNITS...
+  local key="$1" i n; shift
+  local units=("$@")
+  if [ -n "$WATCH_ACTION" ]; then
+    # A confirm is up: only `y` runs it; anything else is a `n`.
+    case "$key" in
+      y|Y) watch_run_action ;;
+      *)   WATCH_NOTICE="cancelled — nothing run"; WATCH_ACTION="" WATCH_PROMPT="" ;;
+    esac
+    return 0
+  fi
+  WATCH_NOTICE=""
+  n="${#units[@]}"
+  for i in "${!units[@]}"; do [ "${units[$i]}" != "$WATCH_CURSOR" ] || break; done
+  case "$key" in
+    q|Q)      return 1 ;;
+    down|j)   [ "$i" -ge $((n - 1)) ] || WATCH_CURSOR="${units[$((i + 1))]}" ;;
+    up|k)     [ "$i" -le 0 ] || WATCH_CURSOR="${units[$((i - 1))]}" ;;
+    K|R|S|T|P|L) watch_key_action "$key" "$WATCH_CURSOR" ;;
+  esac
+  return 0
+}
+
 # A native loop rather than `exec watch -n N runnerctl status`: procps
 # `watch` is not on every runner host, mangles the UTF-8 `—` cells, and
 # would re-run load_config and the config permission checks every tick.
 # Each frame is rendered into a variable first and written with one printf
 # (home + clear + frame), so the redraw is atomic and does not flicker.
 # --iterations N (test-only, undocumented) stops after N redraws so the sim
-# can run the loop with its no-op `pause`.
+# can run the loop with its no-op `pause`; that path is headless — no
+# cursor, no legend, no key read — so it is exactly the view of before.
+# Interactively (GHR-33) each frame ends with the key legend and a status
+# line (a notice, or the pending confirm), and the wait between redraws is
+# a key read with the interval as its timeout: a key redraws at once, a
+# timeout is a tick. The journal memo counts ticks, not keys.
 cmd_watch() { # [--interval N] [--iterations N] [--color WHEN] [--stall-after N]
-  local interval=2 iterations="" tick=0 out header
+  local interval=2 iterations="" tick=0 refreshed=-1 out header units=() status
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     view_opt "$@"
@@ -1747,14 +1985,32 @@ cmd_watch() { # [--interval N] [--iterations N] [--color WHEN] [--stall-after N]
   trap 'exit 0' INT TERM
   term_cursor hide
   while :; do
-    # A fresh journal read every JOURNAL_CACHE_TTL ticks, starting with the first.
-    [ $((tick % JOURNAL_CACHE_TTL)) -ne 0 ] || rm -f -- "$JOURNAL_MEMO_DIR"/*
-    out="$(render_status)"
+    # A fresh journal read every JOURNAL_CACHE_TTL ticks, starting with the
+    # first — once per such tick, however many key redraws it spans.
+    if [ $((tick % JOURNAL_CACHE_TTL)) -eq 0 ] && [ "$tick" -ne "$refreshed" ]; then
+      rm -f -- "$JOURNAL_MEMO_DIR"/*
+      refreshed="$tick"
+    fi
     header="$(paint "$C_BOLD" "runnerctl watch — ${HOSTNAME:-$(uname -n)} — $(date +%H:%M:%S) — every ${interval}s (Ctrl-C to quit)")"
-    printf '\033[H\033[2J%s\n%s\n' "$header" "$out"
-    pause "$interval"
-    tick=$((tick + 1))
-    [ -z "$iterations" ] || [ "$tick" -lt "$iterations" ] || break
+    watch_table
+    if [ -n "$iterations" ]; then
+      printf '\033[H\033[2J%s\n%s\n' "$header" "$WATCH_TABLE"
+      pause "$interval"
+      tick=$((tick + 1))
+      [ "$tick" -lt "$iterations" ] || break
+      continue
+    fi
+    mapfile -t units < <(discover)
+    # The cursor follows its unit; a slot that went away drops it to the top.
+    [[ " ${units[*]} " == *" $WATCH_CURSOR "* ]] || WATCH_CURSOR="${units[0]:-}"
+    out="$(watch_highlight "$WATCH_TABLE" "$(short_name "$WATCH_CURSOR")")"
+    status="${WATCH_PROMPT:-$WATCH_NOTICE}"
+    printf '\033[H\033[2J%s\n%s\n\n%s\n%s\n' "$header" "$out" "$(paint "$C_DIM" "$WATCH_LEGEND")" "$status"
+    if read_key "$interval"; then
+      watch_handle_key "$KEY" "${units[@]}" || break
+    else
+      tick=$((tick + 1))
+    fi
   done
 }
 

@@ -242,6 +242,31 @@ keep the `journalctl` cost down — a job start or end shows up within
 10 × interval seconds. It needs a terminal: with stdout redirected it exits 1
 and points at `status`; `status --once` is the plain one-shot table.
 
+The view is interactive, so a stalled or leaking slot can be dealt with from
+the screen you are already looking at instead of leaving `watch`, reading
+the IDX and typing a second command. `↑`/`↓` (or `j`/`k`) move a highlighted
+cursor over the slot rows — it follows the slot's unit name, not its row
+number, so a scaled pool does not move it — and a key acts on the selected
+slot. Every action that changes something first shows a `y/n` line naming
+the exact command it will run; `y` runs it (through `sudo`, like the
+commands — the first one may prompt for a password), anything else cancels,
+and the result becomes the status line under the legend:
+
+| key | on the selected slot | runs |
+| --- | --- | --- |
+| `K` | kill the running job — the `STALLED` case. The slot's whole cgroup goes, `Restart=always` brings the runner back and GitHub marks the job failed. Refused when no job is running | `systemctl restart <unit>` |
+| `R` | restart the runner service — any active row; a warning line says so when a job is in flight | `systemctl restart <unit>` |
+| `S` / `T` | stop / start the slot (stop carries the same warning while a job runs) | `systemctl stop\|start <unit>` |
+| `P` | reap the `+N leaked` processes on an idle slot, exactly as `reap <IDX>` does | `kill -TERM …`, then `kill -KILL` for what survives |
+| `L` | show `logs <slot> -n 50` in `$PAGER` (`less`; `q` returns to the table). No confirm — it changes nothing | `journalctl -u <unit> -n 50` |
+| `q` | quit | |
+
+The redraws keep coming at `--interval` while a confirm line is up, so the
+table under it is current when you answer. On a terminal narrower than the
+table the `MAX`, `HIGH` and `ENVFILE` columns are dropped, never
+`WORKING-ON` — its `idle 2h31m (7 jobs)` is what tells you a slot is safe to
+act on.
+
 ### Machine-readable output: `status --json`
 
 `runnerctl status --json` prints the same facts as one JSON object, for a
