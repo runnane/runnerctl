@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.8.0](https://github.com/runnane/runnerctl/compare/v0.7.0...v0.8.0) (2026-09-13)
+
+
+### Features
+
+* interactive watch — select a slot, kill/restart/stop/start/reap/logs from the screen (GHR-33) ([a9214b5](https://github.com/runnane/runnerctl/commit/a9214b594b795ec7e99f790144b41239f2ae6363))
+* interactive watch — select a slot, kill/restart/stop/start/reap/logs from the screen (GHR-33) ([7e543f4](https://github.com/runnane/runnerctl/commit/7e543f41934670b2dc6a51c194f9744c93f12a81))
+* UPGRADE_URL defaults to the latest GitHub release asset; --ref vX.Y.Z maps to that release, --ref &lt;branch&gt; to the raw URL (GHR-24) ([c538d64](https://github.com/runnane/runnerctl/commit/c538d64c7609bb7a6212992ce45310666227f905))
+* UPGRADE_URL defaults to the latest GitHub release asset; --ref vX.Y.Z maps to that release, --ref &lt;branch&gt; to the raw URL (GHR-24) ([9287d34](https://github.com/runnane/runnerctl/commit/9287d3478b7ad914baa0f4e3f86f884984422b28))
+
+
+### Bug Fixes
+
+* pin the status header through a stubbable host_line() so the sim's whole-output diff is deterministic (GHR-34) ([041720e](https://github.com/runnane/runnerctl/commit/041720ebf5a6fb432b44cf203b18f18aa24b5f27))
+* pin the status header through a stubbable host_line() so the sim's whole-output diff is deterministic (GHR-34) ([864a695](https://github.com/runnane/runnerctl/commit/864a69547ff4a5be8e8da48021d7d4563eac8f27))
+
 ## [0.7.0](https://github.com/runnane/runnerctl/compare/v0.6.0...v0.7.0) (2026-09-13)
 
 
