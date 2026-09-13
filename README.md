@@ -97,11 +97,17 @@ an idle slot, how long it has been idle and how many jobs it has finished
 since it started:
 
 ```
+runnerctl 0.7.0 — Host: 16 cores, 62Gi RAM, 48Gi available
+
 IDX RUNNER                 PROFILE  ACTIVE                              SINCE    ENABLED   MAX    HIGH   USED        PRESS  RESTART  ENVFILE WORKING-ON
 0   org.host-1             ci       active/running                     3d 4h    enabled   26.0G  25.0G  3.1G/24.9G  0.4%   always   —       my-app:test (12m)
 1   org.host-2             ci       active/running ↻3 (last: oom-kill)  2d 7h    enabled   26.0G  25.0G  128M        0.0%   always   —       idle 2h31m (7 jobs)
 2   org.host-3             deploy   inactive/dead                      6d       disabled  —      —      —           —      always   —       —
 ```
+
+The header leads with the version of the `runnerctl` that is running —
+`upgrade` fetches `main`, so on a fleet that is otherwise only visible
+through a second command — then the host's cores and memory.
 
 `ACTIVE` folds in a restart count (`↻3`) when systemd has restarted the unit
 since it was last started by hand (`NRestarts`, which `systemctl
@@ -246,7 +252,7 @@ memory values); no `jq` needed to produce it, and the table and the JSON are
 rendered from one collector, so they cannot disagree on a value:
 
 ```json
-{"host":{"cores":16,"mem_total":64424509440,"mem_available":51539607552},
+{"runnerctl":"0.7.0","host":{"cores":16,"mem_total":64424509440,"mem_available":51539607552},
  "slots":[
   {"idx":0,"unit":"actions.runner.org.host-1.service","name":"org.host-1",
    "active":"active","sub":"running","enabled":"enabled",
@@ -286,7 +292,9 @@ read), `memory_events` (`{"high","max","oom_kill"}` from the cgroup's
 percentages and total stall microseconds; the `PRESS` column is
 `full_avg10`), each object null when the file could not be read. `host`
 carries `cores`
-(`nproc`) and `mem_total` / `mem_available` (bytes, from `/proc/meminfo`).
+(`nproc`) and `mem_total` / `mem_available` (bytes, from `/proc/meminfo`);
+`runnerctl` is the version of the script that produced the object, for
+inventorying a fleet.
 `--json` is one-shot and refuses `--watch`; poll it instead.
 ### Health checks for cron / uptime monitors: `health`
 
