@@ -448,6 +448,42 @@ case_upgrade_ref_missing_value() {
   expect_no_log '.'
 }
 
+case_resolve_url_no_ref_unchanged() {
+  run_fn eval 'UPGRADE_URL="https://github.com/runnane/runnerctl/releases/latest/download/runnerctl"; resolve_url ""'
+  expect_rc 0
+  expect_out '^https://github\.com/runnane/runnerctl/releases/latest/download/runnerctl$'
+}
+
+case_resolve_url_release_version_ref() {
+  run_fn eval 'UPGRADE_URL="https://github.com/runnane/runnerctl/releases/latest/download/runnerctl"; resolve_url v1.2.3'
+  expect_rc 0
+  expect_out '^https://github\.com/runnane/runnerctl/releases/download/v1\.2\.3/runnerctl$'
+}
+
+case_resolve_url_release_version_ref_normalised() {
+  run_fn eval 'UPGRADE_URL="https://github.com/runnane/runnerctl/releases/latest/download/runnerctl"; resolve_url 1.2.3'
+  expect_rc 0
+  expect_out '^https://github\.com/runnane/runnerctl/releases/download/v1\.2\.3/runnerctl$'
+}
+
+case_resolve_url_release_branch_ref_falls_back_to_raw() {
+  run_fn eval 'UPGRADE_URL="https://github.com/runnane/runnerctl/releases/latest/download/runnerctl"; resolve_url main'
+  expect_rc 0
+  expect_out '^https://raw\.githubusercontent\.com/runnane/runnerctl/main/runnerctl$'
+}
+
+case_resolve_url_raw_url_ref_replaces_segment() {
+  run_fn eval 'UPGRADE_URL="https://raw.githubusercontent.com/runnane/runnerctl/main/runnerctl"; resolve_url v1.2.3'
+  expect_rc 0
+  expect_out '^https://raw\.githubusercontent\.com/runnane/runnerctl/v1\.2\.3/runnerctl$'
+}
+
+case_resolve_url_unsupported_url_dies() {
+  run_fn eval 'UPGRADE_URL="https://example.com/mirror/runnerctl"; resolve_url v1.2.3'
+  expect_rc 1
+  expect_err '^runnerctl: --ref only works with a github\.com/<owner>/<repo>/releases/\.\.\. or raw\.githubusercontent\.com UPGRADE_URL \(have: https://example\.com/mirror/runnerctl\)$'
+}
+
 case_scale_2() {
   run scale 2
   expect_rc 0
@@ -2090,6 +2126,12 @@ t "apply --max=30G --restart-sec=5: = form writes both values"     case_apply_ma
 t "apply --max lots: invalid value rejected"                       case_apply_max_invalid_value_rejected
 t "apply --restart-sec soon: invalid value rejected"               case_apply_restart_sec_invalid_value_rejected
 t "upgrade --ref: missing value dies before any download"          case_upgrade_ref_missing_value
+t "resolve_url: no ref leaves UPGRADE_URL unchanged"                case_resolve_url_no_ref_unchanged
+t "resolve_url: release URL + vX.Y.Z maps to that release asset"    case_resolve_url_release_version_ref
+t "resolve_url: release URL + X.Y.Z normalises to vX.Y.Z"           case_resolve_url_release_version_ref_normalised
+t "resolve_url: release URL + branch ref falls back to raw URL"     case_resolve_url_release_branch_ref_falls_back_to_raw
+t "resolve_url: raw URL + ref replaces the ref segment"              case_resolve_url_raw_url_ref_replaces_segment
+t "resolve_url: unsupported UPGRADE_URL + ref dies"                  case_resolve_url_unsupported_url_dies
 t "scale 2: two drop-ins, enable 1-2, disable 3, one reload"       case_scale_2
 t "scale 2: daemon-reload before enable --now"                     case_scale_reloads_before_enable
 t "scale 2: a failed slot is reported, not swallowed"              case_scale_start_failure_reported

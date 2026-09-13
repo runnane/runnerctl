@@ -19,7 +19,7 @@ One command, for a fresh host or one that already has any version of
 `runnerctl` on it:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/runnane/runnerctl/main/runnerctl | sudo bash -s -- install
+curl -fsSL https://github.com/runnane/runnerctl/releases/latest/download/runnerctl | sudo bash -s -- install
 ```
 
 The script downloads itself, checks that the copy parses and carries a
@@ -48,7 +48,7 @@ found path and what would happen to it.
 Prefer to read before you run? Same thing in two steps:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/runnane/runnerctl/main/runnerctl -o runnerctl
+curl -fsSL https://github.com/runnane/runnerctl/releases/latest/download/runnerctl -o runnerctl
 less runnerctl && sudo bash runnerctl install
 ```
 
@@ -105,9 +105,10 @@ IDX RUNNER                 PROFILE  ACTIVE                              SINCE   
 2   org.host-3             deploy   inactive/dead                      6d       disabled  —      —      —           —      always   —       —
 ```
 
-The header leads with the version of the `runnerctl` that is running —
-`upgrade` fetches `main`, so on a fleet that is otherwise only visible
-through a second command — then the host's cores and memory.
+The header leads with the version of the `runnerctl` that is running — each
+host only picks up a new one when `upgrade` runs, so on a fleet that is
+otherwise only visible through a second command — then the host's cores and
+memory.
 
 `ACTIVE` folds in a restart count (`↻3`) when systemd has restarted the unit
 since it was last started by hand (`NRestarts`, which `systemctl
@@ -515,23 +516,28 @@ safe to run repeatedly.
 
 ```sh
 runnerctl upgrade --check      # report installed vs available
-runnerctl upgrade              # install the latest from main
-runnerctl upgrade --ref v0.1.0 # pin a tag or branch
+runnerctl upgrade              # install the latest tagged release
+runnerctl upgrade --ref v0.1.0 # pin a specific release
+runnerctl upgrade --ref main   # track main instead of tagged releases
 ```
 
 `upgrade` downloads the script from `UPGRADE_URL` (default: this repository's
-`main`), checks that it parses and carries a `RUNNERCTL_VERSION`, and replaces
-the installed file by rename — so a running invocation is unaffected. It will
-not downgrade unless `--ref` is given, and it uses `sudo` only when the install
-location is not writable. Point `UPGRADE_URL` at a fork or a mirror in the
-config file to upgrade from somewhere else.
+latest GitHub release asset), checks that it parses and carries a
+`RUNNERCTL_VERSION`, and replaces the installed file by rename — so a running
+invocation is unaffected. It will not downgrade unless `--ref` is given, and
+it uses `sudo` only when the install location is not writable. `--ref
+vX.Y.Z` pins that release's asset; `--ref <branch or commit>` (e.g. `main`)
+fetches the raw file at that ref instead, for hosts that want to track it
+ahead of a release. Point `UPGRADE_URL` at a fork or a mirror in the config
+file to upgrade from somewhere else.
 
 Versions are cut by [release-please](https://github.com/googleapis/release-please)
 from the conventional-commit history: each merge to `main` refreshes a release
 PR, and merging that PR bumps `RUNNERCTL_VERSION`, writes [`CHANGELOG.md`](CHANGELOG.md),
-tags `vX.Y.Z` and publishes a GitHub release with the script attached. Between
-releases `main` carries the next version's changes under the last version
-number; `--ref vX.Y.Z` pins a released one.
+tags `vX.Y.Z` and publishes a GitHub release with the script attached. Hosts
+on the default `UPGRADE_URL` only ever pick up a tagged release; `--ref main`
+opts a host into the next version's changes under the last version's tag,
+and `--ref vX.Y.Z` pins one explicitly.
 
 ### What it writes
 

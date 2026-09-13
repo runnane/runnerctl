@@ -151,8 +151,10 @@ copy stamped `9.9.9`, refusal to overwrite a non-runnerctl file, and the
 piped form. The piped case is offline: a temp config sets
 `UPGRADE_URL="file://$PWD/runnerctl"` and `cat runnerctl | bash -s -- --config
 <that> install --prefix <tmp>` exercises the real download path through
-`curl`'s `file://` support. `--ref` is not covered (it needs a
-raw.githubusercontent.com URL); verify it by hand.
+`curl`'s `file://` support. `--ref`'s URL mapping (`resolve_url`) has its own
+`sim` cases through `run_fn`; the actual `--ref` download here is not covered
+(a real GitHub release or raw.githubusercontent.com fetch), so verify that
+end-to-end path by hand.
 
 ## release
 
@@ -190,6 +192,9 @@ Two things the automation cannot do for you:
   the action fails with `GitHub Actions is not permitted to create or approve
   pull requests`.
 
-`runnerctl upgrade` fetches `main`, so between a feature merge and the release
-PR merge hosts pick up the new behaviour under the old version number; pin
-`--ref vX.Y.Z` when that matters.
+`runnerctl upgrade` defaults to the latest tagged GitHub release, so hosts
+only ever pick up released behaviour under its correct version stamp.
+`--ref vX.Y.Z` pins a specific release; `--ref <branch>` (e.g. `main`) falls
+back to fetching that ref's raw file for a host that wants to track main
+ahead of a release, accepting that its version number then lags its bytes
+between a feature merge and the release PR merge.

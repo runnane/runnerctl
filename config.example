@@ -11,8 +11,8 @@
 # Profile used when --profile is omitted.
 #DEFAULT_PROFILE="ci"
 
-# Where `runnerctl upgrade` fetches the new script from (a fork, a pinned tag).
-#UPGRADE_URL="https://raw.githubusercontent.com/runnane/runnerctl/main/runnerctl"
+# Where `runnerctl upgrade` fetches the new script from (a fork, a mirror).
+#UPGRADE_URL="https://github.com/runnane/runnerctl/releases/latest/download/runnerctl"
 
 # --when-idle / drain: seconds between idle polls, and the default --timeout.
 #POLL_SEC="5"
