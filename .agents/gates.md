@@ -100,6 +100,12 @@ Traps:
   (default: the file is absent). Prefix a single `run` to flip it:
   `RUNNERCTL_STUB_ENV_FILE_EXISTS=1 run apply --profile deploy`.
 - `status` calls `nproc` and `free` for real; only the runner rows are asserted.
+  `status --json`'s `host` object comes from `host_facts`, which the stub pins.
+- The `status --json` case (GHR-16) asserts the parsed JSON through
+  `python3` (`expect_json`): where python3 is absent the case keeps its
+  exit-code, shape and read-only assertions, prints a `skip` notice for the
+  rest and still passes — it is not an xfail and never counts as a failure.
+  ubuntu-latest has python3, so CI runs the full case.
 
 ## migrate-test
 

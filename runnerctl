@@ -23,7 +23,7 @@
 # Usage:
 #   runnerctl [--config PATH] <command> [args]
 #
-#   runnerctl status [--watch|-w] [--interval N] [--once]
+#   runnerctl status [--json] [--watch|-w] [--interval N] [--once]
 #   runnerctl watch  [--interval N]
 #   runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
 #                    [--restart-sec N] [--env-file PATH] [--restart] \
@@ -61,6 +61,11 @@
 # seconds (default 2) until Ctrl-C, for keeping an eye on a drain, a profile
 # roll or a slot approaching its memory cap; it needs a terminal, and the
 # journal-derived WORKING-ON cells refresh every 10th redraw.
+#
+# `status --json` prints the same facts as one JSON object — raw bytes, epoch
+# seconds, null where the table shows — — for monitoring and inventory
+# tooling; the keys are listed in the README. It is one-shot: poll it rather
+# than --watch it.
 #
 # Recommended baselines:
 #   CI host:      runnerctl scale 2 --max 26G --high 22G
@@ -448,46 +453,96 @@ now_epoch() { date +%s; }
 #                  no job, and the idle time and count are unknowable there
 #   (no access)    neither the journal nor the cgroup can be read
 # For the last two cmd_status prints a one-line hint under the table.
-job_info() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
-  local u="$1" cg="$2" lines rj ii name ts n env repo job worker runtime=""
-  [ -n "$cg" ] || { echo "—"; return; }
+#
+# GHR-16: the facts and the cell are two functions over one journal fetch.
+# job_facts leaves the raw picture in the JOB_* variables — the table
+# (job_cell) and `status --json` both read those, so the two cannot disagree
+# on what a slot is doing:
+#   JOB_STATE   none | running | idle | idle-fresh | starting | idle-unknown
+#               | no-access — `running` covers both the journal's answer and
+#               the /proc-only one, `idle-fresh` is "idle (no jobs yet)"
+#   JOB_NAME / JOB_REPO
+#               the running job and its repository (short, `my-app`), either
+#               empty when unknown
+#   JOB_SINCE   epoch second the running job started: the Runner.Worker's
+#               start when it can be seen, else the `Running job:` line's
+#               stamp; empty when neither is known
+#   JOB_RUNTIME the running job's age as the cell prints it, empty when unknown
+#   JOB_IDLE_SINCE / JOB_DONE
+#               epoch second of the last completion (or of the unit's start
+#               for idle-fresh) and the completed count (0 for idle-fresh)
+#   JOB_ACCESS  ok | no-journal | no-access — what could be read: `no-journal`
+#               is the /proc-only picture, `no-access` neither source
+JOB_STATE="" JOB_NAME="" JOB_REPO="" JOB_SINCE="" JOB_RUNTIME="" JOB_IDLE_SINCE="" JOB_DONE="" JOB_ACCESS=""
+job_facts() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
+  local u="$1" cg="$2" lines rj ii ts env worker age
+  JOB_STATE=none JOB_NAME="" JOB_REPO="" JOB_SINCE="" JOB_RUNTIME="" JOB_IDLE_SINCE="" JOB_DONE="" JOB_ACCESS=ok
+  [ -n "$cg" ] || return 0
   if lines="$(journal_job_lines_cached "$u" "${3:-}")"; then
     rj="$(journal_running_job "$lines")"
     if [ -z "$rj" ]; then
       ii="$(journal_idle_info "$lines")"
       if [ -n "$ii" ]; then
-        ts="${ii%%$'\t'*}"; n="${ii#*$'\t'}"
-        if [[ "$ts" =~ ^[0-9]+$ ]]; then runtime="$(fmt_dur $(( $(now_epoch) - ts )))"; else runtime="—"; fi
-        printf 'idle %s (%s job%s)\n' "$runtime" "$n" "$([ "$n" -eq 1 ] || echo s)"
+        JOB_STATE=idle
+        ts="${ii%%$'\t'*}"; JOB_DONE="${ii#*$'\t'}"
+        [[ "$ts" =~ ^[0-9]+$ ]] && JOB_IDLE_SINCE="$ts"
       else
-        echo "idle $(since_state active "${4:-}" "") (no jobs yet)"
+        JOB_STATE="idle-fresh" JOB_DONE=0
+        JOB_IDLE_SINCE="$(age_to_epoch "$(state_age active "${4:-}" "")")"
       fi
-      return
+      return 0
     fi
-    name="${rj%%$'\t'*}"; ts="${rj#*$'\t'}"
-    repo="$(proc_job_env "$cg" | grep -m1 '^GITHUB_REPOSITORY=' | cut -d= -f2- || true)"
+    JOB_STATE=running
+    JOB_NAME="${rj%%$'\t'*}"; ts="${rj#*$'\t'}"
+    JOB_REPO="$(proc_job_env "$cg" | grep -m1 '^GITHUB_REPOSITORY=' | cut -d= -f2- || true)"
+    JOB_REPO="${JOB_REPO##*/}"
     worker="$(proc_worker_pid "$cg")"
     if [ -n "$worker" ]; then
-      runtime="$(proc_runtime "$worker")"
+      age="$(proc_age "$worker")"
+      if [ -n "$age" ]; then JOB_RUNTIME="$(fmt_dur "$age")"; JOB_SINCE="$(age_to_epoch "$age")"; fi
     elif [[ "$ts" =~ ^[0-9]+$ ]]; then
-      runtime="$(fmt_dur $(( $(now_epoch) - ts )))"
+      JOB_SINCE="$ts"; JOB_RUNTIME="$(fmt_dur $(( $(now_epoch) - ts )))"
     fi
-    printf '%s%s%s\n' "${repo:+${repo##*/}:}" "$name" "${runtime:+ ($runtime)}"
-    return
+    return 0
   fi
-  cgroup_readable "$cg" || { echo "(no access)"; return; }
+  cgroup_readable "$cg" || { JOB_STATE="no-access" JOB_ACCESS="no-access"; return 0; }
+  JOB_ACCESS=no-journal
   worker="$(proc_worker_pid "$cg")"
-  [ -n "$worker" ] && runtime="$(proc_runtime "$worker")"
+  if [ -n "$worker" ]; then
+    age="$(proc_age "$worker")"
+    if [ -n "$age" ]; then JOB_RUNTIME="$(fmt_dur "$age")"; JOB_SINCE="$(age_to_epoch "$age")"; fi
+  fi
   env="$(proc_job_env "$cg")"
   if [ -n "$env" ]; then
-    repo="$(grep -m1 '^GITHUB_REPOSITORY=' <<<"$env" | cut -d= -f2- || true)"
-    job="$(grep -m1 '^GITHUB_JOB=' <<<"$env" | cut -d= -f2- || true)"
-    printf '%s:%s%s\n' "${repo##*/}" "${job:-?}" "${runtime:+ ($runtime)}"
+    JOB_STATE=running
+    JOB_REPO="$(grep -m1 '^GITHUB_REPOSITORY=' <<<"$env" | cut -d= -f2- || true)"
+    JOB_REPO="${JOB_REPO##*/}"
+    JOB_NAME="$(grep -m1 '^GITHUB_JOB=' <<<"$env" | cut -d= -f2- || true)"
   elif [ -n "$worker" ]; then
-    echo "(starting)"
+    JOB_STATE=starting
   else
-    echo "idle ?"
+    JOB_STATE="idle-unknown"
   fi
+}
+
+# The WORKING-ON cell from the JOB_* facts job_facts left behind.
+job_cell() {
+  case "$JOB_STATE" in
+    none)         echo "—" ;;
+    running)      printf '%s%s%s\n' "${JOB_REPO:+$JOB_REPO:}" "${JOB_NAME:-?}" "${JOB_RUNTIME:+ ($JOB_RUNTIME)}" ;;
+    idle)         printf 'idle %s (%s job%s)\n' "$(fmt_dur "$([ -z "$JOB_IDLE_SINCE" ] || echo $(( $(now_epoch) - JOB_IDLE_SINCE )))")" \
+                    "$JOB_DONE" "$([ "$JOB_DONE" -eq 1 ] || echo s)" ;;
+    idle-fresh)   echo "idle $(fmt_dur "$([ -z "$JOB_IDLE_SINCE" ] || echo $(( $(now_epoch) - JOB_IDLE_SINCE )))") (no jobs yet)" ;;
+    starting)     echo "(starting)" ;;
+    idle-unknown) echo "idle ?" ;;
+    no-access)    echo "(no access)" ;;
+  esac
+}
+
+# Facts and cell in one call, for a caller that only wants the text.
+job_info() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
+  job_facts "$@"
+  job_cell
 }
 
 # --- Waiting for a slot to go idle (GHR-11) -----------------------------------
@@ -617,21 +672,38 @@ now_mono() {
   echo $(( ${up%%.*} * 1000000 + 10#$frac ))
 }
 
-# How long a unit has been in its ActiveState: since the active-enter stamp
-# while active/activating/reloading, otherwise since the inactive-enter stamp
-# (StateChangeTimestamp also moves on sub-state changes, so it is not used).
-# Stamps are µs since boot; 0 or empty means the state was never entered.
-since_state() { # ACTIVE-STATE ACTIVE-ENTER-US INACTIVE-ENTER-US
+# How long a unit has been in its ActiveState, in whole seconds: since the
+# active-enter stamp while active/activating/reloading, otherwise since the
+# inactive-enter stamp (StateChangeTimestamp also moves on sub-state changes,
+# so it is not used). Stamps are µs since boot; 0 or empty means the state
+# was never entered, and then nothing is printed. The raw figure both
+# renderers derive from (GHR-16): the table formats it, the JSON turns it
+# into an epoch second.
+state_age() { # ACTIVE-STATE ACTIVE-ENTER-US INACTIVE-ENTER-US
   local ts
   case "$1" in
     active|activating|reloading) ts="$2" ;;
     *)                           ts="$3" ;;
   esac
   if [[ "$ts" =~ ^[0-9]+$ ]] && [ "$ts" -gt 0 ]; then
-    fmt_dur $(( ($(now_mono) - ts) / 1000000 ))
-  else
-    echo "—"
+    echo $(( ($(now_mono) - ts) / 1000000 ))
   fi
+}
+
+# The SINCE cell: state_age as a duration, — when the state was never entered.
+since_state() { # ACTIVE-STATE ACTIVE-ENTER-US INACTIVE-ENTER-US
+  local age
+  age="$(state_age "$@")"
+  if [ -n "$age" ]; then fmt_dur "$age"; else echo "—"; fi
+}
+
+# Epoch second an event happened at, from how many seconds ago it was — the
+# JSON side of every SINCE-like cell (GHR-16). Nothing for an empty or
+# negative age (a clock that went backwards), which is where the table
+# prints —.
+age_to_epoch() { # AGE-SECONDS
+  [[ "${1:-}" =~ ^[0-9]+$ ]] || return 0
+  echo $(( $(now_epoch) - $1 ))
 }
 
 # When PID started, in µs since boot: field 22 of /proc/PID/stat, in clock
@@ -648,12 +720,12 @@ proc_start_mono() {
   echo $(( st[19] * 1000000 / tck ))
 }
 
-# fmt_dur of how long PID has been alive; empty if PID cannot be read.
-proc_runtime() {
+# How many seconds PID has been alive; empty if PID cannot be read.
+proc_age() {
   local start
   start="$(proc_start_mono "$1")"
   [ -n "$start" ] || return 0
-  fmt_dur $(( ($(now_mono) - start) / 1000000 ))
+  echo $(( ($(now_mono) - start) / 1000000 ))
 }
 
 hbytes() {
@@ -674,15 +746,13 @@ hbytes() {
 # RESULT itself is appended, unparenthesised, whenever it is not success:
 # that is the current invocation's own reason and takes precedence over a
 # journal guess. Not padded/truncated to the column width — like WORKING-ON,
-# a long cell just overflows that row's alignment.
-status_active_cell() { # UNIT ACTIVE-STATE SUB-STATE NRESTARTS RESULT
-  local u="$1" cell="$2/$3" n="${4:-0}" result="${5:-success}" reason
+# a long cell just overflows that row's alignment. Pure: the reason is looked
+# up once by collect_slot (GHR-16), which is also where the JSON reads it.
+status_active_cell() { # ACTIVE-STATE SUB-STATE NRESTARTS RESULT LAST-RESTART-REASON
+  local cell="$1/$2" n="${3:-0}" result="${4:-success}" reason="${5:-}"
   if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt 0 ]; then
     cell+=" ↻$n"
-    if [ "$result" = success ]; then
-      reason="$(journal_restart_reason "$u")"
-      [ -n "$reason" ] && cell+=" (last: $reason)"
-    fi
+    [ -n "$reason" ] && cell+=" (last: $reason)"
   fi
   [ "$result" = success ] || cell+=" $result"
   printf '%s\n' "$cell"
@@ -780,11 +850,13 @@ guard_env_file() {
 # see render_dropin) — a plain read, no run_priv: the file is root-owned but
 # world-readable like the rest of /etc/systemd/system. "—" when the drop-in
 # is missing (never applied, or reverted by remove-limits) or unreadable.
+# The profile named in a unit's managed drop-in header; nothing when the unit
+# has no drop-in or its header names none (the table shows that as —).
 slot_profile() {
   local line
-  line="$(head -n1 "$SYSTEMD_DIR/$1.d/$DROPIN_NAME" 2>/dev/null)" || { echo "—"; return; }
-  [[ "$line" =~ \(profile:\ ([^\)]+)\) ]] && { echo "${BASH_REMATCH[1]}"; return; }
-  echo "—"
+  line="$(head -n1 "$SYSTEMD_DIR/$1.d/$DROPIN_NAME" 2>/dev/null)" || return 0
+  [[ "$line" =~ \(profile:\ ([^\)]+)\) ]] && echo "${BASH_REMATCH[1]}"
+  return 0
 }
 
 # --- Commands -----------------------------------------------------------------
@@ -806,6 +878,69 @@ status_row() {
   printf '%s%s\n' "$out" "$1"
 }
 
+# --- One collector, two renderers (GHR-16) -----------------------------------
+# Everything `status` knows about one slot, gathered once into SLOT — one
+# unit_props fetch, one drop-in read, at most one journal_restart_reason
+# lookup and the one journal fetch job_facts makes — so the table
+# (render_status) and `status --json` (render_status_json) format the same
+# raw values and cannot disagree on a property. Values are systemd's own
+# strings, untouched: MemoryMax stays `infinity` or `[not set]` here, the
+# stamps stay µs since boot; the renderers decide what — or null — means.
+#   unit idx name              the unit, its 0-based index, its short RUNNER name
+#   active sub enabled         ActiveState SubState UnitFileState
+#   memory_max memory_high memory_current memory_peak
+#   restart                    the Restart= policy
+#   env_file                   EnvironmentFiles, raw (`/etc/x (ignore_errors=no)`),
+#                              empty when none
+#   cgroup invocation          ControlGroup InvocationID
+#   active_enter inactive_enter
+#   restarts result            NRestarts Result
+#   profile                    the drop-in's profile, empty when none
+#   since_age                  seconds in the current ActiveState (state_age),
+#                              empty when the state was never entered
+#   last_restart_reason        journal_restart_reason's answer, looked up only
+#                              when NRestarts > 0 and Result is success (the
+#                              ACTIVE cell's condition), empty otherwise
+#   job_*                      the JOB_* facts of job_facts, same names
+declare -A SLOT=()
+collect_slot() { # UNIT IDX
+  local u="$1" k v n
+  SLOT=([unit]="$u" [idx]="$2" [name]="$(short_name "$u")"
+        [active]="" [sub]="" [enabled]="" [memory_max]="" [memory_high]=""
+        [memory_current]="" [memory_peak]="" [restart]="" [env_file]=""
+        [cgroup]="" [invocation]="" [active_enter]="" [inactive_enter]=""
+        [restarts]="" [result]="" [profile]="" [since_age]="" [last_restart_reason]="")
+  while IFS='=' read -r k v; do
+    case "$k" in
+      ActiveState)                      SLOT[active]="$v" ;;
+      SubState)                         SLOT[sub]="$v" ;;
+      UnitFileState)                    SLOT[enabled]="$v" ;;
+      MemoryMax)                        SLOT[memory_max]="$v" ;;
+      MemoryHigh)                       SLOT[memory_high]="$v" ;;
+      MemoryCurrent)                    SLOT[memory_current]="$v" ;;
+      MemoryPeak)                       SLOT[memory_peak]="$v" ;;
+      Restart)                          SLOT[restart]="$v" ;;
+      EnvironmentFiles)                 SLOT[env_file]="$v" ;;
+      ControlGroup)                     SLOT[cgroup]="$v" ;;
+      InvocationID)                     SLOT[invocation]="$v" ;;
+      ActiveEnterTimestampMonotonic)    SLOT[active_enter]="$v" ;;
+      InactiveEnterTimestampMonotonic)  SLOT[inactive_enter]="$v" ;;
+      NRestarts)                        SLOT[restarts]="$v" ;;
+      Result)                           SLOT[result]="$v" ;;
+    esac
+  done < <(unit_props "$u")
+  SLOT[profile]="$(slot_profile "$u")"
+  SLOT[since_age]="$(state_age "${SLOT[active]}" "${SLOT[active_enter]}" "${SLOT[inactive_enter]}")"
+  n="${SLOT[restarts]}"
+  if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt 0 ] && [ "${SLOT[result]:-success}" = success ]; then
+    SLOT[last_restart_reason]="$(journal_restart_reason "$u")"
+  fi
+  job_facts "$u" "${SLOT[cgroup]}" "${SLOT[invocation]}" "${SLOT[active_enter]}"
+  SLOT[job_state]="$JOB_STATE" SLOT[job_name]="$JOB_NAME" SLOT[job_repo]="$JOB_REPO"
+  SLOT[job_since]="$JOB_SINCE" SLOT[job_runtime]="$JOB_RUNTIME"
+  SLOT[job_idle_since]="$JOB_IDLE_SINCE" SLOT[job_done]="$JOB_DONE" SLOT[job_access]="$JOB_ACCESS"
+}
+
 # The status table itself, printed once to stdout. `status` calls it once;
 # `watch` (GHR-3, below cmd_logs) captures it per tick and redraws it in place.
 render_status() {
@@ -813,34 +948,130 @@ render_status() {
   echo "Host: $(nproc) cores, $(free -h | awk '/^Mem:/{print $2" RAM, "$7" available"}')"
   echo
   status_row IDX RUNNER PROFILE ACTIVE SINCE ENABLED MAX HIGH USED RESTART ENVFILE WORKING-ON
-  local i=0 u job no_access=false
+  local i=0 u no_access=false
   while read -r u; do
     [ -n "$u" ] || continue
-    local short="${u#actions.runner.}"; short="${short%.service}"
-    local -A P=()
-    local k v
-    while IFS='=' read -r k v; do
-      [ -n "$k" ] || continue
-      P[$k]="$v"
-    done < <(unit_props "$u")
-    local envf="${P[EnvironmentFiles]:-}"; [ -n "$envf" ] || envf="—"
-    job="$(job_info "$u" "${P[ControlGroup]:-}" "${P[InvocationID]:-}" "${P[ActiveEnterTimestampMonotonic]:-}")"
+    collect_slot "$u" "$i"
     # `idle ?` is the /proc-only reader's idle: it knows the slot is idle but
     # not for how long, which is the same missing journal access.
-    case "$job" in "(no access)"|"idle ?") no_access=true ;; esac
-    status_row "$i" "$short" "$(slot_profile "$u")" \
-      "$(status_active_cell "$u" "${P[ActiveState]:-}" "${P[SubState]:-}" "${P[NRestarts]:-0}" "${P[Result]:-success}")" \
-      "$(since_state "${P[ActiveState]:-}" "${P[ActiveEnterTimestampMonotonic]:-}" "${P[InactiveEnterTimestampMonotonic]:-}")" \
-      "${P[UnitFileState]:-}" \
-      "$(hbytes "${P[MemoryMax]:-}")" "$(hbytes "${P[MemoryHigh]:-}")" \
-      "$(status_used_cell "${P[MemoryCurrent]:-}" "${P[MemoryPeak]:-}")" "${P[Restart]:-}" "$envf" \
-      "$job"
+    case "${SLOT[job_state]}" in no-access|idle-unknown) no_access=true ;; esac
+    status_row "$i" "${SLOT[name]}" "${SLOT[profile]:-—}" \
+      "$(status_active_cell "${SLOT[active]}" "${SLOT[sub]}" "${SLOT[restarts]:-0}" "${SLOT[result]:-success}" "${SLOT[last_restart_reason]}")" \
+      "$(if [ -n "${SLOT[since_age]}" ]; then fmt_dur "${SLOT[since_age]}"; else echo "—"; fi)" \
+      "${SLOT[enabled]}" \
+      "$(hbytes "${SLOT[memory_max]}")" "$(hbytes "${SLOT[memory_high]}")" \
+      "$(status_used_cell "${SLOT[memory_current]}" "${SLOT[memory_peak]}")" "${SLOT[restart]}" "${SLOT[env_file]:-—}" \
+      "$(job_cell)"
     i=$((i+1))
   done < <(discover)
   # Once under the table, not per row, so the rows stay parseable.
   if $no_access; then
     echo "note: WORKING-ON needs journal read access (systemd-journal group) or root"
   fi
+}
+
+# --- Machine-readable status (GHR-16) ----------------------------------------
+# A JSON string: backslash, quote and the control characters escaped (\n \r
+# \t by name, the rest as \u00XX), everything else verbatim. systemd's own
+# property values carry none of these in practice; escaped anyway.
+json_str() { # STRING
+  local s="${1-}" out="" c i n
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  if [[ "$s" == *[[:cntrl:]]* ]]; then
+    n=${#s}
+    for ((i = 0; i < n; i++)); do
+      c="${s:i:1}"
+      case "$c" in
+        $'\n')      out+='\n' ;;
+        $'\r')      out+='\r' ;;
+        $'\t')      out+='\t' ;;
+        [[:cntrl:]]) printf -v c '\\u%04x' "'$c"; out+="$c" ;;
+        *)          out+="$c" ;;
+      esac
+    done
+    s="$out"
+  fi
+  printf '"%s"\n' "$s"
+}
+
+# A JSON value from a raw string: null when empty, else a string.
+json_strn() { if [ -n "${1:-}" ]; then json_str "$1"; else echo null; fi; }
+
+# A JSON number from a raw string: unquoted only when it is all digits, null
+# otherwise — a stamp that was never set, a count that is missing.
+json_num() { if [[ "${1:-}" =~ ^[0-9]+$ ]]; then echo "$1"; else echo null; fi; }
+
+# A JSON byte count from a systemd memory property: null where hbytes prints
+# — (unset, infinity, [not set]), the number otherwise, and any other
+# string as a string so nothing is silently dropped.
+json_bytes() {
+  case "${1:-}" in
+    ''|infinity|max|18446744073709551615|'[not set]') echo null; return ;;
+  esac
+  if [[ "$1" =~ ^[0-9]+$ ]]; then echo "$1"; else json_str "$1"; fi
+}
+
+# Core count and memory in bytes for the JSON `host` object — `nproc` and
+# /proc/meminfo, on one line: "CORES MEM_TOTAL MEM_AVAILABLE", any of them
+# empty where it cannot be read. Behind a function so a test config can pin
+# it. The table's own header keeps `free -h`, whose rounding is what people
+# are used to reading.
+host_facts() {
+  local cores
+  cores="$(nproc 2>/dev/null || true)"
+  awk -v c="$cores" '
+    /^MemTotal:/     { t = $2 * 1024 }
+    /^MemAvailable:/ { a = $2 * 1024 }
+    END { printf "%s %s %s\n", c, (t == "" ? "" : sprintf("%.0f", t)), (a == "" ? "" : sprintf("%.0f", a)) }
+  ' /proc/meminfo 2>/dev/null || echo "$cores"
+}
+
+# `status --json`: the same SLOT facts as raw bytes, epoch seconds and null
+# — formatting is the consumer's job. One object per slot, keys stable:
+#   idx unit name active sub enabled memory_max memory_high memory_current
+#   memory_peak restart env_file since restarts result last_restart_reason
+#   profile job idle_since jobs_completed working_on_access
+# `job` is {"repo","name","since"} while a job is in flight (any of the
+# three null when unknown), null when idle or not running; `idle_since` and
+# `jobs_completed` are set while the slot is idle with a readable journal
+# (`jobs_completed` 0 when nothing has finished since the unit started);
+# `working_on_access` is "ok", "no-journal" (only /proc could be read) or
+# "no-access" — the note under the table, per slot.
+render_status_json() {
+  require_runners
+  local cores mem_total mem_avail i=0 u sep="" job idle_since completed
+  read -r cores mem_total mem_avail < <(host_facts) || true
+  printf '{"host":{"cores":%s,"mem_total":%s,"mem_available":%s},\n "slots":[' \
+    "$(json_num "$cores")" "$(json_num "$mem_total")" "$(json_num "$mem_avail")"
+  while read -r u; do
+    [ -n "$u" ] || continue
+    collect_slot "$u" "$i"
+    case "${SLOT[job_state]}" in
+      running|starting)
+        job="{\"repo\":$(json_strn "${SLOT[job_repo]}"),\"name\":$(json_strn "${SLOT[job_name]}"),\"since\":$(json_num "${SLOT[job_since]}")}" ;;
+      *) job=null ;;
+    esac
+    case "${SLOT[job_state]}" in
+      idle|idle-fresh) idle_since="$(json_num "${SLOT[job_idle_since]}")"; completed="$(json_num "${SLOT[job_done]}")" ;;
+      *)               idle_since=null; completed=null ;;
+    esac
+    printf '%s\n  {"idx":%s,"unit":%s,"name":%s,"active":%s,"sub":%s,"enabled":%s' \
+      "$sep" "$i" "$(json_str "$u")" "$(json_str "${SLOT[name]}")" \
+      "$(json_strn "${SLOT[active]}")" "$(json_strn "${SLOT[sub]}")" "$(json_strn "${SLOT[enabled]}")"
+    printf ',"memory_max":%s,"memory_high":%s,"memory_current":%s,"memory_peak":%s' \
+      "$(json_bytes "${SLOT[memory_max]}")" "$(json_bytes "${SLOT[memory_high]}")" \
+      "$(json_bytes "${SLOT[memory_current]}")" "$(json_bytes "${SLOT[memory_peak]}")"
+    printf ',"restart":%s,"env_file":%s,"since":%s,"restarts":%s,"result":%s,"last_restart_reason":%s,"profile":%s' \
+      "$(json_strn "${SLOT[restart]}")" "$(json_strn "${SLOT[env_file]}")" \
+      "$(json_num "$(age_to_epoch "${SLOT[since_age]}")")" "$(json_num "${SLOT[restarts]}")" \
+      "$(json_strn "${SLOT[result]}")" "$(json_strn "${SLOT[last_restart_reason]}")" "$(json_strn "${SLOT[profile]}")"
+    printf ',"job":%s,"idle_since":%s,"jobs_completed":%s,"working_on_access":%s}' \
+      "$job" "$idle_since" "$completed" "$(json_str "${SLOT[job_access]}")"
+    sep=","
+    i=$((i+1))
+  done < <(discover)
+  printf '\n]}\n'
 }
 
 cmd_apply() {
@@ -1036,21 +1267,25 @@ cmd_logs() {
 # --- Live view (GHR-3) --------------------------------------------------------
 # `status` prints the table once; `status --watch|-w` and `watch` redraw it
 # in place every --interval seconds (default 2) until Ctrl-C. --once turns a
-# watch back into a single print; the last of --watch/--once wins.
-cmd_status() { # [--watch|-w] [--once] [--interval N]
-  local watch=false args=()
+# watch back into a single print; the last of --watch/--once wins. --json
+# (GHR-16) prints the same facts as one JSON object instead of the table; it
+# is a one-shot format, so it refuses --watch rather than streaming frames.
+cmd_status() { # [--json] [--watch|-w] [--once] [--interval N]
+  local watch=false json=false args=()
   while [ $# -gt 0 ]; do
     case "$1" in
       --watch|-w) watch=true; shift ;;
       --once)     watch=false; shift ;;
+      --json)     json=true; shift ;;
       *)          args+=("$1"); shift ;;
     esac
   done
   if $watch; then
+    ! $json || die "--json cannot be combined with --watch; poll 'runnerctl status --json' instead"
     cmd_watch ${args[@]+"${args[@]}"}
   else
     [ "${#args[@]}" -eq 0 ] || die "unknown option: ${args[0]}"
-    render_status
+    if $json; then render_status_json; else render_status; fi
   fi
 }
 
