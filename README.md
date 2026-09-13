@@ -97,10 +97,10 @@ an idle slot, how long it has been idle and how many jobs it has finished
 since it started:
 
 ```
-IDX RUNNER                 PROFILE  ACTIVE                              SINCE    ENABLED   MAX    HIGH   USED        RESTART  ENVFILE WORKING-ON
-0   org.host-1             ci       active/running                     3d 4h    enabled   26.0G  22.0G  3.1G/24.9G  always   —       my-app:test (12m)
-1   org.host-2             ci       active/running ↻3 (last: oom-kill)  2d 7h    enabled   26.0G  22.0G  128M        always   —       idle 2h31m (7 jobs)
-2   org.host-3             deploy   inactive/dead                      6d       disabled  —      —      —           always   —       —
+IDX RUNNER                 PROFILE  ACTIVE                              SINCE    ENABLED   MAX    HIGH   USED        PRESS  RESTART  ENVFILE WORKING-ON
+0   org.host-1             ci       active/running                     3d 4h    enabled   26.0G  25.0G  3.1G/24.9G  0.4%   always   —       my-app:test (12m)
+1   org.host-2             ci       active/running ↻3 (last: oom-kill)  2d 7h    enabled   26.0G  25.0G  128M        0.0%   always   —       idle 2h31m (7 jobs)
+2   org.host-3             deploy   inactive/dead                      6d       disabled  —      —      —           —      always   —       —
 ```
 
 `ACTIVE` folds in a restart count (`↻3`) when systemd has restarted the unit
@@ -118,6 +118,19 @@ unparenthesised — e.g. `failed/failed ↻3 oom-kill`.
 `USED` becomes `current/peak` (`3.1G/24.9G`) when the host's systemd reports
 `MemoryPeak` (>= 254); on an older systemd, or a unit with memory accounting
 off, it stays current-only, silently.
+
+`PRESS` is the slot's memory pressure — the kernel's PSI `full avg10` from
+the cgroup's `memory.pressure`: the share of the last ten seconds that
+*every* task in the slot spent stalled waiting for memory. It is what
+`MemoryPeak` cannot tell you: whether the job running now is working or
+being throttled at `MemoryHigh`. Yellow from `PRESSURE_WARN_PCT` (config,
+default 10), red from `PRESSURE_CRIT_PCT` (default 50), `—` where the
+cgroup has no such file (a stopped slot, cgroup v1). A `STALLED` job with a
+high `PRESS` is starved, not hung — raise the cap or fix the job rather than
+restarting the slot. The cgroup's `memory.events` counters (`high`: times
+`memory.high` throttled it, `max`: times it hit `memory.max`, `oom_kill`:
+processes the OOM killer took, all since the unit started) are read at the
+same time and reported in `--json` and in `health`'s line.
 
 `SINCE` is measured from systemd's active-enter timestamp for a running slot
 and from its inactive-enter timestamp for a stopped or failed one (`—` for a
@@ -241,7 +254,9 @@ rendered from one collector, so they cannot disagree on a value:
    "restart":"always","env_file":null,"since":1757622000,
    "restarts":0,"result":"success","last_restart_reason":null,"profile":"ci",
    "job":{"repo":"my-app","name":"test","since":1757707200,"stalled":false},
-   "idle_since":null,"jobs_completed":null,"working_on_access":"ok","leaked_procs":null}
+   "idle_since":null,"jobs_completed":null,"working_on_access":"ok","leaked_procs":null,
+   "memory_events":{"high":4,"max":1,"oom_kill":0},
+   "memory_pressure":{"full_avg10":0.41,"full_avg60":0.12,"full_total":9876543}}
 ]}
 ```
 
@@ -265,7 +280,12 @@ could be read, so `job` may be present but `idle_since` never is) or
 `"no-access"` — the note under the table, per slot, and `leaked_procs`: how
 many processes a finished job left in an idle slot's cgroup (the table's
 `+N leaked`; `0` when none, null while busy or when the cgroup cannot be
-read). `host` carries `cores`
+read), `memory_events` (`{"high","max","oom_kill"}` from the cgroup's
+`memory.events`, counts since the unit started) and `memory_pressure`
+(`{"full_avg10","full_avg60","full_total"}` from `memory.pressure` —
+percentages and total stall microseconds; the `PRESS` column is
+`full_avg10`), each object null when the file could not be read. `host`
+carries `cores`
 (`nproc`) and `mem_total` / `mem_available` (bytes, from `/proc/meminfo`).
 `--json` is one-shot and refuses `--watch`; poll it instead.
 ### Health checks for cron / uptime monitors: `health`
@@ -275,15 +295,17 @@ read). `host` carries `cores`
 closes that: exit 0 with `ok: N slot(s) healthy` when every enabled slot is
 `active`/`activating`/`reloading`, no slot has restarted `--max-restarts`
 times (default 5) or more since its last manual start, no job has been
-running for `--stall-after` seconds (default `STALL_SEC`, 1 h) or more, and
-no idle slot has leaked processes; otherwise one line per problem on stdout
-and exit 1:
+running for `--stall-after` seconds (default `STALL_SEC`, 1 h) or more, no
+idle slot has leaked processes, and no slot is under full memory pressure
+of `PRESSURE_CRIT_PCT` (50 %) or more; otherwise one line per problem on
+stdout and exit 1:
 
 ```
 example.slot-2: enabled but inactive/dead since 3d
 example.slot-1: 7 restarts since last start (oom-kill)
 example.slot-3: stalled — job my-app:build running 1h33m, longer than 1h (--stall-after 3600)
 example.slot-4: 2 leaked process(es) left by finished jobs (node, esbuild) — runnerctl reap 3
+example.slot-5: under full memory pressure 63.2% (avg10, PRESSURE_CRIT_PCT=50) — throttled at MemoryHigh (4 times so far), see USED vs HIGH
 ```
 
 `--quiet` drops the output either way and keeps just the exit code, for a
