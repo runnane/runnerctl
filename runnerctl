@@ -38,6 +38,7 @@
 #   runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
 #                  [--since WHEN] [-g PATTERN]
 #   runnerctl remove-limits [<unit|slot-index|name> ...]
+#   runnerctl health [--quiet] [--max-restarts N]
 #   runnerctl profiles
 #   runnerctl config-example
 #   runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
@@ -61,6 +62,15 @@
 # seconds (default 2) until Ctrl-C, for keeping an eye on a drain, a profile
 # roll or a slot approaching its memory cap; it needs a terminal, and the
 # journal-derived WORKING-ON cells refresh every 10th redraw.
+#
+# `health` is a yes/no for cron or an uptime monitor's push endpoint: exit 0
+# ("ok: N slot(s) healthy") when every enabled slot is running and no slot has
+# restarted --max-restarts times (default 5) or more, else one line per
+# problem and exit 1; --quiet drops the output and keeps the exit code, for
+# `runnerctl health --quiet || alert`. NRestarts is systemd's count since the
+# unit's last manual start, not a rolling "in the last hour" window — there is
+# no cheap way to bucket it by wall-clock time, so that is what gets reported.
+# A disabled, scaled-down slot is not a problem.
 #
 # Recommended baselines:
 #   CI host:      runnerctl scale 2 --max 26G --high 22G
@@ -1135,6 +1145,74 @@ cmd_remove_limits() {
   fi
 }
 
+# GHR-14: a yes/no for cron/uptime probes — nothing on the host can currently
+# notice "slot has been inactive/dead since Tuesday" without parsing `status`.
+# Reuses unit_props (GHR-4) and journal_restart_reason (GHR-8); does not touch
+# render_status, which a parallel PR is refactoring — this reads unit_props
+# itself instead of sharing its collector.
+#
+# A problem is:
+#   - UnitFileState=enabled and not active/activating/reloading (a disabled,
+#     scaled-down slot is healthy on purpose — not a problem);
+#   - NRestarts >= --max-restarts (default 5), plus the journal's last-known
+#     reason when journal_restart_reason has one. NRestarts is systemd's count
+#     since the unit's last manual start, not "in the last hour" — there is no
+#     cheap way to bucket it by wall-clock time, so that is what this reports.
+# No problems: exit 0, "ok: N slot(s) healthy" (suppressed by --quiet). Any
+# problem: one line each on stdout (suppressed by --quiet; the exit code is
+# not), exit 1. No units at all: require_runners' existing die (not
+# suppressed by --quiet — only cmd_health's own output is).
+cmd_health() { # [--quiet] [--max-restarts N]
+  local quiet=false max_restarts=5
+  while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    case "$1" in
+      --quiet)
+        quiet=true; shift ;;
+      --max-restarts)
+        need_val "$@"
+        [[ "$2" =~ ^[0-9]+$ ]] || die "--max-restarts value '$2' is invalid — want an integer"
+        max_restarts="$2"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  require_runners
+  local u short n=0 problems=()
+  while read -r u; do
+    [ -n "$u" ] || continue
+    n=$((n + 1))
+    short="${u#actions.runner.}"; short="${short%.service}"
+    local -A P=()
+    local k v
+    while IFS='=' read -r k v; do
+      [ -n "$k" ] || continue
+      P[$k]="$v"
+    done < <(unit_props "$u")
+    local active="${P[ActiveState]:-}" sub="${P[SubState]:-}"
+    local enabled="${P[UnitFileState]:-}" nrestarts="${P[NRestarts]:-0}"
+    case "$active" in
+      active | activating | reloading) ;;
+      *)
+        if [ "$enabled" = enabled ]; then
+          problems+=("$short: enabled but $active/$sub since $(since_state "$active" "${P[ActiveEnterTimestampMonotonic]:-}" "${P[InactiveEnterTimestampMonotonic]:-}")")
+        fi
+        ;;
+    esac
+    if [[ "$nrestarts" =~ ^[0-9]+$ ]] && [ "$nrestarts" -ge "$max_restarts" ]; then
+      local reason line="$short: $nrestarts restarts since last start"
+      reason="$(journal_restart_reason "$u")"
+      [ -n "$reason" ] && line+=" ($reason)"
+      problems+=("$line")
+    fi
+  done < <(discover)
+  if [ "${#problems[@]}" -eq 0 ]; then
+    $quiet || echo "ok: $n slot(s) healthy"
+    return 0
+  fi
+  $quiet || printf '%s\n' "${problems[@]}"
+  return 1
+}
+
 cmd_profiles() {
   local p
   echo "Config: $CONFIG_FILE$([ -f "$CONFIG_FILE" ] || echo ' (not present — built-ins only)')"
@@ -1740,13 +1818,14 @@ main() {
     enable|disable)     cmd_toggle "$cmd" "$@" ;;
     logs)               cmd_logs "$@" ;;
     remove-limits)      cmd_remove_limits "$@" ;;
+    health)             cmd_health "$@" ;;
     profiles)           cmd_profiles "$@" ;;
     config-example)     cmd_config_example ;;
     migrate)            cmd_migrate "$@" ;;
     upgrade)            cmd_upgrade "$@" ;;
     version|--version)  echo "runnerctl $RUNNERCTL_VERSION" ;;
     -h|--help|help)     usage ;;
-    *) die "unknown command '$cmd' (status watch apply scale env-init start stop restart drain enable disable logs remove-limits profiles config-example migrate install upgrade version)" ;;
+    *) die "unknown command '$cmd' (status watch health apply scale env-init start stop restart drain enable disable logs remove-limits profiles config-example migrate install upgrade version)" ;;
   esac
 }
 

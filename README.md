@@ -77,6 +77,7 @@ runnerctl enable|disable <unit|slot-index|name>
 runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
                [--since WHEN] [-g PATTERN]
 runnerctl remove-limits [<unit|slot-index|name> ...]
+runnerctl health [--quiet] [--max-restarts N]
 runnerctl profiles
 runnerctl config-example
 runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
@@ -159,6 +160,39 @@ journal-derived `WORKING-ON` cells, which are refreshed every tenth redraw to
 keep the `journalctl` cost down — a job start or end shows up within
 10 × interval seconds. It needs a terminal: with stdout redirected it exits 1
 and points at `status`; `status --once` is the plain one-shot table.
+
+### Health checks for cron / uptime monitors: `health`
+
+`runnerctl status` always exits 0, so nothing on the host can notice "slot
+2 has been `inactive/dead` since Tuesday" without parsing the table. `health`
+closes that: exit 0 with `ok: N slot(s) healthy` when every enabled slot is
+`active`/`activating`/`reloading` and no slot has restarted `--max-restarts`
+times (default 5) or more since its last manual start; otherwise one line
+per problem on stdout and exit 1:
+
+```
+example.slot-2: enabled but inactive/dead since 3d
+example.slot-1: 7 restarts since last start (oom-kill)
+```
+
+`--quiet` drops the output either way and keeps just the exit code, for a
+cron line like:
+
+```sh
+runnerctl health --quiet || alert "runner pool unhealthy on $(hostname)"
+```
+
+A disabled, scaled-down slot is not a problem — only an *enabled* slot that
+is not running counts. The restart count is systemd's `NRestarts`, which
+resets on `systemctl start`/`restart`: it is restarts since the unit's last
+manual start, not a rolling "in the last hour" window — there is no cheap
+way to bucket it by wall-clock time without walking the journal for every
+slot, so this reports what `systemctl show` already tracks. When a restart
+count trips the threshold and the journal knows why the *last* one happened,
+the reason (`oom-kill`, `exit-code N`, `signal NAME`) is appended, same as
+the `ACTIVE` column in `status`. A host with no runner units at all still
+gets the usual `no 'actions.runner.*.service' units found` error (exit 1,
+not suppressed by `--quiet`).
 
 ### Graceful restart and stop: `--when-idle` and `drain`
 

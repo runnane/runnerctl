@@ -1296,6 +1296,49 @@ case_journal_restart_reason_line_no_match() {
   expect_no_out '.'
 }
 
+# --- GHR-14: health command for cron/uptime probes --------------------------
+# Default stub: slot-1 active/enabled (0 restarts), slot-2 active/enabled (3
+# restarts, below the default threshold of 5), slot-3 inactive/disabled (a
+# disabled slot down is not a problem) — so plain `health` is healthy.
+
+case_health_default_stub_is_healthy() {
+  run health
+  expect_rc 0
+  expect_out '^ok: 3 slot\(s\) healthy$'
+  # Read-only: no privileged call of any kind reaches the stub's log.
+  expect_no_log '^(systemctl|tee|rm|mkdir|chown|chmod|test) '
+}
+
+case_health_max_restarts_below_default_flags_slot2() {
+  run health --max-restarts 3
+  expect_rc 1
+  expect_out '^example\.slot-2: 3 restarts since last start \(oom-kill\)$'
+}
+
+case_health_enabled_but_dead_slot_is_a_problem() {
+  RUNNERCTL_STUB_SLOT3_ENABLED=1 run health
+  expect_rc 1
+  expect_out '^example\.slot-3: enabled but inactive/dead since 6d$'
+}
+
+case_health_quiet_suppresses_output_keeps_exit_code() {
+  run health --quiet --max-restarts 3
+  expect_rc 1
+  expect_no_out '.'
+}
+
+case_health_unknown_option_dies() {
+  run health --bogus
+  expect_rc 1
+  expect_err "unknown option: --bogus"
+}
+
+case_health_max_restarts_missing_value_dies() {
+  run health --max-restarts
+  expect_rc 1
+  expect_err "needs a value"
+}
+
 # --- Registry -----------------------------------------------------------------
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
@@ -1402,6 +1445,14 @@ t "journal_restart_reason_line: OOM killer sentence -> oom-kill"      case_journ
 t "journal_restart_reason_line: code=exited,status=137 -> exit-code 137" case_journal_restart_reason_line_exit_code
 t "journal_restart_reason_line: code=killed,status=9/KILL -> signal KILL" case_journal_restart_reason_line_signal
 t "journal_restart_reason_line: unrelated line -> nothing"            case_journal_restart_reason_line_no_match
+
+# --- GHR-14: health command for cron/uptime probes --------------------------
+t "health: default stub is healthy, read-only, no privileged call"    case_health_default_stub_is_healthy
+t "health --max-restarts 3: slot-2's 3 restarts trip it (oom-kill)"   case_health_max_restarts_below_default_flags_slot2
+t "health: an enabled-but-dead slot is a problem"                      case_health_enabled_but_dead_slot_is_a_problem
+t "health --quiet: no stdout either way, exit code kept"               case_health_quiet_suppresses_output_keeps_exit_code
+t "health --bogus: unknown option dies"                                case_health_unknown_option_dies
+t "health --max-restarts: missing value dies"                          case_health_max_restarts_missing_value_dies
 
 # --- Summary ------------------------------------------------------------------
 echo
