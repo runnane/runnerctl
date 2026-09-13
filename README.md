@@ -65,10 +65,10 @@ runnerctl [--config PATH] <command> [args]
 runnerctl status [--json] [--watch|-w] [--interval N] [--once] \
                  [--color auto|always|never] [--stall-after N]
 runnerctl watch  [--interval N] [--color auto|always|never] [--stall-after N]
-runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
+runnerctl apply  [--profile NAME] [--max 26G] [--high 25G] \
                  [--restart-sec N] [--env-file PATH] [--restart] \
                  [--when-idle] [--timeout N] [<unit|slot-index|name> ...]
-runnerctl scale N [--profile NAME] [--max 26G] [--high 22G] \
+runnerctl scale N [--profile NAME] [--max 26G] [--high 25G] \
                   [--restart] [--when-idle] [--timeout N]
 runnerctl env-init [--profile NAME] [--env-file PATH]
 runnerctl start|stop|restart [--when-idle] [--timeout N] \
@@ -309,11 +309,22 @@ Two profiles are built in so the tool is usable with no config at all:
 
 | profile  | memory cap        | restart | EnvironmentFile             |
 | -------- | ----------------- | ------- | --------------------------- |
-| `ci`     | 26G max / 22G high| 10 s    | none                        |
+| `ci`     | 26G max / 25G high| 10 s    | none                        |
 | `deploy` | none              | 15 s    | `/etc/runnerctl/deploy.env` |
 
 `ci` is a memory-capped build/test pool: a runaway job is contained to its own
-cgroup and `Restart=always` brings the slot back. `deploy` is an uncapped,
+cgroup. What happens at the cap is deliberate: every drop-in sets
+`OOMPolicy=continue`, so when the kernel OOM-kills the step that outgrew
+`MemoryMax` only that step dies — it exits 137, the job fails with a readable
+log, and Runner.Listener stays up. systemd's default (`stop`) would take the
+whole unit down instead, `Restart=always` would bring it back, and GitHub
+would report "runner lost communication" with no log — the `↻N (last:
+oom-kill)` churn `status` shows on an older install. `MemorySwapMax=0` keeps
+the cap firm (a capped job cannot swap out to stay under it and thrash), and
+`MemoryHigh` sits 1G under the cap on purpose: `memory.high` throttles rather
+than kills, and a build crawling in a wide throttle band for hours shows up as
+a STALLED job, which is worse for CI than a fast failure. `Restart=always`
+still brings a slot back from anything else. `deploy` is an uncapped,
 long-lived runner whose secrets come from a root-owned file on the box rather
 than from GitHub Actions secrets — the point being to shrink the blast radius
 of a runner that can reach production.
@@ -325,7 +336,7 @@ Typical baselines:
 
 ```sh
 # CI host: two active slots, capped
-runnerctl scale 2 --max 26G --high 22G
+runnerctl scale 2 --max 26G --high 25G
 
 # Deploy box: scaffold the secrets file, fill it in, then apply
 runnerctl env-init --profile deploy
@@ -428,8 +439,10 @@ StartLimitIntervalSec=0
 [Service]
 Restart=always
 RestartSec=10
-MemoryHigh=22G
+OOMPolicy=continue
+MemoryHigh=25G
 MemoryMax=26G
+MemorySwapMax=0
 ```
 
 `remove-limits` deletes the managed drop-ins again. `scale` stops and disables

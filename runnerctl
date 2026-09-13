@@ -8,7 +8,9 @@
 # plus reports status and scales the active pool.
 #
 # Built-in profiles (--profile, default: ci):
-#   ci      CI build/test pool. Memory-capped + auto-restart.
+#   ci      CI build/test pool. Memory-capped + auto-restart. A step that
+#           outgrows the cap is OOM-killed on its own (OOMPolicy=continue):
+#           the job fails with a readable log, the runner stays up.
 #   deploy  Dedicated deploy runner. Long-lived, auto-restart, secrets from a
 #           root-owned on-device EnvironmentFile — NOT memory-capped.
 #
@@ -26,10 +28,10 @@
 #   runnerctl status [--json] [--watch|-w] [--interval N] [--once] \
 #                    [--color auto|always|never] [--stall-after N]
 #   runnerctl watch  [--interval N] [--color auto|always|never] [--stall-after N]
-#   runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
+#   runnerctl apply  [--profile NAME] [--max 26G] [--high 25G] \
 #                    [--restart-sec N] [--env-file PATH] [--restart] \
 #                    [--when-idle] [--timeout N] [<unit|slot-index|name> ...]
-#   runnerctl scale N [--profile NAME] [--max 26G] [--high 22G] \
+#   runnerctl scale N [--profile NAME] [--max 26G] [--high 25G] \
 #                     [--restart] [--when-idle] [--timeout N]
 #   runnerctl env-init [--profile NAME] [--env-file PATH]
 #   runnerctl start|stop|restart [--when-idle] [--timeout N] \
@@ -88,7 +90,7 @@
 # A disabled, scaled-down slot is not a problem.
 #
 # Recommended baselines:
-#   CI host:      runnerctl scale 2 --max 26G --high 22G
+#   CI host:      runnerctl scale 2 --max 26G --high 25G
 #   Live view:    runnerctl watch --interval 5
 #   Deploy box:   runnerctl env-init --profile deploy   # then fill secrets
 #                 runnerctl apply --profile deploy --restart
@@ -178,8 +180,11 @@ builtin_profile() {
     ci)
       # Memory-capped so parallel jobs can't OOM a shared box; auto-restart.
       # 2 slots × 26G leaves headroom on a 60G box; bump on a bigger box.
+      # MemoryHigh sits 1G under the cap on purpose: memory.high throttles
+      # instead of killing, and a build crawling in a wide throttle band
+      # for hours is worse for CI than a fast exit 137 (GHR-28).
       PROFILE_DESC="CI build/test pool — memory-capped, auto-restart."
-      MEM_MAX="26G"; MEM_HIGH="22G"; RESTART_SEC="10"; ENV_FILE=""
+      MEM_MAX="26G"; MEM_HIGH="25G"; RESTART_SEC="10"; ENV_FILE=""
       ;;
     deploy)
       # Long-lived, auto-restart, uncapped (deploys are SSH/release-bound and a
@@ -881,15 +886,25 @@ render_dropin() {
   echo "[Service]"
   echo "Restart=always"
   echo "RestartSec=${RESTART_SEC}"
+  echo "# OOMPolicy: systemd's default (stop) takes the WHOLE unit down when the"
+  echo "# kernel OOM-kills any one process of it — the job dies as 'runner lost"
+  echo "# communication' and the runner restarts. With continue only the killed"
+  echo "# step is gone: it exits 137, the job fails with its log, the Listener"
+  echo "# stays up (GHR-28)."
+  echo "OOMPolicy=continue"
   if [ -n "$ENV_FILE" ]; then
     echo "# On-device secrets/config (root-owned, chmod 600). Never in GitHub."
     echo "EnvironmentFile=${ENV_FILE}"
   fi
   if [ -n "$MEM_MAX" ]; then
     echo "# MemoryHigh: soft reclaim/throttle before the hard cap."
-    echo "# MemoryMax:  hard — contains a runaway to its cgroup; Restart resurrects it."
+    echo "# MemoryMax:  hard — contains a runaway to its cgroup; the OOM killer takes"
+    echo "#             the offending step, OOMPolicy above keeps the runner."
+    echo "# MemorySwapMax=0: the cap bounds RAM only; without this a capped job"
+    echo "#             swaps out to stay under it and thrashes instead of failing."
     [ -n "$MEM_HIGH" ] && echo "MemoryHigh=${MEM_HIGH}"
     echo "MemoryMax=${MEM_MAX}"
+    echo "MemorySwapMax=0"
   fi
 }
 
@@ -1250,7 +1265,7 @@ cmd_apply() {
     done
     echo "Applied profile '$PROFILE' to ${#units[@]} slot(s): $short_list"
   else
-    echo "Applied profile '$PROFILE': Restart=always RestartSec=$RESTART_SEC${MEM_MAX:+ MemoryMax=$MEM_MAX MemoryHigh=$MEM_HIGH}${ENV_FILE:+ EnvironmentFile=$ENV_FILE}"
+    echo "Applied profile '$PROFILE': Restart=always RestartSec=$RESTART_SEC OOMPolicy=continue${MEM_MAX:+ MemoryMax=$MEM_MAX MemoryHigh=$MEM_HIGH MemorySwapMax=0}${ENV_FILE:+ EnvironmentFile=$ENV_FILE}"
   fi
   if $do_restart; then
     local i
@@ -1649,7 +1664,9 @@ cmd_config_example() {
 profile_ci() {
   PROFILE_DESC="CI build/test pool — memory-capped, auto-restart."
   MEM_MAX="26G"        # hard cap per slot (MemoryMax)
-  MEM_HIGH="22G"       # soft throttle point (MemoryHigh)
+  MEM_HIGH="25G"       # soft throttle point (MemoryHigh) — keep it close to
+                       # the cap: memory.high throttles rather than kills, and
+                       # a build crawling there for hours looks STALLED
   RESTART_SEC="10"
   ENV_FILE=""          # no EnvironmentFile for CI slots
 }
@@ -1921,12 +1938,16 @@ cmd_migrate() {
     local bad=0 a b
     a="$(mktemp)"; b="$(mktemp)"
     for u in "${live_units[@]}"; do
+      # Keys this renderer writes that the pre-config script never did
+      # (OOMPolicy, MemorySwapMax — GHR-28) are dropped from the generated
+      # side: a legacy drop-in cannot carry them, and the check is about
+      # the profile VALUES having migrated. The next `apply` writes them.
       (
         # shellcheck disable=SC1090  # the file we just wrote
         . "$written"
         PROFILE="${LIVE_PROF[$u]}"; PROFILE_DESC=""; MEM_MAX=""; MEM_HIGH=""; RESTART_SEC="10"; ENV_FILE=""
         load_profile; render_dropin
-      ) | strip_ini >"$a"
+      ) | strip_ini | grep -vE '^(OOMPolicy|MemorySwapMax)=' >"$a" || true
       strip_ini "${LIVE_FILE[$u]}" >"$b"
       if ! cmp -s "$a" "$b"; then
         bad=$((bad+1))
@@ -1937,6 +1958,7 @@ cmd_migrate() {
     rm -f "$a" "$b"
     [ "$bad" -eq 0 ] || { $dry_run && rm -f "$written"; die "$bad unit(s) differ — fix the profile in $out (or re-apply after migrating) and re-check"; }
     echo "verified: $n_live unit(s) render identically from the generated config"
+    echo "(the next 'runnerctl apply' also adds OOMPolicy=continue and MemorySwapMax=0 to each drop-in)"
   fi
   $dry_run && rm -f "$written"
   $dry_run || echo "Next: runnerctl --config $out profiles   # then install the new runnerctl and run: runnerctl status"

@@ -341,7 +341,7 @@ case_status_envfile_value_with_embedded_equals() {
 case_apply_ci() {
   run apply
   expect_rc 0
-  expect_out "^Applied profile 'ci': Restart=always RestartSec=10 MemoryMax=26G MemoryHigh=22G$"
+  expect_out "^Applied profile 'ci': Restart=always RestartSec=10 OOMPolicy=continue MemoryMax=26G MemoryHigh=25G MemorySwapMax=0$"
   expect_out 'Config takes effect on next'
   expect_log_count "tee $DROPIN_DIR/$U1\\.d/10-runnerctl\\.conf" 1
   expect_log_count 'tee .*/10-runnerctl\.conf$' 3
@@ -349,9 +349,13 @@ case_apply_ci() {
   expect_log_count '^systemctl daemon-reload$' 1
   expect_no_log '^systemctl restart'
   expect_file "$DROPIN_DIR/$U1.d/10-runnerctl.conf" '^MemoryMax=26G$'
-  expect_file "$DROPIN_DIR/$U1.d/10-runnerctl.conf" '^MemoryHigh=22G$'
+  expect_file "$DROPIN_DIR/$U1.d/10-runnerctl.conf" '^MemoryHigh=25G$'
   expect_file "$DROPIN_DIR/$U1.d/10-runnerctl.conf" '^RestartSec=10$'
   expect_file_lacks "$DROPIN_DIR/$U1.d/10-runnerctl.conf" '^EnvironmentFile='
+  # GHR-28: a step's OOM must not take the unit down, and the cap is RAM-only
+  # without a swap cap next to it
+  expect_file "$DROPIN_DIR/$U1.d/10-runnerctl.conf" '^OOMPolicy=continue$'
+  expect_file "$DROPIN_DIR/$U1.d/10-runnerctl.conf" '^MemorySwapMax=0$'
 }
 
 case_apply_restart_flags() {
@@ -378,11 +382,13 @@ case_apply_deploy_refuses_without_env_file() {
 case_apply_deploy_writes_with_env_file() {
   RUNNERCTL_STUB_ENV_FILE_EXISTS=1 run apply --profile deploy
   expect_rc 0
-  expect_out "^Applied profile 'deploy': Restart=always RestartSec=15 EnvironmentFile=$DEPLOY_ENV\$"
+  expect_out "^Applied profile 'deploy': Restart=always RestartSec=15 OOMPolicy=continue EnvironmentFile=$DEPLOY_ENV\$"
   expect_log_order "^test -f $DEPLOY_ENV\$" "tee .*/$U1\\.d/" "tee .*/$U2\\.d/" "tee .*/$U3\\.d/" '^systemctl daemon-reload$'
   expect_file "$DROPIN_DIR/$U3.d/10-runnerctl.conf" "^EnvironmentFile=$DEPLOY_ENV\$"
   expect_file "$DROPIN_DIR/$U3.d/10-runnerctl.conf" '^# Managed by runnerctl \(profile: deploy\)'
-  expect_file_lacks "$DROPIN_DIR/$U3.d/10-runnerctl.conf" '^Memory(Max|High)='
+  expect_file_lacks "$DROPIN_DIR/$U3.d/10-runnerctl.conf" '^Memory(Max|High|SwapMax)='
+  # GHR-28: the OOM policy is not a size — an uncapped profile gets it too
+  expect_file "$DROPIN_DIR/$U3.d/10-runnerctl.conf" '^OOMPolicy=continue$'
 }
 
 case_apply_unknown_profile() {

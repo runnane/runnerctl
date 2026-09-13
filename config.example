@@ -29,7 +29,9 @@
 profile_ci() {
   PROFILE_DESC="CI build/test pool — memory-capped, auto-restart."
   MEM_MAX="26G"        # hard cap per slot (MemoryMax)
-  MEM_HIGH="22G"       # soft throttle point (MemoryHigh)
+  MEM_HIGH="25G"       # soft throttle point (MemoryHigh) — keep it close to
+                       # the cap: memory.high throttles rather than kills, and
+                       # a build crawling there for hours looks STALLED
   RESTART_SEC="10"
   ENV_FILE=""          # no EnvironmentFile for CI slots
 }
