@@ -19,10 +19,11 @@
 #WAIT_TIMEOUT="1800"
 
 # A job running this many seconds or more is STALLED in status/watch, a
-# problem for `health` and "stalled":true in `status --json`. Default 6 h —
-# GitHub's own default job timeout — so anything older has outlived what the
-# service allows. 0 turns the flag off; --stall-after N overrides per run.
-#STALL_SEC="21600"
+# problem for `health`, "stalled":true in `status --json`, and what
+# `restart --if-stalled` / `health --restart-stalled` act on. Default 1 h:
+# no job on a build pool legitimately runs that long. Raise it for a pool
+# with longer jobs; 0 turns the flag off; --stall-after N overrides per run.
+#STALL_SEC="3600"
 
 # `reap`: seconds a leaked process gets after SIGTERM before SIGKILL.
 #REAP_GRACE_SEC="5"
