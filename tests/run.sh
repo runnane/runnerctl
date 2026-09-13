@@ -1773,6 +1773,268 @@ case_status_used_color_thresholds() {
   expect_no_out '.'
 }
 
+# --- GHR-33: interactive watch -------------------------------------------------
+# Without --iterations the loop is interactive: the stub's `tty_read_char`
+# hands out RUNNERCTL_STUB_KEYS one character per read (`-` = a tick with
+# no key; exhausted = ticks forever, so every case ends with `q`), `term_cols`
+# answers RUNNERCTL_STUB_COLS (0 = unknown) and `page` is a logged `cat`.
+# The cursor row is reverse video (ESC[7m … ESC[0m) whatever --color says;
+# each frame ends with the legend and a status line (notice or confirm).
+REV="$ESC\[7m"
+LEGEND='^↑↓/jk select  K kill job  R restart  S stop  T start  P reap  L logs  q quit$'
+SLOT1_UNIT='actions\.runner\.example\.slot-1\.service'
+SLOT2_UNIT='actions\.runner\.example\.slot-2\.service'
+SLOT3_UNIT='actions\.runner\.example\.slot-3\.service'
+
+# The row a frame highlights: a slot row wrapped in reverse video.
+cursor_row() { echo "^${REV}$1 +example\.slot-$2 .*$ESC\[0m$"; }
+
+case_watch_keys_move_the_cursor() {
+  # j, j, k, then an arrow down (ESC [ B) and an arrow up in the O form
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=$'jjk\e[B\eOAq' run watch --interval 1
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 6
+  expect_out_count "$LEGEND" 6
+  # the header of every frame is the one from before (GHR-3 / GHR-32)
+  expect_out_count "${FRAME_PREFIX}runnerctl watch — [^ ]+ — [0-9]{2}:[0-9]{2}:[0-9]{2} — every 1s \(Ctrl-C to quit\)$" 6
+  expect_out_count '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: ' 6
+  # exactly one highlighted row per frame: slot-1, then 2, 3, 2, 3 and the
+  # frame q was read from (2)
+  expect_out_count "^${REV}[0-9]" 6
+  expect_out_count "$(cursor_row 0 1)" 1
+  expect_out_count "$(cursor_row 1 2)" 3
+  expect_out_count "$(cursor_row 2 3)" 2
+  # the unhighlighted rows are the plain ones `status` prints
+  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h .* my-app:test \(12m\)$'
+  # the escape sequences went through the real parser, one char per read
+  expect_log_order '^probe:tty_read_char 1 j$' '^probe:tty_read_char 1 j$' '^probe:tty_read_char 1 k$' \
+                   "^probe:tty_read_char 1 \\\$'\\\\E'$" '^probe:tty_read_char 0\.05 \\\[$' '^probe:tty_read_char 0\.05 B$' \
+                   "^probe:tty_read_char 1 \\\$'\\\\E'$" '^probe:tty_read_char 0\.05 O$' '^probe:tty_read_char 0\.05 A$' \
+                   '^probe:tty_read_char 1 q$' '^probe:term_cursor show$'
+  # a key redraws at once: no pause between these frames
+  expect_no_log '^probe:pause '
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+}
+
+# The cursor clamps at both ends and is keyed by the unit, so a tick (the
+# interval passing with no key) redraws with the same row highlighted.
+case_watch_cursor_clamps_and_survives_a_tick() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='kkjjjj--q' run watch
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 9
+  expect_out_count "$(cursor_row 0 1)" 3
+  expect_out_count "$(cursor_row 1 2)" 1
+  expect_out_count "$(cursor_row 2 3)" 5
+  expect_log_count '^probe:pause 2$' 2
+  # a tick is a journal-memo tick: 2 ticks + tick 0 read the journal once
+  expect_log_count '^probe:journal_job_lines .*slot-1' 1
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+}
+
+# K on the busy slot: the confirm line names the exact command, `y` runs it
+# through run_priv with the cursor shown for a sudo prompt, and the result
+# is the next frame's notice. The journal memo for the slot is dropped
+# before the decision, so the facts are current.
+case_watch_K_kills_the_running_job_after_confirm() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Kyq' run watch
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 3
+  expect_out_count "^Kill the job on example\.slot-1 \(my-app:test \(12m\)\)\? runs: systemctl restart $SLOT1_UNIT  \[y/n\]$" 1
+  expect_out "^running: systemctl restart $SLOT1_UNIT$"
+  expect_out_count '^example\.slot-1: restart done\.$' 1
+  expect_log_count "^systemctl restart $SLOT1_UNIT$" 1
+  expect_log_count '^systemctl ' 1
+  expect_log_order '^probe:term_cursor hide$' '^probe:tty_read_char 2 K$' '^probe:journal_job_lines .*slot-1' \
+                   '^probe:tty_read_char 2 y$' '^probe:term_cursor show$' "^systemctl restart $SLOT1_UNIT$" \
+                   '^probe:term_cursor hide$' '^probe:tty_read_char 2 q$' '^probe:term_cursor show$'
+  expect_log_count '^probe:journal_job_lines .*slot-1' 2
+  # the cursor stayed on the slot
+  expect_out_count "$(cursor_row 0 1)" 3
+}
+
+# Anything but `y` at a confirm cancels it: nothing runs, the notice says so.
+case_watch_confirm_n_runs_nothing() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Knq' run watch
+  expect_rc 0
+  expect_out_count '^Kill the job on example\.slot-1 ' 1
+  expect_out_count '^cancelled — nothing run$' 1
+  expect_no_out '^running:'
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+  # `q` at a confirm is a cancel too, not a quit: a second one quits
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Kqq' run watch
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 3
+  expect_out_count '^cancelled — nothing run$' 1
+  expect_no_log '^systemctl '
+}
+
+# K needs a running job: the idle slot and the stopped one refuse with a
+# notice and no confirm line; (no access) says why it cannot tell.
+case_watch_K_refused_without_a_running_job() {
+  # the `y` after each refusal is no confirm: it is an unbound key that
+  # only clears the notice
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jKyjKyq' run watch
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 7
+  expect_out_count '^example\.slot-2: no job running — nothing to kill$' 1
+  expect_out_count '^example\.slot-3: not running — nothing to kill$' 1
+  expect_no_out '^Kill the job'
+  expect_no_out '\[y/n\]'
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_JOURNAL_ACCESS=0 RUNNERCTL_STUB_KEYS='Kq' run watch
+  expect_rc 0
+  expect_out '^example\.slot-1: cannot tell whether a job is running — needs journal read access \(systemd-journal group\) or root$'
+  expect_no_log '^systemctl '
+}
+
+# R on an active slot: confirm, and a warning line when a job is in flight
+# (slot-1) but not on the idle slot-2; the stopped slot-3 refuses.
+case_watch_R_restarts_with_a_warning_when_busy() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='RyjRyjRq' run watch
+  expect_rc 0
+  expect_out_count "^Restart example\.slot-1\? runs: systemctl restart $SLOT1_UNIT  \[y/n\]$" 1
+  expect_out_count "^warning: a job is running \(my-app:test \(12m\)\) — it will be killed and GitHub marks it failed; runnerctl restart --when-idle waits for it instead$" 1
+  expect_out_count "^Restart example\.slot-2\? runs: systemctl restart $SLOT2_UNIT  \[y/n\]$" 1
+  expect_out_count '^warning:' 1
+  expect_out_count '^example\.slot-3: not active \(inactive\) — T starts it$' 1
+  expect_out_count '^example\.slot-1: restart done\.$' 1
+  expect_out_count '^example\.slot-2: restart done\.$' 1
+  expect_log_order "^systemctl restart $SLOT1_UNIT$" "^systemctl restart $SLOT2_UNIT$"
+  expect_log_count '^systemctl ' 2
+}
+
+# S stops an active slot (warned when busy), T starts a stopped one; the
+# no-op directions refuse.
+case_watch_S_stops_and_T_starts() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='TSyjjSTyq' run watch
+  expect_rc 0
+  expect_out_count '^example\.slot-1: already active — R restarts it$' 1
+  expect_out_count "^Stop example\.slot-1\? runs: systemctl stop $SLOT1_UNIT  \[y/n\]$" 1
+  expect_out_count '^warning: a job is running \(my-app:test \(12m\)\) — it will be killed and GitHub marks it failed; runnerctl stop --when-idle waits for it instead$' 1
+  expect_out_count '^example\.slot-1: stop done\.$' 1
+  expect_out_count '^example\.slot-3: already stopped \(inactive\)$' 1
+  expect_out_count "^Start example\.slot-3\? runs: systemctl start $SLOT3_UNIT  \[y/n\]$" 1
+  expect_out_count '^example\.slot-3: start done\.$' 1
+  expect_log_order "^systemctl stop $SLOT1_UNIT$" "^systemctl start $SLOT3_UNIT$"
+  expect_log_count '^systemctl ' 2
+}
+
+# P reaps the idle slot's leaked processes through cmd_reap (TERM, grace,
+# KILL for survivors); the busy slot and a slot without leaks refuse.
+case_watch_P_reaps_leaked_processes() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 RUNNERCTL_STUB_SURVIVORS=4243 \
+    RUNNERCTL_STUB_KEYS='PjPyq' run watch
+  expect_rc 0
+  expect_out_count "^example\.slot-1: busy \(my-app:test \(12m\)\) — a running job's processes are not leaks$" 1
+  expect_out_count '^Reap 2 leaked process\(es\) on example\.slot-2 \(4242/node, 4243/esbuild\)\? runs: kill -TERM 4242 4243, then kill -KILL what is still alive after 5s  \[y/n\]$' 1
+  expect_out "^running: reap example\.slot-2$"
+  expect_out_count '^example\.slot-2: reaped 2 leaked process\(es\): 4242/node, 4243/esbuild — SIGKILL needed for pid 4243$' 1
+  expect_log_order '^probe:term_cursor show$' '^kill -TERM 4242 4243$' '^probe:pause 5$' '^kill -KILL 4243$' '^probe:term_cursor hide$'
+  expect_log_count '^kill ' 2
+  expect_no_log '^systemctl '
+  # no leaks shown: refused, nothing sent
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_KEYS='jPyq' run watch
+  expect_rc 0
+  expect_out_count '^example\.slot-2: no leaked processes shown — nothing to reap$' 1
+  expect_no_out '\[y/n\]'
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+}
+
+# L pages `logs <slot> -n 50` at once (no confirm — it changes nothing),
+# with the cursor shown for the pager and hidden again for the next frame.
+case_watch_L_pages_the_slot_logs() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jLq' run watch
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 3
+  expect_no_out '\[y/n\]'
+  expect_log_count "^journalctl -u $SLOT2_UNIT -n 50 --no-pager$" 1
+  expect_log_count '^journalctl ' 1
+  # the pager and cmd_logs are the two ends of one pipeline, so only their
+  # place between the cursor calls is ordered, not the two against each other
+  expect_log_order '^probe:tty_read_char 2 L$' '^probe:term_cursor show$' "^journalctl -u $SLOT2_UNIT -n 50 --no-pager$" '^probe:term_cursor hide$' '^probe:tty_read_char 2 q$'
+  expect_log_order '^probe:term_cursor show$' '^probe:page$' '^probe:term_cursor hide$'
+  expect_log_count '^probe:page$' 1
+  expect_no_log '^systemctl '
+}
+
+# q (or Q) quits with the cursor restored; a lone Escape is not a key.
+case_watch_q_quits() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='q' run watch
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 1
+  expect_out_count "$(cursor_row 0 1)" 1
+  expect_log_order '^probe:term_cursor hide$' '^probe:tty_read_char 2 q$' '^probe:term_cursor show$'
+  expect_log_count '^probe:term_cursor ' 2
+  # ESC, then nothing within the follow-up read (the `-`): a lone Escape,
+  # which is no key at all — one frame for it, then Q
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=$'\e-Q' run watch
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 2
+  expect_log_order "^probe:tty_read_char 2 \\\$'\\\\E'$" '^probe:tty_read_char 0\.05 none$' '^probe:pause 0\.05$' '^probe:tty_read_char 2 Q$'
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+}
+
+# --iterations N is the headless view of before: no key is read even with
+# keys on offer, no cursor, no legend, nothing run.
+case_watch_iterations_reads_no_keys() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Kyq' run watch --iterations 2
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 2
+  expect_no_log '^probe:tty_read_char '
+  expect_log_count '^probe:pause 2$' 2
+  expect_no_out "$REV"
+  expect_no_out "$LEGEND"
+  expect_no_out '\[y/n\]'
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+}
+
+# Not a terminal: the refusal of before, and no key is read on the way out.
+case_watch_non_tty_refusal_reads_no_keys() {
+  RUNNERCTL_STUB_KEYS='Kyq' run watch
+  expect_rc 1
+  expect_err "^runnerctl: watch needs a terminal \(stdout is not a tty\); use 'runnerctl status'$"
+  expect_no_out '.'
+  expect_no_log '^probe:tty_read_char '
+  expect_no_log '^systemctl '
+}
+
+# A terminal narrower than the table drops MAX, HIGH and ENVFILE — never
+# WORKING-ON, whose idle duration is what an action is decided on — and a
+# wide (or unknown-width) one keeps every column. `status` is untouched.
+case_watch_narrow_terminal_drops_max_high_envfile() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=140 RUNNERCTL_STUB_KEYS='jq' run watch
+  expect_rc 0
+  expect_out_count '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +USED +PRESS +RESTART +WORKING-ON$' 2
+  expect_no_out 'MAX|HIGH|ENVFILE'
+  expect_out "^${REV}0 +example\.slot-1 +— +active/running +3d 4h +enabled +1\.0G/25\.0G +— +always +my-app:test \(12m\)$ESC\[0m$"
+  expect_out '^1 +example\.slot-2 .* +always +idle 2h31m \(2 jobs\)$'
+  expect_no_out '/etc/x'
+  # the re-render happens once, on the transition: 3 + 3 fetches for the
+  # first frame, 3 for the second
+  expect_log_count '^probe:unit_props ' 9
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 RUNNERCTL_STUB_KEYS='q' run watch
+  expect_rc 0
+  expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$'
+  expect_out '^1 +example\.slot-2 .* /etc/x \(ignore_errors=no\) idle 2h31m \(2 jobs\)$'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='q' run watch
+  expect_rc 0
+  expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$'
+  RUNNERCTL_STUB_COLS=80 run status
+  expect_rc 0
+  expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$'
+  expect_out '^1 +example\.slot-2 .* /etc/x \(ignore_errors=no\) idle 2h31m \(2 jobs\)$'
+}
+
+# --color always: the cursor's reverse video is re-applied after every
+# reset a painted cell ends with, so the row stays highlighted end to end.
+case_watch_color_always_keeps_the_cursor_row_highlighted() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='q' run watch --color always
+  expect_rc 0
+  expect_out "^${REV}0 +example\.slot-1 +$ESC\[2m—$ESC\[0m${REV} +$ESC\[32mactive/running$ESC\[0m${REV} .* $ESC\[32mmy-app:test \(12m\)$ESC\[0m${REV}$ESC\[0m$"
+  expect_out "^1 +example\.slot-2 +$ESC\[2m—$ESC\[0m +$ESC\[33m"
+  expect_out "^$ESC\[2m↑↓/jk select .* q quit$ESC\[0m$"
+}
+
 # --- Registry -----------------------------------------------------------------
 # --- GHR-29: leaked processes on an idle slot, and `reap` --------------------
 # The stub's slot-2 is idle (2h31m, 2 jobs); with the cgroup readable and
@@ -2297,6 +2559,22 @@ t "health: full memory pressure over PRESSURE_CRIT_PCT is a problem"    case_hea
 t "health: a stalled line under pressure says throttled, not hung"      case_health_stalled_line_says_throttled_when_under_pressure
 t "pressure_at_least: inclusive at the threshold, never on unknown"   case_pressure_at_least_boundary_is_inclusive
 t "status --stall-after 600: the STALLED note points at PRESS"          case_status_stalled_note_mentions_press
+
+# --- GHR-33: interactive watch ------------------------------------------------
+t "watch: j/k and the arrows move the cursor, a key redraws at once"     case_watch_keys_move_the_cursor
+t "watch: the cursor clamps at both ends and survives a tick"           case_watch_cursor_clamps_and_survives_a_tick
+t "watch: K, y — confirm names systemctl restart, runs it, notice"       case_watch_K_kills_the_running_job_after_confirm
+t "watch: K, n — cancelled, nothing run; q at a confirm cancels too"    case_watch_confirm_n_runs_nothing
+t "watch: K refused on an idle, stopped or (no access) row"             case_watch_K_refused_without_a_running_job
+t "watch: R restarts, warning line only when a job is in flight"        case_watch_R_restarts_with_a_warning_when_busy
+t "watch: S stops an active slot, T starts a stopped one, no-ops refuse" case_watch_S_stops_and_T_starts
+t "watch: P reaps the idle slot's leaks via cmd_reap, refused elsewhere" case_watch_P_reaps_leaked_processes
+t "watch: L pages logs <slot> -n 50, no confirm"                        case_watch_L_pages_the_slot_logs
+t "watch: q/Q quits, cursor restored; a lone Escape is not a key"       case_watch_q_quits
+t "watch --iterations: headless, reads no keys, no cursor, no legend"   case_watch_iterations_reads_no_keys
+t "watch: the non-tty refusal reads no keys"                            case_watch_non_tty_refusal_reads_no_keys
+t "watch: a narrow terminal drops MAX/HIGH/ENVFILE, never WORKING-ON"   case_watch_narrow_terminal_drops_max_high_envfile
+t "watch --color always: the cursor row stays highlighted end to end"   case_watch_color_always_keeps_the_cursor_row_highlighted
 
 # --- Summary ------------------------------------------------------------------
 echo
