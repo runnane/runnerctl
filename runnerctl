@@ -299,11 +299,28 @@ unit_props() {
 # "insufficient permissions" and exits 1. Read-only and called directly, never
 # through run_priv — status must never prompt for sudo. A config can shadow
 # this to stub it.
+#
+# The filtering is journalctl's own `-g` (a regex over MESSAGE), not a tail:
+# a `-n` window would be eaten by every other line the Listener writes
+# ("Listening for Jobs", update checks, per-job noise), so on a slot up for
+# weeks the `(N jobs)` count would silently cover only the last few hundred
+# lines (GHR-26). With `-g` the fetch is exactly the job lines of the
+# invocation, however long it has been running.
+JOURNAL_JOB_PATTERN='Running job: |completed with result: '
+
+# The journalctl argv for UNIT [INVOCATION-ID], one argument per line, so the
+# harness can assert on it without a journal (journal_job_lines itself is
+# stubbed under `make sim`).
+journal_job_args() { # UNIT [INVOCATION-ID]
+  printf '%s\n' --system -u "$1" -o short-unix --no-pager -q -g "$JOURNAL_JOB_PATTERN"
+  [ -n "${2:-}" ] && printf '%s\n' "_SYSTEMD_INVOCATION_ID=$2"
+  return 0
+}
+
 journal_job_lines() { # UNIT [INVOCATION-ID]
-  local out args=(--system -u "$1" -o short-unix --no-pager -q -n 400)
-  [ -n "${2:-}" ] && args+=("_SYSTEMD_INVOCATION_ID=$2")
-  out="$(journalctl "${args[@]}" 2>/dev/null)" || return 1
-  grep -E 'Running job: |completed with result: ' <<<"$out" || true
+  local args=()
+  mapfile -t args < <(journal_job_args "$@")
+  journalctl "${args[@]}" 2>/dev/null || return 1
 }
 
 # Journal memo for `watch` (GHR-3). A redraw every 2 s would otherwise run
