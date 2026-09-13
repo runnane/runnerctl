@@ -44,6 +44,13 @@
 #   expect_file PATH P             the file `tee`d to PATH exists and matches
 #   expect_file_lacks PATH P       it exists and no line matches
 #   expect_no_file PATH            nothing was written to PATH
+#   expect_json PY-EXPR            stdout parses as JSON and the Python
+#                                  expression over `d` (the parsed object) is
+#                                  true — needs python3; guard with
+#                                  `$HAVE_PYTHON3` and `skip`
+#   skip <notice>                  print a skip notice for a check this box
+#                                  cannot run; not a failure, and NOT an
+#                                  expectation — the case must still assert
 # Env knobs for a single run: prefix it, e.g.
 #   RUNNERCTL_STUB_ENV_FILE_EXISTS=1 run apply --profile deploy
 #
@@ -219,6 +226,27 @@ expect_no_file() {
   local p; p="$(_mirror_path "$1")"
   [ ! -e "$p" ] || FAILS+=("$1 was written")
 }
+
+# GHR-16: assert on the parsed JSON in OUT — EXPR is a Python expression
+# over `d`, the object json.load gave back, so a shape or value check reads
+# as one line (`d["slots"][1]["restarts"] == 3`). A stdout that is not JSON
+# fails the expectation with the parser's message. Needs python3: guard the
+# case with HAVE_PYTHON3 and `skip` (below) where it may be absent.
+HAVE_PYTHON3=false
+command -v python3 >/dev/null 2>&1 && HAVE_PYTHON3=true
+expect_json() {
+  _expect
+  local err
+  # PYTHON_COLORS=0: python >= 3.13 colours its tracebacks, and the escape
+  # codes would land in the failure report.
+  err="$(PYTHON_COLORS=0 python3 -c 'import json,sys; d=json.load(sys.stdin); e=sys.argv[1]; assert eval(e), e' "$1" <<<"$OUT" 2>&1)" \
+    || FAILS+=("json: $1 (${err##*$'\n'})")
+}
+
+# A notice that part of a case could not run on this box (an optional tool
+# is missing). Not a failure and not an expectation — a case that skips must
+# still assert something, or it fails as making no assertions.
+skip() { echo "skip  $*"; }
 
 # --- Case runner --------------------------------------------------------------
 _case() {
@@ -1296,6 +1324,127 @@ case_journal_restart_reason_line_no_match() {
   expect_no_out '.'
 }
 
+# --- GHR-16: status --json, the table's facts as one JSON object -------------
+# Same stub tables as the table cases (tests/stub.config): slot-1 busy on
+# `test` for my-app with MemoryPeak, slot-2 idle after two jobs with three
+# restarts and an oom-kill reason, slot-3 stopped; host_facts pinned. The
+# values are asserted through python3's parser where there is one (ubuntu-
+# latest has it); without it the case keeps its exit-code, shape and
+# read-only assertions and prints a skip notice for the rest.
+
+case_status_json_parses_and_carries_the_slot_facts() {
+  run status --json
+  expect_rc 0
+  expect_out '^\{"host":\{"cores":16,"mem_total":68719476736,"mem_available":51539607552\},$'
+  expect_out '^ "slots":\[$'
+  expect_out '^\]\}$'
+  # read-only, like the table: no privileged call at all.
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test) '
+  # the note under the table is a per-slot field here, never a stray line.
+  expect_no_out '^note:'
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: status --json parse assertions not run"; return 0; fi
+  expect_json 'len(d["slots"]) == 3'
+  expect_json 'd["host"] == {"cores": 16, "mem_total": 68719476736, "mem_available": 51539607552}'
+  expect_json '[s["idx"] for s in d["slots"]] == [0, 1, 2]'
+  expect_json 'd["slots"][0]["unit"] == "actions.runner.example.slot-1.service" and d["slots"][0]["name"] == "example.slot-1"'
+  # slot-1: raw bytes, not 26.0G; the running job with its journal stamp.
+  expect_json 'd["slots"][0]["job"] == {"repo": "my-app", "name": "test", "since": 1000000000}'
+  expect_json 'd["slots"][0]["memory_max"] == 27917287424 and d["slots"][0]["memory_high"] == 23622320128'
+  expect_json 'd["slots"][0]["memory_current"] == 1073741824 and d["slots"][0]["memory_peak"] == 26843545600'
+  expect_json 'd["slots"][0]["env_file"] is None and d["slots"][0]["idle_since"] is None and d["slots"][0]["jobs_completed"] is None'
+  expect_json 'd["slots"][0]["active"] == "active" and d["slots"][0]["sub"] == "running" and d["slots"][0]["enabled"] == "enabled"'
+  expect_json 'd["slots"][0]["restart"] == "always" and d["slots"][0]["restarts"] == 0 and d["slots"][0]["result"] == "success"'
+  expect_json 'd["slots"][0]["last_restart_reason"] is None and d["slots"][0]["profile"] is None'
+  # SINCE as an epoch second: pinned now_epoch minus the 3d 4h (273600 s) the table shows.
+  expect_json 'd["slots"][0]["since"] == 1000000720 - 273600'
+  # slot-2: idle since its last completion, two jobs, restart facts, the raw EnvironmentFiles value.
+  expect_json 'd["slots"][1]["job"] is None'
+  expect_json 'isinstance(d["slots"][1]["idle_since"], int) and d["slots"][1]["idle_since"] == 999991660'
+  expect_json 'd["slots"][1]["jobs_completed"] == 2'
+  expect_json 'd["slots"][1]["restarts"] == 3 and d["slots"][1]["last_restart_reason"] == "oom-kill"'
+  expect_json 'd["slots"][1]["env_file"] == "/etc/x (ignore_errors=no)"'
+  expect_json 'd["slots"][1]["memory_peak"] is None'
+  # slot-3: stopped — infinity / [not set] become null, since from the inactive-enter stamp.
+  expect_json 'd["slots"][2]["active"] == "inactive" and d["slots"][2]["sub"] == "dead" and d["slots"][2]["enabled"] == "disabled"'
+  expect_json 'd["slots"][2]["memory_max"] is None and d["slots"][2]["memory_high"] is None and d["slots"][2]["memory_current"] is None'
+  expect_json 'd["slots"][2]["job"] is None and d["slots"][2]["idle_since"] is None and d["slots"][2]["jobs_completed"] is None'
+  expect_json 'isinstance(d["slots"][2]["since"], int) and d["slots"][2]["since"] == 1000000720 - 518400'
+  expect_json 'all(s["working_on_access"] == "ok" for s in d["slots"])'
+}
+
+# Both renderers read one collector: the JSON makes exactly the fetches the
+# table makes — one unit_props per slot, one journal fetch per running slot,
+# one restart-reason lookup for the restarted slot — never a second one.
+case_status_json_same_fetches_as_the_table() {
+  run status --json
+  expect_rc 0
+  expect_log_count '^probe:unit_props ' 3
+  expect_log_count '^probe:journal_job_lines ' 2
+  expect_log_count '^probe:journal_job_lines actions\.runner\.example\.slot-1\.service ' 1
+  expect_log_count '^probe:journal_job_lines actions\.runner\.example\.slot-2\.service ' 1
+  expect_log_count '^probe:journal_restart_reason ' 1
+}
+
+# PROFILE from a seeded drop-in lands as a string, not — (GHR-15's read).
+case_status_json_profile_from_dropin() {
+  run status          # establishes TMP/WRITES
+  seed_dropin "$U2" deploy
+  run_keep status --json
+  expect_rc 0
+  expect_out '"name":"example.slot-2".*"profile":"deploy"'
+  expect_out '"name":"example.slot-1".*"profile":null'
+}
+
+# The access states the table prints as (no access) / idle ? / a bare job
+# name are one field per slot; the running job seen through /proc alone has
+# no journal stamp, so its `since` is null.
+case_status_json_working_on_access_states() {
+  RUNNERCTL_STUB_JOURNAL_ACCESS=0 run status --json
+  expect_rc 0
+  expect_no_out '^note:'
+  expect_out '"name":"example.slot-1".*"job":null,"idle_since":null,"jobs_completed":null,"working_on_access":"no-access"'
+  expect_out '"name":"example.slot-3".*"working_on_access":"ok"'
+  RUNNERCTL_STUB_JOURNAL_ACCESS=0 RUNNERCTL_STUB_CGROUP_READABLE=1 run status --json
+  expect_rc 0
+  expect_out '"name":"example.slot-1".*"job":\{"repo":"my-app","name":"test","since":null\}.*"working_on_access":"no-journal"'
+  expect_out '"name":"example.slot-2".*"job":null,"idle_since":null,"jobs_completed":null,"working_on_access":"no-journal"'
+}
+
+# idle (no jobs yet): idle_since is the unit's own start, jobs_completed 0.
+case_status_json_idle_fresh_counts_from_unit_start() {
+  RUNNERCTL_STUB_JOURNAL_EMPTY=1 run status --json
+  expect_rc 0
+  expect_out '"name":"example.slot-1".*"since":999727120,.*"job":null,"idle_since":999727120,"jobs_completed":0,"working_on_access":"ok"'
+}
+
+case_status_json_refuses_watch() {
+  run status --json --watch
+  expect_rc 1
+  expect_err '^runnerctl: --json cannot be combined with --watch'
+  expect_no_out '.'
+  RUNNERCTL_STUB_TTY=1 run watch --json --iterations 1
+  expect_rc 1
+  expect_err '^runnerctl: --json cannot be combined with --watch'
+  expect_no_out '.'
+}
+
+# The escaper alone: backslash and quote, a newline by name, another
+# control character as \u00XX, and the empty string.
+case_json_str_escapes() {
+  run_fn json_str 'a"b\c'
+  expect_rc 0
+  expect_out '^"a\\"b\\\\c"$'
+  run_fn json_str $'x\ny'
+  expect_rc 0
+  expect_out '^"x\\ny"$'
+  run_fn json_str $'t\tab\x01'
+  expect_rc 0
+  expect_out '^"t\\tab\\u0001"$'
+  run_fn json_str ''
+  expect_rc 0
+  expect_out '^""$'
+}
+
 # --- GHR-14: health command for cron/uptime probes --------------------------
 # Default stub: slot-1 active/enabled (0 restarts), slot-2 active/enabled (3
 # restarts, below the default threshold of 5), slot-3 inactive/disabled (a
@@ -1445,6 +1594,15 @@ t "journal_restart_reason_line: OOM killer sentence -> oom-kill"      case_journ
 t "journal_restart_reason_line: code=exited,status=137 -> exit-code 137" case_journal_restart_reason_line_exit_code
 t "journal_restart_reason_line: code=killed,status=9/KILL -> signal KILL" case_journal_restart_reason_line_signal
 t "journal_restart_reason_line: unrelated line -> nothing"            case_journal_restart_reason_line_no_match
+
+# --- GHR-16: status --json ---------------------------------------------------
+t "status --json: parses, host + 3 slots with the raw facts"           case_status_json_parses_and_carries_the_slot_facts
+t "status --json: same unit_props / journal fetches as the table"      case_status_json_same_fetches_as_the_table
+t "status --json: profile from a seeded drop-in"                       case_status_json_profile_from_dropin
+t "status --json: working_on_access per slot, no note line"            case_status_json_working_on_access_states
+t "status --json: idle with no jobs yet counts from the unit's start"  case_status_json_idle_fresh_counts_from_unit_start
+t "status --json --watch / watch --json: refused"                      case_status_json_refuses_watch
+t "json_str: escapes backslash, quote, newline, control chars"         case_json_str_escapes
 
 # --- GHR-14: health command for cron/uptime probes --------------------------
 t "health: default stub is healthy, read-only, no privileged call"    case_health_default_stub_is_healthy

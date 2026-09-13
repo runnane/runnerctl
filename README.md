@@ -62,7 +62,7 @@ command needs it installed.
 ```
 runnerctl [--config PATH] <command> [args]
 
-runnerctl status [--watch|-w] [--interval N] [--once]
+runnerctl status [--json] [--watch|-w] [--interval N] [--once]
 runnerctl watch  [--interval N]
 runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
                  [--restart-sec N] [--env-file PATH] [--restart] \
@@ -161,6 +161,47 @@ keep the `journalctl` cost down — a job start or end shows up within
 10 × interval seconds. It needs a terminal: with stdout redirected it exits 1
 and points at `status`; `status --once` is the plain one-shot table.
 
+### Machine-readable output: `status --json`
+
+`runnerctl status --json` prints the same facts as one JSON object, for a
+host-inventory collector, a dashboard or an alerting cron that would
+otherwise have to scrape the table's columns — whose set and widths change
+with every new feature. Raw bytes and epoch seconds, not `26.0G` / `3d 4h`;
+`null` wherever the table prints `—` (including `infinity` and `[not set]`
+memory values); no `jq` needed to produce it, and the table and the JSON are
+rendered from one collector, so they cannot disagree on a value:
+
+```json
+{"host":{"cores":16,"mem_total":64424509440,"mem_available":51539607552},
+ "slots":[
+  {"idx":0,"unit":"actions.runner.org.host-1.service","name":"org.host-1",
+   "active":"active","sub":"running","enabled":"enabled",
+   "memory_max":27917287424,"memory_high":23622320128,"memory_current":3328599552,"memory_peak":26743545600,
+   "restart":"always","env_file":null,"since":1757622000,
+   "restarts":0,"result":"success","last_restart_reason":null,"profile":"ci",
+   "job":{"repo":"my-app","name":"test","since":1757707200},
+   "idle_since":null,"jobs_completed":null,"working_on_access":"ok"}
+]}
+```
+
+Keys, per slot: `idx`, `unit`, `name` (the `RUNNER` column), `active`,
+`sub`, `enabled` (systemd's `ActiveState` / `SubState` / `UnitFileState`),
+`memory_max`, `memory_high`, `memory_current`, `memory_peak` (bytes),
+`restart` (the `Restart=` policy), `env_file` (the raw `EnvironmentFiles`
+value), `since` (epoch second the slot entered its current state — what
+`SINCE` counts from), `restarts` (`NRestarts`), `result` (the current
+invocation's `Result`), `last_restart_reason` (`oom-kill` / `exit-code N` /
+`signal NAME`, looked up under the same condition as the table's
+`(last: …)`, null otherwise), `profile` (from the drop-in), `job` — `{"repo",
+"name", "since"}` while a job is in flight, any of the three null when
+unknown, null when idle or stopped — `idle_since` and `jobs_completed`
+(epoch second of the last completion and the count since the unit started,
+0 and the unit's own start when nothing has finished yet; null while busy or
+stopped), and `working_on_access`: `"ok"`, `"no-journal"` (only `/proc`
+could be read, so `job` may be present but `idle_since` never is) or
+`"no-access"` — the note under the table, per slot. `host` carries `cores`
+(`nproc`) and `mem_total` / `mem_available` (bytes, from `/proc/meminfo`).
+`--json` is one-shot and refuses `--watch`; poll it instead.
 ### Health checks for cron / uptime monitors: `health`
 
 `runnerctl status` always exits 0, so nothing on the host can notice "slot
