@@ -68,6 +68,16 @@ case whose log shows one of them was reached directly fails. Cases assert on std
 ordered list of privileged calls and the content `tee`d to each path. Plain
 bash, no framework — CI and a fresh worktree have nothing but shellcheck.
 
+Two test-only hooks live in the script itself, neither user-facing nor in
+the usage block: `RUNNERCTL_NO_MAIN=1` makes it define its functions and
+return without running a command (`run_fn` in `tests/run.sh` sources it that
+way to call `fmt_dur`, `journal_idle_info`, … directly), and
+`watch --iterations N` stops the live loop after N redraws so the sim can
+run it — with the stub's no-op `pause`, and `stdout_is_tty` answering
+`RUNNERCTL_STUB_TTY=1`, twelve redraws take a fraction of a second. The
+stub also shadows `term_cursor`, so tput's escape codes never reach the
+captured frames.
+
 **Add a case for every behaviour change that touches units** — a new flag, a
 changed call order, a new refusal. A case is a function calling `run <args>`
 then `expect_*` helpers (listed at the top of `tests/run.sh`), registered at

@@ -62,7 +62,8 @@ command needs it installed.
 ```
 runnerctl [--config PATH] <command> [args]
 
-runnerctl status
+runnerctl status [--watch|-w] [--interval N] [--once]
+runnerctl watch  [--interval N]
 runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
                  [--restart-sec N] [--env-file PATH] [--restart] \
                  [--when-idle] [--timeout N] [<unit|slot-index|name> ...]
@@ -142,6 +143,22 @@ drop-in. With no targets, both act on every slot, as before.
 Slots are addressed by unit name, by the `IDX` column, or by the `RUNNER`
 column's short name — an unambiguous prefix or substring of it also works
 (e.g. `slot-1` for `example.slot-1`).
+
+### Live view: `watch`
+
+`runnerctl watch` (or `status --watch` / `status -w`) redraws the same table
+in place every 2 seconds — `--interval N` for another whole number of
+seconds — until Ctrl-C, with a header line carrying the host, the time of
+the redraw and the interval. It is what you keep open while a `drain` or an
+`apply --restart --when-idle` rolls through the pool, or while a capped slot
+creeps up on its `MemoryHigh`. It is a native loop rather than procps
+`watch`, which is not on every runner host and mangles the `—` cells: each
+frame is rendered first and written in one go, so it does not flicker, and
+the config is loaded once, not per tick. Everything is read live except the
+journal-derived `WORKING-ON` cells, which are refreshed every tenth redraw to
+keep the `journalctl` cost down — a job start or end shows up within
+10 × interval seconds. It needs a terminal: with stdout redirected it exits 1
+and points at `status`; `status --once` is the plain one-shot table.
 
 ### Graceful restart and stop: `--when-idle` and `drain`
 
