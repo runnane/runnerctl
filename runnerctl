@@ -1283,7 +1283,9 @@ collect_slot() { # UNIT IDX
 # `watch` (GHR-3, below cmd_logs) captures it per tick and redraws it in place.
 render_status() {
   require_runners
-  echo "Host: $(nproc) cores, $(free -h | awk '/^Mem:/{print $2" RAM, "$7" available"}')"
+  # The version leads the header (GHR-32): `upgrade` fetches main, so what a
+  # host actually runs is otherwise only visible through a second command.
+  echo "runnerctl $RUNNERCTL_VERSION — Host: $(nproc) cores, $(free -h | awk '/^Mem:/{print $2" RAM, "$7" available"}')"
   echo
   paint "$C_BOLD" "$(status_row IDX RUNNER PROFILE ACTIVE SINCE ENABLED MAX HIGH USED PRESS RESTART ENVFILE WORKING-ON)"
   local i=0 u no_access=false stalled=false leaked=false
@@ -1385,7 +1387,9 @@ host_facts() {
 }
 
 # `status --json`: the same SLOT facts as raw bytes, epoch seconds and null
-# — formatting is the consumer's job. One object per slot, keys stable:
+# — formatting is the consumer's job. The top-level object carries
+# `runnerctl` (the version of the script that produced it, GHR-32) and
+# `host`. One object per slot, keys stable:
 #   idx unit name active sub enabled memory_max memory_high memory_current
 #   memory_peak restart env_file since restarts result last_restart_reason
 #   profile job idle_since jobs_completed working_on_access
@@ -1406,8 +1410,8 @@ render_status_json() {
   require_runners
   local cores mem_total mem_avail i=0 u sep="" job idle_since completed
   read -r cores mem_total mem_avail < <(host_facts) || true
-  printf '{"host":{"cores":%s,"mem_total":%s,"mem_available":%s},\n "slots":[' \
-    "$(json_num "$cores")" "$(json_num "$mem_total")" "$(json_num "$mem_avail")"
+  printf '{"runnerctl":%s,"host":{"cores":%s,"mem_total":%s,"mem_available":%s},\n "slots":[' \
+    "$(json_str "$RUNNERCTL_VERSION")" "$(json_num "$cores")" "$(json_num "$mem_total")" "$(json_num "$mem_avail")"
   while read -r u; do
     [ -n "$u" ] || continue
     collect_slot "$u" "$i"

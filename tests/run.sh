@@ -306,6 +306,8 @@ DEPLOY_ENV="/etc/runnerctl/deploy.env"
 case_status_table() {
   run status
   expect_rc 0
+  # GHR-32: the header leads with the version this script carries
+  expect_out_count '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: [0-9]+ cores, ' 1
   expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$'
   # slot-1 also carries MemoryPeak (GHR-8), so USED is current/peak; PRESS
   # is — until the stub answers cgroup_memory_facts (GHR-31).
@@ -1214,6 +1216,8 @@ case_watch_three_iterations_redraw_frames() {
   expect_out_count "$FRAME_PREFIX" 3
   expect_out_count '^runnerctl watch —' 0
   expect_out_count '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$' 3
+  # every frame carries the version header too (GHR-32)
+  expect_out_count '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: ' 3
   expect_out_count '^0 +example\.slot-1 .* my-app:test \(12m\)$' 3
   expect_log_count '^probe:pause 1$' 3
   expect_log_count '^probe:unit_props ' 9
@@ -1347,7 +1351,7 @@ case_journal_restart_reason_line_no_match() {
 case_status_json_parses_and_carries_the_slot_facts() {
   run status --json
   expect_rc 0
-  expect_out '^\{"host":\{"cores":16,"mem_total":68719476736,"mem_available":51539607552\},$'
+  expect_out '^\{"runnerctl":"[0-9]+\.[0-9]+\.[0-9]+","host":\{"cores":16,"mem_total":68719476736,"mem_available":51539607552\},$'
   expect_out '^ "slots":\[$'
   expect_out '^\]\}$'
   # read-only, like the table: no privileged call at all.
@@ -1357,6 +1361,8 @@ case_status_json_parses_and_carries_the_slot_facts() {
   if ! $HAVE_PYTHON3; then skip "python3 not on PATH: status --json parse assertions not run"; return 0; fi
   expect_json 'len(d["slots"]) == 3'
   expect_json 'd["host"] == {"cores": 16, "mem_total": 68719476736, "mem_available": 51539607552}'
+  # GHR-32: the version the script carries, so a fleet can be inventoried
+  expect_json 'isinstance(d["runnerctl"], str) and len(d["runnerctl"].split(".")) == 3 and all(x.isdigit() for x in d["runnerctl"].split("."))'
   expect_json '[s["idx"] for s in d["slots"]] == [0, 1, 2]'
   expect_json 'd["slots"][0]["unit"] == "actions.runner.example.slot-1.service" and d["slots"][0]["name"] == "example.slot-1"'
   # slot-1: raw bytes, not 26.0G; the running job with its journal stamp.
