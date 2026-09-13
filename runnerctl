@@ -1285,7 +1285,7 @@ render_status() {
   require_runners
   # The version leads the header (GHR-32): `upgrade` fetches main, so what a
   # host actually runs is otherwise only visible through a second command.
-  echo "runnerctl $RUNNERCTL_VERSION — Host: $(nproc) cores, $(free -h | awk '/^Mem:/{print $2" RAM, "$7" available"}')"
+  echo "runnerctl $RUNNERCTL_VERSION — Host: $(host_line)"
   echo
   paint "$C_BOLD" "$(status_row IDX RUNNER PROFILE ACTIVE SINCE ENABLED MAX HIGH USED PRESS RESTART ENVFILE WORKING-ON)"
   local i=0 u no_access=false stalled=false leaked=false
@@ -1371,11 +1371,22 @@ json_bytes() {
   if [[ "$1" =~ ^[0-9]+$ ]]; then echo "$1"; else json_str "$1"; fi
 }
 
+# The status table header's "Host: ..." fragment: core count and free -h's
+# human-rounded memory line, e.g. "16 cores, 30Gi RAM, 21Gi available".
+# Behind a function (like host_facts below) so a test config can pin it —
+# free -h's rounding can differ between two runs on a loaded box, which is
+# what made the `status --color always` sim case's whole-output diff flake
+# (GHR-34); the table's own header keeps `free -h`, whose rounding is what
+# people are used to reading, rather than switching to host_facts's exact
+# bytes.
+host_line() {
+  echo "$(nproc) cores, $(free -h | awk '/^Mem:/{print $2" RAM, "$7" available"}')"
+}
+
 # Core count and memory in bytes for the JSON `host` object — `nproc` and
 # /proc/meminfo, on one line: "CORES MEM_TOTAL MEM_AVAILABLE", any of them
 # empty where it cannot be read. Behind a function so a test config can pin
-# it. The table's own header keeps `free -h`, whose rounding is what people
-# are used to reading.
+# it.
 host_facts() {
   local cores
   cores="$(nproc 2>/dev/null || true)"
