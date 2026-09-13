@@ -306,14 +306,15 @@ DEPLOY_ENV="/etc/runnerctl/deploy.env"
 case_status_table() {
   run status
   expect_rc 0
-  expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +RESTART +ENVFILE +WORKING-ON$'
-  # slot-1 also carries MemoryPeak (GHR-8), so USED is current/peak.
-  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +always +— +my-app:test \(12m\)$'
+  expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$'
+  # slot-1 also carries MemoryPeak (GHR-8), so USED is current/peak; PRESS
+  # is — until the stub answers cgroup_memory_facts (GHR-31).
+  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +always +— +my-app:test \(12m\)$'
   # slot-2 has restarted (GHR-8): the ACTIVE cell carries ↻3 and the
   # journal-derived reason, so the plain "active/running" is followed by
   # that annotation before SINCE, not by spaces straight to 41m.
   expect_out '^1 +example\.slot-2 +— +active/running .* +41m +enabled '
-  expect_out '^2 +example\.slot-3 +— +inactive/dead +6d +disabled +— +— +— +always +— +—$'
+  expect_out '^2 +example\.slot-3 +— +inactive/dead +6d +disabled +— +— +— +— +always +— +—$'
   expect_no_out '^3 '
   # status is read-only: no privileged call at all (the `probe:` lines below
   # are the stub logging its own unit_props hits, not a host mutation).
@@ -747,7 +748,7 @@ case_status_dash_cells_keep_columns_aligned() {
   rpos="${row%—}"; rpos="${#rpos}"             # offset of the final — (WORKING-ON cell)
   _expect
   [ "$hpos" -eq "$rpos" ] || FAILS+=("WORKING-ON column: header at $hpos, slot-3 row at $rpos")
-  expect_out '^2 +example\.slot-3 +— +inactive/dead +6d +disabled +— +— +— +always +— +—$'
+  expect_out '^2 +example\.slot-3 +— +inactive/dead +6d +disabled +— +— +— +— +always +— +—$'
 }
 
 # --- GHR-15: apply/remove-limits take targets; status shows the PROFILE ------
@@ -1212,7 +1213,7 @@ case_watch_three_iterations_redraw_frames() {
   expect_out_count "${FRAME_PREFIX}runnerctl watch — [^ ]+ — [0-9]{2}:[0-9]{2}:[0-9]{2} — every 1s \(Ctrl-C to quit\)$" 3
   expect_out_count "$FRAME_PREFIX" 3
   expect_out_count '^runnerctl watch —' 0
-  expect_out_count '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +RESTART +ENVFILE +WORKING-ON$' 3
+  expect_out_count '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$' 3
   expect_out_count '^0 +example\.slot-1 .* my-app:test \(12m\)$' 3
   expect_log_count '^probe:pause 1$' 3
   expect_log_count '^probe:unit_props ' 9
@@ -1284,14 +1285,14 @@ case_status_used_shows_current_over_peak_when_present() {
   run status
   expect_rc 0
   # slot-1 carries MemoryPeak: USED is current/peak, both `hbytes`-formatted.
-  expect_out '^0 +example\.slot-1 .* +1\.0G/25\.0G +always '
+  expect_out '^0 +example\.slot-1 .* +1\.0G/25\.0G +— +always '
 }
 
 case_status_used_stays_current_only_without_peak() {
   run status
   expect_rc 0
   # slot-2 has no MemoryPeak: USED is unchanged, current only, no slash.
-  expect_out '^1 +example\.slot-2 .* +1\.0G +always '
+  expect_out '^1 +example\.slot-2 .* +1\.0G +— +always '
   expect_no_out '^1 +example\.slot-2 .* +1\.0G/'
 }
 
@@ -1535,7 +1536,7 @@ case_status_stall_after_flags_slot1() {
   expect_out '^0 +example\.slot-1 .* my-app:test \(12m\) STALLED$'
   expect_out '^1 +example\.slot-2 .* idle 2h31m \(2 jobs\)$'
   expect_out '^2 +example\.slot-3 .* —$'
-  expect_out_count '^note: STALLED = a job running longer than 10m \(STALL_SEC=600\); .runnerctl logs <IDX>. shows what it is doing$' 1
+  expect_out_count '^note: STALLED = a job running longer than 10m \(STALL_SEC=600\); .runnerctl logs <IDX>. shows what it is doing, a high PRESS means it is memory-throttled rather than hung$' 1
   expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test) '
 }
 
@@ -1629,11 +1630,11 @@ case_status_color_always_paints_by_meaning() {
   expect_rc 0
   # header bold; slot-1 ACTIVE green (no restarts); its stalled job bold red
   expect_out "^$ESC\[1mIDX +RUNNER .* WORKING-ON$ESC\[0m$"
-  expect_out "^0 +example\.slot-1 +$ESC\[2m—$ESC\[0m +$ESC\[32mactive/running$ESC\[0m +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +always +— +$ESC\[1m$ESC\[31mmy-app:test \(12m\) STALLED$ESC\[0m$"
+  expect_out "^0 +example\.slot-1 +$ESC\[2m—$ESC\[0m +$ESC\[32mactive/running$ESC\[0m +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +always +— +$ESC\[1m$ESC\[31mmy-app:test \(12m\) STALLED$ESC\[0m$"
   # slot-2: restarted → yellow ACTIVE; idle → dim WORKING-ON
   expect_out "^1 +example\.slot-2 .* $ESC\[33mactive/running ↻3 \(last: oom-kill\)$ESC\[0m +41m +enabled .* $ESC\[2midle 2h31m \(2 jobs\)$ESC\[0m$"
   # slot-3: inactive → red ACTIVE, disabled → dim ENABLED, WORKING-ON — → dim
-  expect_out "^2 +example\.slot-3 +$ESC\[2m—$ESC\[0m +$ESC\[31minactive/dead$ESC\[0m +6d +$ESC\[2mdisabled$ESC\[0m +— +— +— +always +— +$ESC\[2m—$ESC\[0m$"
+  expect_out "^2 +example\.slot-3 +$ESC\[2m—$ESC\[0m +$ESC\[31minactive/dead$ESC\[0m +6d +$ESC\[2mdisabled$ESC\[0m +— +— +— +— +always +— +$ESC\[2m—$ESC\[0m$"
   expect_out "^$ESC\[31mnote: STALLED = .*$ESC\[0m$"
   # the columns: with the SGR sequences stripped, the painted table is the
   # plain one byte for byte (the GHR-21 padding invariant, now under colour)
@@ -1664,7 +1665,7 @@ case_status_color_never_and_default_are_plain() {
   NO_COLOR='' RUNNERCTL_STUB_TTY=1 run status --color never
   expect_rc 0
   expect_no_out "$SGR"
-  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +always +— +my-app:test \(12m\)$'
+  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +always +— +my-app:test \(12m\)$'
 }
 
 case_status_color_invalid_rejected() {
@@ -1769,13 +1770,13 @@ case_status_leaked_painted_yellow() {
 case_status_json_leaked_procs() {
   RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 run status --json
   expect_rc 0
-  expect_out '"name":"example.slot-2".*"jobs_completed":2,"working_on_access":"ok","leaked_procs":2\}'
-  expect_out '"name":"example.slot-1".*"leaked_procs":null\}'
-  expect_out '"name":"example.slot-3".*"leaked_procs":null\}'
+  expect_out '"name":"example.slot-2".*"jobs_completed":2,"working_on_access":"ok","leaked_procs":2,"memory_events"'
+  expect_out '"name":"example.slot-1".*"leaked_procs":null,"memory_events"'
+  expect_out '"name":"example.slot-3".*"leaked_procs":null,"memory_events"'
   # the default reader cannot see the cgroup: null, not 0
   run status --json
   expect_rc 0
-  expect_out '"name":"example.slot-2".*"leaked_procs":null\}'
+  expect_out '"name":"example.slot-2".*"leaked_procs":null,"memory_events"'
   if ! $HAVE_PYTHON3; then skip "python3 not on PATH: status --json parse assertion not run"; return 0; fi
   RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 run status --json
   expect_json '[s["leaked_procs"] for s in d["slots"]] == [None, 2, None]'
@@ -1960,6 +1961,110 @@ case_health_without_restart_stalled_never_restarts() {
   expect_no_log '^systemctl '
 }
 
+# --- GHR-31: memory pressure and memory.events per slot ----------------------
+# RUNNERCTL_STUB_PRESSURE=1: slot-1 at 63.20 % full avg10 with 4 high events,
+# slot-2 at 0.00 %, slot-3 has no cgroup so it is never asked with one.
+case_status_press_column_from_the_stub() {
+  RUNNERCTL_STUB_PRESSURE=1 run status
+  expect_rc 0
+  expect_out '^0 +example\.slot-1 .* +1\.0G/25\.0G +63\.2% +always '
+  expect_out '^1 +example\.slot-2 .* +1\.0G +0\.0% +always '
+  expect_out '^2 +example\.slot-3 .* +— +— +— +— +always '
+  # one read per slot, from the same collector the table and --json share
+  expect_log_count '^probe:cgroup_memory_facts ' 3
+  expect_log '^probe:cgroup_memory_facts /system\.slice/actions\.runner\.example\.slot-1\.service$'
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+}
+
+case_status_press_painted_by_threshold() {
+  RUNNERCTL_STUB_PRESSURE=1 run status --color always
+  expect_rc 0
+  expect_out "^0 +example\.slot-1 .* +1\.0G/25\.0G +$ESC\[31m63\.2%$ESC\[0m +always "
+  expect_out "^1 +example\.slot-2 .* +1\.0G +0\.0% +always "
+  expect_no_out "$ESC\[3[13]m0\.0%"
+}
+
+case_status_press_color_thresholds() {
+  # plain under WARN, yellow from WARN (10), red from CRIT (50); the config
+  # can move both — checked through the same helper the table uses
+  run_fn eval 'color_setup always; status_press_color 9.99'
+  expect_rc 0
+  expect_no_out '.'
+  run_fn eval 'color_setup always; status_press_color 10.00'
+  expect_out "^$ESC\[33m$"
+  run_fn eval 'color_setup always; status_press_color 50'
+  expect_out "^$ESC\[31m$"
+  run_fn eval 'PRESSURE_CRIT_PCT=70; color_setup always; status_press_color 63.2'
+  expect_out "^$ESC\[33m$"
+  run_fn eval 'color_setup always; status_press_color n/a'
+  expect_no_out '.'
+  run_fn status_press_cell 63.2
+  expect_out '^63\.2%$'
+  run_fn status_press_cell ''
+  expect_out '^—$'
+}
+
+case_status_json_memory_events_and_pressure() {
+  RUNNERCTL_STUB_PRESSURE=1 run status --json
+  expect_rc 0
+  expect_out '"name":"example.slot-1".*"memory_events":\{"high":4,"max":1,"oom_kill":0\},"memory_pressure":\{"full_avg10":63.20,"full_avg60":41.00,"full_total":123456789\}\}'
+  expect_out '"name":"example.slot-2".*"memory_events":\{"high":0,"max":0,"oom_kill":0\},"memory_pressure":\{"full_avg10":0.00,"full_avg60":0.00,"full_total":0\}\}'
+  expect_out '"name":"example.slot-3".*"memory_events":null,"memory_pressure":null\}'
+  expect_no_out '%'
+  # nothing readable (the default stub): both objects null on every slot
+  run status --json
+  expect_rc 0
+  expect_out_count '"memory_events":null,"memory_pressure":null\}' 3
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: status --json parse assertion not run"; return 0; fi
+  RUNNERCTL_STUB_PRESSURE=1 run status --json
+  expect_json 'd["slots"][0]["memory_pressure"]["full_avg10"] == 63.2 and d["slots"][0]["memory_events"]["high"] == 4 and d["slots"][2]["memory_pressure"] is None'
+}
+
+case_health_pressure_over_crit_is_a_problem() {
+  RUNNERCTL_STUB_PRESSURE=1 run health
+  expect_rc 1
+  expect_out '^example\.slot-1: under full memory pressure 63\.2% \(avg10, PRESSURE_CRIT_PCT=50\) — throttled at MemoryHigh \(4 times so far\), see USED vs HIGH$'
+  expect_out_count '^example\.slot-' 1
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+  # at rest, or unreadable: fine
+  run health
+  expect_rc 0
+  expect_out '^ok: 3 slot\(s\) healthy$'
+}
+
+case_health_stalled_line_says_throttled_when_under_pressure() {
+  RUNNERCTL_STUB_PRESSURE=1 run health --stall-after 600
+  expect_rc 1
+  expect_out '^example\.slot-1: stalled — job my-app:test running 12m, longer than 10m \(--stall-after 600\) — under memory pressure 63\.2%, throttled rather than hung$'
+  expect_out '^example\.slot-1: under full memory pressure 63\.2%'
+  # without pressure the stalled line is as before
+  run health --stall-after 600
+  expect_rc 1
+  expect_out '^example\.slot-1: stalled — job my-app:test running 12m, longer than 10m \(--stall-after 600\)$'
+  expect_no_out 'memory pressure'
+}
+
+case_pressure_at_least_boundary_is_inclusive() {
+  # the health rule fires AT the threshold, not one past it — and never on
+  # an unknown value
+  run_fn pressure_at_least 50 50
+  expect_rc 0
+  run_fn pressure_at_least 50.00 50
+  expect_rc 0
+  run_fn pressure_at_least 49.99 50
+  expect_rc 1
+  run_fn pressure_at_least '' 50
+  expect_rc 1
+  run_fn pressure_at_least n/a 50
+  expect_rc 1
+}
+
+case_status_stalled_note_mentions_press() {
+  run status --stall-after 600
+  expect_rc 0
+  expect_out_count '^note: STALLED = .*, a high PRESS means it is memory-throttled rather than hung$' 1
+}
+
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
 t "status: EnvironmentFiles value with embedded '=' survives"       case_status_envfile_value_with_embedded_equals
@@ -2129,6 +2234,16 @@ t "health --restart-stalled: restarts the stalled slot, says so, exit 1" case_he
 t "health --restart-stalled: healthy pool, no privileged call"          case_health_restart_stalled_healthy_pool_touches_nothing
 t "health --restart-stalled: a failed restart is reported"              case_health_restart_stalled_reports_a_failed_restart
 t "health --stall-after 600 alone: reports, never restarts"             case_health_without_restart_stalled_never_restarts
+
+# --- GHR-31: memory pressure column, memory.events, health rule --------------
+t "status: PRESS column from the cgroup's PSI, one read per slot"       case_status_press_column_from_the_stub
+t "status --color always: PRESS red at 63 %, plain at 0 %"              case_status_press_painted_by_threshold
+t "status_press_color / status_press_cell: thresholds and formatting"   case_status_press_color_thresholds
+t "status --json: memory_events and memory_pressure objects, null when unreadable" case_status_json_memory_events_and_pressure
+t "health: full memory pressure over PRESSURE_CRIT_PCT is a problem"    case_health_pressure_over_crit_is_a_problem
+t "health: a stalled line under pressure says throttled, not hung"      case_health_stalled_line_says_throttled_when_under_pressure
+t "pressure_at_least: inclusive at the threshold, never on unknown"   case_pressure_at_least_boundary_is_inclusive
+t "status --stall-after 600: the STALLED note points at PRESS"          case_status_stalled_note_mentions_press
 
 # --- Summary ------------------------------------------------------------------
 echo

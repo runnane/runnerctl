@@ -84,6 +84,14 @@
 # a probe still records the event once). --if-stalled and --when-idle are
 # exclusive: one waits for an idle slot, the other acts on a wedged one.
 #
+# PRESS is the slot's memory pressure (GHR-31): the cgroup's PSI `full avg10`
+# — the share of the last 10 s every task in it spent stalled on memory —
+# yellow from PRESSURE_WARN_PCT (10), red from PRESSURE_CRIT_PCT (50), and a
+# `health` problem at the red line. It is what tells a job throttled at
+# MemoryHigh from one that is hung: a STALLED job with a high PRESS is
+# starved, not stuck. --json carries it with the cgroup's memory.events
+# counters (high / max / oom_kill since the unit started).
+#
 # `status --json` prints the same facts as one JSON object — raw bytes, epoch
 # seconds, null where the table shows — — for monitoring and inventory
 # tooling; the keys are listed in the README. It is one-shot: poll it rather
@@ -147,6 +155,10 @@ WAIT_TIMEOUT="1800"
 STALL_SEC="3600"
 # `reap`: seconds between SIGTERM and SIGKILL for a leaked process (GHR-29).
 REAP_GRACE_SEC="5"
+# PRESS (memory pressure, PSI full avg10 in percent): yellow from WARN, red
+# and a `health` problem from CRIT (GHR-31).
+PRESSURE_WARN_PCT="10"
+PRESSURE_CRIT_PCT="50"
 
 # Profile-provided config (populated by load_profile; flags override).
 PROFILE=""
@@ -192,6 +204,7 @@ load_config() {
   [[ "$DEFAULT_PROFILE" =~ ^[A-Za-z0-9_]+$ ]] || die "DEFAULT_PROFILE '$DEFAULT_PROFILE' set in $CONFIG_FILE is invalid — must match ^[A-Za-z0-9_]+\$"
   [[ "$STALL_SEC" =~ ^[0-9]+$ ]] || die "STALL_SEC '$STALL_SEC' set in $CONFIG_FILE is invalid — want a whole number of seconds (0 disables the stalled flag)"
   [[ "$REAP_GRACE_SEC" =~ ^[0-9]+$ ]] || die "REAP_GRACE_SEC '$REAP_GRACE_SEC' set in $CONFIG_FILE is invalid — want a whole number of seconds"
+  [[ "$PRESSURE_WARN_PCT" =~ ^[0-9]+$ && "$PRESSURE_CRIT_PCT" =~ ^[0-9]+$ ]] || die "PRESSURE_WARN_PCT/PRESSURE_CRIT_PCT set in $CONFIG_FILE are invalid — want whole percentages"
 }
 
 # Built-in profiles. Site-specific values belong in the config file; these are
@@ -529,6 +542,29 @@ pid_alive() { # PID
   local s
   s="$(awk '/^State:/{print $2}' "/proc/$1/status" 2>/dev/null)" || return 1
   [ -n "$s" ] && [ "$s" != Z ]
+}
+
+# GHR-31: what the kernel says about the slot's memory, from its cgroup.
+# memory.events carries counters since the unit started — `high`: times
+# memory.high throttled it, `max`: times it hit memory.max, `oom_kill`:
+# processes the OOM killer took — and memory.pressure the PSI line `full
+# avg10=X avg60=Y avg300=Z total=US`: the share of the last 10/60/300 s
+# EVERY task in the cgroup spent stalled on memory. Prints one key=value
+# line each (events_high, events_max, events_oom_kill, pressure_full_avg10,
+# pressure_full_avg60, pressure_full_total); nothing for an empty cgroup or
+# a file that cannot be read. Plain reads, no run_priv — both files are
+# world-readable, so status never prompts. A config can shadow it.
+cgroup_memory_facts() { # CGROUP
+  local d="/sys/fs/cgroup${1:-}" k v
+  [ -n "${1:-}" ] || return 0
+  if [ -r "$d/memory.events" ]; then
+    while read -r k v; do
+      case "$k" in high|max|oom_kill) echo "events_$k=$v" ;; esac
+    done <"$d/memory.events"
+  fi
+  if [ -r "$d/memory.pressure" ]; then
+    awk '$1 == "full" { for (i = 2; i <= NF; i++) { split($i, a, "="); if (a[1] == "avg10" || a[1] == "avg60" || a[1] == "total") print "pressure_full_" a[1] "=" a[2] } }' "$d/memory.pressure"
+  fi
 }
 
 # Epoch seconds; a config can shadow it to pin the journal-derived runtime.
@@ -1099,7 +1135,7 @@ view_opt() { # ARGS...
 
 # --- Commands -----------------------------------------------------------------
 # Column widths of the status table; the last column (WORKING-ON) is unpadded.
-STATUS_WIDTHS=(3 40 8 19 8 9 6 6 12 8 7)
+STATUS_WIDTHS=(3 40 8 19 8 9 6 6 12 6 8 7)
 
 # Print one status row, padding each cell by CHARACTERS. Bash's printf counts
 # bytes for %-Ns, so the 3-byte `—` cell used for "no value" came out two
@@ -1138,6 +1174,26 @@ status_used_color() { # CURRENT HIGH
   [[ "${1:-}" =~ ^[0-9]+$ && "${2:-}" =~ ^[0-9]+$ ]] && [ "$2" -gt 0 ] || return 0
   if [ "$1" -ge "$2" ]; then echo "$C_RED"; elif [ $(( $1 * 10 )) -ge $(( $2 * 9 )) ]; then echo "$C_YELLOW"; fi
 }
+# GHR-31: the PRESS cell — PSI full avg10 as `12.3%`, — when unknown.
+status_press_cell() { # AVG10
+  [[ "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "—"; return; }
+  awk -v p="$1" 'BEGIN { printf "%.1f%%", p }'
+  echo
+}
+# Red from PRESSURE_CRIT_PCT, yellow from PRESSURE_WARN_PCT, plain below
+# or when unknown. Percent with decimals, so awk compares.
+status_press_color() { # AVG10
+  [[ "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 0
+  case "$(awk -v p="$1" -v w="$PRESSURE_WARN_PCT" -v c="$PRESSURE_CRIT_PCT" 'BEGIN { if (p >= c) print "crit"; else if (p >= w) print "warn"; else print "ok" }')" in
+    crit) echo "$C_RED" ;;
+    warn) echo "$C_YELLOW" ;;
+  esac
+}
+# Is AVG10 at or over PCT? For the health rule and the stalled suffix.
+pressure_at_least() { # AVG10 PCT
+  [[ "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || return 1
+  [ "$(awk -v p="$1" -v t="$2" 'BEGIN { print (p >= t) ? 1 : 0 }')" = 1 ]
+}
 status_job_color() { # JOB-STATE JOB-STALLED [LEAKED]
   case "$1" in
     running)              if [ "${2:-}" = true ]; then echo "$C_BOLD$C_RED"; else echo "$C_GREEN"; fi ;;
@@ -1169,6 +1225,10 @@ status_job_color() { # JOB-STATE JOB-STALLED [LEAKED]
 #   last_restart_reason        journal_restart_reason's answer, looked up only
 #                              when NRestarts > 0 and Result is success (the
 #                              ACTIVE cell's condition), empty otherwise
+#   mem_events_high mem_events_max mem_events_oom_kill
+#   mem_pressure_full_avg10 mem_pressure_full_avg60 mem_pressure_full_total
+#                              cgroup_memory_facts' answers (GHR-31), empty
+#                              where the cgroup or the file is not there
 #   job_*                      the JOB_* facts of job_facts, same names
 #                              (job_leaked / job_leaked_pids / job_leaked_comms
 #                              included, GHR-29)
@@ -1179,7 +1239,9 @@ collect_slot() { # UNIT IDX
         [active]="" [sub]="" [enabled]="" [memory_max]="" [memory_high]=""
         [memory_current]="" [memory_peak]="" [restart]="" [env_file]=""
         [cgroup]="" [invocation]="" [active_enter]="" [inactive_enter]=""
-        [restarts]="" [result]="" [profile]="" [since_age]="" [last_restart_reason]="")
+        [restarts]="" [result]="" [profile]="" [since_age]="" [last_restart_reason]=""
+        [mem_events_high]="" [mem_events_max]="" [mem_events_oom_kill]=""
+        [mem_pressure_full_avg10]="" [mem_pressure_full_avg60]="" [mem_pressure_full_total]="")
   while IFS='=' read -r k v; do
     case "$k" in
       ActiveState)                      SLOT[active]="$v" ;;
@@ -1200,6 +1262,11 @@ collect_slot() { # UNIT IDX
     esac
   done < <(unit_props "$u")
   SLOT[profile]="$(slot_profile "$u")"
+  while IFS='=' read -r k v; do
+    case "$k" in
+      events_high|events_max|events_oom_kill|pressure_full_avg10|pressure_full_avg60|pressure_full_total) SLOT[mem_$k]="$v" ;;
+    esac
+  done < <(cgroup_memory_facts "${SLOT[cgroup]}")
   SLOT[since_age]="$(state_age "${SLOT[active]}" "${SLOT[active_enter]}" "${SLOT[inactive_enter]}")"
   n="${SLOT[restarts]}"
   if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt 0 ] && [ "${SLOT[result]:-success}" = success ]; then
@@ -1218,7 +1285,7 @@ render_status() {
   require_runners
   echo "Host: $(nproc) cores, $(free -h | awk '/^Mem:/{print $2" RAM, "$7" available"}')"
   echo
-  paint "$C_BOLD" "$(status_row IDX RUNNER PROFILE ACTIVE SINCE ENABLED MAX HIGH USED RESTART ENVFILE WORKING-ON)"
+  paint "$C_BOLD" "$(status_row IDX RUNNER PROFILE ACTIVE SINCE ENABLED MAX HIGH USED PRESS RESTART ENVFILE WORKING-ON)"
   local i=0 u no_access=false stalled=false leaked=false
   while read -r u; do
     [ -n "$u" ] || continue
@@ -1237,6 +1304,7 @@ render_status() {
       "$(hbytes "${SLOT[memory_max]}")" "$(hbytes "${SLOT[memory_high]}")" \
       "$(paint "$(status_used_color "${SLOT[memory_current]}" "${SLOT[memory_high]}")" \
                "$(status_used_cell "${SLOT[memory_current]}" "${SLOT[memory_peak]}")")" \
+      "$(paint "$(status_press_color "${SLOT[mem_pressure_full_avg10]}")" "$(status_press_cell "${SLOT[mem_pressure_full_avg10]}")")" \
       "${SLOT[restart]}" "${SLOT[env_file]:-—}" \
       "$(paint "$(status_job_color "${SLOT[job_state]}" "${SLOT[job_stalled]}" "${SLOT[job_leaked]}")" "$(job_cell)")"
     i=$((i+1))
@@ -1246,7 +1314,7 @@ render_status() {
     paint "$C_YELLOW" "note: WORKING-ON needs journal read access (systemd-journal group) or root"
   fi
   if $stalled; then
-    paint "$C_RED" "note: STALLED = a job running longer than $(fmt_dur "$STALL_SEC") (STALL_SEC=$STALL_SEC); 'runnerctl logs <IDX>' shows what it is doing"
+    paint "$C_RED" "note: STALLED = a job running longer than $(fmt_dur "$STALL_SEC") (STALL_SEC=$STALL_SEC); 'runnerctl logs <IDX>' shows what it is doing, a high PRESS means it is memory-throttled rather than hung"
   fi
   if $leaked; then
     paint "$C_YELLOW" "note: +N leaked = processes a finished job left in the slot's cgroup, counting against MemoryMax; 'runnerctl reap <IDX>' kills them"
@@ -1284,6 +1352,9 @@ json_strn() { if [ -n "${1:-}" ]; then json_str "$1"; else echo null; fi; }
 # A JSON number from a raw string: unquoted only when it is all digits, null
 # otherwise — a stamp that was never set, a count that is missing.
 json_num() { if [[ "${1:-}" =~ ^[0-9]+$ ]]; then echo "$1"; else echo null; fi; }
+
+# A JSON number from a decimal string (12.34), null otherwise (GHR-31).
+json_dec() { if [[ "${1:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then echo "$1"; else echo null; fi; }
 
 # A JSON boolean from "true"/"false", null for anything else (unknown).
 json_bool() { case "${1:-}" in true|false) echo "$1" ;; *) echo null ;; esac; }
@@ -1327,7 +1398,10 @@ host_facts() {
 # `working_on_access` is "ok", "no-journal" (only /proc could be read) or
 # "no-access" — the note under the table, per slot; `leaked_procs` is the
 # count of processes a finished job left in an idle slot's cgroup, null
-# while busy or when the cgroup cannot be read (GHR-29).
+# while busy or when the cgroup cannot be read (GHR-29); `memory_events`
+# is {"high","max","oom_kill"} from the cgroup's memory.events and
+# `memory_pressure` {"full_avg10","full_avg60","full_total"} from its
+# memory.pressure, each object null when nothing could be read (GHR-31).
 render_status_json() {
   require_runners
   local cores mem_total mem_avail i=0 u sep="" job idle_since completed
@@ -1356,8 +1430,20 @@ render_status_json() {
       "$(json_strn "${SLOT[restart]}")" "$(json_strn "${SLOT[env_file]}")" \
       "$(json_num "$(age_to_epoch "${SLOT[since_age]}")")" "$(json_num "${SLOT[restarts]}")" \
       "$(json_strn "${SLOT[result]}")" "$(json_strn "${SLOT[last_restart_reason]}")" "$(json_strn "${SLOT[profile]}")"
-    printf ',"job":%s,"idle_since":%s,"jobs_completed":%s,"working_on_access":%s,"leaked_procs":%s}' \
+    printf ',"job":%s,"idle_since":%s,"jobs_completed":%s,"working_on_access":%s,"leaked_procs":%s' \
       "$job" "$idle_since" "$completed" "$(json_str "${SLOT[job_access]}")" "$(json_num "${SLOT[job_leaked]}")"
+    if [ -n "${SLOT[mem_events_high]}${SLOT[mem_events_max]}${SLOT[mem_events_oom_kill]}" ]; then
+      printf ',"memory_events":{"high":%s,"max":%s,"oom_kill":%s}' \
+        "$(json_num "${SLOT[mem_events_high]}")" "$(json_num "${SLOT[mem_events_max]}")" "$(json_num "${SLOT[mem_events_oom_kill]}")"
+    else
+      printf ',"memory_events":null'
+    fi
+    if [ -n "${SLOT[mem_pressure_full_avg10]}${SLOT[mem_pressure_full_avg60]}${SLOT[mem_pressure_full_total]}" ]; then
+      printf ',"memory_pressure":{"full_avg10":%s,"full_avg60":%s,"full_total":%s}}' \
+        "$(json_dec "${SLOT[mem_pressure_full_avg10]}")" "$(json_dec "${SLOT[mem_pressure_full_avg60]}")" "$(json_num "${SLOT[mem_pressure_full_total]}")"
+    else
+      printf ',"memory_pressure":null}'
+    fi
     sep=","
     i=$((i+1))
   done < <(discover)
@@ -1768,7 +1854,11 @@ reap_list() {
 #     line ends `— restarted`; the exit code is still 1, so a probe records
 #     the event once and the next run is clean;
 #   - an idle slot with leaked processes (GHR-29) — needs a readable cgroup,
-#     like the table's `+N leaked`.
+#     like the table's `+N leaked`;
+#   - memory pressure (PSI full avg10) at PRESSURE_CRIT_PCT or more (GHR-31)
+#     — the slot is being throttled at MemoryHigh, not working. A stalled
+#     line also says so from PRESSURE_WARN_PCT, which is the difference
+#     between a starved job and a hung one.
 # No problems: exit 0, "ok: N slot(s) healthy" (suppressed by --quiet). Any
 # problem: one line each on stdout (suppressed by --quiet; the exit code is
 # not), exit 1. No units at all: require_runners' existing die (not
@@ -1816,6 +1906,7 @@ cmd_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart-stall
     fi
     if [ "${SLOT[job_stalled]}" = true ]; then
       line="$short: stalled — job ${SLOT[job_repo]:+${SLOT[job_repo]}:}${SLOT[job_name]:-?} running ${SLOT[job_runtime]}, longer than $(fmt_dur "$STALL_SEC") (--stall-after $STALL_SEC)"
+      ! pressure_at_least "${SLOT[mem_pressure_full_avg10]}" "$PRESSURE_WARN_PCT" || line+=" — under memory pressure $(status_press_cell "${SLOT[mem_pressure_full_avg10]}"), throttled rather than hung"
       # GHR-30: the only privileged call health ever makes, and only here.
       if $restart_stalled; then
         if run_priv systemctl restart "$u"; then line+=" — restarted"; else line+=" — restart FAILED"; fi
@@ -1824,6 +1915,9 @@ cmd_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart-stall
     fi
     if [[ "${SLOT[job_leaked]}" =~ ^[0-9]+$ ]] && [ "${SLOT[job_leaked]}" -gt 0 ]; then
       problems+=("$short: ${SLOT[job_leaked]} leaked process(es) left by finished jobs (${SLOT[job_leaked_comms]}) — runnerctl reap ${SLOT[idx]}")
+    fi
+    if pressure_at_least "${SLOT[mem_pressure_full_avg10]}" "$PRESSURE_CRIT_PCT"; then
+      problems+=("$short: under full memory pressure $(status_press_cell "${SLOT[mem_pressure_full_avg10]}") (avg10, PRESSURE_CRIT_PCT=$PRESSURE_CRIT_PCT) — throttled at MemoryHigh (${SLOT[mem_events_high]:-?} times so far), see USED vs HIGH")
     fi
   done < <(discover)
   if [ "${#problems[@]}" -eq 0 ]; then
@@ -1882,6 +1976,11 @@ cmd_config_example() {
 
 # `reap`: seconds a leaked process gets after SIGTERM before SIGKILL.
 #REAP_GRACE_SEC="5"
+
+# PRESS column (memory pressure, PSI full avg10 in percent): yellow from
+# WARN, red and a `health` problem from CRIT.
+#PRESSURE_WARN_PCT="10"
+#PRESSURE_CRIT_PCT="50"
 
 # Processes matching this ERE are the runner's own and never counted as
 # leaked or reaped. Extend it for an image that wraps the runner differently.

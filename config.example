@@ -28,6 +28,11 @@
 # `reap`: seconds a leaked process gets after SIGTERM before SIGKILL.
 #REAP_GRACE_SEC="5"
 
+# PRESS column (memory pressure, PSI full avg10 in percent): yellow from
+# WARN, red and a `health` problem from CRIT.
+#PRESSURE_WARN_PCT="10"
+#PRESSURE_CRIT_PCT="50"
+
 # Processes matching this ERE are the runner's own and never counted as
 # leaked or reaped. Extend it for an image that wraps the runner differently.
 #RUNNER_OWN_PATTERN='runsvc\.sh|RunnerService\.js|Runner\.(Listener|Worker|PluginHost)'
