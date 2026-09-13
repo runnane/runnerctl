@@ -1488,6 +1488,27 @@ case_health_max_restarts_missing_value_dies() {
   expect_err "needs a value"
 }
 
+# --- GHR-26: journal_job_lines filters with -g, not a -n tail window ---------
+# The real journal_job_lines is stubbed under the sim, so the argv builder is
+# what is asserted: `-g` carries the job-line pattern and there is no `-n`
+# window for the Listener's other output to eat into.
+case_journal_job_args_use_grep_not_a_window() {
+  run_fn journal_job_args actions.runner.example.slot-1.service abc123
+  expect_rc 0
+  expect_out '^-g$'
+  expect_out '^Running job: \|completed with result: $'
+  expect_out '^_SYSTEMD_INVOCATION_ID=abc123$'
+  expect_out '^--system$'
+  expect_no_out '^-n$'
+}
+
+case_journal_job_args_without_invocation_id() {
+  run_fn journal_job_args actions.runner.example.slot-1.service
+  expect_rc 0
+  expect_out '^-g$'
+  expect_no_out '^_SYSTEMD_INVOCATION_ID='
+}
+
 # --- Registry -----------------------------------------------------------------
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
@@ -1603,6 +1624,10 @@ t "status --json: working_on_access per slot, no note line"            case_stat
 t "status --json: idle with no jobs yet counts from the unit's start"  case_status_json_idle_fresh_counts_from_unit_start
 t "status --json --watch / watch --json: refused"                      case_status_json_refuses_watch
 t "json_str: escapes backslash, quote, newline, control chars"         case_json_str_escapes
+
+# --- GHR-26: journal fetch filters with -g ------------------------------------
+t "journal_job_args: -g with the job pattern, invocation scope, no -n"  case_journal_job_args_use_grep_not_a_window
+t "journal_job_args: no invocation id -> no scope argument"             case_journal_job_args_without_invocation_id
 
 # --- GHR-14: health command for cron/uptime probes --------------------------
 t "health: default stub is healthy, read-only, no privileged call"    case_health_default_stub_is_healthy
