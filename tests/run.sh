@@ -18,7 +18,8 @@
 # Helpers (all patterns are `grep -E` regexes):
 #   run <args...>                  run ./runnerctl <args> against the stub;
 #                                  sets OUT ERR RC and the log/writes dir
-#                                  (resets LOG and WRITES first)
+#                                  (resets LOG and WRITES first); killed
+#                                  after RUN_TIMEOUT seconds (default 30)
 #   run_keep <args...>             like `run`, but does not reset WRITES —
 #                                  for a case that seeds the writes-mirror
 #                                  tree (seed_dropin) before checking what a
@@ -35,6 +36,7 @@
 #                                  run_keep, since a plain `run` would wipe it.
 #   expect_rc N                    exit code
 #   expect_out P / expect_no_out P some stdout line matches / none does
+#   expect_out_count P N           exactly N stdout lines match
 #   expect_err P                   some stderr line matches
 #   expect_log P / expect_no_log P some privileged call matches / none does
 #   expect_log_count P N           exactly N privileged calls match
@@ -77,12 +79,17 @@ FAILED=()      # names of failed cases, for the summary
 XFAIL_KEYS=""  # issue keys of the xfail cases that failed as expected
 
 # --- Running runnerctl --------------------------------------------------------
+# Every run is bounded by RUN_TIMEOUT seconds (GHR-3): a command that never
+# returns — a `watch` loop that lost its guard, with the stub's no-op pause —
+# fails its case instead of hanging the gate.
+RUN_TIMEOUT="${RUN_TIMEOUT:-30}"
+
 run() {
   : >"$LOG"
   rm -rf "$WRITES"; mkdir -p "$WRITES"
   RC=0
   OUT="$(RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
-         "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
+         timeout "$RUN_TIMEOUT" "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
   ERR="$(cat "$TMP/err")"
 }
 
@@ -93,7 +100,7 @@ run_keep() {
   : >"$LOG"
   RC=0
   OUT="$(RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
-         "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
+         timeout "$RUN_TIMEOUT" "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
   ERR="$(cat "$TMP/err")"
 }
 
@@ -136,6 +143,13 @@ expect_out() {
 expect_no_out() {
   _expect
   ! grep -Eq -- "$1" <<<"$OUT" || FAILS+=("stdout has a line matching /$1/")
+}
+
+expect_out_count() {
+  _expect
+  local n
+  n="$(grep -Ec -- "$1" <<<"$OUT" || true)"
+  [ "$n" -eq "$2" ] || FAILS+=("stdout lines matching /$1/: want $2, got $n")
 }
 
 expect_err() {
@@ -1087,6 +1101,119 @@ case_journal_idle_info_single_job_is_singular() {
   expect_out '^idle 5m \(1 job\)$'
 }
 
+# --- GHR-3: watch / status --watch redraws the table in place ----------------
+# The stub's `stdout_is_tty` answers RUNNERCTL_STUB_TTY (default 0: the
+# harness's stdout is a pipe), `term_cursor` only logs, and `pause` is the
+# no-op from GHR-11 — so `--iterations N` (test-only) runs N redraws at once.
+# Every frame is one printf: ESC[H ESC[2J, the header line, then the table.
+FRAME_PREFIX=$'^\033\\[H\033\\[2J'
+
+case_watch_interval_zero_rejected() {
+  run watch --interval 0
+  expect_rc 1
+  expect_err "^runnerctl: --interval value '0' is invalid — want a whole number of seconds, at least 1$"
+  expect_no_out '.'
+  expect_no_log '^probe:(unit_props|term_cursor|pause)'
+}
+
+case_watch_interval_non_integer_rejected() {
+  run watch --interval abc
+  expect_rc 1
+  expect_err "^runnerctl: --interval value 'abc' is invalid"
+  expect_no_log '^probe:(unit_props|term_cursor|pause)'
+}
+
+# Not a terminal: refuse before touching the cursor or rendering anything,
+# and point at the one-shot command.
+case_watch_refuses_non_tty() {
+  run watch
+  expect_rc 1
+  expect_err "^runnerctl: watch needs a terminal \(stdout is not a tty\); use 'runnerctl status'$"
+  expect_no_out '.'
+  expect_no_log '^probe:(unit_props|term_cursor|pause)'
+}
+
+# `status -w` (and --watch) is the alias: the non-tty refusal proves it
+# reached the watch path instead of printing the table once.
+case_status_w_is_the_watch_alias() {
+  run status -w
+  expect_rc 1
+  expect_err '^runnerctl: watch needs a terminal'
+  expect_no_out '^IDX '
+  run status --watch
+  expect_rc 1
+  expect_err '^runnerctl: watch needs a terminal'
+}
+
+# --once is a plain status: the table once, no frame prefix, no pause.
+case_status_once_is_plain_status() {
+  run status --once
+  expect_rc 0
+  expect_out_count '^IDX +RUNNER +PROFILE ' 1
+  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h .* my-app:test \(12m\)$'
+  expect_no_out "$FRAME_PREFIX"
+  expect_no_out '^runnerctl watch —'
+  expect_no_log '^probe:(term_cursor|pause)'
+  # and journal reads are not memoised outside watch: one per running slot
+  expect_log_count '^probe:journal_job_lines ' 2
+}
+
+# Three redraws: each frame starts with home+clear on the header line, the
+# header names the interval, the table follows, and one pause of the
+# interval separates the frames. The cursor is hidden first and restored
+# on the way out.
+case_watch_three_iterations_redraw_frames() {
+  RUNNERCTL_STUB_TTY=1 run watch --iterations 3 --interval 1
+  expect_rc 0
+  expect_out_count "${FRAME_PREFIX}runnerctl watch — [^ ]+ — [0-9]{2}:[0-9]{2}:[0-9]{2} — every 1s \(Ctrl-C to quit\)$" 3
+  expect_out_count "$FRAME_PREFIX" 3
+  expect_out_count '^runnerctl watch —' 0
+  expect_out_count '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +RESTART +ENVFILE +WORKING-ON$' 3
+  expect_out_count '^0 +example\.slot-1 .* my-app:test \(12m\)$' 3
+  expect_log_count '^probe:pause 1$' 3
+  expect_log_count '^probe:unit_props ' 9
+  expect_log_order '^probe:term_cursor hide$' '^probe:pause 1$' '^probe:pause 1$' '^probe:pause 1$' '^probe:term_cursor show$'
+  expect_log_count '^probe:term_cursor ' 2
+  # read-only, like status: no privileged call at all
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test) '
+}
+
+# The journal memo: 12 ticks read slot-1's journal twice (tick 0 and tick
+# 10), while unit_props is fetched on every tick. The default interval is 2.
+case_watch_journal_memo_refreshes_every_ten_ticks() {
+  RUNNERCTL_STUB_TTY=1 run watch --iterations 12
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 12
+  expect_out '— every 2s \(Ctrl-C to quit\)$'
+  expect_log_count '^probe:pause 2$' 12
+  expect_log_count '^probe:journal_job_lines .*slot-1' 2
+  expect_log_count '^probe:journal_job_lines .*slot-2' 2
+  expect_no_log '^probe:journal_job_lines .*slot-3'
+  expect_log_count '^probe:unit_props .*slot-1' 12
+  # the memoised cells are still rendered on every frame
+  expect_out_count '^0 +example\.slot-1 .* my-app:test \(12m\)$' 12
+  expect_out_count '^1 +example\.slot-2 .* idle 2h31m \(2 jobs\)$' 12
+}
+
+# A memoised failure stays a failure until the next refresh: with the
+# journal unreadable the /proc fallback runs on every tick from one read.
+case_watch_memo_keeps_journal_failure() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_JOURNAL_ACCESS=0 run watch --iterations 3
+  expect_rc 0
+  expect_log_count '^probe:journal_job_lines .*slot-1' 1
+  expect_out_count '^0 +example\.slot-1 .* \(no access\)$' 3
+  expect_out_count '^note: WORKING-ON needs journal read access' 3
+}
+
+case_watch_unknown_option_rejected() {
+  run watch --bogus
+  expect_rc 1
+  expect_err '^runnerctl: unknown option: --bogus$'
+  run status --interval 5
+  expect_rc 1
+  expect_err '^runnerctl: unknown option: --interval$'
+}
+
 # --- Registry -----------------------------------------------------------------
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
@@ -1173,6 +1300,15 @@ t "scale 2 --when-idle --restart: restarts wait too"                 case_scale_
 t "restart --timeout abc: not an integer"                            case_restart_timeout_not_integer
 t "restart 0 --timeout: missing value"                               case_restart_timeout_missing_value
 t "start --when-idle: flag ignored, no probes"                       case_start_ignores_when_idle
+t "watch --interval 0: rejected, nothing rendered"                   case_watch_interval_zero_rejected
+t "watch --interval abc: not an integer"                             case_watch_interval_non_integer_rejected
+t "watch: refuses a non-tty stdout, points at status"                case_watch_refuses_non_tty
+t "status -w / --watch: reach the watch path"                        case_status_w_is_the_watch_alias
+t "status --once: plain status, journal not memoised"                case_status_once_is_plain_status
+t "watch --iterations 3 --interval 1: three atomic frames, 3 pauses" case_watch_three_iterations_redraw_frames
+t "watch --iterations 12: journal read at tick 0 and 10 only"         case_watch_journal_memo_refreshes_every_ten_ticks
+t "watch: a memoised journal failure holds for the TTL"              case_watch_memo_keeps_journal_failure
+t "watch --bogus / status --interval: unknown option"                case_watch_unknown_option_rejected
 
 # --- Summary ------------------------------------------------------------------
 echo

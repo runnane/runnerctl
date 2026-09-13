@@ -23,7 +23,8 @@
 # Usage:
 #   runnerctl [--config PATH] <command> [args]
 #
-#   runnerctl status
+#   runnerctl status [--watch|-w] [--interval N] [--once]
+#   runnerctl watch  [--interval N]
 #   runnerctl apply  [--profile NAME] [--max 26G] [--high 22G] \
 #                    [--restart-sec N] [--env-file PATH] [--restart] \
 #                    [--when-idle] [--timeout N] [<unit|slot-index|name> ...]
@@ -56,8 +57,14 @@
 # and the runner has no "stop accepting jobs" switch of its own — for a
 # guaranteed drain, change the runner's labels or disable it in GitHub first.
 #
+# `watch` (= `status --watch`) redraws the status table in place every N
+# seconds (default 2) until Ctrl-C, for keeping an eye on a drain, a profile
+# roll or a slot approaching its memory cap; it needs a terminal, and the
+# journal-derived WORKING-ON cells refresh every 10th redraw.
+#
 # Recommended baselines:
 #   CI host:      runnerctl scale 2 --max 26G --high 22G
+#   Live view:    runnerctl watch --interval 5
 #   Deploy box:   runnerctl env-init --profile deploy   # then fill secrets
 #                 runnerctl apply --profile deploy --restart
 #   Host update:  runnerctl drain            # stop every slot once it is idle
@@ -285,6 +292,33 @@ journal_job_lines() { # UNIT [INVOCATION-ID]
   grep -E 'Running job: |completed with result: ' <<<"$out" || true
 }
 
+# Journal memo for `watch` (GHR-3). A redraw every 2 s would otherwise run
+# one journalctl per slot per tick, and a job start or end is not worth
+# seeing that fast: `watch` keeps a memo directory and empties it every
+# JOURNAL_CACHE_TTL ticks, so the journal-derived cells lag a redraw by up to
+# TTL × interval seconds while everything else is live. It is a directory,
+# not an array, because the renderer runs inside "$(...)" (twice: the frame
+# capture and job_info's cell) and nothing written to a shell variable there
+# survives the tick. Outside `watch` JOURNAL_MEMO_DIR is empty and every call
+# goes straight to the journal_job_lines hook — a plain `status` and the
+# --when-idle polls are never stale. The memo wraps the hook rather than
+# replacing it, so a config that shadows journal_job_lines is what gets
+# memoised. Keyed by unit and invocation id, so a restart is a fresh entry.
+JOURNAL_CACHE_TTL=10
+JOURNAL_MEMO_DIR=""
+journal_job_lines_cached() { # UNIT [INVOCATION-ID]
+  [ -n "$JOURNAL_MEMO_DIR" ] || { journal_job_lines "$@"; return; }
+  local f="$JOURNAL_MEMO_DIR/$1.${2:-none}" out rc=0
+  if [ ! -f "$f.rc" ]; then
+    out="$(journal_job_lines "$@")" || rc=$?
+    printf '%s\n' "$out" >"$f"
+    echo "$rc" >"$f.rc"
+  fi
+  cat "$f"
+  rc="$(cat "$f.rc")"
+  return "$rc"
+}
+
 # Parse those lines: prints "<job name>\t<epoch second>" for the running job
 # (the last `Running job:` line with no later `completed with result:` line),
 # nothing when the slot is idle. Pure, so it is unit-testable (`run_fn`).
@@ -379,7 +413,7 @@ now_epoch() { date +%s; }
 job_info() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
   local u="$1" cg="$2" lines rj ii name ts n env repo job worker runtime=""
   [ -n "$cg" ] || { echo "—"; return; }
-  if lines="$(journal_job_lines "$u" "${3:-}")"; then
+  if lines="$(journal_job_lines_cached "$u" "${3:-}")"; then
     rj="$(journal_running_job "$lines")"
     if [ -z "$rj" ]; then
       ii="$(journal_idle_info "$lines")"
@@ -698,7 +732,9 @@ status_row() {
   printf '%s%s\n' "$out" "$1"
 }
 
-cmd_status() {
+# The status table itself, printed once to stdout. `status` calls it once;
+# `watch` (GHR-3, below cmd_logs) captures it per tick and redraws it in place.
+render_status() {
   require_runners
   echo "Host: $(nproc) cores, $(free -h | awk '/^Mem:/{print $2" RAM, "$7" available"}')"
   echo
@@ -920,6 +956,80 @@ cmd_logs() {
   jargs+=(--no-pager)
 
   run_priv journalctl "${jargs[@]}"
+}
+
+# --- Live view (GHR-3) --------------------------------------------------------
+# `status` prints the table once; `status --watch|-w` and `watch` redraw it
+# in place every --interval seconds (default 2) until Ctrl-C. --once turns a
+# watch back into a single print; the last of --watch/--once wins.
+cmd_status() { # [--watch|-w] [--once] [--interval N]
+  local watch=false args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --watch|-w) watch=true; shift ;;
+      --once)     watch=false; shift ;;
+      *)          args+=("$1"); shift ;;
+    esac
+  done
+  if $watch; then
+    cmd_watch ${args[@]+"${args[@]}"}
+  else
+    [ "${#args[@]}" -eq 0 ] || die "unknown option: ${args[0]}"
+    render_status
+  fi
+}
+
+# Is stdout a terminal? Behind a function so a test config can shadow it.
+stdout_is_tty() { [ -t 1 ]; }
+
+# Hide/show the cursor through tput where it exists; silent where it does
+# not (minimal hosts, no TERM). Behind a function so a test config can
+# shadow it — tput writes its escape codes to stdout.
+term_cursor() { # hide|show
+  command -v tput >/dev/null 2>&1 || return 0
+  case "$1" in hide) tput civis ;; show) tput cnorm ;; esac 2>/dev/null || true
+}
+
+# A native loop rather than `exec watch -n N runnerctl status`: procps
+# `watch` is not on every runner host, mangles the UTF-8 `—` cells, and
+# would re-run load_config and the config permission checks every tick.
+# Each frame is rendered into a variable first and written with one printf
+# (home + clear + frame), so the redraw is atomic and does not flicker.
+# --iterations N (test-only, undocumented) stops after N redraws so the sim
+# can run the loop with its no-op `pause`.
+cmd_watch() { # [--interval N] [--iterations N]
+  local interval=2 iterations="" tick=0 out header
+  while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    case "$1" in
+      --interval)
+        need_val "$@"
+        [[ "$2" =~ ^0*[1-9][0-9]*$ ]] || die "--interval value '$2' is invalid — want a whole number of seconds, at least 1"
+        interval="$2"; shift 2 ;;
+      --iterations)
+        need_val "$@"
+        [[ "$2" =~ ^[0-9]+$ ]] || die "--iterations value '$2' is invalid — want an integer"
+        iterations="$2"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  stdout_is_tty || die "watch needs a terminal (stdout is not a tty); use 'runnerctl status'"
+  require_runners
+  JOURNAL_MEMO_DIR="$(mktemp -d)"
+  # Ctrl-C exits 0 through the EXIT trap, which restores the cursor either way.
+  trap 'term_cursor show; rm -rf "$JOURNAL_MEMO_DIR"' EXIT
+  trap 'exit 0' INT TERM
+  term_cursor hide
+  while :; do
+    # A fresh journal read every JOURNAL_CACHE_TTL ticks, starting with the first.
+    [ $((tick % JOURNAL_CACHE_TTL)) -ne 0 ] || rm -f -- "$JOURNAL_MEMO_DIR"/*
+    out="$(render_status)"
+    header="runnerctl watch — ${HOSTNAME:-$(uname -n)} — $(date +%H:%M:%S) — every ${interval}s (Ctrl-C to quit)"
+    printf '\033[H\033[2J%s\n%s\n' "$header" "$out"
+    pause "$interval"
+    tick=$((tick + 1))
+    [ -z "$iterations" ] || [ "$tick" -lt "$iterations" ] || break
+  done
 }
 
 cmd_remove_limits() {
@@ -1546,6 +1656,7 @@ main() {
   case "$cmd" in
     install)            cmd_install "$@" ;;
     status)             cmd_status "$@" ;;
+    watch)              cmd_status --watch "$@" ;;
     apply)              cmd_apply "$@" ;;
     scale)              cmd_scale "$@" ;;
     env-init)           cmd_env_init "$@" ;;
@@ -1560,7 +1671,7 @@ main() {
     upgrade)            cmd_upgrade "$@" ;;
     version|--version)  echo "runnerctl $RUNNERCTL_VERSION" ;;
     -h|--help|help)     usage ;;
-    *) die "unknown command '$cmd' (status apply scale env-init start stop restart drain enable disable logs remove-limits profiles config-example migrate install upgrade version)" ;;
+    *) die "unknown command '$cmd' (status watch apply scale env-init start stop restart drain enable disable logs remove-limits profiles config-example migrate install upgrade version)" ;;
   esac
 }
 
