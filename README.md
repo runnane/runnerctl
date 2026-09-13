@@ -87,16 +87,33 @@ runnerctl version
 
 `status` shows each slot's state and how long it has been in it (`SINCE`),
 which profile it carries (`PROFILE`, read from its drop-in — `—` if it has
-none), memory cap/usage, restart policy, env file and the job it is currently
-working on, with how long that job has been running — or, for an idle slot,
-how long it has been idle and how many jobs it has finished since it started:
+none), memory cap/current/peak usage, restart policy, env file and the job it
+is currently working on, with how long that job has been running — or, for
+an idle slot, how long it has been idle and how many jobs it has finished
+since it started:
 
 ```
-IDX RUNNER                 PROFILE  ACTIVE          SINCE    ENABLED   MAX    HIGH   USED   RESTART  ENVFILE WORKING-ON
-0   org.host-1             ci       active/running  3d 4h    enabled   26.0G  22.0G  3.1G   always   —       my-app:test (12m)
-1   org.host-2             ci       active/running  2d 7h    enabled   26.0G  22.0G  128M   always   —       idle 2h31m (7 jobs)
-2   org.host-3             deploy   inactive/dead   6d       disabled  —      —      —      always   —       —
+IDX RUNNER                 PROFILE  ACTIVE                              SINCE    ENABLED   MAX    HIGH   USED        RESTART  ENVFILE WORKING-ON
+0   org.host-1             ci       active/running                     3d 4h    enabled   26.0G  22.0G  3.1G/24.9G  always   —       my-app:test (12m)
+1   org.host-2             ci       active/running ↻3 (last: oom-kill)  2d 7h    enabled   26.0G  22.0G  128M        always   —       idle 2h31m (7 jobs)
+2   org.host-3             deploy   inactive/dead                      6d       disabled  —      —      —           always   —       —
 ```
+
+`ACTIVE` folds in a restart count (`↻3`) when systemd has restarted the unit
+since it was last started by hand (`NRestarts`, which `systemctl
+start`/`restart` resets — the right scope for a crash loop
+`StartLimitIntervalSec=0` deliberately never parks `failed`). When there have
+been restarts and the *current* invocation's `Result` is `success` — so
+nothing else here says why the last one happened — the journal is checked for
+the reason and, when found, shown as `(last: oom-kill)`, `(last: exit-code
+137)` or `(last: signal KILL)`; needs the same journal access as
+`WORKING-ON`, and says nothing when it cannot be read or found. When the
+current invocation's `Result` is itself not `success`, that is shown instead,
+unparenthesised — e.g. `failed/failed ↻3 oom-kill`.
+
+`USED` becomes `current/peak` (`3.1G/24.9G`) when the host's systemd reports
+`MemoryPeak` (>= 254); on an older systemd, or a unit with memory accounting
+off, it stays current-only, silently.
 
 `SINCE` is measured from systemd's active-enter timestamp for a running slot
 and from its inactive-enter timestamp for a stopped or failed one (`—` for a
