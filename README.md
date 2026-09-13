@@ -78,6 +78,7 @@ runnerctl enable|disable <unit|slot-index|name>
 runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
                [--since WHEN] [-g PATTERN]
 runnerctl remove-limits [<unit|slot-index|name> ...]
+runnerctl reap [--dry-run] [<unit|slot-index|name> ...]
 runnerctl health [--quiet] [--max-restarts N] [--stall-after N]
 runnerctl profiles
 runnerctl config-example
@@ -146,6 +147,39 @@ jobs never legitimately run that long (`0` turns the flag off), or pass
 runtime, so it has the same access needs as the runtime itself: the journal,
 or a visible `Runner.Worker`.
 
+An idle slot whose cgroup still holds processes that are not the runner's
+own — a dev server, a file watcher, a `node` child that ignored SIGTERM when
+its step ended — shows them as `idle 2h31m (7 jobs) +3 leaked`, in yellow,
+with a `note:` line under the table. They count against the slot's
+`MemoryMax` until something kills them, and until now that something was
+the next restart of the whole slot. Leaks are only counted while the slot is
+idle (a running job's processes cannot be told from them) and only when
+`status` can read the cgroup — root or the runner's user; the runner's own
+tree (`runsvc.sh`, `RunnerService.js`, `Runner.Listener`/`Worker`/`PluginHost`)
+is never counted, and `RUNNER_OWN_PATTERN` in the config extends that for an
+image that wraps the runner differently. Containers a job starts with
+docker live under the docker daemon's cgroup, not the slot's: neither the
+memory cap nor this count sees them.
+
+### Killing what a job left behind: `reap`
+
+`runnerctl reap [--dry-run] [<slot> ...]` (default: every slot) kills exactly
+the leaked processes of an idle slot and nothing else — `SIGTERM`, then
+`REAP_GRACE_SEC` (config, default 5 s) later `SIGKILL` for whatever is still
+there — so the Listener keeps running and the slot never leaves the pool:
+
+```
+$ sudo runnerctl reap
+example.slot-1: busy (my-app:test, 12m) — skipped, a running job's processes are not leaks
+example.slot-2: reaped 2 leaked process(es): 4242/node, 4243/esbuild — SIGKILL needed for pid 4243
+example.slot-3: not running — nothing to reap
+```
+
+A busy slot is skipped, never signalled; `--dry-run` lists what would go.
+It needs to see the cgroup (root or the runner user) and the journal to
+know the slot is idle, and dies with a hint otherwise. For leaks that come
+back every job, fix the workflow step; `reap` from cron is the stopgap.
+
 ### Colour
 
 When stdout is a terminal the table is coloured by meaning, so a wedged or
@@ -206,7 +240,7 @@ rendered from one collector, so they cannot disagree on a value:
    "restart":"always","env_file":null,"since":1757622000,
    "restarts":0,"result":"success","last_restart_reason":null,"profile":"ci",
    "job":{"repo":"my-app","name":"test","since":1757707200,"stalled":false},
-   "idle_since":null,"jobs_completed":null,"working_on_access":"ok"}
+   "idle_since":null,"jobs_completed":null,"working_on_access":"ok","leaked_procs":null}
 ]}
 ```
 
@@ -227,7 +261,10 @@ stopped — `idle_since` and `jobs_completed`
 0 and the unit's own start when nothing has finished yet; null while busy or
 stopped), and `working_on_access`: `"ok"`, `"no-journal"` (only `/proc`
 could be read, so `job` may be present but `idle_since` never is) or
-`"no-access"` — the note under the table, per slot. `host` carries `cores`
+`"no-access"` — the note under the table, per slot, and `leaked_procs`: how
+many processes a finished job left in an idle slot's cgroup (the table's
+`+N leaked`; `0` when none, null while busy or when the cgroup cannot be
+read). `host` carries `cores`
 (`nproc`) and `mem_total` / `mem_available` (bytes, from `/proc/meminfo`).
 `--json` is one-shot and refuses `--watch`; poll it instead.
 ### Health checks for cron / uptime monitors: `health`
@@ -236,14 +273,16 @@ could be read, so `job` may be present but `idle_since` never is) or
 2 has been `inactive/dead` since Tuesday" without parsing the table. `health`
 closes that: exit 0 with `ok: N slot(s) healthy` when every enabled slot is
 `active`/`activating`/`reloading`, no slot has restarted `--max-restarts`
-times (default 5) or more since its last manual start, and no job has been
-running for `--stall-after` seconds (default `STALL_SEC`, 6 h) or more;
-otherwise one line per problem on stdout and exit 1:
+times (default 5) or more since its last manual start, no job has been
+running for `--stall-after` seconds (default `STALL_SEC`, 6 h) or more, and
+no idle slot has leaked processes; otherwise one line per problem on stdout
+and exit 1:
 
 ```
 example.slot-2: enabled but inactive/dead since 3d
 example.slot-1: 7 restarts since last start (oom-kill)
 example.slot-3: stalled — job my-app:build running 12h33m, longer than 6h (--stall-after 21600)
+example.slot-4: 2 leaked process(es) left by finished jobs (node, esbuild) — runnerctl reap 3
 ```
 
 `--quiet` drops the output either way and keeps just the exit code, for a

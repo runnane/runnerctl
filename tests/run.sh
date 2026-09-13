@@ -1725,6 +1725,139 @@ case_status_used_color_thresholds() {
 }
 
 # --- Registry -----------------------------------------------------------------
+# --- GHR-29: leaked processes on an idle slot, and `reap` --------------------
+# The stub's slot-2 is idle (2h31m, 2 jobs); with the cgroup readable and
+# RUNNERCTL_STUB_LEAKED=1 its proc_leaked answers 4242/node and 4243/esbuild.
+
+case_status_leaked_suffix_and_note() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 run status
+  expect_rc 0
+  expect_out '^1 +example\.slot-2 .* idle 2h31m \(2 jobs\) \+2 leaked$'
+  # the busy slot and the stopped one are never walked: leaks cannot be told
+  # from a job's own processes, and a stopped unit has no cgroup
+  expect_out '^0 +example\.slot-1 .* my-app:test \(12m\)$'
+  expect_out '^2 +example\.slot-3 .* —$'
+  expect_log_count '^probe:proc_leaked ' 1
+  expect_log '^probe:proc_leaked /system\.slice/actions\.runner\.example\.slot-2\.service$'
+  expect_out_count "^note: \+N leaked = processes a finished job left in the slot's cgroup, counting against MemoryMax; 'runnerctl reap <IDX>' kills them$" 1
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+}
+
+case_status_no_leaks_no_suffix() {
+  # readable cgroup, nothing leaked: the cell is untouched and there is no note
+  RUNNERCTL_STUB_CGROUP_READABLE=1 run status
+  expect_rc 0
+  expect_out '^1 +example\.slot-2 .* idle 2h31m \(2 jobs\)$'
+  expect_no_out 'leaked'
+  expect_log_count '^probe:proc_leaked ' 1
+  # unreadable cgroup (the default reader): not even asked, nothing shown
+  run status
+  expect_rc 0
+  expect_out '^1 +example\.slot-2 .* idle 2h31m \(2 jobs\)$'
+  expect_no_out 'leaked'
+  expect_no_log '^probe:proc_leaked '
+}
+
+case_status_leaked_painted_yellow() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 run status --color always
+  expect_rc 0
+  expect_out "^1 +example\.slot-2 .*$ESC\[33midle 2h31m \(2 jobs\) \+2 leaked$ESC\[0m$"
+  expect_out "^$ESC\[33mnote: \+N leaked"
+}
+
+case_status_json_leaked_procs() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 run status --json
+  expect_rc 0
+  expect_out '"name":"example.slot-2".*"jobs_completed":2,"working_on_access":"ok","leaked_procs":2\}'
+  expect_out '"name":"example.slot-1".*"leaked_procs":null\}'
+  expect_out '"name":"example.slot-3".*"leaked_procs":null\}'
+  # the default reader cannot see the cgroup: null, not 0
+  run status --json
+  expect_rc 0
+  expect_out '"name":"example.slot-2".*"leaked_procs":null\}'
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: status --json parse assertion not run"; return 0; fi
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 run status --json
+  expect_json '[s["leaked_procs"] for s in d["slots"]] == [None, 2, None]'
+}
+
+case_health_leaked_is_a_problem() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 run health
+  expect_rc 1
+  expect_out '^example\.slot-2: 2 leaked process\(es\) left by finished jobs \(node, esbuild\) — runnerctl reap 1$'
+  expect_out_count '^example\.slot-' 1
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+  RUNNERCTL_STUB_CGROUP_READABLE=1 run health
+  expect_rc 0
+  expect_out '^ok: 3 slot\(s\) healthy$'
+}
+
+case_reap_term_pause_kill_order() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 RUNNERCTL_STUB_SURVIVORS=4243 run reap
+  expect_rc 0
+  expect_out '^example\.slot-1: busy \(my-app:test, 12m\) — skipped, a running job.s processes are not leaks$'
+  expect_out '^example\.slot-2: reaped 2 leaked process\(es\): 4242/node, 4243/esbuild — SIGKILL needed for pid 4243$'
+  expect_out '^example\.slot-3: not running — nothing to reap$'
+  expect_log_order '^kill -TERM 4242 4243$' '^probe:pause 5$' '^probe:pid_alive 4242$' '^probe:pid_alive 4243$' '^kill -KILL 4243$'
+  expect_log_count '^kill ' 2
+  expect_no_log '^systemctl '
+}
+
+case_reap_everything_dies_on_term() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 run reap 1
+  expect_rc 0
+  expect_out '^example\.slot-2: reaped 2 leaked process\(es\): 4242/node, 4243/esbuild$'
+  expect_no_out 'SIGKILL'
+  expect_log_count '^kill -TERM 4242 4243$' 1
+  expect_no_log '^kill -KILL'
+  expect_out_count '^example\.slot-' 1
+}
+
+case_reap_dry_run_makes_no_call() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 run reap --dry-run
+  expect_rc 0
+  expect_out '^example\.slot-2: would kill 2 leaked process\(es\): 4242/node, 4243/esbuild$'
+  expect_no_log '^kill '
+  expect_no_log '^probe:pause '
+}
+
+case_reap_busy_slot_is_skipped_not_killed() {
+  # target the busy slot only: nothing must be sent, and the run is not a failure
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 run reap 0
+  expect_rc 0
+  expect_out '^example\.slot-1: busy \(my-app:test, 12m\) — skipped'
+  expect_no_log '^kill '
+  expect_no_log '^probe:proc_leaked '
+}
+
+case_reap_nothing_to_reap() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 run reap 1
+  expect_rc 0
+  expect_out '^example\.slot-2: nothing to reap$'
+  expect_no_log '^kill '
+}
+
+case_reap_unreadable_cgroup_dies() {
+  run reap 1
+  expect_rc 1
+  expect_err "^runnerctl: example\.slot-2: cannot read the slot's processes — run reap as root or the runner user$"
+  expect_no_log '^kill '
+  # no journal either: the idle question itself cannot be answered
+  RUNNERCTL_STUB_JOURNAL_ACCESS=0 run reap 1
+  expect_rc 1
+  expect_err '^runnerctl: example\.slot-2: cannot tell whether the slot is idle — reap needs journal read access'
+  expect_no_log '^kill '
+}
+
+case_reap_unknown_option_and_bad_target() {
+  run reap --bogus
+  expect_rc 1
+  expect_err '^runnerctl: unknown option: --bogus$'
+  run reap nope
+  expect_rc 1
+  expect_err "no runner slot matches 'nope'"
+  expect_no_log '^kill '
+}
+
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
 t "status: EnvironmentFiles value with embedded '=' survives"       case_status_envfile_value_with_embedded_equals
@@ -1868,6 +2001,20 @@ t "health: an enabled-but-dead slot is a problem"                      case_heal
 t "health --quiet: no stdout either way, exit code kept"               case_health_quiet_suppresses_output_keeps_exit_code
 t "health --bogus: unknown option dies"                                case_health_unknown_option_dies
 t "health --max-restarts: missing value dies"                          case_health_max_restarts_missing_value_dies
+
+# --- GHR-29: leaked processes and reap ---------------------------------------
+t "status: idle slot with leaks shows +N leaked, note once, busy slot not walked" case_status_leaked_suffix_and_note
+t "status: no leaks / unreadable cgroup: no suffix, no note"           case_status_no_leaks_no_suffix
+t "status --color always: a leaking idle cell and its note are yellow" case_status_leaked_painted_yellow
+t "status --json: leaked_procs 2 on the idle slot, null elsewhere"     case_status_json_leaked_procs
+t "health: leaked processes are a problem naming the reap command"     case_health_leaked_is_a_problem
+t "reap: TERM all, pause, KILL the survivor; busy and stopped slots skipped" case_reap_term_pause_kill_order
+t "reap 1: no survivors, no SIGKILL"                                   case_reap_everything_dies_on_term
+t "reap --dry-run: lists, sends nothing"                                case_reap_dry_run_makes_no_call
+t "reap 0: a busy slot is skipped, never signalled"                     case_reap_busy_slot_is_skipped_not_killed
+t "reap 1: clean slot says nothing to reap"                             case_reap_nothing_to_reap
+t "reap 1: unreadable cgroup / no journal die with a hint"              case_reap_unreadable_cgroup_dies
+t "reap --bogus / reap nope: rejected"                                  case_reap_unknown_option_and_bad_target
 
 # --- Summary ------------------------------------------------------------------
 echo
