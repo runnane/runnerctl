@@ -3,8 +3,9 @@
 # legacy-with-migrate, dry-run, --no-migrate, migrate-failure abort,
 # no-downgrade, refusal to overwrite a foreign file, the piped form (offline,
 # via a file:// UPGRADE_URL), and a copy in the invoking user's ~/.local/bin or
-# ~/bin that PATH does not reach (getent stubbed, HOME a temp dir). No
-# systemd, no root, no network.
+# ~/bin that PATH does not reach (getent stubbed, HOME a temp dir), and the
+# absolute mode of everything it creates, including under a restrictive umask.
+# No systemd, no root, no network.
 # Run from the repo root: bash tests/install-test.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -28,6 +29,9 @@ legacy=tests/fixtures/runnerctl-legacy
 RUNNERCTL_CONFIG="$tmp/etc/config" ./runnerctl install --prefix "$tmp/bin" >"$tmp/out1" 2>&1 \
   || fail "fresh install exited $? — $(cat "$tmp/out1")"
 [ -x "$tmp/bin/runnerctl" ] || fail "fresh install did not produce an executable"
+# The absolute mode, not `-x`: `-x` is owner-relative and passes at 0700,
+# which is the mode GHR-47 shipped. A #! script needs a+r as well as a+x.
+[ "$(stat -c '%a' "$tmp/bin/runnerctl")" = 755 ] || fail "fresh install mode is $(stat -c '%a' "$tmp/bin/runnerctl"), want 755"
 cmp -s runnerctl "$tmp/bin/runnerctl" || fail "installed file differs from the source"
 grep -q "fresh install" "$tmp/out1" || fail "fresh path not reported"
 grep -q "^Next:" "$tmp/out1" || fail "next steps not printed on fresh install"
@@ -100,6 +104,9 @@ cat runnerctl | bash -s -- --config "$tmp/piped.config" install --prefix "$tmp/p
   || fail "piped install exited $? — $(cat "$tmp/out10")"
 grep -q "^source: file://" "$tmp/out10" || fail "piped install did not download its source"
 [ "$("$tmp/piped/runnerctl" version)" = "runnerctl $ver" ] || fail "piped install did not land $ver"
+# The download is staged through a mktemp, mode 0600, so this is the path
+# GHR-47 broke: `chmod +x` on it yielded 0711 under umask 022.
+[ "$(stat -c '%a' "$tmp/piped/runnerctl")" = 755 ] || fail "piped install mode is $(stat -c '%a' "$tmp/piped/runnerctl"), want 755"
 
 # 10. Under sudo the invoking user's ~/.local/bin is off PATH: a legacy copy
 #     there is found via $SUDO_USER (getent stubbed to a temp home), migrated
@@ -167,5 +174,44 @@ RUNNERCTL_CONFIG="$tmp/home/etc/config" ./runnerctl install --prefix "$tmp/ulb13
 grep -q "not downgrading" "$tmp/out15" || fail "newer home copy was not refused: $(cat "$tmp/out15")"
 [ -e "$HOME/bin/runnerctl" ] && [ ! -e "$tmp/ulb13b" ] || fail "refused downgrade still moved something"
 rm -f "$HOME/bin/runnerctl"
+
+# 14. Under a restrictive umask everything created still comes out a+rx. This
+#     is the regression guard for GHR-47: a symbolic `chmod +x` is masked by
+#     the umask, and `cp` masks the copied mode too, so at umask 077 the file
+#     landed 0700 and a freshly created prefix or config directory 0700 with
+#     it — root could run runnerctl and nobody else could.
+(
+  umask 077
+  RUNNERCTL_CONFIG="$tmp/u77/etc/config" ./runnerctl install --prefix "$tmp/u77/bin" >"$tmp/out16" 2>&1
+) || fail "umask 077 install exited $? — $(cat "$tmp/out16")"
+[ "$(stat -c '%a' "$tmp/u77/bin/runnerctl")" = 755 ] || fail "umask 077 install mode is $(stat -c '%a' "$tmp/u77/bin/runnerctl"), want 755"
+[ "$(stat -c '%a' "$tmp/u77/bin")" = 755 ] || fail "umask 077 prefix mode is $(stat -c '%a' "$tmp/u77/bin"), want 755"
+[ "$(stat -c '%a' "$tmp/u77/etc")" = 755 ] || fail "umask 077 config dir mode is $(stat -c '%a' "$tmp/u77/etc"), want 755"
+# Same under the piped form, whose bytes come from a 0600 mktemp download.
+(
+  umask 077
+  cat runnerctl | bash -s -- --config "$tmp/piped.config" install --prefix "$tmp/u77b" >"$tmp/out17" 2>&1
+) || fail "umask 077 piped install exited $? — $(cat "$tmp/out17")"
+[ "$(stat -c '%a' "$tmp/u77b/runnerctl")" = 755 ] || fail "umask 077 piped mode is $(stat -c '%a' "$tmp/u77b/runnerctl"), want 755"
+
+# 15. An existing target: too narrow a mode is widened to a+rx so a host
+#     already installed at 0700 heals, and anything wider the admin set is
+#     kept rather than flattened to 755.
+mkdir -p "$tmp/heal"
+sed 's/^RUNNERCTL_VERSION=.*/RUNNERCTL_VERSION="0.0.1"/' runnerctl >"$tmp/heal/runnerctl"; chmod 700 "$tmp/heal/runnerctl"
+RUNNERCTL_CONFIG="$tmp/heal/etc/config" ./runnerctl install --prefix "$tmp/heal" >"$tmp/out18" 2>&1 \
+  || fail "heal install exited $? — $(cat "$tmp/out18")"
+grep -q "^upgrade: 0.0.1 -> $ver" "$tmp/out18" || fail "heal install was not an upgrade: $(cat "$tmp/out18")"
+[ "$(stat -c '%a' "$tmp/heal/runnerctl")" = 755 ] || fail "0700 target was not widened: $(stat -c '%a' "$tmp/heal/runnerctl")"
+mkdir -p "$tmp/keep"
+sed 's/^RUNNERCTL_VERSION=.*/RUNNERCTL_VERSION="0.0.1"/' runnerctl >"$tmp/keep/runnerctl"; chmod 775 "$tmp/keep/runnerctl"
+RUNNERCTL_CONFIG="$tmp/keep/etc/config" ./runnerctl install --prefix "$tmp/keep" >"$tmp/out19" 2>&1 \
+  || fail "mode-preserving install exited $? — $(cat "$tmp/out19")"
+[ "$(stat -c '%a' "$tmp/keep/runnerctl")" = 775 ] || fail "775 target was not preserved: $(stat -c '%a' "$tmp/keep/runnerctl")"
+# An existing directory keeps the mode the admin gave it.
+mkdir -p "$tmp/dirkeep/bin"; chmod 700 "$tmp/dirkeep/bin"
+RUNNERCTL_CONFIG="$tmp/dirkeep/etc/config" ./runnerctl install --prefix "$tmp/dirkeep/bin" >"$tmp/out20" 2>&1 \
+  || fail "existing-prefix install exited $? — $(cat "$tmp/out20")"
+[ "$(stat -c '%a' "$tmp/dirkeep/bin")" = 700 ] || fail "existing prefix mode was changed: $(stat -c '%a' "$tmp/dirkeep/bin")"
 
 echo "install-test ok"
