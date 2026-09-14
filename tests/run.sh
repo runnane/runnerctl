@@ -1392,7 +1392,7 @@ case_journal_restart_reason_line_no_match() {
 case_status_json_parses_and_carries_the_slot_facts() {
   run status --json
   expect_rc 0
-  expect_out '^\{"runnerctl":"[0-9]+\.[0-9]+\.[0-9]+","host":\{"cores":16,"mem_total":68719476736,"mem_available":51539607552\},$'
+  expect_out '^\{"runnerctl":"[0-9]+\.[0-9]+\.[0-9]+","host":\{"name":"stub-host-1","cores":16,"mem_total":68719476736,"mem_available":51539607552\},$'
   expect_out '^ "slots":\[$'
   expect_out '^\]\}$'
   # read-only, like the table: no privileged call at all.
@@ -1401,7 +1401,7 @@ case_status_json_parses_and_carries_the_slot_facts() {
   expect_no_out '^note:'
   if ! $HAVE_PYTHON3; then skip "python3 not on PATH: status --json parse assertions not run"; return 0; fi
   expect_json 'len(d["slots"]) == 3'
-  expect_json 'd["host"] == {"cores": 16, "mem_total": 68719476736, "mem_available": 51539607552}'
+  expect_json 'd["host"] == {"name": "stub-host-1", "cores": 16, "mem_total": 68719476736, "mem_available": 51539607552}'
   # GHR-32: the version the script carries, so a fleet can be inventoried
   expect_json 'isinstance(d["runnerctl"], str) and len(d["runnerctl"].split(".")) == 3 and all(x.isdigit() for x in d["runnerctl"].split("."))'
   expect_json '[s["idx"] for s in d["slots"]] == [0, 1, 2]'
@@ -1429,6 +1429,41 @@ case_status_json_parses_and_carries_the_slot_facts() {
   expect_json 'd["slots"][2]["job"] is None and d["slots"][2]["idle_since"] is None and d["slots"][2]["jobs_completed"] is None'
   expect_json 'isinstance(d["slots"][2]["since"], int) and d["slots"][2]["since"] == 1000000720 - 518400'
   expect_json 'all(s["working_on_access"] == "ok" for s in d["slots"])'
+}
+
+# GHR-38: host.name is null, not an empty string or a missing key, when the
+# host cannot say what it is called. A consumer testing `is None` must not
+# have to also test for "".
+case_status_json_host_name_null_when_unreadable() {
+  RUNNERCTL_STUB_HOST_NAME='' run status --json
+  expect_rc 0
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: host.name null assertion not run"; return 0; fi
+  expect_json '"name" in d["host"] and d["host"]["name"] is None'
+  # the rest of the host object is unaffected by the missing name
+  expect_json 'd["host"]["cores"] == 16'
+}
+
+# GHR-38: a host with no runner units is a well-formed empty payload from
+# --json and exit 0 — NOT the table's die. A fleet aggregator has to be able
+# to tell "this host has no runners" from "this host did not answer", and an
+# abort here makes those two indistinguishable.
+case_status_json_no_units_is_empty_slots_not_a_die() {
+  RUNNERCTL_STUB_NO_UNITS=1 run status --json
+  expect_rc 0
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: empty-slots assertions not run"; return 0; fi
+  expect_json 'd["slots"] == []'
+  # still self-describing: the envelope is complete, only the slots are empty
+  expect_json 'd["host"]["name"] == "stub-host-1" and d["host"]["cores"] == 16'
+  expect_json 'isinstance(d["runnerctl"], str)'
+}
+
+# GHR-38, the other half: the TABLE still dies on a runner-less host. The
+# --json change is deliberately scoped, because someone typing `status` on a
+# box with no runners has usually typed it on the wrong box.
+case_status_table_no_units_still_dies() {
+  RUNNERCTL_STUB_NO_UNITS=1 run status
+  expect_rc 1
+  expect_err "no 'actions\.runner\.\*\.service' units found on this host\."
 }
 
 # Both renderers read one collector: the JSON makes exactly the fetches the
@@ -2628,6 +2663,9 @@ t "journal_restart_reason_line: unrelated line -> nothing"            case_journ
 
 # --- GHR-16: status --json ---------------------------------------------------
 t "status --json: parses, host + 3 slots with the raw facts"           case_status_json_parses_and_carries_the_slot_facts
+t "status --json: host.name null when the host cannot be named"        case_status_json_host_name_null_when_unreadable
+t "status --json: no runner units is slots:[] and exit 0, not a die"   case_status_json_no_units_is_empty_slots_not_a_die
+t "status: the table still dies on a host with no runner units"        case_status_table_no_units_still_dies
 t "status --json: same unit_props / journal fetches as the table"      case_status_json_same_fetches_as_the_table
 t "status --json: profile from a seeded drop-in"                       case_status_json_profile_from_dropin
 t "status --json: working_on_access per slot, no note line"            case_status_json_working_on_access_states
