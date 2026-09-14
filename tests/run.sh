@@ -2795,6 +2795,24 @@ case_fleet_upgrade_check_reports_each_host_and_counts() {
   expect_no_log '^(systemctl|sudo|tee|rm|mkdir|chown|chmod) '
 }
 
+# GHR-52: upgrade gained placement lines (note:/relocated:/retired:), and
+# fleet_upgrade_report classifies a host by grepping its stdout — treating
+# anything it cannot classify as a FAILED host. So every added line is a chance
+# to turn a healthy fan-out red, and this pins that it does not.
+#
+# It also pins the honest reporting of the half-done case: a host that retired
+# its shadow but could not write the system copy must NOT read as `upgraded`.
+case_fleet_upgrade_classifies_a_self_healing_host_not_as_unrecognised() {
+  RUNNERCTL_STUB_FLEET_HOSTS="box-relocating box-retireonly" run fleet upgrade
+  expect_rc 0
+  expect_out '^box-relocating +0\.0\.1 -> 9\.9\.9 +upgraded$'
+  expect_out '^box-retireonly +1\.0\.0 -> 9\.9\.9 +update available$'
+  expect_no_out 'unrecognised'
+  # 0 unclear is the assertion that matters: an unclassified host is counted
+  # as bad and would fail the whole fan-out.
+  expect_out '^2 host\(s\): 0 already level, 2 upgraded, 0 unreachable or unclear$'
+}
+
 case_fleet_upgrade_applies_and_says_what_changed() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver" run fleet upgrade
   expect_rc 0
@@ -3621,6 +3639,7 @@ t "fleet health --quiet: silent, exit code kept, not forwarded"        case_flee
 t "fleet health: unknown option and bad value die before dialling"     case_fleet_health_unknown_option_dies
 t "fleet upgrade --check: per-host versions and a count, writes nothing" case_fleet_upgrade_check_reports_each_host_and_counts
 t "fleet upgrade: applies and says what changed"                       case_fleet_upgrade_applies_and_says_what_changed
+t "fleet upgrade: a self-healing host is classified, not unrecognised" case_fleet_upgrade_classifies_a_self_healing_host_not_as_unrecognised
 t "fleet upgrade: a failed host is a row, the rest still upgrade"      case_fleet_upgrade_failed_host_is_a_row_not_an_abort
 t "fleet upgrade: an unrecognised answer is shown, not guessed at"     case_fleet_upgrade_unrecognised_answer_is_shown_not_guessed
 t "fleet upgrade: --ref forwarded; unknown option dies before dialling" case_fleet_upgrade_ref_is_forwarded_and_bad_option_dies

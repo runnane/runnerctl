@@ -627,7 +627,11 @@ ssh build-1 'command -v runnerctl || echo "not on the non-interactive PATH"'
 
 Either install it system-wide (`/usr/local/bin`, which `sshd`'s default PATH
 does include) or set `FLEET_RUNNERCTL` to its absolute path, which moves no
-files.
+files. A host whose runnerctl already carries the placement healing relocates
+itself on the next `runnerctl upgrade` — see [Upgrade heals *where* runnerctl
+is](#upgrade-heals-where-runnerctl-is-not-only-which-version-it-is). An older
+one has to be bootstrapped by hand once, because the version that would heal it
+is precisely the version it does not have yet.
 
 **No privileges are needed for this.** `status` never asks for sudo, so an
 ordinary unprivileged ssh login is enough; where the login cannot read the
@@ -1014,10 +1018,11 @@ safe to run repeatedly.
 ### Self-upgrade
 
 ```sh
-runnerctl upgrade --check      # report installed vs available
+runnerctl upgrade --check      # report installed vs available, change nothing
 runnerctl upgrade              # install the latest tagged release
 runnerctl upgrade --ref v0.1.0 # pin a specific release
 runnerctl upgrade --ref main   # track main instead of tagged releases
+runnerctl upgrade --no-relocate # upgrade exactly where this copy stands
 ```
 
 `upgrade` downloads the script from `UPGRADE_URL` (default: this repository's
@@ -1037,6 +1042,48 @@ tags `vX.Y.Z` and publishes a GitHub release with the script attached. Hosts
 on the default `UPGRADE_URL` only ever pick up a tagged release; `--ref main`
 opts a host into the next version's changes under the last version's tag,
 and `--ref vX.Y.Z` pins one explicitly.
+
+#### Upgrade heals *where* runnerctl is, not only which version it is
+
+A version-only upgrade cannot fix the most common reason `fleet` cannot reach a
+host. `ssh host runnerctl` runs no login shell and so reads no `~/.profile` —
+which on Ubuntu and Debian is what adds `~/.local/bin` and `~/bin` — so a
+runnerctl under a home directory works perfectly when its owner types it, and
+the fan-out reports `remote exit 127` forever. Upgrading it in place healed the
+version every time and the reachability never.
+
+So `upgrade` picks a target the way `install` does:
+
+| what it finds | what it does |
+| --- | --- |
+| a copy outside any home | upgrades it in place — unchanged behaviour |
+| a home copy, nothing installed system-wide | moves it to `--prefix` (default `/usr/local/bin`), retiring the old one as `.retired` |
+| a home copy **shadowing** a system one | retires the home copy — you were typing one version while `fleet` ran another — and upgrades the system copy |
+
+```
+$ runnerctl upgrade
+installed: 0.8.1 (/home/jon/.local/bin/runnerctl)
+available: 0.10.3 (https://.../runnerctl)
+note: this copy is not on the PATH a non-interactive ssh gets, so 'fleet' cannot run it
+relocated: /home/jon/.local/bin/runnerctl -> /usr/local/bin/runnerctl
+retired: /home/jon/.local/bin/runnerctl.retired
+Upgraded 0.8.1 -> 0.10.3 at /usr/local/bin/runnerctl
+```
+
+**It only ever acts when the privilege is already free** — the location is
+writable, you are root, or `sudo -n` succeeds. Otherwise it upgrades in place
+and names the remedy instead. It never prompts for a password: `fleet upgrade`
+fans this command out, and one prompt would hang the fan-out on that host,
+which is exactly what `BatchMode=yes` prevents on the ssh side.
+
+Two deliberate limits. A shadow is **not** retired when the system copy behind
+it is *older* — that would quietly downgrade what you get when you type
+`runnerctl`. And when the shadow is retired but the system copy still needs a
+privileged write, the last line is `Update available. Run: sudo runnerctl
+upgrade`, not `Upgraded`: the command reports work outstanding rather than work
+it did not do.
+
+`--no-relocate` keeps a deliberately personal copy where it is.
 
 ### What it writes
 

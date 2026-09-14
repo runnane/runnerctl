@@ -62,11 +62,24 @@
 #   runnerctl config-example
 #   runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
 #   runnerctl install [--prefix DIR] [--ref <branch|tag>] [--no-migrate] [--dry-run]
-#   runnerctl upgrade [--check] [--ref <branch|tag>]
+#   runnerctl upgrade [--check] [--ref <branch|tag>] [--prefix DIR] [--no-relocate]
 #   runnerctl version
 #
 # Install or upgrade any host (a pre-config install is migrated first):
 #   curl -fsSL https://github.com/runnane/runnerctl/releases/latest/download/runnerctl | sudo bash -s -- install
+#
+# `upgrade` heals WHERE runnerctl is, not only which version it is (GHR-52).
+# `ssh host runnerctl` runs no login shell and so reads no ~/.profile, which on
+# Ubuntu is what adds ~/.local/bin and ~/bin — so a runnerctl under a home
+# directory works perfectly when its owner types it and is invisible to
+# `fleet`, which reports `remote exit 127` forever. When upgrade finds itself
+# running from such a copy it moves to --prefix (default /usr/local/bin) and
+# retires the old one as .retired; where a system copy already exists, the home
+# copy was shadowing it — you type one version and the fan-out runs another —
+# and is retired instead. Either way it only acts when the privilege is already
+# free (writable, root, or passwordless sudo): it never prompts, because
+# `fleet upgrade` fans this out and a password prompt would hang it once per
+# host. --no-relocate keeps a deliberately personal copy where it is.
 #
 # --when-idle (restart, stop, apply --restart, scale) waits for each targeted
 # slot to finish its job before acting on it, one slot at a time so the pool
@@ -4310,35 +4323,191 @@ install_file() {
   "${priv[@]}" mv -f "$staged" "$dest"
 }
 
+# --- Where an upgrade should land (GHR-52) ------------------------------------
+# `upgrade` used to rewrite $self and nothing else, which heals the VERSION and
+# never the PLACEMENT. A runnerctl in ~/.local/bin then gets upgraded forever
+# inside a directory no non-interactive ssh can see: `fleet` reports `remote
+# exit 127` for a host whose owner can type `runnerctl` all day and see it
+# work. Three hosts of four were in exactly that state (GHR-51), and nothing
+# in the tool was ever going to say so.
+#
+# So upgrade picks a target the way install does. The privilege rule is the
+# conservative half: it does whatever part of the heal costs no password, and
+# NAMES the rest. Never a prompt — `fleet upgrade` fans this out, and a sudo
+# prompt would hang the fan-out once per host, which is precisely the failure
+# BatchMode=yes exists to prevent on the ssh side.
+
+# The invoking user's home — $SUDO_USER's when set, which is the same rule
+# find_home_runnerctl uses, so install and upgrade always agree on whose home
+# is in question.
+invoking_home() {
+  if [ -n "${SUDO_USER:-}" ]; then
+    getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6 || true
+  else
+    printf '%s\n' "${HOME:-}"
+  fi
+}
+
+# Is PATH inside that home? A resolved PREFIX test, never a glob: a home of
+# /home/jon must not swallow /home/jonathan/bin/runnerctl, and the trailing
+# slash is what stops it.
+under_home() { # PATH
+  local rp hp
+  hp="$(invoking_home)"
+  [ -n "$hp" ] || return 1
+  rp="$(readlink -f "$1" 2>/dev/null || printf '%s' "$1")"
+  hp="$(readlink -f "$hp" 2>/dev/null || printf '%s' "$hp")"
+  [ -n "$hp" ] || return 1
+  [ "${rp#"$hp"/}" != "$rp" ]
+}
+
+# Can a file be placed at PATH without asking a human for anything? Writable
+# already, or root, or sudo is configured passwordless. `sudo -n` is the whole
+# point: it fails fast instead of prompting.
+priv_is_free() { # DEST
+  # Exactly the two conditions install_file itself checks, because a DEST whose
+  # file is writable inside a directory that is NOT still cannot be replaced:
+  # install_file stages `$dir/.runnerctl.new.$$` first. Testing the file alone
+  # said "free", then the staging copy hit sudo anyway.
+  #
+  # needs_priv walks up to the nearest existing ancestor, so a prefix that does
+  # not exist yet is judged by the directory that will come to hold it.
+  if ! needs_priv "$(dirname "$1")" && { [ ! -e "$1" ] || [ -w "$1" ]; }; then
+    return 0
+  fi
+  [ "$(id -u)" -ne 0 ] || return 0
+  sudo -n true 2>/dev/null
+}
+
 cmd_upgrade() {
-  local check=false ref=""
+  local check=false ref="" prefix="" relocate=true
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     case "$1" in
-      --check) check=true; shift ;;
-      --ref)   need_val "$@"; ref="$2"; shift 2 ;;
+      --check)       check=true; shift ;;
+      --ref)         need_val "$@"; ref="$2"; shift 2 ;;
+      # Where a home copy is moved TO. Mirrors install's flag, and is what
+      # makes any of this testable without writing to a real /usr/local/bin.
+      --prefix)      need_val "$@"; prefix="${2%/}"; shift 2 ;;
+      # For a deliberately personal copy: upgrade exactly where it stands.
+      --no-relocate) relocate=false; shift ;;
       *) die "unknown option: $1" ;;
     esac
   done
-  local self url new_ver
+  local self url new_ver sys sys_ver=""
   self="$(readlink -f "${BASH_SOURCE[0]}")"
+  [ -n "$prefix" ] || prefix="/usr/local/bin"
+  sys="$prefix/runnerctl"
   url="$(resolve_url "$ref")"
   DOWNLOAD_TMP="$(mktemp)"; trap 'rm -f "$DOWNLOAD_TMP"' EXIT
   fetch_script "$url" "$DOWNLOAD_TMP"
   new_ver="$(remote_version "$DOWNLOAD_TMP")"
 
-  echo "installed: $RUNNERCTL_VERSION ($self)"
+  # --- placement -------------------------------------------------------------
+  # target  = the file to write, empty when this call must not write one
+  # cur_*   = what the fleet runs TODAY, which is not $self once $self is a
+  #           shadowed home copy — and it is cur_ver the version gates compare
+  # retire  = the home copy to rename out of the way, empty to leave it
+  local homecopy=false
+  if $relocate && [ "$self" != "$sys" ] && under_home "$self"; then homecopy=true; fi
+  if $homecopy && [ -e "$sys" ] && looks_like_runnerctl "$sys"; then
+    sys_ver="$(remote_version "$sys")"
+  fi
+  local target="$self" cur_ver="$RUNNERCTL_VERSION" cur_path="$self" retire="" note=""
+  if $homecopy; then
+    if priv_is_free "$sys"; then
+      target="$sys"; retire="$self.retired"
+      if [ -n "$sys_ver" ]; then
+        cur_ver="$sys_ver"; cur_path="$sys"
+        note="note: $sys (runnerctl $sys_ver) is shadowed by this copy — you type one and 'fleet' runs the other"
+      else
+        note="note: this copy is not on the PATH a non-interactive ssh gets, so 'fleet' cannot run it"
+      fi
+    elif [ -n "$sys_ver" ] && ! version_lt "$sys_ver" "$RUNNERCTL_VERSION"; then
+      # $sys cannot be written without a password, but it already holds a
+      # runnerctl at least as new as this one — so retiring the shadow on its
+      # own is a strict improvement and costs no privilege at all. Never
+      # retire a shadow over an OLDER $sys: that would quietly downgrade what
+      # the user gets when they type `runnerctl`.
+      target=""; cur_ver="$sys_ver"; cur_path="$sys"; retire="$self.retired"
+      note="note: $sys (runnerctl $sys_ver) is shadowed by this copy — retiring this one; run 'sudo runnerctl upgrade' to move $sys on"
+    else
+      note="note: this copy is not on the PATH a non-interactive ssh gets, so 'fleet' cannot run it. To move it: sudo runnerctl install"
+    fi
+  fi
+
+  echo "installed: $cur_ver ($cur_path)"
   echo "available: $new_ver ($url)"
-  if [ "$new_ver" = "$RUNNERCTL_VERSION" ] && cmp -s "$DOWNLOAD_TMP" "$self"; then
+  [ -z "$note" ] || echo "$note"
+
+  # These four sentences are a PARSED CONTRACT, not prose: fleet_upgrade_report
+  # greps ^Upgraded, ^Already up to date\. (with the period), ^Update
+  # available\. and `not downgrading`, and counts anything it cannot classify
+  # as a failed host. Every line this function added above is additive and on
+  # its own line for exactly that reason. Do not reword them.
+  # "same" is about the VERSION, so it compares against the file that holds
+  # cur_ver today ($cur_path) — never against $target, which does not exist yet
+  # when this call is relocating. Getting that backwards reports
+  # "Upgraded 0.10.3 -> 0.10.3" for a host whose only real problem was where
+  # the file lived.
+  local same=false
+  if [ "$new_ver" = "$cur_ver" ] && cmp -s "$DOWNLOAD_TMP" "$cur_path" 2>/dev/null; then
+    same=true
+  fi
+  if $same && [ -z "$retire" ]; then
     echo "Already up to date."; return 0
   fi
-  if [ -z "$ref" ] && version_lt "$new_ver" "$RUNNERCTL_VERSION"; then
+  if [ -z "$ref" ] && version_lt "$new_ver" "$cur_ver"; then
     echo "Remote is older than installed — not downgrading (pass --ref to force a specific version)."
     return 0
   fi
-  if $check; then echo "Update available. Run: runnerctl upgrade"; return 0; fi
-  install_file "$DOWNLOAD_TMP" "$self"
-  echo "Upgraded $RUNNERCTL_VERSION -> $new_ver at $self"
+  if $check; then
+    if [ -n "$retire" ]; then
+      if [ -n "$target" ] && [ "$target" != "$self" ] && [ -z "$sys_ver" ]; then
+        echo "would relocate: $self -> $target"
+      fi
+      echo "would retire: $retire"
+    fi
+    if $same; then echo "Already up to date."; else echo "Update available. Run: runnerctl upgrade"; fi
+    return 0
+  fi
+  # Gated on what $target actually holds, NOT on $same: a relocation must place
+  # the file even when the version is unchanged, because the version was never
+  # the problem — a same-version copy in ~/.local/bin is exactly the host the
+  # fan-out cannot reach.
+  if [ -n "$target" ] && ! cmp -s "$DOWNLOAD_TMP" "$target" 2>/dev/null; then
+    # Same explicit mode as install, and for the same reason (GHR-47): under
+    # root's umask 077 a freshly created prefix is 0700 and nobody but root
+    # can traverse it to reach the binary.
+    local tdir priv=()
+    # $target's OWN directory, never $prefix: with --no-relocate (or any
+    # in-place upgrade) $target is $self and $prefix is merely the default
+    # that was not used, so creating it would conjure an empty /usr/local/bin
+    # on a host that had deliberately opted out.
+    tdir="$(dirname "$target")"
+    ! needs_priv "$tdir" || priv=(run_priv)
+    [ -d "$tdir" ] || "${priv[@]}" mkdir -p -m 755 "$tdir"
+    install_file "$DOWNLOAD_TMP" "$target"
+  fi
+  if [ -n "$retire" ]; then
+    # Renaming the script that is currently running is safe: the rename keeps
+    # the inode, and bash is reading it through an open descriptor.
+    mv -f "$self" "$retire"
+    if [ -n "$target" ] && [ "$target" != "$self" ] && [ -z "$sys_ver" ]; then
+      echo "relocated: $self -> $target"
+    fi
+    echo "retired: $retire"
+  fi
+  if $same; then
+    echo "Already up to date."
+  elif [ -z "$target" ]; then
+    # Retire-only: the shadow is gone, but $sys still needs a privileged write
+    # and this call never made one. Claiming an upgrade here would be a plain
+    # false report of work that did not happen.
+    echo "Update available. Run: sudo runnerctl upgrade"
+  else
+    echo "Upgraded $cur_ver -> $new_ver at $target"
+  fi
 }
 
 # Under sudo PATH is secure_path, so a runnerctl the invoking user runs from
