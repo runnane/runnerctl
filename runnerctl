@@ -4236,21 +4236,36 @@ fetch_script() {
   [ -n "$(remote_version "$2")" ] || die "downloaded file carries no RUNNERCTL_VERSION — not installing"
 }
 
-# Put SRC at DEST atomically. An existing DEST keeps its owner and mode; a new
-# one is root:root 755 when it took sudo to write, 755 otherwise.
+# Put SRC at DEST atomically, readable and executable by everyone: a runnerctl
+# only root can run is the same as no runnerctl at all. An existing DEST keeps
+# its owner and any extra bits it carries, widened to a+rx; a new one is
+# root:root 755 when it took sudo to write, 755 otherwise.
+#
+# The mode is always an explicit octal, never `chmod +x` (GHR-47). A symbolic
+# mode with no "who" is masked by the umask, so `chmod +x` is a+x *minus the
+# umask* — and the bytes being staged are a mktemp download, mode 0600, which
+# `cp` carries over. Under root's umask that landed 0700 (umask 077) or 0711
+# (umask 022), and 0711 is broken too: running a #! script needs read as well
+# as execute, so the invoking user got "Permission denied" either way while
+# the install's own `"$target" version` proof passed as root.
 install_file() {
-  local src="$1" dest="$2" dir staged
+  local src="$1" dest="$2" dir staged mode=755
   dir="$(dirname "$dest")"; staged="$dir/.$(basename "$dest").new.$$"
   local priv=()
   { [ -w "$dir" ] && { [ ! -e "$dest" ] || [ -w "$dest" ]; }; } || priv=(run_priv)
   "${priv[@]}" cp "$src" "$staged"
   if [ -e "$dest" ]; then
     "${priv[@]}" chown --reference="$dest" "$staged"
-    "${priv[@]}" chmod --reference="$dest" "$staged"
+    # Keep what the admin set — setuid bits, a wider group — but never less
+    # than a+rx, so a host already installed at 0700 heals on the next run
+    # instead of staying unrunnable.
+    mode="$(stat -c '%a' "$dest" 2>/dev/null || echo 755)"
+    [[ "$mode" =~ ^[0-7]+$ ]] || mode=755
+    mode="$(printf '%04o' "$(( 8#$mode | 8#0555 ))")"
   else
     [ "${#priv[@]}" -eq 0 ] || run_priv chown root:root "$staged"
   fi
-  "${priv[@]}" chmod +x "$staged"
+  "${priv[@]}" chmod "$mode" "$staged"
   "${priv[@]}" mv -f "$staged" "$dest"
 }
 
@@ -4408,12 +4423,18 @@ cmd_install() {
   if [ "$old" = "$target" ] && is_legacy_script "$target" && ! $migrate; then
     install_file "$target" "$target.legacy"
   fi
+  # Both directories are created with an explicit mode for the same reason the
+  # file is (GHR-47): under root's umask 077 a freshly created /usr/local/bin
+  # or /etc/runnerctl is 0700, and a non-root user cannot then traverse it to
+  # reach the binary or read the config. An existing directory is left exactly
+  # as the admin has it.
   local priv=()
   ! needs_priv "$prefix" || priv=(run_priv)
-  "${priv[@]}" mkdir -p "$prefix"
+  [ -d "$prefix" ] || "${priv[@]}" mkdir -p -m 755 "$prefix"
   install_file "$src" "$target"
-  priv=(); ! needs_priv "$(dirname "$CONFIG_FILE")" || priv=(run_priv)
-  "${priv[@]}" mkdir -p "$(dirname "$CONFIG_FILE")"
+  local confdir; confdir="$(dirname "$CONFIG_FILE")"
+  priv=(); ! needs_priv "$confdir" || priv=(run_priv)
+  [ -d "$confdir" ] || "${priv[@]}" mkdir -p -m 755 "$confdir"
   echo "Installed runnerctl $new_ver at $target"
   if [ -n "$retired" ]; then
     # After the new file is in place, never before: a failure here leaves both
