@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/runnane/runnerctl/compare/v0.10.3...v0.11.0) (2026-09-14)
+
+
+### Features
+
+* upgrade heals where runnerctl is, not only which version it is (GHR-52) ([#55](https://github.com/runnane/runnerctl/issues/55)) ([92724f6](https://github.com/runnane/runnerctl/commit/92724f66030e2844d8d5976b97452cf8b3813d65))
+
 ## [0.10.3](https://github.com/runnane/runnerctl/compare/v0.10.2...v0.10.3) (2026-09-14)
 
 
