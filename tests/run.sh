@@ -2605,6 +2605,66 @@ case_fleet_status_tells_timeout_remote_error_and_unreachable_apart() {
   expect_json '[h["exit_code"] for h in d["fleet"]] == [255, 124, 1]'
 }
 
+# GHR-50: the fan-out's own bootstrap failures — the faults that stand between
+# a freshly configured FLEET_HOSTS and its first working table. Each was a row
+# saying only "remote exit N", which is accurate and tells the reader nothing.
+#
+# These assertions pin the REMEDY, not the rc. The rc was already right and
+# still sent a reader to the wrong host: 127 is a PATH fault and 126 is the
+# 0700/0711 install, and re-running the installer only fixes one of them.
+case_fleet_status_names_the_fix_for_a_host_that_cannot_run_runnerctl() {
+  RUNNERCTL_STUB_FLEET_HOSTS="box-noinstall box-notexec box-multicall" run fleet status
+  expect_rc 1
+  # 127 on a bare name. Naming ~/.profile is the point: it is why a runnerctl
+  # the same user runs by hand is invisible to a non-interactive ssh.
+  expect_out '^box-noinstall +remote exit 127 — bash: line 1: runnerctl: command not found — runnerctl is not on that host'
+  expect_out '^box-noinstall .*~/\.local/bin and ~/bin are not on it'
+  expect_out '^box-noinstall .*set FLEET_RUNNERCTL to its absolute path'
+  # 126 with a full path: installed, not executable by the ssh login. It must
+  # NOT be told runnerctl is missing.
+  expect_out '^box-notexec +remote exit 126 — bash: /usr/local/bin/runnerctl: Permission denied — runnerctl is installed on that host but the ssh login cannot execute it'
+  expect_out "^box-notexec .*'sudo chmod 755' the path it names"
+  expect_no_out '^box-notexec .*is not on that host'
+  # A multicall dispatcher answering to the name is neither of the above.
+  expect_out "^box-multicall +remote exit 1 — coreutils: unknown program 'runnerctl' — a multicall binary answered to that name"
+  expect_no_out '^box-multicall .*chmod 755'
+}
+
+# The hint has to survive the envelope too: --json is what a monitor reads, and
+# a remedy only the table carries is half a fix.
+case_fleet_status_json_carries_the_bootstrap_remedy() {
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: bootstrap-hint envelope assertions not run"; return 0; fi
+  RUNNERCTL_STUB_FLEET_HOSTS="box-noinstall box-notexec" run fleet status --json
+  expect_json '[h["exit_code"] for h in d["fleet"]] == [127, 126]'
+  # reachable stays true: the remote shell ran and said no, so this is not the
+  # "nothing is known about this host" class that 124/255 mean.
+  expect_json '[h["reachable"] for h in d["fleet"]] == [True, True]'
+  expect_json '"FLEET_RUNNERCTL" in d["fleet"][0]["error"]'
+  expect_json '"chmod 755" in d["fleet"][1]["error"]'
+  expect_json '"chmod" not in d["fleet"][0]["error"]'
+}
+
+# fleet health renders through the same helper, and it is the surface a cron
+# job reads: a monitor that fires with no remedy in the line wakes someone at
+# 03:00 to re-derive this.
+case_fleet_health_carries_the_bootstrap_remedy() {
+  RUNNERCTL_STUB_FLEET_HOSTS="box-noinstall" run fleet health
+  expect_rc 1
+  expect_out '^box-noinstall: remote exit 127 — .*set FLEET_RUNNERCTL to its absolute path'
+  expect_no_out '^ok: '
+}
+
+# The one ordering an rc alone cannot settle. A mutating fan-out runs the
+# remote command under sudo, so a missing runnerctl arrives as `sudo:
+# runnerctl: command not found` at rc 1 — both signatures on one line. It is a
+# PATH fault; sending the reader to write a sudoers line fixes nothing.
+case_fleet_a_sudo_wrapped_missing_runnerctl_is_a_path_fault_not_a_sudo_one() {
+  RUNNERCTL_STUB_FLEET_HOSTS="box-sudowrap" run fleet status
+  expect_rc 1
+  expect_out '^box-sudowrap +remote exit 1 — .*runnerctl is not on that host'
+  expect_no_out 'needs passwordless sudo'
+}
+
 case_fleet_status_version_skew_note() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver" run fleet status
   expect_rc 0
@@ -3547,6 +3607,10 @@ t "fleet status: one HOST-prefixed table, column header once"          case_flee
 t "fleet status: an unreachable host is a row, the rest still report"  case_fleet_status_unreachable_host_is_a_row_not_a_fatal
 t "fleet status: timeout, remote error and unreachable stay distinct"  case_fleet_status_tells_timeout_remote_error_and_unreachable_apart
 t "fleet status: a version mismatch adds the skew note, level does not" case_fleet_status_version_skew_note
+t "fleet status: a host that cannot run runnerctl is told how to fix it" case_fleet_status_names_the_fix_for_a_host_that_cannot_run_runnerctl
+t "fleet status --json: the bootstrap remedy rides in the envelope"     case_fleet_status_json_carries_the_bootstrap_remedy
+t "fleet health: a bootstrap failure carries its remedy too"            case_fleet_health_carries_the_bootstrap_remedy
+t "fleet: a sudo-wrapped missing runnerctl reads as a PATH fault"       case_fleet_a_sudo_wrapped_missing_runnerctl_is_a_path_fault_not_a_sudo_one
 t "fleet status --json: each host's payload nested unchanged"          case_fleet_status_json_nests_each_payload_unchanged
 t "fleet status --json: exit 0 with no object is an explained error"   case_fleet_status_json_rejects_a_non_object_payload
 t "fleet health: all healthy is one summary line, exit 0"              case_fleet_health_all_healthy_is_one_line_exit_zero

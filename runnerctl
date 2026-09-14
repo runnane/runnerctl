@@ -2716,12 +2716,46 @@ fleet_reachable() { # RC
 fleet_error_text() { # RC ERRFILE
   local rc="$1" err="" hint=""
   [ ! -s "$2" ] || err="$(head -1 "$2")"
-  # A sudo refusal is accurate but leaves the reader to work out the fix, and
-  # it is the single most likely failure of a mutating fan-out. Name the
-  # remedy where it is read. BatchMode=yes is what makes this a failure to
-  # report at all rather than a fan-out hung on a password prompt.
-  case "$err" in
+  # An accurate error that leaves the reader to work out the fix is half a
+  # message. Name the remedy where it is read.
+  #
+  # The bootstrap failures below are told apart by the shell's own exit codes
+  # rather than by matching English, because they are genuinely different
+  # faults with different fixes, and a row saying only "remote exit 127" sends
+  # someone to reinstall runnerctl on a host that already has it.
+  #
+  # Probed rather than assumed (GHR-50): a root-owned 0700 OR 0711 script on
+  # PATH fails 126 "Permission denied" naming the FULL PATH, and only a name
+  # that resolves to nothing fails 127 on the BARE NAME. So the 0700/0711
+  # install this project shipped in 0.9.0-0.10.0 (GHR-47) is the 126 row,
+  # never the 127 one.
+  #
+  # And 127 is NOT "not installed". `ssh host runnerctl` runs no login shell,
+  # so it never reads ~/.profile — on Ubuntu that is what adds ~/.local/bin
+  # and ~/bin, and a runnerctl installed there works perfectly when the same
+  # user logs in and is invisible to the fan-out. Hence "not on the PATH for a
+  # non-interactive ssh login" rather than "not installed", and hence
+  # FLEET_RUNNERCTL named as the fix that does not move any files.
+  #
+  # First match wins, and the order matters: `sudo: runnerctl: command not
+  # found` carries both signatures and is a PATH fault, not a sudo refusal.
+  case "$rc:$err" in
+    127:*|*"command not found"*)
+      # `command not found` is safe to match as text: runnerctl never says it,
+      # so this cannot swallow a remote error of its own. A bare "not found"
+      # would — systemctl says "Unit ... not found" through this same pipe.
+      hint=" — runnerctl is not on that host's PATH for a non-interactive ssh login (which reads no ~/.profile, so ~/.local/bin and ~/bin are not on it); set FLEET_RUNNERCTL to its absolute path, or install it system-wide with 'curl -fsSL $UPGRADE_URL | sudo bash -s -- install'" ;;
+    *"unknown program"*|*"applet not found"*)
+      # A multicall binary (uutils, busybox) answering to the name. Both
+      # phrases are dispatcher signatures that runnerctl cannot produce, so
+      # matching them as text costs nothing.
+      hint=" — a multicall binary answered to that name instead of runnerctl; check what FLEET_RUNNERCTL resolves to on that host, and that the real runnerctl is readable by the ssh login" ;;
+    126:*)
+      hint=" — runnerctl is installed on that host but the ssh login cannot execute it; 'sudo chmod 755' the path it names, or re-run the installer" ;;
     *sudo:*|*"a password is required"*|*"may not run"*|*"no tty present"*)
+      # The single most likely failure of a mutating fan-out. BatchMode=yes is
+      # what makes this a failure to report at all rather than a fan-out hung
+      # on a password prompt.
       hint=" — the ssh login needs passwordless sudo on that host; see the fleet section of the README for the exact sudoers line" ;;
   esac
   case "$rc" in
