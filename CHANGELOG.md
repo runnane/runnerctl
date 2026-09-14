@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.9.0](https://github.com/runnane/runnerctl/compare/v0.8.1...v0.9.0) (2026-09-14)
+
+
+### Features
+
+* fleet capacity budgets — a ceiling for rolling restarts, a floor for drains (GHR-44) ([#46](https://github.com/runnane/runnerctl/issues/46)) ([e9f94ad](https://github.com/runnane/runnerctl/commit/e9f94adefb75b0a5f9559bb590aad2766443a936))
+* fleet health — one exit code for the whole fleet (GHR-40) ([#43](https://github.com/runnane/runnerctl/issues/43)) ([b67a2a5](https://github.com/runnane/runnerctl/commit/b67a2a59e81e7f84f0605124547557c01ece60c1))
+* fleet mutating fan-out — --host, serial hosts, the capacity gate and the sudo contract (GHR-43) ([#45](https://github.com/runnane/runnerctl/issues/45)) ([27fdc11](https://github.com/runnane/runnerctl/commit/27fdc1173967c63df177a6284df79bbf6757d113))
+* fleet status — drive several runner hosts from one central node over ssh (GHR-39) ([#42](https://github.com/runnane/runnerctl/issues/42)) ([a289b31](https://github.com/runnane/runnerctl/commit/a289b31e946c21bf2f3942f08dbaed0114cb1d52))
+* fleet upgrade — hold every runner host on one version from one place (GHR-41) ([#44](https://github.com/runnane/runnerctl/issues/44)) ([fdd0146](https://github.com/runnane/runnerctl/commit/fdd0146234f1f33d1068327e449e5dc073c2587e))
+* status --json carries host.name and no longer dies on a runner-less host (GHR-38) ([#40](https://github.com/runnane/runnerctl/issues/40)) ([e293642](https://github.com/runnane/runnerctl/commit/e29364242160e180ace81e3c0c70289d13cad114))
+
 ## [0.8.1](https://github.com/runnane/runnerctl/compare/v0.8.0...v0.8.1) (2026-09-14)
 
 
