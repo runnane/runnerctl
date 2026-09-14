@@ -2549,6 +2549,104 @@ case_status_stalled_note_mentions_press() {
   expect_out_count '^note: STALLED = .*, a high PRESS means it is memory-throttled rather than hung$' 1
 }
 
+# --- GHR-39: fleet mode ------------------------------------------------------
+# The fan-out goes through ssh_run for every host, the column header is
+# printed once rather than per host, and each host's rows carry its name.
+case_fleet_status_table_one_header_rows_per_host() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status
+  expect_rc 0
+  expect_out_count '^HOST +IDX +RUNNER ' 1
+  expect_out_count '^build-1 +[0-9]+ +example\.slot-' 3
+  expect_out_count '^build-2 +[0-9]+ +example\.slot-' 3
+  # one round trip per host, and nothing reached ssh itself
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 1
+  expect_no_log '^direct:ssh '
+  # the remote host's own runnerctl header is folded away, not repeated
+  expect_no_out '^build-1 runnerctl '
+}
+
+# An unreachable host must never take the fan-out down with it: the other
+# hosts still report, and the exit code still tells a monitor something broke.
+case_fleet_status_unreachable_host_is_a_row_not_a_fatal() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-unreachable" run fleet status
+  expect_rc 1
+  expect_out '^gw-unreachable +unreachable — ssh: connect to host gw-unreachable port 22: No route to host$'
+  # the healthy host is unaffected
+  expect_out_count '^build-1 +[0-9]+ +example\.slot-' 3
+}
+
+# The three ways a host can fail to produce a status are NOT the same thing,
+# and flattening them is the bug this pins: only 124/255 mean "nothing is
+# known about this host". A remote runnerctl that ran and exited non-zero
+# reached the host fine — on a runner-less box that is its own good message.
+case_fleet_status_tells_timeout_remote_error_and_unreachable_apart() {
+  RUNNERCTL_STUB_FLEET_HOSTS="gw-unreachable slow-timeout box-norunners" run fleet status
+  expect_rc 1
+  expect_out '^gw-unreachable +unreachable — '
+  expect_out '^slow-timeout +timed out after 30s$'
+  expect_out "^box-norunners +remote exit 1 — runnerctl: no 'actions\\.runner\\.\\*\\.service' units found on this host\\.$"
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: reachable-flag assertions not run"; return 0; fi
+  RUNNERCTL_STUB_FLEET_HOSTS="gw-unreachable slow-timeout box-norunners" run fleet status --json
+  expect_json '[h["reachable"] for h in d["fleet"]] == [False, False, True]'
+  expect_json '[h["exit_code"] for h in d["fleet"]] == [255, 124, 1]'
+}
+
+case_fleet_status_version_skew_note() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver" run fleet status
+  expect_rc 0
+  expect_out_count "^note: the hosts are not all on one runnerctl version .*run 'runnerctl upgrade' on the ones that lag$" 1
+  # level fleet: no note at all
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status
+  expect_rc 0
+  expect_no_out '^note: the hosts are not all on one runnerctl version'
+}
+
+# The envelope nests each host's payload UNCHANGED — that is what lets fleet
+# mode work with no JSON parser on the central node, so it has to stay true.
+case_fleet_status_json_nests_each_payload_unchanged() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 gw-unreachable" run fleet status --json
+  expect_rc 1
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: fleet envelope assertions not run"; return 0; fi
+  expect_json 'len(d["fleet"]) == 3'
+  expect_json '[h["host_name"] for h in d["fleet"]] == ["build-1", "build-2", "gw-unreachable"]'
+  # the nested object is the host's own status payload, slots and all
+  expect_json 'len(d["fleet"][0]["status"]["slots"]) == 3'
+  expect_json 'd["fleet"][0]["status"]["slots"][0]["name"] == "example.slot-1"'
+  expect_json 'd["fleet"][0]["status"]["host"]["cores"] == 16'
+  # GHR-38: the payload names the host itself, independently of the ssh alias
+  expect_json 'd["fleet"][0]["status"]["host"]["name"] == "stub-host-1"'
+  expect_json 'd["fleet"][0]["host_name"] != d["fleet"][0]["status"]["host"]["name"]'
+  # a host that did not answer carries a null status, never a fabricated one
+  expect_json 'd["fleet"][2]["status"] is None and d["fleet"][2]["reachable"] is False'
+  expect_json 'd["fleet"][0]["error"] is None and "No route to host" in d["fleet"][2]["error"]'
+}
+
+# exit 0 + reachable + no error + no payload is the one combination a
+# consumer cannot interpret, so a non-object answer says what went wrong.
+case_fleet_status_json_rejects_a_non_object_payload() {
+  RUNNERCTL_STUB_FLEET_HOSTS="ugly-garbage" run fleet status --json
+  expect_rc 1
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: payload-sanity assertions not run"; return 0; fi
+  expect_json 'd["fleet"][0]["status"] is None'
+  expect_json 'd["fleet"][0]["exit_code"] == 0 and d["fleet"][0]["reachable"] is True'
+  expect_json '"no JSON object on stdout" in d["fleet"][0]["error"]'
+}
+
+case_fleet_unconfigured_says_so() {
+  run fleet status
+  expect_rc 1
+  expect_err 'fleet mode is not configured — set FLEET_HOSTS='
+  expect_no_log '^probe:ssh_run '
+}
+
+case_fleet_unknown_subcommand_dies() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet bogus
+  expect_rc 1
+  expect_err "unknown fleet command 'bogus'"
+  expect_no_log '^probe:ssh_run '
+}
+
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
 t "status: EnvironmentFiles value with embedded '=' survives"       case_status_envfile_value_with_embedded_equals
@@ -2765,6 +2863,16 @@ t "watch --iterations: headless, reads no keys, no cursor, no legend"   case_wat
 t "watch: the non-tty refusal reads no keys"                            case_watch_non_tty_refusal_reads_no_keys
 t "watch: a narrow terminal drops MAX/HIGH/ENVFILE, never WORKING-ON"   case_watch_narrow_terminal_drops_max_high_envfile
 t "watch --color always: the cursor row stays highlighted end to end"   case_watch_color_always_keeps_the_cursor_row_highlighted
+
+# --- GHR-39: fleet mode -------------------------------------------------------
+t "fleet status: one HOST-prefixed table, column header once"          case_fleet_status_table_one_header_rows_per_host
+t "fleet status: an unreachable host is a row, the rest still report"  case_fleet_status_unreachable_host_is_a_row_not_a_fatal
+t "fleet status: timeout, remote error and unreachable stay distinct"  case_fleet_status_tells_timeout_remote_error_and_unreachable_apart
+t "fleet status: a version mismatch adds the skew note, level does not" case_fleet_status_version_skew_note
+t "fleet status --json: each host's payload nested unchanged"          case_fleet_status_json_nests_each_payload_unchanged
+t "fleet status --json: exit 0 with no object is an explained error"   case_fleet_status_json_rejects_a_non_object_payload
+t "fleet: an unconfigured fleet says so and dials nothing"             case_fleet_unconfigured_says_so
+t "fleet bogus: unknown subcommand dies, dials nothing"                case_fleet_unknown_subcommand_dies
 
 # --- Summary ------------------------------------------------------------------
 echo

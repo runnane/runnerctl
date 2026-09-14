@@ -47,6 +47,29 @@
 # Narrower than RUNNER_OWN_PATTERN on purpose: Runner.Worker IS the job.
 #RUNNER_LISTENER_PATTERN='runsvc\.sh|RunnerService\.js|Runner\.Listener'
 
+# --- Fleet mode -------------------------------------------------------------
+# `runnerctl fleet status` runs this tool from one central node against
+# several runner hosts over ssh. Uncomment FLEET_HOSTS on the central node
+# only; the runner hosts themselves need no fleet config, just runnerctl
+# installed and an ssh login. Read-only status never asks for sudo, so an
+# unprivileged login is enough.
+#
+# ssh aliases (from ~/.ssh/config) or user@host. This is site data — keep it
+# here, never in the runnerctl script.
+#FLEET_HOSTS=(build-1 build-2 build-3)
+
+# Extra ssh options, appended after the built-in ones so they can override
+# any of them. A polling loop wants connection reuse; a one-shot does not.
+#FLEET_SSH_OPTS=(-o ControlMaster=auto -o ControlPath=~/.ssh/cm-%r@%h:%p -o ControlPersist=60)
+
+# Most hosts contacted at once, and the per-host seconds budget. The timeout
+# is what stops one wedged host holding up the whole fan-out.
+#FLEET_PARALLEL="8"
+#FLEET_TIMEOUT="30"
+
+# The remote command, for hosts where runnerctl is not on the ssh user's PATH.
+#FLEET_RUNNERCTL="runnerctl"
+
 # A profile is a function that sets these variables. Defining profile_ci or
 # profile_deploy replaces the built-in of the same name.
 profile_ci() {

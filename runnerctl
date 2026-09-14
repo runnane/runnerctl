@@ -46,6 +46,7 @@
 #   runnerctl kill [--dry-run] [--if-stalled] [--stall-after N] \
 #                  [<unit|slot-index|name> ...]
 #   runnerctl health [--quiet] [--max-restarts N] [--stall-after N] [--restart-stalled]
+#   runnerctl fleet status [--json] [--color auto|always|never]
 #   runnerctl profiles
 #   runnerctl config-example
 #   runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
@@ -138,6 +139,20 @@
 # no cheap way to bucket it by wall-clock time, so that is what gets reported.
 # A disabled, scaled-down slot is not a problem.
 #
+# `fleet` (GHR-39) runs this same tool from one central node against several
+# runner hosts over ssh: `fleet status` fans `status` out to every host in
+# FLEET_HOSTS (config file — site data, never in this script), at most
+# FLEET_PARALLEL at a time, and prints one table with a HOST column, or one
+# JSON object with each host's payload nested unchanged under --json. It
+# needs runnerctl installed on each host and nothing else: read-only status
+# never asks for sudo, so a plain unprivileged ssh login is enough.
+# A host that does not answer is a ROW, never a fatal — the other hosts still
+# report, and the exit code is non-zero so a monitor still notices. Three
+# outcomes are kept apart on purpose: unreachable, timed out, and the remote
+# runnerctl exiting non-zero (on a runner-less host that is its own message,
+# not a fleet fault). When the hosts are not all on one version, a note says
+# so under the table.
+#
 # Recommended baselines:
 #   CI host:      runnerctl scale 2 --max 26G --high 25G
 #   Live view:    runnerctl watch --interval 5
@@ -187,6 +202,22 @@ KILL_GRACE_SEC="10"
 # and a `health` problem from CRIT (GHR-31).
 PRESSURE_WARN_PCT="10"
 PRESSURE_CRIT_PCT="50"
+# Fleet mode (GHR-39): one central node driving several runner hosts over ssh.
+# FLEET_HOSTS is the inventory — ssh aliases or user@host — and lives in the
+# config file, never here: it is site data, and this repo is public. Empty
+# means fleet mode is not configured, which every `fleet` command says
+# outright rather than printing an empty table.
+FLEET_HOSTS=()
+# Extra ssh options, appended AFTER the built-in ones so a site can override
+# any of them (e.g. adding ControlMaster/ControlPersist for a polling loop).
+FLEET_SSH_OPTS=()
+# Most hosts contacted at once, and the per-host seconds budget.
+FLEET_PARALLEL="8"
+FLEET_TIMEOUT="30"
+# The remote command. Fleet mode requires runnerctl installed on each host
+# (see the fleet section of the README for why); point this at an absolute
+# path where it is not on the ssh user's PATH.
+FLEET_RUNNERCTL="runnerctl"
 
 # Profile-provided config (populated by load_profile; flags override).
 PROFILE=""
@@ -233,6 +264,12 @@ load_config() {
   [[ "$STALL_SEC" =~ ^[0-9]+$ ]] || die "STALL_SEC '$STALL_SEC' set in $CONFIG_FILE is invalid — want a whole number of seconds (0 disables the stalled flag)"
   [[ "$REAP_GRACE_SEC" =~ ^[0-9]+$ ]] || die "REAP_GRACE_SEC '$REAP_GRACE_SEC' set in $CONFIG_FILE is invalid — want a whole number of seconds"
   [[ "$PRESSURE_WARN_PCT" =~ ^[0-9]+$ && "$PRESSURE_CRIT_PCT" =~ ^[0-9]+$ ]] || die "PRESSURE_WARN_PCT/PRESSURE_CRIT_PCT set in $CONFIG_FILE are invalid — want whole percentages"
+  # Fleet settings (GHR-39). Validated here, once, rather than per host: a
+  # typo in a fleet-wide config should fail before anything is dialled, not
+  # produce N identical errors after N connections have been made.
+  [[ "$FLEET_PARALLEL" =~ ^[1-9][0-9]*$ ]] || die "FLEET_PARALLEL '$FLEET_PARALLEL' set in $CONFIG_FILE is invalid — want a whole number of hosts, 1 or more"
+  [[ "$FLEET_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "FLEET_TIMEOUT '$FLEET_TIMEOUT' set in $CONFIG_FILE is invalid — want a whole number of seconds, 1 or more"
+  [ -n "$FLEET_RUNNERCTL" ] || die "FLEET_RUNNERCTL set in $CONFIG_FILE is empty — want the remote command name or an absolute path"
 }
 
 # Built-in profiles. Site-specific values belong in the config file; these are
@@ -2460,6 +2497,251 @@ cmd_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart-stall
   return 1
 }
 
+# --- Fleet mode (GHR-39) ------------------------------------------------------
+# One central node drives several runner hosts over ssh. The transport fans
+# out WHOLE commands — one `ssh <host> runnerctl status` per host — rather
+# than shimming the per-host primitives underneath. Measured (GHR-37): a
+# single `status` makes 21 primitive calls against the 3-slot stub, and the
+# /proc walks are per PID rather than per slot, so a primitive-level shim
+# would be hundreds of round-trips on a busy slot against exactly one here.
+#
+# Fleet mode requires runnerctl installed on each host. Piping this script
+# over stdin per call was considered and rejected: `is_piped` refuses
+# everything but `install` deliberately, and version skew is better solved
+# once by a fleet-wide upgrade than by paying a transfer on every command.
+
+# Every ssh call goes through here — nothing else in this script may invoke
+# ssh. That is what lets tests/stub.config shadow the transport the way it
+# already shadows systemctl and journalctl, and the harness fails any call
+# that bypasses the stub. The exit status is the remote command's, except
+# that ssh itself answers 255 and `timeout` answers 124.
+#
+# BatchMode=yes is load-bearing rather than tidy: under a non-interactive
+# ssh a remote sudo password prompt HANGS FOREVER, and a fan-out hangs once
+# per host. With it the prompt fails fast and the host becomes a row.
+#
+# No ControlMaster by default. Within one fan-out there is exactly one ssh
+# per host, so multiplexing buys nothing; it pays only across invocations (a
+# polling loop) or in a slice that runs several commands per host, and it
+# costs a socket directory and stale-socket handling this does not need. A
+# site that wants it adds it through FLEET_SSH_OPTS, appended last so it can
+# override anything set here. Host key policy is deliberately left to the
+# caller's ssh config rather than decided here.
+ssh_run() { # HOST COMMAND...
+  local host="$1"; shift
+  timeout "$FLEET_TIMEOUT" ssh \
+    -o BatchMode=yes \
+    -o ConnectTimeout=10 \
+    ${FLEET_SSH_OPTS+"${FLEET_SSH_OPTS[@]}"} \
+    -- "$host" "$@"
+}
+
+require_fleet() {
+  [ "${#FLEET_HOSTS[@]}" -gt 0 ] || die "fleet mode is not configured — set FLEET_HOSTS=(host1 host2 ...) in $CONFIG_FILE ('runnerctl config-example' shows the block). An empty fleet is a missing config, not an empty table."
+}
+
+# Where a fan-out buffers its per-host output. Buffering is not an
+# optimisation: concurrent writers interleave on a shared stdout, and half a
+# line from one host inside another's JSON is unparseable.
+FLEET_DIR=""
+fleet_cleanup() {
+  [ -z "$FLEET_DIR" ] || rm -rf "$FLEET_DIR"
+  FLEET_DIR=""
+}
+
+# Run REMOTE-ARGS on every FLEET_HOSTS entry, at most FLEET_PARALLEL at a
+# time. Each host's stdout, stderr and exit status land in their own files,
+# indexed by position in FLEET_HOSTS so the render order is the config order
+# rather than whichever host answered first.
+fleet_fanout() { # REMOTE-ARGS...
+  local i host running=0 hrc
+  FLEET_DIR="$(mktemp -d)"
+  trap fleet_cleanup EXIT
+  for i in "${!FLEET_HOSTS[@]}"; do
+    host="${FLEET_HOSTS[$i]}"
+    {
+      # `|| hrc=$?` rather than a bare call plus `echo $?`: under `set -e` a
+      # non-zero ssh_run kills this subshell before the status can be
+      # recorded, so every failure would read as the missing-file fallback
+      # and a timeout would be indistinguishable from an unreachable host.
+      hrc=0
+      ssh_run "$host" "$@" >"$FLEET_DIR/$i.out" 2>"$FLEET_DIR/$i.err" || hrc=$?
+      echo "$hrc" >"$FLEET_DIR/$i.rc"
+    } &
+    running=$((running + 1))
+    if [ "$running" -ge "$FLEET_PARALLEL" ]; then
+      wait -n 2>/dev/null || true
+      running=$((running - 1))
+    fi
+  done
+  wait
+}
+
+fleet_rc() { # INDEX
+  cat "$FLEET_DIR/$1.rc" 2>/dev/null || echo 255
+}
+
+# Whether the host answered at all, as a JSON boolean. The distinction this
+# draws is the one that matters operationally: ssh could not reach the host
+# (255) or the call ran out of time (124) — nothing is known about it — versus
+# the remote runnerctl running fine and exiting non-zero, which on a
+# runner-less host is its own perfectly good message and not a fleet fault.
+fleet_reachable() { # RC
+  case "$1" in 124|255) echo false ;; *) echo true ;; esac
+}
+
+fleet_error_text() { # RC ERRFILE
+  local rc="$1" err=""
+  [ ! -s "$2" ] || err="$(head -1 "$2")"
+  case "$rc" in
+    0)   echo "" ;;
+    124) echo "timed out after ${FLEET_TIMEOUT}s${err:+ — $err}" ;;
+    255) echo "unreachable${err:+ — $err}" ;;
+    *)   echo "remote exit $rc${err:+ — $err}" ;;
+  esac
+}
+
+# A host's payload is only nested verbatim when it actually looks like the
+# object it claims to be. rc 0 with something else on stdout would otherwise
+# produce invalid fleet JSON, and a consumer would blame the fleet tool.
+fleet_payload_ok() { # INDEX
+  [ -s "$FLEET_DIR/$1.out" ] && [ "$(head -c 1 "$FLEET_DIR/$1.out")" = "{" ]
+}
+
+# `fleet status --json`: each host's own payload nested UNCHANGED inside an
+# envelope. This is why fleet mode needs no JSON parser and keeps the
+# script's zero-jq dependency — the remote object is already valid, so it is
+# concatenated, never re-serialised, and cannot be corrupted in transit.
+fleet_status_json() {
+  local i host rc sep="" bad=0 err ok
+  printf '{"fleet":['
+  for i in "${!FLEET_HOSTS[@]}"; do
+    host="${FLEET_HOSTS[$i]}"
+    rc="$(fleet_rc "$i")"
+    ok=false
+    if [ "$rc" = 0 ] && fleet_payload_ok "$i"; then ok=true; fi
+    $ok || bad=$((bad + 1))
+    # A host that exited 0 with something other than an object gets an error
+    # of its own rather than a bare null status: exit 0, reachable, no error
+    # and no payload is the one combination a consumer cannot interpret.
+    if [ "$rc" = 0 ] && ! $ok; then
+      err="exit 0 but no JSON object on stdout — check FLEET_RUNNERCTL and the remote login's output"
+    else
+      err="$(fleet_error_text "$rc" "$FLEET_DIR/$i.err")"
+    fi
+    printf '%s\n  {"host_name":%s,"reachable":%s,"exit_code":%s,"error":%s,"status":' \
+      "$sep" "$(json_str "$host")" "$(fleet_reachable "$rc")" "$(json_num "$rc")" \
+      "$(json_strn "$err")"
+    if $ok; then cat "$FLEET_DIR/$i.out"; else printf 'null'; fi
+    printf '}'
+    sep=","
+  done
+  printf '\n]}\n'
+  [ "$bad" -eq 0 ]
+}
+
+# `fleet status`: every host's already-rendered rows with a HOST column
+# prefixed on. Prefixing only — the remote table is NEVER parsed by column
+# position, because a cell longer than its width shifts everything after it
+# on that row (`active/running ↻3 (last: oom-kill)` does). Adding on the left
+# is safe whatever the row does to its right.
+#
+# Line position IS reliable, unlike column position: the remote `status`
+# prints its version header, a blank, the column header, then one row per
+# slot, and any note lines last.
+fleet_status_table() {
+  local i host rc hostw=4 ver first_ver="" skew=false bad=0 n=0
+  local -a lines notes=()
+  for host in "${FLEET_HOSTS[@]}"; do
+    [ "${#host}" -le "$hostw" ] || hostw="${#host}"
+  done
+  for i in "${!FLEET_HOSTS[@]}"; do
+    host="${FLEET_HOSTS[$i]}"
+    rc="$(fleet_rc "$i")"
+    if [ "$rc" != 0 ]; then
+      bad=$((bad + 1))
+      printf '%-*s %s\n' "$hostw" "$host" \
+        "$(paint "$C_RED" "$(fleet_error_text "$rc" "$FLEET_DIR/$i.err")")"
+      continue
+    fi
+    mapfile -t lines <"$FLEET_DIR/$i.out"
+    # A zero-status host that produced no table is still a failed row rather
+    # than an unbound-variable crash two lines down: `set -u` makes
+    # ${lines[0]} on an empty mapfile fatal, and the header and column-header
+    # lines are only there to index if the remote actually printed a table.
+    if [ "${#lines[@]}" -lt 3 ]; then
+      bad=$((bad + 1))
+      printf '%-*s %s\n' "$hostw" "$host" \
+        "$(paint "$C_RED" "no status table returned")"
+      continue
+    fi
+    ver="${lines[0]#runnerctl }"; ver="${ver%% *}"
+    if [ -z "$first_ver" ]; then first_ver="$ver"
+    elif [ "$ver" != "$first_ver" ]; then skew=true
+    fi
+    if [ "$n" -eq 0 ]; then
+      paint "$C_BOLD" "$(printf '%-*s %s' "$hostw" "HOST" "${lines[2]}")"
+    fi
+    n=$((n + 1))
+    local l
+    for l in "${lines[@]:3}"; do
+      case "$l" in
+        note:*) notes+=("$l") ;;
+        '')     ;;
+        *)      printf '%-*s %s\n' "$hostw" "$host" "$l" ;;
+      esac
+    done
+  done
+  # Notes are per-fleet, not per-host: the same note from six hosts is one
+  # fact about the fleet, and six copies of it buries the rows above.
+  if [ "${#notes[@]}" -gt 0 ]; then
+    printf '%s\n' "${notes[@]}" | sort -u
+  fi
+  if $skew; then
+    # Names only what exists today: `runnerctl upgrade`, run per host. A
+    # fleet-wide upgrade is GHR-41 and this line gets to name it once it is
+    # real — telling someone to run a command that does not exist is worse
+    # than telling them nothing.
+    paint "$C_YELLOW" "note: the hosts are not all on one runnerctl version (see 'fleet status --json', .fleet[].status.runnerctl); run 'runnerctl upgrade' on the ones that lag"
+  fi
+  [ "$bad" -eq 0 ]
+}
+
+cmd_fleet() {
+  local sub="${1:-status}"
+  shift || true
+  case "$sub" in
+    status) cmd_fleet_status "$@" ;;
+    *)      die "unknown fleet command '$sub' (status)" ;;
+  esac
+}
+
+cmd_fleet_status() { # [--json] [--color WHEN]
+  local json=false rc=0
+  while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    view_opt "$@"
+    if [ "$VIEW_SHIFT" -gt 0 ]; then shift "$VIEW_SHIFT"; continue; fi
+    case "$1" in
+      --json) json=true; shift ;;
+      *)      die "unknown option: $1" ;;
+    esac
+  done
+  require_fleet
+  if $json; then
+    fleet_fanout "$FLEET_RUNNERCTL" status --json
+    fleet_status_json || rc=$?
+  else
+    color_setup "$COLOR_MODE"
+    # --color never on the remote: the fleet renderer paints locally, and a
+    # remote SGR sequence would be measured as visible width by the prefix.
+    fleet_fanout "$FLEET_RUNNERCTL" status --color never
+    fleet_status_table || rc=$?
+  fi
+  fleet_cleanup
+  return "$rc"
+}
+
 cmd_profiles() {
   local p
   echo "Config: $CONFIG_FILE$([ -f "$CONFIG_FILE" ] || echo ' (not present — built-ins only)')"
@@ -2527,6 +2809,29 @@ cmd_config_example() {
 # never killed by `kill` — everything else in the slot's cgroup is the job.
 # Narrower than RUNNER_OWN_PATTERN on purpose: Runner.Worker IS the job.
 #RUNNER_LISTENER_PATTERN='runsvc\.sh|RunnerService\.js|Runner\.Listener'
+
+# --- Fleet mode -------------------------------------------------------------
+# `runnerctl fleet status` runs this tool from one central node against
+# several runner hosts over ssh. Uncomment FLEET_HOSTS on the central node
+# only; the runner hosts themselves need no fleet config, just runnerctl
+# installed and an ssh login. Read-only status never asks for sudo, so an
+# unprivileged login is enough.
+#
+# ssh aliases (from ~/.ssh/config) or user@host. This is site data — keep it
+# here, never in the runnerctl script.
+#FLEET_HOSTS=(build-1 build-2 build-3)
+
+# Extra ssh options, appended after the built-in ones so they can override
+# any of them. A polling loop wants connection reuse; a one-shot does not.
+#FLEET_SSH_OPTS=(-o ControlMaster=auto -o ControlPath=~/.ssh/cm-%r@%h:%p -o ControlPersist=60)
+
+# Most hosts contacted at once, and the per-host seconds budget. The timeout
+# is what stops one wedged host holding up the whole fan-out.
+#FLEET_PARALLEL="8"
+#FLEET_TIMEOUT="30"
+
+# The remote command, for hosts where runnerctl is not on the ssh user's PATH.
+#FLEET_RUNNERCTL="runnerctl"
 
 # A profile is a function that sets these variables. Defining profile_ci or
 # profile_deploy replaces the built-in of the same name.
@@ -3120,13 +3425,14 @@ main() {
     reap)               cmd_reap "$@" ;;
     kill)               cmd_kill "$@" ;;
     health)             cmd_health "$@" ;;
+    fleet)              cmd_fleet "$@" ;;
     profiles)           cmd_profiles "$@" ;;
     config-example)     cmd_config_example ;;
     migrate)            cmd_migrate "$@" ;;
     upgrade)            cmd_upgrade "$@" ;;
     version|--version)  echo "runnerctl $RUNNERCTL_VERSION" ;;
     -h|--help|help)     usage ;;
-    *) die "unknown command '$cmd' (status watch health apply scale env-init start stop restart drain enable disable logs remove-limits reap kill profiles config-example migrate install upgrade version)" ;;
+    *) die "unknown command '$cmd' (status watch health fleet apply scale env-init start stop restart drain enable disable logs remove-limits reap kill profiles config-example migrate install upgrade version)" ;;
   esac
 }
 
