@@ -613,6 +613,22 @@ FLEET_HOSTS=(build-1 build-2 build-3)   # ssh aliases, or user@host
 default 30), `FLEET_SSH_OPTS` and `FLEET_RUNNERCTL` (where the remote command
 lives, if it is not on the ssh user's `PATH`).
 
+**"Installed" means installed on the PATH a *non-interactive* ssh gets**, which
+is not the PATH you see when you log in. `ssh host runnerctl` runs no login
+shell and so reads no `~/.profile` — on Ubuntu and Debian that file is what adds
+`~/.local/bin` and `~/bin` — so a runnerctl under your home directory works
+perfectly when you ssh in and type it, and the fan-out still reports
+`remote exit 127 — runnerctl: command not found`. Check it the way the fan-out
+sees it, not the way your login does:
+
+```bash
+ssh build-1 'command -v runnerctl || echo "not on the non-interactive PATH"'
+```
+
+Either install it system-wide (`/usr/local/bin`, which `sshd`'s default PATH
+does include) or set `FLEET_RUNNERCTL` to its absolute path, which moves no
+files.
+
 **No privileges are needed for this.** `status` never asks for sudo, so an
 ordinary unprivileged ssh login is enough; where the login cannot read the
 journal, the per-slot `WORKING-ON` degrades exactly as it does locally rather
@@ -627,6 +643,13 @@ outcomes are deliberately kept apart, because they call for different actions:
 | `unreachable — …` | ssh could not reach the host. Nothing is known about it. |
 | `timed out after Ns` | it did not answer inside `FLEET_TIMEOUT`. Nothing is known about it. |
 | `remote exit N — …` | the host answered fine and its `runnerctl` exited non-zero. On a host with no runner units that is its own perfectly good message, not a fleet fault. |
+| `remote exit 127 — …` | nothing named `runnerctl` on that host's non-interactive ssh `PATH` — see the PATH note above. Set `FLEET_RUNNERCTL`, or install it system-wide. |
+| `remote exit 126 — …` | runnerctl **is** there and the ssh login cannot execute it. Installs from 0.9.0 and 0.10.0 landed `0700`/`0711`; `sudo chmod 755` the path the row names, or re-run the installer (0.10.1 widens it). |
+
+The last two are told apart by the exit code rather than the wording, and they
+are different faults: 126 names a full path and needs a `chmod`, 127 names a
+bare command and needs a `PATH`. Each row carries its own remedy, so the table
+is the summary rather than the lookup.
 
 When the hosts are not all on the same `runnerctl` version, a note says so
 under the table — on a fleet that is otherwise invisible until something
