@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/runnane/runnerctl/compare/v0.9.0...v0.10.0) (2026-09-14)
+
+
+### Features
+
+* `provision N` installs and registers the runners a host does not have yet (GHR-45) ([#47](https://github.com/runnane/runnerctl/issues/47)) ([4982a11](https://github.com/runnane/runnerctl/commit/4982a116c12d632434209f86215fc9698e72fbdc))
+
 ## [0.9.0](https://github.com/runnane/runnerctl/compare/v0.8.1...v0.9.0) (2026-09-14)
 
 
