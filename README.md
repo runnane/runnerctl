@@ -670,10 +670,92 @@ If you would rather keep sudo out of it entirely, install `runnerctl`
 somewhere the ssh user owns and point `FLEET_RUNNERCTL` at it — `upgrade`
 writes directly when the destination is writable and never escalates.
 
-Only `status`, `health` and `upgrade` fan out today. The remaining mutating
-commands, and the general `sudo` contract they need, are tracked separately;
-`watch` and `logs -f` stay per-host, being interactive and streaming
-respectively.
+#### Changing things: the mutating fan-out
+
+`apply`, `scale`, `start`, `stop`, `restart`, `drain`, `kill`, `reap`,
+`remove-limits`, `enable` and `disable` fan out too, with their own flags and
+targets forwarded untouched:
+
+```
+$ runnerctl fleet restart --when-idle --host build-1 --host build-2
+build-1: restart done.
+build-2: restart done.
+fleet restart: 2 host(s) ok, 0 failed
+```
+
+These differ from the read-only commands in three ways, all deliberate.
+
+**One host at a time.** `FLEET_PARALLEL` is ignored for mutating commands.
+Combined with the per-host `--when-idle` (one slot at a time *within* a host),
+that bounds the blast radius to a single host at any moment. It is slow on a
+large fleet; that is the right trade for something that can take CI capacity
+down.
+
+**`--host H`** narrows the target and is repeatable. It is validated against
+`FLEET_HOSTS`, so a typo dies naming the host rather than silently doing
+nothing.
+
+**`stop`, `drain` and `disable` are refused fleet-wide** unless you pass
+`--host H` or `--all-hosts`:
+
+```
+$ runnerctl fleet drain
+runnerctl: 'fleet drain' across every host would take the whole pool's capacity
+down at once — each host draining politely one slot at a time still lands them
+all at zero together. Name the hosts with --host H (repeatable), or pass
+--all-hosts if you do mean the entire fleet.
+```
+
+That refusal exists because per-host politeness **does not compose**. Every
+host draining one slot at a time is still every host arriving at zero at
+roughly the same moment. `restart` and `kill` are not gated — the unit comes
+back — and nor are the commands that do not remove capacity.
+
+Note that `--when-idle` stays *best-effort per host*, for the reason it always
+was: between the idle check and the `systemctl` call the Listener can still
+pick up a job, and the runner has no "stop accepting jobs" switch. A fleet
+does not turn that into a fleet-wide guarantee — it gives you one such window
+per host. For a guaranteed drain, change the runner's labels or disable it in
+GitHub first.
+
+##### sudo for the mutating commands
+
+These run privileged commands on each host, so the ssh login needs
+passwordless sudo for them. The set the fan-out actually uses:
+
+```
+# /etc/sudoers.d/runnerctl  (on each runner host)
+# systemctl: start/stop/restart/enable/disable/daemon-reload
+# mkdir + tee: write the managed drop-in;  rm: remove-limits
+# kill: reap and kill;  test: the EnvironmentFile guard in apply/scale
+# Check the binary paths on your own distribution before pasting this.
+%runnerctl ALL=(root) NOPASSWD: /usr/bin/systemctl, /usr/bin/mkdir, \
+    /usr/bin/tee, /usr/bin/rm, /usr/bin/kill, /usr/bin/test
+```
+
+Add the `upgrade` set from the previous section if you also run `fleet
+upgrade`.
+
+Without it the fan-out **fails fast and names the host**, with the remedy
+appended to the row — it never hangs, because ssh runs with `BatchMode=yes`:
+
+```
+box-2: remote exit 1 — sudo: a password is required — the ssh login needs
+passwordless sudo on that host; see the fleet section of the README for the
+exact sudoers line
+```
+
+##### What does not fan out
+
+- **`env-init` never will.** It writes an EnvironmentFile of secrets, and
+  fanning it out means copying secrets over ssh. Run it on each host.
+- **`watch`** is interactive and **`logs -f`** is streaming; both only make
+  sense against one host. Each says so rather than reporting "unknown
+  command".
+
+A fleet-wide rolling budget — restart at most N slots at once, or never drain
+below K running — is tracked separately; today the controls are the serial
+sequencing, `--host`, and the `--all-hosts` acknowledgement above.
 
 ### Profiles
 
