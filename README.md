@@ -508,6 +508,84 @@ example.slot-2: killed 2 process(es): 4100/Runner.Worker, 4101/node — the runn
 kill done (1 stalled slot(s)).
 ```
 
+### Several hosts from one place: `fleet status`
+
+Everything above is one host. `fleet` runs the same tool from a central node
+against every runner host in `FLEET_HOSTS`, over ssh:
+
+```
+$ runnerctl fleet status
+HOST     IDX RUNNER          PROFILE  ACTIVE           SINCE  ENABLED  ...  WORKING-ON
+build-1  0   org.build-1-a   ci       active/running   3d 4h  enabled  ...  my-app:test (12m)
+build-1  1   org.build-1-b   ci       active/running   2d 7h  enabled  ...  idle 2h31m (7 jobs)
+build-2  0   org.build-2-a   ci       active/running   6d     enabled  ...  my-app:lint (2m)
+build-3  unreachable — ssh: connect to host build-3 port 22: No route to host
+```
+
+Set the inventory on the **central node only** — the runner hosts need no
+fleet config, just `runnerctl` installed and an ssh login:
+
+```bash
+FLEET_HOSTS=(build-1 build-2 build-3)   # ssh aliases, or user@host
+```
+
+`runnerctl config-example` prints the whole block, including `FLEET_PARALLEL`
+(how many hosts at once, default 8), `FLEET_TIMEOUT` (per-host seconds,
+default 30), `FLEET_SSH_OPTS` and `FLEET_RUNNERCTL` (where the remote command
+lives, if it is not on the ssh user's `PATH`).
+
+**No privileges are needed for this.** `status` never asks for sudo, so an
+ordinary unprivileged ssh login is enough; where the login cannot read the
+journal, the per-slot `WORKING-ON` degrades exactly as it does locally rather
+than failing.
+
+**A host that does not answer is a row, never a fatal.** The other hosts still
+report and the exit code is non-zero, so a monitor still notices. Three
+outcomes are deliberately kept apart, because they call for different actions:
+
+| row | meaning |
+| --- | --- |
+| `unreachable — …` | ssh could not reach the host. Nothing is known about it. |
+| `timed out after Ns` | it did not answer inside `FLEET_TIMEOUT`. Nothing is known about it. |
+| `remote exit N — …` | the host answered fine and its `runnerctl` exited non-zero. On a host with no runner units that is its own perfectly good message, not a fleet fault. |
+
+When the hosts are not all on the same `runnerctl` version, a note says so
+under the table — on a fleet that is otherwise invisible until something
+behaves differently on one box.
+
+`fleet status --json` gives one object with **each host's payload nested
+unchanged**:
+
+```json
+{"fleet":[
+  {"host_name":"build-1","reachable":true,"exit_code":0,"error":null,
+   "status":{"runnerctl":"0.8.1","host":{"name":"build-1",…},"slots":[…]}},
+  {"host_name":"build-3","reachable":false,"exit_code":255,
+   "error":"unreachable — ssh: connect to host build-3 port 22: No route to host",
+   "status":null}
+]}
+```
+
+`host_name` is the alias the central node dialled; `status.host.name` is what
+the host calls itself. They are separate on purpose — a disagreement between
+them is worth seeing. `reachable` is false only for the two "nothing is known"
+cases, so a remote error keeps it true.
+
+Because each payload is nested rather than re-serialised, fleet mode needs no
+JSON parser and `runnerctl` still depends on nothing beyond coreutils, awk,
+systemd and curl.
+
+**Fleet mode needs `runnerctl` installed on each host.** Piping the script over
+ssh on every call would avoid that and remove version skew, but it pays a
+transfer on every command to solve a problem a fleet-wide upgrade solves once,
+and it would mean relaxing a deliberate refusal (`runnerctl` only accepts
+`install` when read from a pipe). Keep the hosts levelled with `runnerctl
+upgrade` instead.
+
+Only `status` fans out today. Mutating commands, and the `sudo` contract they
+need, are tracked separately; `watch` and `logs -f` stay per-host, being
+interactive and streaming respectively.
+
 ### Profiles
 
 Two profiles are built in so the tool is usable with no config at all:
