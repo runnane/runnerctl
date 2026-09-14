@@ -582,9 +582,41 @@ and it would mean relaxing a deliberate refusal (`runnerctl` only accepts
 `install` when read from a pipe). Keep the hosts levelled with `runnerctl
 upgrade` instead.
 
-Only `status` fans out today. Mutating commands, and the `sudo` contract they
-need, are tracked separately; `watch` and `logs -f` stay per-host, being
-interactive and streaming respectively.
+#### One exit code for the fleet: `fleet health`
+
+`health` is already the yes/no for cron and uptime monitors, but on a fleet it
+is one cron entry and one monitor per host. `fleet health` reduces the whole
+fan-out to a single exit code:
+
+```
+$ runnerctl fleet health
+ok: 6 slot(s) healthy across 2 host(s)
+
+$ runnerctl fleet health ; echo "exit $?"
+build-1: example.slot-1: stalled — job my-app:test running 1h49m, longer than 1h (--stall-after 3600)
+build-3: unreachable — ssh: connect to host build-3 port 22: No route to host
+exit 1
+```
+
+Each problem keeps the wording the single-host command uses and gains its
+host, so the format is the one you already read. `--quiet` drops the output
+and keeps the exit code, for `runnerctl fleet health --quiet || alert`.
+
+**A host that did not answer is a problem.** Exit 0 requires every host to
+have been reached *and* reported healthy — a monitor that goes green because
+a host dropped out of the fan-out is worse than no monitor at all.
+
+`--max-restarts`, `--stall-after` and `--restart-stalled` are passed through
+to each host. `--quiet` is not: the remote's output is where the problem lines
+come from, so a quiet remote would leave nothing to report.
+
+`--restart-stalled` restarts slots on the remote hosts, so it needs
+passwordless sudo there. Without it the call fails fast and says so, per host
+— it never hangs, because the fan-out runs ssh with `BatchMode=yes`.
+
+Only `status` and `health` fan out today. Mutating commands, and the `sudo`
+contract they need, are tracked separately; `watch` and `logs -f` stay
+per-host, being interactive and streaming respectively.
 
 ### Profiles
 

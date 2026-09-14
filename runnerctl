@@ -47,6 +47,8 @@
 #                  [<unit|slot-index|name> ...]
 #   runnerctl health [--quiet] [--max-restarts N] [--stall-after N] [--restart-stalled]
 #   runnerctl fleet status [--json] [--color auto|always|never]
+#   runnerctl fleet health [--quiet] [--max-restarts N] [--stall-after N] \
+#                          [--restart-stalled]
 #   runnerctl profiles
 #   runnerctl config-example
 #   runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
@@ -152,6 +154,16 @@
 # runnerctl exiting non-zero (on a runner-less host that is its own message,
 # not a fleet fault). When the hosts are not all on one version, a note says
 # so under the table.
+# `fleet health` reduces the same fan-out to ONE exit code, so a central node
+# needs one cron entry and one push URL rather than one per host: exit 0 only
+# when every host was reached and reported healthy, else one line per problem
+# prefixed with its host. A host that did not answer is a problem — a monitor
+# that goes green because a host dropped out of the fan-out is worse than no
+# monitor. --quiet keeps the exit code and drops the output, as it does for
+# one host; it is NOT forwarded, since the remote's stdout is where the
+# problem lines come from. --restart-stalled is forwarded and acts on each
+# host, which needs passwordless sudo there — without it BatchMode makes it
+# fail fast and say so rather than hang.
 #
 # Recommended baselines:
 #   CI host:      runnerctl scale 2 --max 26G --high 25G
@@ -2712,8 +2724,106 @@ cmd_fleet() {
   shift || true
   case "$sub" in
     status) cmd_fleet_status "$@" ;;
-    *)      die "unknown fleet command '$sub' (status)" ;;
+    health) cmd_fleet_health "$@" ;;
+    *)      die "unknown fleet command '$sub' (status health)" ;;
   esac
+}
+
+# `fleet health`: one exit code for the whole fleet, so a central node needs
+# one cron entry and one push URL instead of one per runner host.
+#
+# Exit 0 only when every host was reached AND reported healthy. A HOST THAT
+# DID NOT ANSWER IS A PROBLEM, never a silent pass — a monitor that goes
+# green because a host dropped out of the fan-out is worse than no monitor,
+# and that is the single assertion this command exists to make true.
+cmd_fleet_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart-stalled]
+  local quiet=false rc=0
+  local -a fwd=()
+  while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    case "$1" in
+      # --quiet is LOCAL only and deliberately not forwarded: the remote's
+      # stdout is where the problem lines come from, so a quiet remote would
+      # leave this command with an exit code and nothing to report.
+      --quiet)
+        quiet=true; shift ;;
+      --max-restarts)
+        need_val "$@"
+        [[ "$2" =~ ^[0-9]+$ ]] || die "--max-restarts value '$2' is invalid — want an integer"
+        fwd+=(--max-restarts "$2"); shift 2 ;;
+      --stall-after)
+        need_val "$@"
+        # Validated here as well as on each host so a typo fails once, before
+        # anything is dialled, rather than N times after N connections.
+        [[ "$2" =~ ^[0-9]+$ ]] || die "--stall-after value '$2' is invalid — want a whole number of seconds"
+        fwd+=(--stall-after "$2"); shift 2 ;;
+      --restart-stalled)
+        fwd+=(--restart-stalled); shift ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  require_fleet
+  fleet_fanout "$FLEET_RUNNERCTL" health ${fwd[@]+"${fwd[@]}"}
+  fleet_health_report "$quiet" || rc=$?
+  fleet_cleanup
+  return "$rc"
+}
+
+# Reduce the fan-out to problem lines and one exit code. Each host's own
+# output is reused verbatim with the host name prefixed, so the single-host
+# format people already read stays intact.
+fleet_health_report() { # QUIET
+  local quiet="$1" i host rc line slots total=0 counted=true hosts_ok=0
+  local -a problems=()
+  for i in "${!FLEET_HOSTS[@]}"; do
+    host="${FLEET_HOSTS[$i]}"
+    rc="$(fleet_rc "$i")"
+    case "$rc" in
+      0)
+        hosts_ok=$((hosts_ok + 1))
+        # "ok: N slot(s) healthy" — read the count when it is there, and just
+        # stop counting if any host words it differently (an older remote,
+        # say) rather than reporting a total that is quietly short.
+        line="$(head -1 "$FLEET_DIR/$i.out" 2>/dev/null || true)"
+        if [[ "$line" =~ ^ok:\ ([0-9]+)\ slot ]]; then
+          slots="${BASH_REMATCH[1]}"; total=$((total + slots))
+        else
+          counted=false
+        fi
+        ;;
+      1)
+        # The host answered and reported problems: its lines, prefixed.
+        local before="${#problems[@]}"
+        while IFS= read -r line; do
+          [ -n "$line" ] || continue
+          problems+=("$host: $line")
+        done <"$FLEET_DIR/$i.out"
+        # Exit 1 with nothing on stdout is a die, not a problem list — a
+        # runner-less host says so on stderr. Without this the host would
+        # contribute no problem AND no ok, so a fleet of one such host would
+        # exit 0 with the failure invisible: the exact hole this command
+        # exists to close.
+        if [ "${#problems[@]}" -eq "$before" ]; then
+          problems+=("$host: $(fleet_error_text "$rc" "$FLEET_DIR/$i.err")")
+        fi
+        ;;
+      *)
+        problems+=("$host: $(fleet_error_text "$rc" "$FLEET_DIR/$i.err")")
+        ;;
+    esac
+  done
+  if [ "${#problems[@]}" -eq 0 ]; then
+    if ! $quiet; then
+      if $counted; then
+        echo "ok: $total slot(s) healthy across $hosts_ok host(s)"
+      else
+        echo "ok: $hosts_ok host(s) healthy"
+      fi
+    fi
+    return 0
+  fi
+  $quiet || printf '%s\n' "${problems[@]}"
+  return 1
 }
 
 cmd_fleet_status() { # [--json] [--color WHEN]
