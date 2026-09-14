@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/runnane/runnerctl/compare/v0.8.0...v0.8.1) (2026-09-14)
+
+
+### Bug Fixes
+
+* `kill` SIGKILLs the job, not the runner — `restart` hangs on a stalled step (GHR-36) ([#38](https://github.com/runnane/runnerctl/issues/38)) ([2dbf89d](https://github.com/runnane/runnerctl/commit/2dbf89d418540507afd08b3b766cb7b7c802a179))
+
 ## [0.8.0](https://github.com/runnane/runnerctl/compare/v0.7.0...v0.8.0) (2026-09-13)
 
 
