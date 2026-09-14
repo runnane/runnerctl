@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.3](https://github.com/runnane/runnerctl/compare/v0.10.2...v0.10.3) (2026-09-14)
+
+
+### Bug Fixes
+
+* name the remedy when a fleet host cannot run runnerctl (GHR-50) ([#53](https://github.com/runnane/runnerctl/issues/53)) ([a621c38](https://github.com/runnane/runnerctl/commit/a621c38dcb0d424b27f01dac85e42c406fdb1f3c))
+
 ## [0.10.2](https://github.com/runnane/runnerctl/compare/v0.10.1...v0.10.2) (2026-09-14)
 
 
