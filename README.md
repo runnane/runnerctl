@@ -1079,9 +1079,14 @@ which is exactly what `BatchMode=yes` prevents on the ssh side.
 Two deliberate limits. A shadow is **not** retired when the system copy behind
 it is *older* — that would quietly downgrade what you get when you type
 `runnerctl`. And when the shadow is retired but the system copy still needs a
-privileged write, the last line is `Update available. Run: sudo runnerctl
-upgrade`, not `Upgraded`: the command reports work outstanding rather than work
-it did not do.
+privileged write, the last line is `Update available. Run: sudo
+/usr/local/bin/runnerctl upgrade`, not `Upgraded`: the command reports work
+outstanding rather than work it did not do.
+
+Every command runnerctl tells you to run under `sudo` names an **absolute
+path**, deliberately. `sudo` resets `PATH` to `secure_path`, which does not
+include `~/.local/bin` — so a bare `sudo runnerctl ...` is exactly the thing
+that fails on the hosts these messages are about.
 
 `--no-relocate` keeps a deliberately personal copy where it is.
 

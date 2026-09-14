@@ -4430,9 +4430,18 @@ cmd_upgrade() {
       # retire a shadow over an OLDER $sys: that would quietly downgrade what
       # the user gets when they type `runnerctl`.
       target=""; cur_ver="$sys_ver"; cur_path="$sys"; retire="$self.retired"
-      note="note: $sys (runnerctl $sys_ver) is shadowed by this copy — retiring this one; run 'sudo runnerctl upgrade' to move $sys on"
+      # Absolute here too. This one happens to resolve today because $sys is
+      # under /usr/local/bin, which IS on secure_path — but that is luck of
+      # the default prefix, not construction, and a --prefix elsewhere would
+      # break it silently.
+      note="note: $sys (runnerctl $sys_ver) is shadowed by this copy — retiring this one; run 'sudo $sys upgrade' to move it on"
     else
-      note="note: this copy is not on the PATH a non-interactive ssh gets, so 'fleet' cannot run it. To move it: sudo runnerctl install"
+      # ABSOLUTE path, not the bare name (GHR-53). sudo resets PATH to
+      # secure_path, which does not include ~/.local/bin — the very fact this
+      # sentence is complaining about one clause earlier. `sudo runnerctl
+      # install` therefore died with "command not found" on the first real
+      # host to read this note.
+      note="note: this copy is not on the PATH a non-interactive ssh gets, so 'fleet' cannot run it. To move it: sudo $self install"
     fi
   fi
 
@@ -4504,7 +4513,11 @@ cmd_upgrade() {
     # Retire-only: the shadow is gone, but $sys still needs a privileged write
     # and this call never made one. Claiming an upgrade here would be a plain
     # false report of work that did not happen.
-    echo "Update available. Run: sudo runnerctl upgrade"
+    # Absolute, same reason as the notes above (GHR-53). Only the "^Update
+    # available." prefix is parsed by fleet_upgrade_report, so naming the path
+    # here costs nothing and stops the sentence depending on secure_path
+    # happening to contain $sys.
+    echo "Update available. Run: sudo $sys upgrade"
   else
     echo "Upgraded $cur_ver -> $new_ver at $target"
   fi
