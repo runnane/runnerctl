@@ -51,6 +51,8 @@
 #                  [<unit|slot-index|name> ...]
 #   runnerctl health [--quiet] [--max-restarts N] [--stall-after N] [--restart-stalled]
 #   runnerctl fleet status [--json] [--color auto|always|never]
+#   runnerctl fleet watch  [--interval N] [--host H]... \
+#                          [--color auto|always|never] [--stall-after N]
 #   runnerctl fleet health [--quiet] [--max-restarts N] [--stall-after N] \
 #                          [--restart-stalled]
 #   runnerctl fleet upgrade [--check] [--ref <branch|tag>]
@@ -176,6 +178,18 @@
 # runnerctl exiting non-zero (on a runner-less host that is its own message,
 # not a fleet fault). When the hosts are not all on one version, a note says
 # so under the table.
+# `fleet watch` (GHR-54) is that same table in a redraw loop, and the reason
+# it is a command of its own rather than `watch runnerctl fleet status` is the
+# ssh cost. A fan-out pays a TCP connect, a key exchange and an auth PER HOST
+# PER CALL, so polling six hosts every two seconds is around 180 full logins a
+# minute — sshd throttles it at MaxStartups, fail2ban reads it as an attack,
+# and rows start coming back `unreachable` for reasons that have nothing to do
+# with the hosts. `fleet watch` opens ONE connection per host and holds it for
+# the session, so the first tick pays the handshake and every later tick rides
+# it. Two smaller differences from `fleet status`: it asks the remotes to
+# PAINT (the host that drew a cell is the only thing that knows it is STALLED
+# or throttled), and its default interval is 5 s, because every tick is a
+# round trip to every host. It is VIEW-ONLY — `q` quits and no key acts.
 # `fleet health` reduces the same fan-out to ONE exit code, so a central node
 # needs one cron entry and one push URL rather than one per host: exit 0 only
 # when every host was reached and reported healthy, else one line per problem
@@ -204,7 +218,8 @@
 # slot at a time still lands the fleet at zero together. Note --when-idle
 # stays best-effort per host, and a fleet does not make it a fleet-wide
 # guarantee. `env-init` is excluded permanently (it would copy secrets over
-# ssh); `watch` and `logs` stay per-host.
+# ssh); `logs` stays per-host because it streams from one journal, while
+# `watch` has a fleet form of its own, described above.
 # Two graded capacity budgets (GHR-44), and they are two flags rather than
 # one because the operations have OPPOSITE dynamics. `--max-unavailable N`
 # (restart/apply/scale) is a CEILING: a restarted slot comes back, so the
@@ -239,6 +254,7 @@
 #   New host:     runnerctl provision 2 --url https://github.com/<org>
 #   CI host:      runnerctl scale 2 --max 26G --high 25G
 #   Live view:    runnerctl watch --interval 5
+#   Fleet view:   runnerctl fleet watch --interval 5   # from the central node
 #   Deploy box:   runnerctl env-init --profile deploy   # then fill secrets
 #                 runnerctl apply --profile deploy --restart
 #   Host update:  runnerctl drain            # stop every slot once it is idle
@@ -1369,6 +1385,19 @@ color_setup() { # auto|always|never
 paint() { # SGR TEXT
   printf '%s%s%s\n' "$1" "$2" "${1:+$C_RESET}"
 }
+# TEXT with its SGR sequences removed, into SGR_STRIPPED: the characters that
+# are actually visible, for measuring a padded cell or for reading a value out
+# of a line that may or may not have been painted.
+#
+# Into a global rather than onto stdout because every caller is per-line inside
+# a redraw loop, and a subshell per line is a cost a frame does not need. The
+# bounded `*([0-9;])` is what extglob is switched on for at the top of this
+# script: an unbounded `*` would run to the LAST `m` on the line and eat
+# everything between two painted cells.
+SGR_STRIPPED=""
+strip_sgr() { # TEXT
+  SGR_STRIPPED="${1//$'\e['*([0-9;])m/}"
+}
 # Options `status` and `watch` share: --color WHEN and --stall-after N. Sets
 # VIEW_SHIFT to the argv words consumed, 0 when $1 is neither.
 VIEW_SHIFT=0
@@ -1411,7 +1440,7 @@ status_row() {
     if [[ " $STATUS_DROP " == *" $c "* ]]; then c=$((c + 1)); continue; fi
     c=$((c + 1))
     out+="$v"
-    n="${v//$'\e['*([0-9;])m/}"
+    strip_sgr "$v"; n="$SGR_STRIPPED"
     if [ "${#n}" -lt "$w" ]; then printf -v v '%*s' $((w - ${#n})) ''; out+="$v"; fi
     out+=" "
   done
@@ -2076,7 +2105,7 @@ watch_highlight() { # TABLE NAME
 watch_table_width() { # TABLE
   local line n w=0
   while IFS= read -r line; do
-    n="${line//$'\e['*([0-9;])m/}"
+    strip_sgr "$line"; n="$SGR_STRIPPED"
     ! [[ "$n" =~ ^(IDX|[0-9]+)\  ]] || [ "${#n}" -le "$w" ] || w="${#n}"
   done <<<"$1"
   echo "$w"
@@ -2656,20 +2685,86 @@ cmd_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart-stall
 # ssh a remote sudo password prompt HANGS FOREVER, and a fan-out hangs once
 # per host. With it the prompt fails fast and the host becomes a row.
 #
-# No ControlMaster by default. Within one fan-out there is exactly one ssh
-# per host, so multiplexing buys nothing; it pays only across invocations (a
-# polling loop) or in a slice that runs several commands per host, and it
-# costs a socket directory and stale-socket handling this does not need. A
-# site that wants it adds it through FLEET_SSH_OPTS, appended last so it can
-# override anything set here. Host key policy is deliberately left to the
+# No ControlMaster for a ONE-SHOT command. Within one fan-out there is
+# exactly one ssh per host, so multiplexing buys nothing there and it costs a
+# socket directory and stale-socket handling. It pays across INVOCATIONS —
+# which is exactly what a polling loop is, and what `fleet watch` opens one
+# for (fleet_ssh_control_open, below); FLEET_SSH_CONTROL_OPTS is empty for
+# every other command. A site that wants multiplexing for all of them adds it
+# through FLEET_SSH_OPTS, appended LAST so it overrides both what is set here
+# and the watch's own sockets. Host key policy is deliberately left to the
 # caller's ssh config rather than decided here.
 ssh_run() { # HOST COMMAND...
   local host="$1"; shift
   timeout "$FLEET_TIMEOUT" ssh \
     -o BatchMode=yes \
     -o ConnectTimeout=10 \
+    ${FLEET_SSH_CONTROL_OPTS+"${FLEET_SSH_CONTROL_OPTS[@]}"} \
     ${FLEET_SSH_OPTS+"${FLEET_SSH_OPTS[@]}"} \
     -- "$host" "$@"
+}
+
+# --- Persistent ssh for a polling loop (GHR-54) -------------------------------
+# A fan-out pays a TCP connect, a key exchange and an authentication PER HOST
+# PER CALL. For a one-shot `fleet status` that is invisible. For a POLL it is
+# the whole problem: `watch runnerctl fleet status` against six hosts at
+# watch(1)'s two-second default is around 180 full logins a minute, which
+# sshd throttles at MaxStartups and fail2ban reads as an attack — and the
+# rows then come back `unreachable` for a reason that has nothing to do with
+# the hosts.
+#
+# So a polling loop opens ONE connection per host and keeps it: the first
+# tick pays the handshake and every later tick is another channel on the
+# same socket. This is the case ssh_run's note above says multiplexing pays
+# for, and until now it was the case with no implementation.
+FLEET_SSH_CONTROL_DIR=""
+FLEET_SSH_CONTROL_OPTS=()
+
+# Open the session. PERSIST-SECONDS is how long a master outlives its last
+# client, and it has to comfortably exceed one tick or the gap between two
+# redraws drops the connection the next redraw was about to reuse.
+#
+# ControlPath is `%C` — ssh's hash of (local host, remote host, port, user) —
+# rather than the `%r@%h:%p` every ssh_config example shows, and that is not
+# a style choice. A unix socket path is capped near 104 bytes, and ssh does
+# not fail loudly when a ControlPath exceeds it: it just stops multiplexing.
+# %C is a fixed 40 characters whatever the host is called, so a long hostname
+# cannot silently turn the poll back into a reconnect per tick — which is the
+# exact failure this command exists to remove.
+fleet_ssh_control_open() { # PERSIST-SECONDS
+  FLEET_SSH_CONTROL_DIR="$(mktemp -d)"
+  FLEET_SSH_CONTROL_OPTS=(
+    -o ControlMaster=auto
+    -o "ControlPath=$FLEET_SSH_CONTROL_DIR/%C"
+    -o "ControlPersist=$1"
+  )
+}
+
+# Close it. Explicit rather than left to ControlPersist to expire, because
+# removing the socket directory on the way out would otherwise leave one
+# master per host holding a connection that nothing can reach any more, for
+# the rest of the persist window. Best-effort per host: a host that never
+# answered has no master to close, and that is not an error worth reporting.
+fleet_ssh_control_close() {
+  local host
+  [ -n "$FLEET_SSH_CONTROL_DIR" ] || return 0
+  for host in ${FLEET_HOSTS+"${FLEET_HOSTS[@]}"}; do
+    ssh_control "$host" exit
+  done
+  rm -rf "$FLEET_SSH_CONTROL_DIR"
+  FLEET_SSH_CONTROL_DIR=""
+  FLEET_SSH_CONTROL_OPTS=()
+}
+
+# The SECOND sanctioned ssh path, and the only other one: control-socket
+# administration (`ssh -O`), which carries no remote command and so cannot go
+# through ssh_run. Like ssh_run it is a function precisely so tests/stub.config
+# can shadow it — anything that reaches `ssh` itself has bypassed the
+# transport, and the harness fails the case for it.
+ssh_control() { # HOST OPERATION
+  ssh -o BatchMode=yes \
+    ${FLEET_SSH_CONTROL_OPTS+"${FLEET_SSH_CONTROL_OPTS[@]}"} \
+    -O "$2" -- "$1" >/dev/null 2>&1 || true
 }
 
 require_fleet() {
@@ -2827,6 +2922,15 @@ fleet_status_json() {
 # Line position IS reliable, unlike column position: the remote `status`
 # prints its version header, a blank, the column header, then one row per
 # slot, and any note lines last.
+#
+# FLEET_REMOTE_COLOR says whether the remote was asked to paint. `fleet
+# status` asks for --color never and paints locally; `fleet watch` (GHR-54)
+# asks for --color always, because the only thing that knows a cell is
+# STALLED or running is the host that drew it. Everywhere this renderer reads
+# a remote line BY CONTENT it therefore has to read the stripped text, or a
+# painted `note:` line stops looking like a note and is printed as a slot row
+# on every host instead of being collected and deduped once.
+FLEET_REMOTE_COLOR=false
 fleet_status_table() {
   local i host rc hostw=4 ver first_ver="" skew=false bad=0 n=0
   local -a lines notes=()
@@ -2853,17 +2957,26 @@ fleet_status_table() {
         "$(paint "$C_RED" "no status table returned")"
       continue
     fi
-    ver="${lines[0]#runnerctl }"; ver="${ver%% *}"
+    strip_sgr "${lines[0]}"
+    ver="${SGR_STRIPPED#runnerctl }"; ver="${ver%% *}"
     if [ -z "$first_ver" ]; then first_ver="$ver"
     elif [ "$ver" != "$first_ver" ]; then skew=true
     fi
     if [ "$n" -eq 0 ]; then
-      paint "$C_BOLD" "$(printf '%-*s %s' "$hostw" "HOST" "${lines[2]}")"
+      if $FLEET_REMOTE_COLOR; then
+        # The remote drew its own column header bold and ended it with a
+        # reset, so wrapping the whole line would switch bold off partway
+        # along and leave the rest plain. Only the HOST cell is ours to paint.
+        printf '%s %s\n' "$(paint "$C_BOLD" "$(printf '%-*s' "$hostw" "HOST")")" "${lines[2]}"
+      else
+        paint "$C_BOLD" "$(printf '%-*s %s' "$hostw" "HOST" "${lines[2]}")"
+      fi
     fi
     n=$((n + 1))
     local l
     for l in "${lines[@]:3}"; do
-      case "$l" in
+      strip_sgr "$l"
+      case "$SGR_STRIPPED" in
         note:*) notes+=("$l") ;;
         '')     ;;
         *)      printf '%-*s %s\n' "$hostw" "$host" "$l" ;;
@@ -2890,14 +3003,15 @@ cmd_fleet() {
   shift || true
   case "$sub" in
     status)  cmd_fleet_status "$@" ;;
+    watch)   cmd_fleet_watch "$@" ;;
     health)  cmd_fleet_health "$@" ;;
     upgrade) cmd_fleet_upgrade "$@" ;;
     apply|scale|start|stop|restart|drain|kill|reap|remove-limits|enable|disable)
              cmd_fleet_run "$sub" "$@" ;;
     # env-init is PERMANENTLY excluded, not merely unimplemented: it writes an
     # EnvironmentFile of secrets, and fanning it out means pushing secrets
-    # over ssh. watch and logs are interactive and streaming, so they stay
-    # per-host. Saying which of the three it is beats "unknown command".
+    # over ssh. `logs` stays per-host because it streams. Saying which of the
+    # two it is beats "unknown command".
     env-init)
              die "fleet env-init is not supported and will not be: it writes an EnvironmentFile of secrets, which fanning out means copying secrets over ssh. Run 'runnerctl env-init' on each host." ;;
     # provision is excluded for env-init's reason plus one of its own: it
@@ -2906,9 +3020,9 @@ cmd_fleet() {
     # single fleet-wide command cannot supply.
     provision)
              die "fleet provision is not supported: it takes a registration token (fanning it out copies a credential to every host) and each host needs its own runner names. Run 'runnerctl provision N' on each host." ;;
-    watch|logs)
-             die "fleet $sub is not supported: $sub is $([ "$sub" = watch ] && echo interactive || echo streaming) and only makes sense against one host. Use 'runnerctl fleet status' for an overview, or ssh to the host." ;;
-    *)       die "unknown fleet command '$sub' (status health upgrade apply scale start stop restart drain kill reap remove-limits enable disable)" ;;
+    logs)
+             die "fleet logs is not supported: logs streams from one journal and only makes sense against one host. Use 'runnerctl fleet watch' for a live fleet-wide view, or ssh to the host." ;;
+    *)       die "unknown fleet command '$sub' (status watch health upgrade apply scale start stop restart drain kill reap remove-limits enable disable)" ;;
   esac
 }
 
@@ -3402,6 +3516,113 @@ cmd_fleet_status() { # [--json] [--color WHEN]
   fi
   fleet_cleanup
   return "$rc"
+}
+
+# --- Fleet watch (GHR-54) -----------------------------------------------------
+# `fleet status` in a redraw loop, over ssh connections that stay open.
+#
+# The loop is cmd_watch's shape — one printf of home + clear + frame, so the
+# redraw is atomic and does not flicker — and the frame is the fleet table
+# rather than the local one. Three things differ, and each follows from the
+# table coming from somewhere else:
+#
+#   * The connections are HELD OPEN (fleet_ssh_control_open). This is the
+#     whole reason the command exists: `watch runnerctl fleet status` dials
+#     every host afresh on every tick and gets throttled for it.
+#   * The remote is asked for `--color always`, where `fleet status` asks for
+#     `never` and paints locally. A watch wants the per-cell colour the local
+#     watch has, and the only thing that knows a cell is STALLED, throttled
+#     or running is the host that drew it.
+#   * It is VIEW-ONLY. `q` quits and no key acts. A cursor that addresses a
+#     (host, slot) pair and runs a mutating command over ssh is a different
+#     feature, with its own confirm and its own answer to the capacity gate
+#     (GHR-43/44) — filed as GHR-55 rather than half-built here.
+#
+# The default interval is 5 s rather than the local watch's 2 s: every tick is
+# a network round trip to every host, and a tick that has not finished before
+# the next one starts is not a faster view, it is a queue.
+FLEET_WATCH_LEGEND="q quit — this view is read-only; act with 'runnerctl fleet <command>' or on the host"
+
+# Restores the terminal, drops the fan-out's buffer directory and closes every
+# ssh master. Ordering is deliberate: the cursor comes back first, so a slow
+# or hanging close cannot leave an invisible cursor behind.
+fleet_watch_cleanup() {
+  term_cursor show
+  fleet_cleanup
+  fleet_ssh_control_close
+}
+
+cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] [--stall-after N]
+  local interval=5 iterations="" tick=0 header frame remote_color=never
+  local -a hosts=() fwd=()
+  while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    view_opt "$@"
+    if [ "$VIEW_SHIFT" -gt 0 ]; then
+      # --color is acted on at BOTH ends: the remote paints its cells and this
+      # end paints the HOST column and the header. --stall-after is only
+      # meaningful where the STALLED marker is DRAWN, which is the remote — so
+      # it is forwarded, and without that it would be an accepted flag that
+      # silently does nothing.
+      [ "$1" != --stall-after ] || fwd+=(--stall-after "$2")
+      shift "$VIEW_SHIFT"; continue
+    fi
+    case "$1" in
+      --interval)
+        need_val "$@"
+        [[ "$2" =~ ^0*[1-9][0-9]*$ ]] || die "--interval value '$2' is invalid — want a whole number of seconds, at least 1"
+        interval="$2"; shift 2 ;;
+      --iterations)
+        need_val "$@"
+        [[ "$2" =~ ^[0-9]+$ ]] || die "--iterations value '$2' is invalid — want an integer"
+        iterations="$2"; shift 2 ;;
+      --host)
+        need_val "$@"
+        hosts+=("$2"); shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  require_fleet
+  [ "${#hosts[@]}" -eq 0 ] || fleet_select_hosts "${hosts[@]}"
+  stdout_is_tty || die "fleet watch needs a terminal (stdout is not a tty); use 'runnerctl fleet status'"
+  color_setup "$COLOR_MODE"
+  # Whether the REMOTE paints is the same question as whether this end does:
+  # under --color never a remote SGR sequence would be the one thing in the
+  # frame that ignored the flag. C_RESET is set exactly when colour is on.
+  if [ -n "$C_RESET" ]; then remote_color=always; FLEET_REMOTE_COLOR=true; fi
+  # One tick is the interval plus however long the slowest host takes, and
+  # FLEET_TIMEOUT caps that second part; the margin on top means a master is
+  # never expiring at the moment the next tick wants it.
+  fleet_ssh_control_open "$((interval + FLEET_TIMEOUT + 30))"
+  # Ctrl-C exits 0 through the EXIT trap, which tears the session down either way.
+  trap fleet_watch_cleanup EXIT
+  trap 'exit 0' INT TERM
+  term_cursor hide
+  while :; do
+    header="$(paint "$C_BOLD" "runnerctl fleet watch — ${#FLEET_HOSTS[@]} host(s) — $(date +%H:%M:%S) — every ${interval}s (q to quit)")"
+    fleet_fanout "$FLEET_RUNNERCTL" status --color "$remote_color" ${fwd[@]+"${fwd[@]}"}
+    # fleet_fanout arms its OWN EXIT trap on every call, so ours has to go
+    # back afterwards. Without this the last thing to run on exit is the
+    # tmpdir removal alone — cursor still hidden, and every ssh master left
+    # alive until ControlPersist expires.
+    trap fleet_watch_cleanup EXIT
+    # A frame is rendered whatever the hosts said: an unreachable host is a
+    # row (fleet_status_table's own contract), and its non-zero return is not
+    # a reason to stop watching the ones that answered.
+    frame="$(fleet_status_table || true)"
+    fleet_cleanup
+    if [ -n "$iterations" ]; then
+      printf '\033[H\033[2J%s\n%s\n' "$header" "$frame"
+      pause "$interval"
+      tick=$((tick + 1))
+      [ "$tick" -lt "$iterations" ] || break
+      continue
+    fi
+    printf '\033[H\033[2J%s\n%s\n\n%s\n' "$header" "$frame" "$(paint "$C_DIM" "$FLEET_WATCH_LEGEND")"
+    if read_key "$interval"; then
+      case "$KEY" in q|Q) break ;; esac
+    fi
+  done
 }
 
 cmd_profiles() {
@@ -3918,9 +4139,14 @@ cmd_config_example() {
 # here, never in the runnerctl script.
 #FLEET_HOSTS=(build-1 build-2 build-3)
 
-# Extra ssh options, appended after the built-in ones so they can override
-# any of them. A polling loop wants connection reuse; a one-shot does not.
-#FLEET_SSH_OPTS=(-o ControlMaster=auto -o ControlPath=~/.ssh/cm-%r@%h:%p -o ControlPersist=60)
+# Extra ssh options, appended after the built-in ones — and after the ones
+# `fleet watch` sets for its own session — so they can override any of them.
+# `fleet watch` already holds one connection per host open for as long as it
+# runs, so this is only needed to reuse connections ACROSS separate commands.
+# Note %C rather than %r@%h:%p: a unix socket path is capped near 104 bytes
+# and ssh stops multiplexing SILENTLY when a ControlPath exceeds it, while %C
+# is a fixed-length hash whatever the host is called.
+#FLEET_SSH_OPTS=(-o ControlMaster=auto -o ControlPath=~/.ssh/cm-%C -o ControlPersist=60)
 
 # Most hosts contacted at once, and the per-host seconds budget. The timeout
 # is what stops one wedged host holding up the whole fan-out.

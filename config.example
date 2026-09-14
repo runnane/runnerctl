@@ -96,9 +96,14 @@
 # here, never in the runnerctl script.
 #FLEET_HOSTS=(build-1 build-2 build-3)
 
-# Extra ssh options, appended after the built-in ones so they can override
-# any of them. A polling loop wants connection reuse; a one-shot does not.
-#FLEET_SSH_OPTS=(-o ControlMaster=auto -o ControlPath=~/.ssh/cm-%r@%h:%p -o ControlPersist=60)
+# Extra ssh options, appended after the built-in ones — and after the ones
+# `fleet watch` sets for its own session — so they can override any of them.
+# `fleet watch` already holds one connection per host open for as long as it
+# runs, so this is only needed to reuse connections ACROSS separate commands.
+# Note %C rather than %r@%h:%p: a unix socket path is capped near 104 bytes
+# and ssh stops multiplexing SILENTLY when a ControlPath exceeds it, while %C
+# is a fixed-length hash whatever the host is called.
+#FLEET_SSH_OPTS=(-o ControlMaster=auto -o ControlPath=~/.ssh/cm-%C -o ControlPersist=60)
 
 # Most hosts contacted at once, and the per-host seconds budget. The timeout
 # is what stops one wedged host holding up the whole fan-out.
