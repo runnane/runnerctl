@@ -28,6 +28,11 @@
 # `reap`: seconds a leaked process gets after SIGTERM before SIGKILL.
 #REAP_GRACE_SEC="5"
 
+# `kill`: seconds the Listener gets to notice its Worker was killed and
+# report the job failed, before the whole unit's cgroup is SIGKILLed
+# instead. Counted in POLL_SEC steps.
+#KILL_GRACE_SEC="10"
+
 # PRESS column (memory pressure, PSI full avg10 in percent): yellow from
 # WARN, red and a `health` problem from CRIT.
 #PRESSURE_WARN_PCT="10"
@@ -36,6 +41,11 @@
 # Processes matching this ERE are the runner's own and never counted as
 # leaked or reaped. Extend it for an image that wraps the runner differently.
 #RUNNER_OWN_PATTERN='runsvc\.sh|RunnerService\.js|Runner\.(Listener|Worker|PluginHost)'
+
+# Processes matching this ERE are the Listener side of the runner and are
+# never killed by `kill` — everything else in the slot's cgroup is the job.
+# Narrower than RUNNER_OWN_PATTERN on purpose: Runner.Worker IS the job.
+#RUNNER_LISTENER_PATTERN='runsvc\.sh|RunnerService\.js|Runner\.Listener'
 
 # A profile is a function that sets these variables. Defining profile_ci or
 # profile_deploy replaces the built-in of the same name.

@@ -1831,25 +1831,41 @@ case_watch_cursor_clamps_and_survives_a_tick() {
   expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
 }
 
-# K on the busy slot: the confirm line names the exact command, `y` runs it
-# through run_priv with the cursor shown for a sudo prompt, and the result
-# is the next frame's notice. The journal memo for the slot is dropped
-# before the decision, so the facts are current.
+# K on the busy slot: the confirm line names the exact command — the job's
+# own pids, not a restart (GHR-36) — `y` runs it through run_priv with the
+# cursor shown for a sudo prompt, and the result is the next frame's notice.
+# The journal memo for the slot is dropped before the decision and again
+# inside the wait, so both see current facts: BUSY_POLLS=3 is the Listener
+# reporting the job failed on the first poll after its Worker was killed.
 case_watch_K_kills_the_running_job_after_confirm() {
-  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Kyq' run watch
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_BUSY_POLLS=3 \
+    RUNNERCTL_STUB_KEYS='Kyq' run watch
   expect_rc 0
   expect_out_count "$FRAME_PREFIX" 3
-  expect_out_count "^Kill the job on example\.slot-1 \(my-app:test \(12m\)\)\? runs: systemctl restart $SLOT1_UNIT  \[y/n\]$" 1
-  expect_out "^running: systemctl restart $SLOT1_UNIT$"
-  expect_out_count '^example\.slot-1: restart done\.$' 1
-  expect_log_count "^systemctl restart $SLOT1_UNIT$" 1
-  expect_log_count '^systemctl ' 1
+  expect_out_count "^Kill the job on example\.slot-1 \(my-app:test \(12m\)\)\? runs: kill -KILL 4100 4101 \(4100/Runner\.Worker, 4101/node\) — the runner stays up and reports it failed  \[y/n\]$" 1
+  expect_out '^running: kill example\.slot-1$'
+  expect_out_count '^example\.slot-1: killed 2 process\(es\): 4100/Runner\.Worker, 4101/node — the runner stayed up and reports the job failed$' 1
+  expect_log_count '^kill -KILL 4100 4101$' 1
+  expect_no_log '^systemctl '
   expect_log_order '^probe:term_cursor hide$' '^probe:tty_read_char 2 K$' '^probe:journal_job_lines .*slot-1' \
-                   '^probe:tty_read_char 2 y$' '^probe:term_cursor show$' "^systemctl restart $SLOT1_UNIT$" \
+                   '^probe:proc_job_tree /system\.slice/actions\.runner\.example\.slot-1\.service$' \
+                   '^probe:tty_read_char 2 y$' '^probe:term_cursor show$' '^kill -KILL 4100 4101$' \
                    '^probe:term_cursor hide$' '^probe:tty_read_char 2 q$' '^probe:term_cursor show$'
-  expect_log_count '^probe:journal_job_lines .*slot-1' 2
   # the cursor stayed on the slot
   expect_out_count "$(cursor_row 0 1)" 3
+}
+
+# K on a slot wedged in its own stop names the unit kill instead — the state
+# a `systemctl restart` of a stalled job leaves behind, and the one thing
+# that gets out of it.
+case_watch_K_on_a_deactivating_slot_names_the_unit_kill() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_DEACTIVATING=1 \
+    RUNNERCTL_STUB_KEYS='Kyq' run watch
+  expect_rc 0
+  expect_out_count "^example\.slot-1 is stuck stopping \(deactivating/stop-sigterm\) — SIGKILL the whole unit\? runs: systemctl kill -s KILL $SLOT1_UNIT  \[y/n\]$" 1
+  expect_log_count "^systemctl kill -s KILL $SLOT1_UNIT\$" 1
+  expect_no_log '^kill -KILL'
+  expect_no_log '^systemctl restart'
 }
 
 # Anything but `y` at a confirm cancels it: nothing runs, the notice says so.
@@ -2167,6 +2183,130 @@ case_reap_unknown_option_and_bad_target() {
   expect_rc 1
   expect_err "no runner slot matches 'nope'"
   expect_no_log '^kill '
+}
+
+# --- GHR-36: `kill` takes the job, not the runner ----------------------------
+# The job's own processes get SIGKILL and the Listener is left alone, so it
+# reports the job failed itself. RUNNERCTL_STUB_BUSY_POLLS=1 is that report
+# arriving: slot-1's journal shows the job completed from the second read on.
+case_kill_sigkills_the_job_tree_and_leaves_the_runner() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_BUSY_POLLS=1 run kill 0
+  expect_rc 0
+  expect_out '^example\.slot-1: killed 2 process\(es\): 4100/Runner\.Worker, 4101/node — the runner stayed up and reports the job failed$'
+  expect_log_count '^kill -KILL 4100 4101$' 1
+  expect_log_count '^kill ' 1
+  # the whole point: no restart, and no systemctl at all
+  expect_no_log '^systemctl '
+  expect_log_order '^probe:proc_job_tree /system\.slice/actions\.runner\.example\.slot-1\.service$' \
+                   '^kill -KILL 4100 4101$' '^probe:pause 5$'
+}
+
+# The Listener is wedged too: it never reports the job gone, so after
+# KILL_GRACE_SEC the whole unit's cgroup is SIGKILLed instead. Without this
+# escalation a `kill` on the worst case would report success and change
+# nothing — which is the bug `restart` had.
+case_kill_escalates_to_the_unit_when_the_job_survives() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 run kill 0
+  expect_rc 0
+  expect_out '^example\.slot-1: job still running 10s after SIGKILL — the runner is wedged too — killing the whole unit$'
+  expect_out "^example\.slot-1: SIGKILLed the unit's cgroup — Restart=always brings the slot back$"
+  expect_log_order '^kill -KILL 4100 4101$' '^probe:pause 5$' '^probe:pause 5$' \
+                   "^systemctl kill -s KILL $SLOT1_UNIT\$"
+  expect_log_count '^systemctl ' 1
+  expect_no_log '^systemctl restart'
+}
+
+# A slot wedged in its own graceful stop — where `systemctl restart` of a
+# stalled job sits for TimeoutStopSec — skips straight to the unit kill:
+# there is nothing left to ask nicely.
+case_kill_deactivating_slot_goes_straight_to_the_unit() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_DEACTIVATING=1 run kill 0
+  expect_rc 0
+  expect_out '^example\.slot-1: stuck stopping \(deactivating/stop-sigterm\) — a graceful stop it will not answer — killing the whole unit$'
+  expect_log_count "^systemctl kill -s KILL $SLOT1_UNIT\$" 1
+  expect_no_log '^kill -KILL'
+  # the per-process walk is not even attempted
+  expect_no_log '^probe:proc_job_tree '
+}
+
+# No readable cgroup (neither root nor the runner user): nothing to enumerate,
+# so systemd does it — it can signal a cgroup this user cannot read.
+case_kill_unreadable_cgroup_uses_systemd() {
+  run kill 0
+  expect_rc 0
+  expect_out "^example\.slot-1: cannot read the slot's processes \(run as root or the runner user to kill just the job\) — killing the whole unit\$"
+  expect_log_count "^systemctl kill -s KILL $SLOT1_UNIT\$" 1
+  expect_no_log '^kill -KILL'
+}
+
+case_kill_dry_run_sends_nothing() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 run kill --dry-run 0
+  expect_rc 0
+  expect_out '^example\.slot-1: would kill 2 process\(es\): 4100/Runner\.Worker, 4101/node$'
+  expect_no_log '^(kill|systemctl) '
+  expect_no_log '^probe:pause '
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_DEACTIVATING=1 run kill --dry-run 0
+  expect_rc 0
+  expect_out "^example\.slot-1: stuck stopping \(deactivating/stop-sigterm\) — a graceful stop it will not answer — would run systemctl kill -s KILL $SLOT1_UNIT\$"
+  expect_no_log '^(kill|systemctl) '
+}
+
+# No job, no kill — and nothing is sent for a slot that only looks busy.
+case_kill_without_a_running_job_is_refused() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 run kill 1 2
+  expect_rc 0
+  expect_out '^example\.slot-2: no job running — nothing to kill$'
+  expect_out '^example\.slot-3: not running — nothing to kill$'
+  expect_no_log '^(kill|systemctl) '
+  expect_no_log '^probe:proc_job_tree '
+  RUNNERCTL_STUB_JOURNAL_ACCESS=0 run kill 0
+  expect_rc 1
+  expect_err '^runnerctl: example\.slot-1: cannot tell whether a job is running — kill needs journal read access \(systemd-journal group\) or root$'
+  expect_no_log '^(kill|systemctl) '
+}
+
+# A bare `kill` would take every slot's job at once: refuse it, and point at
+# the flag that makes a no-target run mean something.
+case_kill_needs_a_target() {
+  run kill
+  expect_rc 1
+  expect_err '^runnerctl: kill needs a target \(a unit, slot index or name\) — or --if-stalled to take every stalled slot$'
+  expect_no_log '^(kill|systemctl) '
+  run kill --bogus
+  expect_rc 1
+  expect_err '^runnerctl: unknown option: --bogus$'
+  run kill nope
+  expect_rc 1
+  expect_err "no runner slot matches 'nope'"
+}
+
+# --if-stalled selects exactly the STALLED slots, like restart --if-stalled,
+# and the same threshold rules apply.
+case_kill_if_stalled_takes_only_the_stalled_slot() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_BUSY_POLLS=1 run kill --if-stalled --stall-after 600
+  expect_rc 0
+  expect_out '^example\.slot-1: stalled — my-app:test, 12m, longer than 10m — killing$'
+  expect_out '^example\.slot-2: not stalled \(idle 2h31m \(2 jobs\)\) — skipped$'
+  expect_out '^example\.slot-3: not running — skipped$'
+  expect_out '^kill done \(1 stalled slot\(s\)\)\.$'
+  expect_log_count '^kill -KILL 4100 4101$' 1
+  RUNNERCTL_STUB_CGROUP_READABLE=1 run kill --if-stalled
+  expect_rc 0
+  expect_out '^no stalled slot — nothing killed\.$'
+  expect_no_log '^(kill|systemctl) '
+  run kill --if-stalled --stall-after 0
+  expect_rc 1
+  expect_err '^runnerctl: --if-stalled needs a threshold: STALL_SEC is 0'
+}
+
+case_kill_grace_default_and_config_example() {
+  run_fn eval "echo \$KILL_GRACE_SEC"
+  expect_rc 0
+  expect_out '^10$'
+  run config-example
+  expect_rc 0
+  expect_out '^#KILL_GRACE_SEC="10"$'
+  expect_out "^#RUNNER_LISTENER_PATTERN='runsvc\\\\.sh\|RunnerService\\\\.js\|Runner\\\\.Listener'\$"
 }
 
 # --- GHR-30: a 1 h default, and --if-stalled / --restart-stalled -------------
@@ -2538,6 +2678,17 @@ t "reap 1: clean slot says nothing to reap"                             case_rea
 t "reap 1: unreadable cgroup / no journal die with a hint"              case_reap_unreadable_cgroup_dies
 t "reap --bogus / reap nope: rejected"                                  case_reap_unknown_option_and_bad_target
 
+# --- GHR-36: kill the job, not the runner ------------------------------------
+t "kill <slot>: SIGKILL the job tree, runner untouched, no systemctl"   case_kill_sigkills_the_job_tree_and_leaves_the_runner
+t "kill: job survives the grace — escalates to systemctl kill -s KILL"  case_kill_escalates_to_the_unit_when_the_job_survives
+t "kill: a deactivating slot goes straight to the unit kill"            case_kill_deactivating_slot_goes_straight_to_the_unit
+t "kill: unreadable cgroup hands the unit to systemd"                   case_kill_unreadable_cgroup_uses_systemd
+t "kill --dry-run: lists, sends nothing (both paths)"                   case_kill_dry_run_sends_nothing
+t "kill: idle, stopped and no-journal slots refuse before acting"       case_kill_without_a_running_job_is_refused
+t "kill: a bare kill needs a target; bad option and bad target"         case_kill_needs_a_target
+t "kill --if-stalled: the stalled slot only, threshold rules"           case_kill_if_stalled_takes_only_the_stalled_slot
+t "kill: KILL_GRACE_SEC default 10, both knobs in config-example"       case_kill_grace_default_and_config_example
+
 # --- GHR-30: 1 h stall default, --if-stalled, health --restart-stalled -------
 t "STALL_SEC defaults to 3600, config-example agrees"                   case_stall_sec_default_is_one_hour
 t "restart --if-stalled --stall-after 600: slot-1 only, others skipped"  case_restart_if_stalled_restarts_only_the_stalled_slot
@@ -2563,7 +2714,8 @@ t "status --stall-after 600: the STALLED note points at PRESS"          case_sta
 # --- GHR-33: interactive watch ------------------------------------------------
 t "watch: j/k and the arrows move the cursor, a key redraws at once"     case_watch_keys_move_the_cursor
 t "watch: the cursor clamps at both ends and survives a tick"           case_watch_cursor_clamps_and_survives_a_tick
-t "watch: K, y — confirm names systemctl restart, runs it, notice"       case_watch_K_kills_the_running_job_after_confirm
+t "watch: K, y — confirm names the job's pids, kills them, notice"       case_watch_K_kills_the_running_job_after_confirm
+t "watch: K on a deactivating slot names systemctl kill -s KILL"        case_watch_K_on_a_deactivating_slot_names_the_unit_kill
 t "watch: K, n — cancelled, nothing run; q at a confirm cancels too"    case_watch_confirm_n_runs_nothing
 t "watch: K refused on an idle, stopped or (no access) row"             case_watch_K_refused_without_a_running_job
 t "watch: R restarts, warning line only when a job is in flight"        case_watch_R_restarts_with_a_warning_when_busy

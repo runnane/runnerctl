@@ -43,6 +43,8 @@
 #                  [--since WHEN] [-g PATTERN]
 #   runnerctl remove-limits [<unit|slot-index|name> ...]
 #   runnerctl reap [--dry-run] [<unit|slot-index|name> ...]
+#   runnerctl kill [--dry-run] [--if-stalled] [--stall-after N] \
+#                  [<unit|slot-index|name> ...]
 #   runnerctl health [--quiet] [--max-restarts N] [--stall-after N] [--restart-stalled]
 #   runnerctl profiles
 #   runnerctl config-example
@@ -69,9 +71,9 @@
 # the journal-derived WORKING-ON cells refresh every 10th redraw. It is
 # interactive (GHR-33): ↑/↓ (or j/k) move the cursor over the slot rows and
 # a key acts on the selected slot, each after a y/n confirm line that names
-# the exact command — K kills the running job (systemctl restart; the
-# cgroup goes, Restart=always brings the runner back, GitHub marks the job
-# failed — for a STALLED row), R restarts the service (warned when a job is
+# the exact command — K kills the running job (`kill`: SIGKILL for the job's
+# own processes, the Listener stays up and reports it failed — for a STALLED
+# row), R restarts the service (warned when a job is
 # in flight), S/T stop/start it, P reaps its `+N leaked` processes, L opens
 # `logs <slot> -n 50` in $PAGER. Privileged keys go through sudo like the
 # commands do. Too narrow a terminal drops MAX, HIGH and ENVFILE from the
@@ -85,13 +87,26 @@
 # past an hour on a build pool is wedged, not slow; --stall-after N
 # overrides, 0 disables) is STALLED: marked in the WORKING-ON cell,
 # `"stalled":true` in --json, and a problem for `health`. The flag has an
-# action (GHR-30): `restart --if-stalled` (or `stop --if-stalled`) acts on
+# actions (GHR-30): `restart --if-stalled` (or `stop --if-stalled`) acts on
 # exactly the slots whose job is STALLED and skips every other one with a
-# line — the whole cgroup goes, Restart=always brings the runner back and
-# GitHub marks the job failed — and `health --restart-stalled` does the same
-# from cron, appending `— restarted` to the problem line (exit stays 1, so
-# a probe still records the event once). --if-stalled and --when-idle are
-# exclusive: one waits for an idle slot, the other acts on a wedged one.
+# line, and `health --restart-stalled` does the same from cron, appending
+# `— restarted` to the problem line (exit stays 1, so a probe still records
+# the event once). --if-stalled and --when-idle are exclusive: one waits for
+# an idle slot, the other acts on a wedged one.
+#
+# But a restart is a GRACEFUL stop, and a stalled step is exactly what will
+# not answer one: GitHub's unit has KillMode=process, KillSignal=SIGTERM,
+# TimeoutStopSec=5min, so `restart` on a wedged job hangs five minutes in
+# `deactivating/stop-sigterm` and then kills only the main process. `kill`
+# (GHR-36) is the tool for that row: `runnerctl kill [--dry-run]
+# [--if-stalled] [--stall-after N] [target ...]` SIGKILLs the job's own
+# processes — everything in the slot's cgroup that is not the Listener — so
+# the runner stays up, reports the job failed and takes work again in
+# seconds. A slot already wedged in its own stop, one whose cgroup cannot be
+# read, and one whose Listener has not reported the job gone KILL_GRACE_SEC
+# (10) after its Worker died are escalated to `systemctl kill -s KILL
+# <unit>`, which signals the whole cgroup whatever KillMode says, with
+# Restart=always bringing the slot back. A bare `kill` needs a target.
 #
 # PRESS is the slot's memory pressure (GHR-31): the cgroup's PSI `full avg10`
 # — the share of the last 10 s every task in it spent stalled on memory —
@@ -164,6 +179,10 @@ WAIT_TIMEOUT="1800"
 STALL_SEC="3600"
 # `reap`: seconds between SIGTERM and SIGKILL for a leaked process (GHR-29).
 REAP_GRACE_SEC="5"
+# `kill`: seconds to give the Listener to notice its Worker died and report
+# the job failed, before the whole unit's cgroup is SIGKILLed instead
+# (GHR-36). Counted in POLL_SEC steps, so a value below POLL_SEC is one poll.
+KILL_GRACE_SEC="10"
 # PRESS (memory pressure, PSI full avg10 in percent): yellow from WARN, red
 # and a `health` problem from CRIT (GHR-31).
 PRESSURE_WARN_PCT="10"
@@ -545,6 +564,31 @@ proc_leaked() { # CGROUP
   done <"/sys/fs/cgroup${1}/cgroup.procs"
 }
 
+# GHR-36: the job's own process tree — everything in the cgroup that is NOT
+# the Listener side of the runner. `runsvc.sh` -> node RunnerService.js ->
+# Runner.Listener is what must survive a `kill`: it is the process that
+# notices its Worker died, reports the job failed to GitHub and goes back to
+# waiting, so the slot is idle in seconds with no restart and no
+# re-registration. Everything else in the cgroup — Runner.Worker,
+# Runner.PluginHost and every step process under them — is the job.
+# Prints `pid<TAB>comm` per process; nothing when the cgroup cannot be read
+# (then `kill` escalates to systemd, which can signal it without reading it).
+# Containers a job started live under the docker daemon's cgroup, not here.
+RUNNER_LISTENER_PATTERN='runsvc\.sh|RunnerService\.js|Runner\.Listener'
+proc_job_tree() { # CGROUP
+  local pid cmd comm
+  cgroup_readable "$1" || return 0
+  while read -r pid; do
+    [ -r "/proc/$pid/cmdline" ] || continue
+    cmd="$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)"
+    # An empty cmdline is a zombie or a kernel thread: nothing to kill.
+    [ -n "$cmd" ] || continue
+    [[ "$cmd" =~ $RUNNER_LISTENER_PATTERN ]] && continue
+    comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo '?')"
+    printf '%s\t%s\n' "$pid" "$comm"
+  done <"/sys/fs/cgroup${1}/cgroup.procs"
+}
+
 # Is PID still around (and not a zombie)? Behind a function so a test
 # config can answer for `reap`'s survivors.
 pid_alive() { # PID
@@ -650,6 +694,22 @@ job_leak_check() { # CGROUP
     JOB_LEAKED_COMMS+="${JOB_LEAKED_COMMS:+, }${comm:-?}"
   done < <(proc_leaked "$1")
 }
+# GHR-36: the job-side processes of the cgroup, for `kill`. Same shape as
+# job_leak_check — JOB_TREE is "" when the cgroup cannot be read (the caller
+# then has nothing to signal itself and hands the unit to systemd) and 0 when
+# it is readable and holds nothing but the Listener's own tree.
+job_tree_check() { # CGROUP
+  local pid comm
+  JOB_TREE="" JOB_TREE_PIDS="" JOB_TREE_COMMS=""
+  cgroup_readable "$1" || return 0
+  JOB_TREE=0
+  while IFS=$'\t' read -r pid comm; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    JOB_TREE=$((JOB_TREE + 1))
+    JOB_TREE_PIDS+="${JOB_TREE_PIDS:+ }$pid"
+    JOB_TREE_COMMS+="${JOB_TREE_COMMS:+, }${comm:-?}"
+  done < <(proc_job_tree "$1")
+}
 # JOB_STALLED from the running job's age (seconds), per the contract above.
 job_stall_check() { # AGE-SECONDS
   JOB_STALLED=""
@@ -660,6 +720,9 @@ job_facts() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
   local u="$1" cg="$2" lines rj ii ts env worker age=""
   JOB_STATE=none JOB_NAME="" JOB_REPO="" JOB_SINCE="" JOB_RUNTIME="" JOB_STALLED="" JOB_IDLE_SINCE="" JOB_DONE="" JOB_ACCESS=ok
   JOB_LEAKED="" JOB_LEAKED_PIDS="" JOB_LEAKED_COMMS=""
+  # The cgroup this picture was read from, for a caller that then has to act
+  # on the processes in it (`kill`, GHR-36).
+  JOB_CGROUP="$cg"
   [ -n "$cg" ] || return 0
   if lines="$(journal_job_lines_cached "$u" "${3:-}")"; then
     rj="$(journal_running_job "$lines")"
@@ -759,10 +822,21 @@ SLOT_JOB=""
 # One unit_props fetch, then job_facts on it: the JOB_* picture of UNIT for
 # a command that acts on one slot at a time (--when-idle, --if-stalled,
 # reap) rather than through collect_slot.
+SLOT_ACTIVE="" SLOT_SUB=""
 slot_job_facts() { # UNIT
   local cg="" inv="" ae="" k v
+  SLOT_ACTIVE="" SLOT_SUB=""
   while IFS='=' read -r k v; do
-    case "$k" in ControlGroup) cg="$v" ;; InvocationID) inv="$v" ;; ActiveEnterTimestampMonotonic) ae="$v" ;; esac
+    case "$k" in
+      ControlGroup) cg="$v" ;;
+      InvocationID) inv="$v" ;;
+      ActiveEnterTimestampMonotonic) ae="$v" ;;
+      # GHR-36: `kill` needs to tell a running slot from one already wedged
+      # in its own stop (deactivating/stop-sigterm), where the job is gone
+      # from systemd's point of view but nothing has actually died.
+      ActiveState) SLOT_ACTIVE="$v" ;;
+      SubState) SLOT_SUB="$v" ;;
+    esac
   done < <(unit_props "$1")
   job_facts "$1" "$cg" "$inv" "$ae"
 }
@@ -1843,7 +1917,7 @@ watch_job_warning() {
 # A key on the selected slot: either WATCH_NOTICE (a refusal or a result, no
 # command runs) or WATCH_PROMPT + WATCH_ACTION (a confirm line stating the
 # exact command, run on `y`). L runs at once — reading logs changes nothing.
-#   WATCH_ACTION   ctl:restart|ctl:stop|ctl:start|reap  (+ the unit in WATCH_UNIT)
+#   WATCH_ACTION   ctl:restart|ctl:stop|ctl:start|reap|kill  (+ the unit in WATCH_UNIT)
 watch_key_action() { # KEY UNIT
   local u="$2" short
   short="$(short_name "$u")"
@@ -1859,13 +1933,30 @@ watch_key_action() { # KEY UNIT
   watch_slot_facts "$u"
   case "$1" in
     K)
-      case "${SLOT[job_state]}" in
-        running)   WATCH_ACTION="ctl:restart"
-                   WATCH_PROMPT="Kill the job on $short ($(job_cell))? runs: systemctl restart $u  [y/n]" ;;
-        no-access) WATCH_NOTICE="$short: cannot tell whether a job is running — needs journal read access (systemd-journal group) or root" ;;
-        none)      WATCH_NOTICE="$short: not running — nothing to kill" ;;
-        *)         WATCH_NOTICE="$short: no job running — nothing to kill" ;;
-      esac ;;
+      # GHR-36: the job's own processes, not `systemctl restart` — a restart
+      # is a graceful stop and a stalled step is what will not answer one.
+      # The prompt names whichever command this slot will actually take.
+      if [ "${SLOT[active]}" = deactivating ]; then
+        WATCH_ACTION="kill"
+        WATCH_PROMPT="$short is stuck stopping (${SLOT[active]}/${SLOT[sub]:-?}) — SIGKILL the whole unit? runs: systemctl kill -s KILL $u  [y/n]"
+      else
+        case "${SLOT[job_state]}" in
+          running|starting)
+            job_tree_check "${SLOT[cgroup]}"
+            WATCH_ACTION="kill"
+            if [ -z "$JOB_TREE" ]; then
+              WATCH_PROMPT="Kill the job on $short ($(job_cell))? the slot's processes cannot be read here, so runs: systemctl kill -s KILL $u  [y/n]"
+            elif [ "$JOB_TREE" -eq 0 ]; then
+              WATCH_ACTION=""
+              WATCH_NOTICE="$short: nothing but the runner itself in the slot's cgroup — nothing to kill"
+            else
+              WATCH_PROMPT="Kill the job on $short ($(job_cell))? runs: kill -KILL $JOB_TREE_PIDS ($(kill_list)) — the runner stays up and reports it failed  [y/n]"
+            fi ;;
+          no-access) WATCH_NOTICE="$short: cannot tell whether a job is running — needs journal read access (systemd-journal group) or root" ;;
+          none)      WATCH_NOTICE="$short: not running — nothing to kill" ;;
+          *)         WATCH_NOTICE="$short: no job running — nothing to kill" ;;
+        esac
+      fi ;;
     R)
       case "${SLOT[active]}" in
         active|activating|reloading)
@@ -1914,6 +2005,10 @@ watch_run_action() {
     reap)
       printf '\nrunning: reap %s\n' "$short"
       out="$(cmd_reap "$WATCH_UNIT" 2>&1)" || true
+      WATCH_NOTICE="${out##*$'\n'}" ;;
+    kill)
+      printf '\nrunning: kill %s\n' "$short"
+      out="$(cmd_kill "$WATCH_UNIT" 2>&1)" || true
       WATCH_NOTICE="${out##*$'\n'}" ;;
   esac
   term_cursor hide
@@ -2096,13 +2191,153 @@ cmd_reap() { # [--dry-run] [target ...] (default: all)
   done
 }
 
-# `pid/comm, pid/comm` from the JOB_LEAKED_* facts, for reap's lines.
-reap_list() {
+# `pid/comm, pid/comm` from a PIDS + COMMS pair, for reap's and kill's lines.
+pid_comm_list() { # PIDS COMMS
   local out="" pids comms i
-  read -ra pids <<<"$JOB_LEAKED_PIDS"
-  IFS=',' read -ra comms <<<"${JOB_LEAKED_COMMS// /}"
+  read -ra pids <<<"$1"
+  IFS=',' read -ra comms <<<"${2// /}"
   for i in "${!pids[@]}"; do out+="${out:+, }${pids[$i]}/${comms[$i]:-?}"; done
   echo "$out"
+}
+reap_list() { pid_comm_list "$JOB_LEAKED_PIDS" "$JOB_LEAKED_COMMS"; }
+kill_list() { pid_comm_list "$JOB_TREE_PIDS" "$JOB_TREE_COMMS"; }
+
+# GHR-36: kill the JOB, not the runner. `systemctl restart` is a graceful
+# shutdown — the unit GitHub's svc.sh installs carries KillMode=process,
+# KillSignal=SIGTERM, TimeoutStopSec=5min, so systemd signals only
+# `runsvc.sh`, which asks the Listener, which asks the Worker to cancel the
+# step. A step that is genuinely stalled never answers: the restart hangs in
+# `deactivating/stop-sigterm` for five minutes and systemd then SIGKILLs the
+# main process only, leaving the job's processes alive in the cgroup. That is
+# the exact opposite of what "kill the stalled job" has to mean.
+#
+# So: SIGKILL the job's own processes (proc_job_tree — everything in the
+# cgroup but the Listener side), which nothing can ignore, and leave the
+# Listener up. It notices its Worker died, reports the job failed to GitHub
+# and is idle in seconds — no restart, no re-registration blip, no other
+# slot's work disturbed.
+#
+# Two escalations to `systemctl kill -s KILL <unit>`, which signals every
+# process of the unit's cgroup whatever KillMode says, with Restart=always
+# bringing the slot back:
+#   - the cgroup cannot be read (not root, not the runner user), so there are
+#     no pids to signal — systemd can do it without reading anything;
+#   - the slot is already wedged in its own stop, or the Listener has not
+#     reported the job gone KILL_GRACE_SEC after its Worker was killed (it is
+#     hung too). This is the case a plain `restart` cannot get out of.
+cmd_kill() { # [--dry-run] [--if-stalled] [--stall-after N] [target ...]
+  local dry_run=false if_stalled=false targets=() units=() u t short acted=0
+  while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    case "$1" in
+      --dry-run)     dry_run=true; shift ;;
+      --if-stalled)  if_stalled=true; shift ;;
+      --stall-after) need_val "$@"; set_stall_after "$2"; shift 2 ;;
+      -*)            die "unknown option: $1" ;;
+      *)             targets+=("$1"); shift ;;
+    esac
+  done
+  if $if_stalled && [ "$STALL_SEC" -le 0 ]; then
+    die "--if-stalled needs a threshold: STALL_SEC is 0 (pass --stall-after N)"
+  fi
+  require_runners
+  if [ "${#targets[@]}" -gt 0 ]; then
+    for t in "${targets[@]}"; do
+      # Resolve on its own line: a die inside "$(...)" only exits the subshell.
+      u="$(resolve "$t")"
+      units+=("$u")
+    done
+  else
+    # Killing every slot's job at once is never what someone means by a bare
+    # `kill`; with --if-stalled the selection is the stalled set, so no target
+    # is the normal form.
+    $if_stalled || die "kill needs a target (a unit, slot index or name) — or --if-stalled to take every stalled slot"
+    mapfile -t units < <(discover)
+  fi
+  for u in "${units[@]}"; do
+    short="$(short_name "$u")"
+    if $if_stalled; then
+      stalled_gate "$u" killing || continue
+    else
+      slot_job_facts "$u"
+      kill_gate "$short" || continue
+    fi
+    acted=$((acted + 1))
+    kill_slot "$u" "$short" "$dry_run"
+  done
+  if $if_stalled && [ "$acted" -eq 0 ]; then
+    echo "no stalled slot — nothing killed."
+  elif $if_stalled; then
+    echo "kill done ($acted stalled slot(s))."
+  fi
+}
+
+# May `kill` act on the slot slot_job_facts just described? A deactivating
+# unit is the wedged-stop case and always may — that is the state a hung
+# `restart` leaves behind, and the one only a SIGKILL gets out of.
+kill_gate() { # SHORT
+  [ "$SLOT_ACTIVE" != deactivating ] || return 0
+  case "$JOB_STATE" in
+    running|starting) return 0 ;;
+    no-access) die "$1: cannot tell whether a job is running — kill needs journal read access (systemd-journal group) or root" ;;
+    none) echo "$1: not running — nothing to kill"; return 1 ;;
+    *) echo "$1: no job running — nothing to kill"; return 1 ;;
+  esac
+}
+
+# One slot, with its facts already in the JOB_*/SLOT_ACTIVE globals.
+kill_slot() { # UNIT SHORT DRY-RUN
+  local u="$1" short="$2" dry="$3" waited=0 killed
+  if [ "$SLOT_ACTIVE" = deactivating ]; then
+    kill_unit "$u" "$short" "$dry" "stuck stopping (${SLOT_ACTIVE}/${SLOT_SUB:-?}) — a graceful stop it will not answer"
+    return 0
+  fi
+  job_tree_check "$JOB_CGROUP"
+  if [ -z "$JOB_TREE" ]; then
+    kill_unit "$u" "$short" "$dry" "cannot read the slot's processes (run as root or the runner user to kill just the job)"
+    return 0
+  fi
+  if [ "$JOB_TREE" -eq 0 ]; then
+    echo "$short: nothing but the runner itself in the slot's cgroup — nothing to kill"
+    return 0
+  fi
+  killed="$JOB_TREE process(es): $(kill_list)"
+  if $dry; then
+    echo "$short: would kill $killed"
+    return 0
+  fi
+  # shellcheck disable=SC2086  # the pids are one argument each on purpose
+  run_priv kill -KILL $JOB_TREE_PIDS
+  # The Listener reports the job failed on its own; poll until it has, so a
+  # Listener that is wedged too is escalated rather than left behind a line
+  # claiming success.
+  [[ "$POLL_SEC" =~ ^[1-9][0-9]*$ ]] || die "POLL_SEC must be a positive integer (config sets '$POLL_SEC')"
+  while :; do
+    pause "$POLL_SEC"
+    waited=$((waited + POLL_SEC))
+    # Under `watch` the journal read is memoised per tick; this poll has to
+    # see the new lines, not the ones the frame was drawn from.
+    [ -z "$JOURNAL_MEMO_DIR" ] || rm -f -- "$JOURNAL_MEMO_DIR/$u".*
+    slot_job_facts "$u"
+    [ "$JOB_STATE" = running ] || break
+    [ "$waited" -lt "$KILL_GRACE_SEC" ] || {
+      kill_unit "$u" "$short" false "job still running ${waited}s after SIGKILL — the runner is wedged too"
+      return 0
+    }
+  done
+  echo "$short: killed $killed — the runner stayed up and reports the job failed"
+}
+
+# The escalation: systemd signals the whole cgroup, KillMode notwithstanding.
+kill_unit() { # UNIT SHORT DRY-RUN WHY
+  local u="$1" short="$2" dry="$3" why="$4"
+  if $dry; then
+    echo "$short: $why — would run systemctl kill -s KILL $u"
+    return 0
+  fi
+  echo "$short: $why — killing the whole unit"
+  run_priv systemctl kill -s KILL "$u"
+  echo "$short: SIGKILLed the unit's cgroup — Restart=always brings the slot back"
 }
 
 # GHR-14: a yes/no for cron/uptime probes — nothing on the host can currently
@@ -2248,6 +2483,11 @@ cmd_config_example() {
 # `reap`: seconds a leaked process gets after SIGTERM before SIGKILL.
 #REAP_GRACE_SEC="5"
 
+# `kill`: seconds the Listener gets to notice its Worker was killed and
+# report the job failed, before the whole unit's cgroup is SIGKILLed
+# instead. Counted in POLL_SEC steps.
+#KILL_GRACE_SEC="10"
+
 # PRESS column (memory pressure, PSI full avg10 in percent): yellow from
 # WARN, red and a `health` problem from CRIT.
 #PRESSURE_WARN_PCT="10"
@@ -2256,6 +2496,11 @@ cmd_config_example() {
 # Processes matching this ERE are the runner's own and never counted as
 # leaked or reaped. Extend it for an image that wraps the runner differently.
 #RUNNER_OWN_PATTERN='runsvc\.sh|RunnerService\.js|Runner\.(Listener|Worker|PluginHost)'
+
+# Processes matching this ERE are the Listener side of the runner and are
+# never killed by `kill` — everything else in the slot's cgroup is the job.
+# Narrower than RUNNER_OWN_PATTERN on purpose: Runner.Worker IS the job.
+#RUNNER_LISTENER_PATTERN='runsvc\.sh|RunnerService\.js|Runner\.Listener'
 
 # A profile is a function that sets these variables. Defining profile_ci or
 # profile_deploy replaces the built-in of the same name.
@@ -2847,6 +3092,7 @@ main() {
     logs)               cmd_logs "$@" ;;
     remove-limits)      cmd_remove_limits "$@" ;;
     reap)               cmd_reap "$@" ;;
+    kill)               cmd_kill "$@" ;;
     health)             cmd_health "$@" ;;
     profiles)           cmd_profiles "$@" ;;
     config-example)     cmd_config_example ;;
@@ -2854,7 +3100,7 @@ main() {
     upgrade)            cmd_upgrade "$@" ;;
     version|--version)  echo "runnerctl $RUNNERCTL_VERSION" ;;
     -h|--help|help)     usage ;;
-    *) die "unknown command '$cmd' (status watch health apply scale env-init start stop restart drain enable disable logs remove-limits reap profiles config-example migrate install upgrade version)" ;;
+    *) die "unknown command '$cmd' (status watch health apply scale env-init start stop restart drain enable disable logs remove-limits reap kill profiles config-example migrate install upgrade version)" ;;
   esac
 }
 
