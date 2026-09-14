@@ -80,6 +80,8 @@ runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
                [--since WHEN] [-g PATTERN]
 runnerctl remove-limits [<unit|slot-index|name> ...]
 runnerctl reap [--dry-run] [<unit|slot-index|name> ...]
+runnerctl kill [--dry-run] [--if-stalled] [--stall-after N] \
+               [<unit|slot-index|name> ...]
 runnerctl health [--quiet] [--max-restarts N] [--stall-after N] [--restart-stalled]
 runnerctl profiles
 runnerctl config-example
@@ -254,7 +256,7 @@ and the result becomes the status line under the legend:
 
 | key | on the selected slot | runs |
 | --- | --- | --- |
-| `K` | kill the running job — the `STALLED` case. The slot's whole cgroup goes, `Restart=always` brings the runner back and GitHub marks the job failed. Refused when no job is running | `systemctl restart <unit>` |
+| `K` | kill the running job — the `STALLED` case. `SIGKILL` for the job's own processes, exactly as [`kill`](#killing-a-stalled-job-kill) does: the runner stays up and reports the job failed. Refused when no job is running; a slot wedged in its own stop, or one whose cgroup this user cannot read, is offered the unit kill instead | `kill -KILL <job pids>`, or `systemctl kill -s KILL <unit>` |
 | `R` | restart the runner service — any active row; a warning line says so when a job is in flight | `systemctl restart <unit>` |
 | `S` / `T` | stop / start the slot (stop carries the same warning while a job runs) | `systemctl stop\|start <unit>` |
 | `P` | reap the `+N leaked` processes on an idle slot, exactly as `reap <IDX>` does | `kill -TERM …`, then `kill -KILL` for what survives |
@@ -410,7 +412,7 @@ the GitHub API or UI. For a guaranteed drain, first make GitHub stop routing
 work to the runner — change its labels to ones no workflow requests, or
 disable it in the organisation's runner settings — then `runnerctl drain`.
 
-### Killing a stalled job: `restart --if-stalled`
+### Restarting a stalled slot: `restart --if-stalled`
 
 `--when-idle` never force-kills, by design. `--if-stalled` is the opposite
 tool for the opposite situation: `runnerctl restart --if-stalled
@@ -426,14 +428,71 @@ example.slot-3: not running — skipped
 restart done (1 stalled slot(s)).
 ```
 
-It restarts the whole unit rather than signalling the job's processes: the
-cgroup goes as one, `Restart=always` brings the runner back in seconds, and
-GitHub marks the job failed — a partial kill would leave the Listener
-believing it is still busy. `stop --if-stalled` works the same way (the slot
-stays down); `start` refuses the flag, and so does combining it with
-`--when-idle`. With nothing stalled it prints `no stalled slot — nothing
-restarted.` and exits 0. A slot whose journal cannot be read is a refusal,
-not a guess — run it with journal access or as root.
+It restarts the whole unit rather than signalling the job's processes:
+`Restart=always` brings the runner back in seconds and GitHub marks the job
+failed. `stop --if-stalled` works the same way (the slot stays down); `start`
+refuses the flag, and so does combining it with `--when-idle`. With nothing
+stalled it prints `no stalled slot — nothing restarted.` and exits 0. A slot
+whose journal cannot be read is a refusal, not a guess — run it with journal
+access or as root.
+
+**A restart is still a *graceful* stop, and a stalled step is precisely what
+will not answer one** — see `kill` below for the case where it hangs.
+
+### Killing a stalled job: `kill`
+
+The unit GitHub's `svc.sh` installs carries `KillMode=process`,
+`KillSignal=SIGTERM`, `TimeoutStopSec=5min`. So a `restart` signals only
+`runsvc.sh`, which asks the Listener, which asks the Worker to cancel the
+step — and a step that is genuinely wedged never answers. The unit sits in
+`deactivating/stop-sigterm` for five minutes, systemd then kills the main
+process only, and the job's processes are still in the cgroup. `status`
+shows the slot mid-hang:
+
+```
+IDX RUNNER          PROFILE ACTIVE                    SINCE  ...  WORKING-ON
+1   example.slot-2  ci      deactivating/stop-sigterm —      ...  my-app:build (49m)
+```
+
+`runnerctl kill [--dry-run] [--if-stalled] [--stall-after N] <slot> ...`
+is the tool that actually ends the job. It `SIGKILL`s the job's own
+processes — everything in the slot's cgroup that is not the Listener side of
+the runner (`runsvc.sh`, `RunnerService.js`, `Runner.Listener`;
+`RUNNER_LISTENER_PATTERN` extends that for an image that wraps the runner
+differently) — and leaves the Listener alone, so it notices its Worker died,
+reports the job failed to GitHub itself and takes work again in seconds. No
+restart, no re-registration, and no other slot disturbed:
+
+```
+$ sudo runnerctl kill 1
+example.slot-2: killed 2 process(es): 4100/Runner.Worker, 4101/node — the runner stayed up and reports the job failed
+```
+
+Three cases escalate to `systemctl kill -s KILL <unit>`, which signals every
+process of the unit's cgroup whatever `KillMode` says, with `Restart=always`
+bringing the slot back:
+
+- the slot is already wedged in its own stop (`deactivating`) — there is
+  nothing left to ask nicely;
+- the cgroup cannot be read (neither root nor the runner user), so there are
+  no pids to signal — systemd can do it without reading them;
+- the Listener has not reported the job gone `KILL_GRACE_SEC` (config,
+  default 10 s) after its Worker was killed — it is hung too. This is the
+  case a plain `restart` cannot get out of at all.
+
+`--dry-run` names what would go and sends nothing. A bare `kill` with no
+target is refused — killing every slot's job at once is never what it means
+— but `--if-stalled` (with `--stall-after N`, same rules as
+`restart --if-stalled`) selects exactly the `STALLED` slots and then needs no
+target:
+
+```
+$ sudo runnerctl kill --if-stalled
+example.slot-1: not stalled (my-app:test (12m)) — skipped
+example.slot-2: stalled — my-app:build, 1h49m, longer than 1h — killing
+example.slot-2: killed 2 process(es): 4100/Runner.Worker, 4101/node — the runner stayed up and reports the job failed
+kill done (1 stalled slot(s)).
+```
 
 ### Profiles
 
