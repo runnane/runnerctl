@@ -2640,6 +2640,76 @@ case_fleet_unconfigured_says_so() {
   expect_no_log '^probe:ssh_run '
 }
 
+case_fleet_health_all_healthy_is_one_line_exit_zero() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet health
+  expect_rc 0
+  expect_out '^ok: 6 slot\(s\) healthy across 2 host\(s\)$'
+  expect_out_count '^ok: ' 1
+}
+
+# A problem keeps the single-host wording and gains its host, so the format
+# people already read survives the aggregation.
+case_fleet_health_problem_is_attributed_to_its_host() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet health --stall-after 600
+  expect_rc 1
+  expect_out '^build-1: example\.slot-1: stalled — job my-app:test running 12m, longer than 10m \(--stall-after 600\)$'
+  expect_out '^build-2: example\.slot-1: stalled — '
+  expect_no_out '^ok: '
+  # the flag really reached the hosts rather than being matched locally
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl health --stall-after 600$' 1
+}
+
+# THE assertion this command exists for: a host that did not answer can never
+# produce a green fleet. A monitor going green because a host dropped out of
+# the fan-out is worse than no monitor at all.
+case_fleet_health_unreachable_host_is_a_problem_never_a_silent_pass() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-unreachable" run fleet health
+  expect_rc 1
+  expect_out '^gw-unreachable: unreachable — ssh: connect to host gw-unreachable port 22: No route to host$'
+  expect_no_out '^ok: '
+  # a timeout is the same class of unknown, and says which it was
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 slow-timeout" run fleet health
+  expect_rc 1
+  expect_out '^slow-timeout: timed out after 30s$'
+  expect_no_out '^ok: '
+}
+
+# A runner-less host exits 1 with its message on STDERR, so it contributes no
+# problem line of its own. Without the stderr fallback it would count as
+# neither a problem nor an ok, and a fleet of one such host would exit 0 with
+# the failure invisible.
+case_fleet_health_remote_die_with_empty_stdout_is_still_a_problem() {
+  RUNNERCTL_STUB_FLEET_HOSTS="box-norunners" run fleet health
+  expect_rc 1
+  expect_out "^box-norunners: remote exit 1 — runnerctl: no 'actions\\.runner\\.\\*\\.service' units found on this host\\.$"
+  expect_no_out '^ok: '
+}
+
+case_fleet_health_quiet_keeps_the_exit_code() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-unreachable" run fleet health --quiet
+  expect_rc 1
+  expect_no_out '.'
+  # --quiet is local: forwarding it would silence the very output the
+  # problem lines are read from
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl health$' 1
+  expect_no_log 'runnerctl health.*--quiet'
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet health --quiet
+  expect_rc 0
+  expect_no_out '.'
+}
+
+case_fleet_health_unknown_option_dies() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet health --bogus
+  expect_rc 1
+  expect_err 'unknown option: --bogus'
+  expect_no_log '^probe:ssh_run '
+  # a bad value fails once, before anything is dialled
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet health --max-restarts nope
+  expect_rc 1
+  expect_err "--max-restarts value 'nope' is invalid"
+  expect_no_log '^probe:ssh_run '
+}
+
 case_fleet_unknown_subcommand_dies() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet bogus
   expect_rc 1
@@ -2871,6 +2941,12 @@ t "fleet status: timeout, remote error and unreachable stay distinct"  case_flee
 t "fleet status: a version mismatch adds the skew note, level does not" case_fleet_status_version_skew_note
 t "fleet status --json: each host's payload nested unchanged"          case_fleet_status_json_nests_each_payload_unchanged
 t "fleet status --json: exit 0 with no object is an explained error"   case_fleet_status_json_rejects_a_non_object_payload
+t "fleet health: all healthy is one summary line, exit 0"              case_fleet_health_all_healthy_is_one_line_exit_zero
+t "fleet health: a problem keeps its wording and gains its host"       case_fleet_health_problem_is_attributed_to_its_host
+t "fleet health: an unreachable host is a problem, never a pass"       case_fleet_health_unreachable_host_is_a_problem_never_a_silent_pass
+t "fleet health: a remote die with empty stdout is still a problem"    case_fleet_health_remote_die_with_empty_stdout_is_still_a_problem
+t "fleet health --quiet: silent, exit code kept, not forwarded"        case_fleet_health_quiet_keeps_the_exit_code
+t "fleet health: unknown option and bad value die before dialling"     case_fleet_health_unknown_option_dies
 t "fleet: an unconfigured fleet says so and dials nothing"             case_fleet_unconfigured_says_so
 t "fleet bogus: unknown subcommand dies, dials nothing"                case_fleet_unknown_subcommand_dies
 
