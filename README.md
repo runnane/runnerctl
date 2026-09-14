@@ -10,6 +10,10 @@ a role **profile** — memory caps, restart policy, an on-device
 unit files are never hand-edited and the settings survive a runner reinstall.
 It also reports what each slot is doing and scales the active pool up or down.
 
+On a host that has no runners yet, [`provision`](#provisioning-runners) is what
+creates those services in the first place — it installs and registers the
+runners with GitHub, then the rest of the tool manages them.
+
 Nothing site-specific is in the script: hostnames, memory sizes for your boxes,
 secret-file paths and templates live in an optional config file on each host.
 
@@ -57,11 +61,86 @@ for anything that writes under `/etc` or talks to `systemctl` (or run it as
 root). Only `install` works when the script is read from a pipe; every other
 command needs it installed.
 
+## Provisioning runners
+
+`install` installs **this script**. Nothing it does creates a runner — so on a
+fresh box every other command used to stop at:
+
+```
+runnerctl: no 'actions.runner.*.service' units found on this host.
+```
+
+`provision N` is the step that was missing. It brings the host up to `N` runner
+slots and hands over to `scale`/`apply`:
+
+```sh
+# A new CI box: two runners registered to an org, then capped and started
+sudo runnerctl provision 2 --url https://github.com/your-org
+sudo runnerctl scale 2 --max 26G --high 25G
+```
+
+What it does, per slot: fetches the [actions/runner](https://github.com/actions/runner)
+release, **verifies the SHA-256 GitHub publishes with it**, unpacks a copy into
+`/opt/actions-runner/<prefix>-<n>`, registers it with the runner's own
+`config.sh --unattended`, and lets the runner's own `svc.sh install` write the
+systemd unit. runnerctl never writes a unit file itself — the result is exactly
+the units the rest of this tool already manages through drop-ins.
+
+It is **idempotent against a target count**, like `scale`. `provision 4` on a
+host with 2 slots adds two and leaves the existing ones untouched; `provision 2`
+on a host with 4 changes nothing. It never deregisters a runner: removing one
+from GitHub needs a removal token and is not automated.
+
+### Credentials
+
+The registration token can come from any of three places, checked in this order:
+
+| how | when to use it |
+| --- | --- |
+| `--token <token>` | the token from **Settings → Actions → Runners → New self-hosted runner**. Valid one hour, registers any number of runners. Nothing long-lived touches the host. |
+| `--pat <token>` or `$GITHUB_TOKEN` | a PAT that mints the registration token over the API. A classic PAT needs `repo` for a repo runner, `admin:org` for an org one. |
+| the `gh` CLI | if `gh` is already logged in on the box, no flag at all. |
+
+The PAT is handed to `curl` on **stdin**, through its own config format, so it
+never appears in `/proc/<pid>/cmdline`. The *registration* token is passed to
+`config.sh` as a command-line argument — that is GitHub's own documented
+install, and it means the token is briefly visible in `ps` to other users on
+the box. runnerctl itself never prints or stores it.
+
+### Options worth knowing
+
+- `--dry-run` — reads the release metadata and prints every step, changing
+  nothing and needing no credentials.
+- `--runner-version X.Y.Z` — pin the runner release; the default is the latest.
+- `--sha256 SUM` / `--no-verify-checksum` — pin the digest by hand, or (last
+  resort) install without one. A release whose checksum cannot be found is
+  **refused** rather than trusted.
+- `--labels a,b` — extra labels on top of the ones the runner sets for itself.
+- `--name-prefix P` — runner names are `<prefix>-<n>`; the default prefix is the
+  host's short name.
+- `--runner-user U` / `--runner-root DIR` — the account the runners run as
+  (default `github-runner`, created as a system user when missing) and where
+  they live (default `/opt/actions-runner`). `config.sh` refuses to run as
+  root, so the runner never does.
+- `--url` — the org, repo or enterprise to register against. Set `RUNNER_URL`
+  in the config file to stop repeating it on a host.
+
+`runnerctl provision --help` lists all of them, and `runnerctl config-example`
+shows the config-file defaults for every value except the credentials.
+
+Provisioning is deliberately **excluded from `fleet`**: fanning it out would
+copy a registration token to every host, and each host needs its own runner
+names. Run it per host.
+
 ## Usage
 
 ```
 runnerctl [--config PATH] <command> [args]
 
+runnerctl provision N [--url URL] [--token TOK | --pat TOK] [--labels a,b] \
+                      [--name-prefix P] [--runner-user U] [--runner-root DIR] \
+                      [--runner-version X.Y.Z] [--sha256 SUM] [--replace] \
+                      [--dry-run]
 runnerctl status [--json] [--watch|-w] [--interval N] [--once] \
                  [--color auto|always|never] [--stall-after N]
 runnerctl watch  [--interval N] [--color auto|always|never] [--stall-after N]

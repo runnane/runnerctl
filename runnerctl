@@ -25,6 +25,10 @@
 # Usage:
 #   runnerctl [--config PATH] <command> [args]
 #
+#   runnerctl provision N [--url URL] [--token TOK | --pat TOK] [--labels a,b] \
+#                         [--name-prefix P] [--runner-user U] [--runner-root DIR] \
+#                         [--runner-version X.Y.Z] [--sha256 SUM] [--replace] \
+#                         [--dry-run]     ('provision --help' for all of them)
 #   runnerctl status [--json] [--watch|-w] [--interval N] [--once] \
 #                    [--color auto|always|never] [--stall-after N]
 #   runnerctl watch  [--interval N] [--color auto|always|never] [--stall-after N]
@@ -201,7 +205,25 @@
 # on the commands it cannot help rather than quietly ignored. Both walk one
 # SLOT per call, since a per-host call would take a whole host out in a step.
 #
+# `provision N` (GHR-45) is what makes the units exist in the first place. On
+# a box with no runners every other command used to dead-end in "no
+# 'actions.runner.*.service' units found" — `install` installs THIS SCRIPT,
+# and nothing installed a runner. provision fetches GitHub's runner release
+# (verifying the SHA-256 published with it), unpacks one copy per slot under
+# RUNNER_ROOT, registers each with the runner's own `config.sh` and lets the
+# runner's own `svc.sh` write the unit — so the result is exactly the units
+# the rest of this tool manages, never a unit file written by hand. It is
+# idempotent against a target count like `scale`: `provision 4` on a host
+# with 2 adds two, `provision 2` on a host with 4 changes nothing, and it
+# never deregisters anything. The registration token comes from --token (the
+# one GitHub's "New self-hosted runner" page shows), from --pat/$GITHUB_TOKEN,
+# or from the gh CLI's existing login; one token registers every slot in the
+# run. Note that `config.sh` takes the token as a command-line argument — as
+# it does in GitHub's own documented install — so it is briefly visible in
+# `ps` to other users on the box; runnerctl itself never prints or stores it.
+#
 # Recommended baselines:
+#   New host:     runnerctl provision 2 --url https://github.com/<org>
 #   CI host:      runnerctl scale 2 --max 26G --high 25G
 #   Live view:    runnerctl watch --interval 5
 #   Deploy box:   runnerctl env-init --profile deploy   # then fill secrets
@@ -267,6 +289,39 @@ FLEET_TIMEOUT="30"
 # path where it is not on the ssh user's PATH.
 FLEET_RUNNERCTL="runnerctl"
 
+# Provisioning (GHR-45): where `provision` puts a runner and who it runs as.
+# RUNNER_URL is the only one that is genuinely site data (the org or repo the
+# runners register against) — it stays empty here and is set per host in the
+# config file or passed as --url, because this repo is public.
+RUNNER_URL=""
+# One directory per slot is created under this root: $RUNNER_ROOT/<prefix>-<n>.
+RUNNER_ROOT="/opt/actions-runner"
+# The unprivileged account the runner runs as. `config.sh` refuses to run as
+# root, and a job that can write outside its own work dir is a job that can
+# rewrite the runner — so provision creates this as a system user when it is
+# missing rather than defaulting to the invoking one.
+RUNNER_USER="github-runner"
+RUNNER_GROUP=""   # empty = same name as RUNNER_USER
+# Runner names are <prefix>-<n>, and the prefix defaults to the host's short
+# name so one org's runner list stays readable across boxes. The unit GitHub
+# installs is then actions.runner.<scope>.<prefix>-<n>.service.
+RUNNER_NAME_PREFIX=""
+# Extra labels, comma-separated, appended to the ones the runner sets for
+# itself (self-hosted, the OS and the architecture). Empty = no extra labels.
+RUNNER_LABELS=""
+# The runner's _work directory, relative to the runner's own directory.
+RUNNER_WORK="_work"
+# Runner group to register into (GitHub org/enterprise runner groups). Empty
+# = the account's default group, which is what a repo-scoped runner must use.
+RUNNER_GROUP_NAME=""
+# Empty = ask the releases API for the latest. Pin a version here (or with
+# --runner-version) on a host that must not move.
+RUNNER_VERSION=""
+# Where the runner tarball and the release metadata come from. Overridable
+# for a mirror or GitHub Enterprise Server.
+RUNNER_API_URL="https://api.github.com"
+RUNNER_DOWNLOAD_URL="https://github.com/actions/runner/releases/download"
+
 # Profile-provided config (populated by load_profile; flags override).
 PROFILE=""
 PROFILE_DESC=""
@@ -318,6 +373,15 @@ load_config() {
   [[ "$FLEET_PARALLEL" =~ ^[1-9][0-9]*$ ]] || die "FLEET_PARALLEL '$FLEET_PARALLEL' set in $CONFIG_FILE is invalid — want a whole number of hosts, 1 or more"
   [[ "$FLEET_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "FLEET_TIMEOUT '$FLEET_TIMEOUT' set in $CONFIG_FILE is invalid — want a whole number of seconds, 1 or more"
   [ -n "$FLEET_RUNNERCTL" ] || die "FLEET_RUNNERCTL set in $CONFIG_FILE is empty — want the remote command name or an absolute path"
+  # Provisioning settings (GHR-45). Checked here so a typo fails before a
+  # download, a useradd or a registration — not half way through slot 3.
+  [[ "$RUNNER_ROOT" == /* ]] || die "RUNNER_ROOT '$RUNNER_ROOT' set in $CONFIG_FILE is invalid — want an absolute path"
+  valid_user_name "$RUNNER_USER" || die "RUNNER_USER '$RUNNER_USER' set in $CONFIG_FILE is invalid — want a POSIX user name"
+  [ -z "$RUNNER_GROUP" ] || valid_user_name "$RUNNER_GROUP" || die "RUNNER_GROUP '$RUNNER_GROUP' set in $CONFIG_FILE is invalid — want a POSIX group name"
+  [ -z "$RUNNER_NAME_PREFIX" ] || valid_runner_name "$RUNNER_NAME_PREFIX" || die "RUNNER_NAME_PREFIX '$RUNNER_NAME_PREFIX' set in $CONFIG_FILE is invalid — want letters, digits, dot, dash or underscore"
+  [ -z "$RUNNER_VERSION" ] || valid_runner_version "$RUNNER_VERSION" || die "RUNNER_VERSION '$RUNNER_VERSION' set in $CONFIG_FILE is invalid — want X.Y.Z"
+  [[ "$RUNNER_WORK" != /* && -n "$RUNNER_WORK" ]] || die "RUNNER_WORK '$RUNNER_WORK' set in $CONFIG_FILE is invalid — want a path relative to the runner's own directory"
+  [ -z "$RUNNER_URL" ] || valid_runner_url "$RUNNER_URL" || die "RUNNER_URL '$RUNNER_URL' set in $CONFIG_FILE is invalid — want https://github.com/<org>[/<repo>] or an enterprise URL"
 }
 
 # Built-in profiles. Site-specific values belong in the config file; these are
@@ -435,8 +499,12 @@ discover() {
   systemctl list-unit-files --no-legend "$UNIT_GLOB" 2>/dev/null | awk '{print $1}' | sort -V
 }
 
+# A host with no runner units is the normal state of a NEW box, not a broken
+# one, so the refusal names the command that fixes it (GHR-45) instead of
+# leaving the reader to find out that `install` installs this script and
+# nothing here installs a runner.
 require_runners() {
-  [ -n "$(discover)" ] || die "no '$UNIT_GLOB' units found on this host."
+  [ -n "$(discover)" ] || die "no '$UNIT_GLOB' units found on this host. This box has no runners yet — 'runnerctl provision N --url https://github.com/<org>' installs and registers them; 'runnerctl provision --help' lists the options."
 }
 
 prop() { systemctl show "$1" -p "$2" --value 2>/dev/null; }
@@ -2778,6 +2846,12 @@ cmd_fleet() {
     # per-host. Saying which of the three it is beats "unknown command".
     env-init)
              die "fleet env-init is not supported and will not be: it writes an EnvironmentFile of secrets, which fanning out means copying secrets over ssh. Run 'runnerctl env-init' on each host." ;;
+    # provision is excluded for env-init's reason plus one of its own: it
+    # takes a registration token, so fanning it out pushes a credential over
+    # ssh to every host — and each host needs its own runner names, which a
+    # single fleet-wide command cannot supply.
+    provision)
+             die "fleet provision is not supported: it takes a registration token (fanning it out copies a credential to every host) and each host needs its own runner names. Run 'runnerctl provision N' on each host." ;;
     watch|logs)
              die "fleet $sub is not supported: $sub is $([ "$sub" = watch ] && echo interactive || echo streaming) and only makes sense against one host. Use 'runnerctl fleet status' for an overview, or ssh to the host." ;;
     *)       die "unknown fleet command '$sub' (status health upgrade apply scale start stop restart drain kill reap remove-limits enable disable)" ;;
@@ -3293,6 +3367,403 @@ cmd_profiles() {
   echo "* = default profile"
 }
 
+# --- Provisioning: making the runner units exist (GHR-45) --------------------
+# Everything above this point manages runners that are ALREADY registered, and
+# `install` installs THIS SCRIPT — so on a new box every command dead-ended in
+# require_runners' refusal and the first step was an undocumented manual loop.
+# `provision N` closes that gap: it fetches GitHub's runner release, unpacks a
+# copy per slot under $RUNNER_ROOT, registers each with the runner's own
+# `config.sh` and lets the runner's own `svc.sh` write the systemd unit. The
+# units are therefore exactly the ones the rest of this tool already knows how
+# to manage through drop-ins — provision never writes a unit file itself.
+#
+# It is idempotent against a TARGET COUNT, like `scale`: slots that exist are
+# left alone, so `provision 4` on a host with 2 adds two and `provision 2` on
+# a host with 4 changes nothing. It never removes a runner: deregistering
+# needs a removal token from GitHub and is GHR-46.
+
+valid_user_name() { [[ "$1" =~ ^[a-z_][a-z0-9_-]*$ ]]; }
+valid_runner_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
+valid_runner_version() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+valid_runner_url() { [[ "$1" =~ ^https?://[^/]+/[^/]+(/[^/]+)?/?$ ]]; }
+
+# uname -m -> the architecture in GitHub's runner asset names. Refusing here
+# beats a 404 on a download URL built from a name GitHub never published.
+runner_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)       echo x64 ;;
+    aarch64|arm64)      echo arm64 ;;
+    armv7l|armv7l*|armhf) echo arm ;;
+    *) die "unsupported architecture '$(uname -m)' — GitHub publishes Linux runners for x86_64, aarch64 and armv7l only" ;;
+  esac
+}
+
+# The URL decides which API path mints a token and what GitHub calls the
+# scope. Prints "<kind> <api-path>", e.g. "org orgs/acme".
+runner_scope() { # URL
+  local u="${1%/}" rest
+  [[ "$u" =~ ^https?://[^/]+/(.+)$ ]] || die "--url '$1' is not a GitHub URL — want https://github.com/<org>, .../<org>/<repo>, or .../enterprises/<slug>"
+  rest="${BASH_REMATCH[1]}"
+  case "$rest" in
+    enterprises/*/*) die "--url '$1' has too many path segments for an enterprise — want .../enterprises/<slug>" ;;
+    enterprises/*)   echo "enterprise enterprises/${rest#enterprises/}" ;;
+    */*/*)           die "--url '$1' has too many path segments — want <org> or <org>/<repo>" ;;
+    */*)             echo "repo repos/$rest" ;;
+    *)               echo "org orgs/$rest" ;;
+  esac
+}
+
+# Every outbound HTTP call goes through here, so a config can stub the network
+# (tests/stub.config does) and so a PAT is handed to curl on STDIN through its
+# own config format rather than in argv — anything in argv is readable by any
+# user on the box through /proc/<pid>/cmdline. Prints the response body.
+http_api() { # METHOD URL [TOKEN]
+  local method="$1" url="$2" token="${3:-}" cfg=""
+  command -v curl >/dev/null || die "curl is required to talk to $url"
+  [ -z "$token" ] || cfg="header = \"Authorization: Bearer $token\""
+  printf '%s\n' "$cfg" | curl -fsSL --max-time 30 -K - -X "$method" \
+    -H "Accept: application/vnd.github+json" \
+    -H "X-GitHub-Api-Version: 2022-11-28" \
+    "$url"
+}
+
+# First string value of NAME in the JSON on stdin. The API's objects put one
+# field per line, which is all this needs — and all it promises: it is for
+# pulling a known scalar out of a known response, not for parsing JSON.
+json_field() { # NAME
+  sed -n 's/.*"'"$1"'"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
+}
+
+# The published SHA-256 of one release asset, from the release JSON in FILE.
+# Two sources, in this order (both probed against the live API 2026-09-14, and
+# they agreed on the same digest for actions-runner-linux-x64-2.337.0):
+#   assets[].digest — "sha256:<hex>", structured metadata, what GitHub
+#                     publishes today and the one to trust;
+#   the release body — <!-- BEGIN SHA linux-x64 --><hex><!-- END ... -->, the
+#                     long-standing marker and the only one on releases that
+#                     predate the digest field.
+# Empty output means neither was there, which the caller refuses on rather
+# than unpacking a tarball it cannot vouch for.
+runner_release_sha() { # RELEASE-JSON-FILE ASSET-NAME ARCH
+  local json="$1" asset="$2" arch="$3" sha
+  sha="$(awk -v n="\"$asset\"" '
+      index($0, "\"name\"") && index($0, n) { seen = 1; next }
+      seen && index($0, "\"digest\"") {
+        if (match($0, /sha256:[0-9a-f]+/)) print substr($0, RSTART + 7, RLENGTH - 7)
+        exit
+      }' "$json")"
+  if [ -z "$sha" ]; then
+    sha="$(grep -o "BEGIN SHA linux-$arch -->[0-9a-f]\{64\}" "$json" 2>/dev/null | head -1 | grep -o '[0-9a-f]\{64\}' || true)"
+  fi
+  printf '%s' "$sha"
+}
+
+# Download URL -> DEST. Separate from http_api because it is a large binary
+# body with a much longer budget, and because a config stubs this one alone.
+runner_fetch_tarball() { # URL DEST
+  command -v curl >/dev/null || die "curl is required to download $1"
+  curl -fsSL --max-time 600 "$1" -o "$2" || die "download failed: $1"
+}
+
+runner_sha256() { # FILE
+  command -v sha256sum >/dev/null || die "sha256sum is required to verify the runner tarball (pass --no-verify-checksum to skip, at your own risk)"
+  sha256sum "$1" | awk '{print $1}'
+}
+
+# Run CMD... from DIR as USER. GitHub's config.sh and svc.sh source ./env.sh
+# relative to the WORKING DIRECTORY, so they only work from the runner's own
+# directory, and `runuser` has no --chdir of its own (probed, util-linux on
+# the dev box) — hence the explicit cd in the shell it starts. Goes through
+# run_priv like every other host mutation, so the harness sees it.
+runner_exec() { # DIR USER CMD...
+  local dir="$1" user="$2"; shift 2
+  local as=()
+  # run_priv is already root, so becoming root again through runuser would be
+  # a dependency and a log line for nothing. Only dropping privilege needs it.
+  [ "$user" = root ] || as=(runuser -u "$user" --)
+  # SC2016 is the point: the $1/$@ below belong to the inner bash, which gets
+  # the directory and the command as its own arguments rather than having them
+  # pasted into a string this shell expanded.
+  # shellcheck disable=SC2016
+  run_priv ${as+"${as[@]}"} bash -c 'cd "$1" || exit 1; shift; exec "$@"' runnerctl "$dir" "$@"
+}
+
+# The three questions provision asks the host about accounts and tooling,
+# each its own function so a config can answer them without the test box's
+# own /etc/passwd or $PATH deciding what the fixture sees.
+runner_user_exists() { id -u "$1" >/dev/null 2>&1; }
+runner_group_exists() { getent group "$1" >/dev/null 2>&1; }
+runner_have_gh() { command -v gh >/dev/null 2>&1; }
+
+# The account the runner runs as. config.sh REFUSES to run as root, and a job
+# that can write outside its own tree can rewrite the runner, so a dedicated
+# unprivileged user is the default rather than the invoking one.
+ensure_runner_user() { # USER GROUP DRY-RUN
+  local user="$1" group="$2" dry="$3"
+  if runner_user_exists "$user"; then
+    echo "  user:    $user (exists)"
+    return 0
+  fi
+  if $dry; then
+    echo "  user:    $user (would be created as a system user)"
+    return 0
+  fi
+  if [ -n "$group" ] && ! runner_group_exists "$group"; then
+    run_priv groupadd --system "$group" || die "could not create group '$group'"
+  fi
+  local gopt=()
+  [ -z "$group" ] || gopt=(-g "$group")
+  # A real shell, not nologin: job steps run through it, and an operator
+  # debugging a slot needs to be able to become this user.
+  run_priv useradd --system --create-home --shell /bin/bash \
+    --comment "GitHub Actions runner (runnerctl)" ${gopt+"${gopt[@]}"} "$user" \
+    || die "could not create user '$user'"
+  echo "  user:    $user (created)"
+}
+
+# A registration token, however the operator supplied the credentials. GitHub
+# registration tokens last an hour and register any number of runners, so one
+# is minted per RUN, not per slot.
+runner_registration_token() { # API-PATH PAT
+  local path="$1" pat="$2" body tok
+  if [ -n "$pat" ]; then
+    body="$(http_api POST "$RUNNER_API_URL/$path/actions/runners/registration-token" "$pat")" \
+      || die "could not mint a registration token for $path — check the token's scope (a classic PAT needs 'repo' for a repo runner, 'admin:org' for an org one) and that it has not expired"
+    tok="$(printf '%s' "$body" | json_field token)"
+    [ -n "$tok" ] || die "the registration-token response for $path carried no token"
+    printf '%s' "$tok"
+    return 0
+  fi
+  # gh already holds a login on plenty of boxes; --jq keeps the token off argv.
+  runner_have_gh || die "no registration token: pass --token <token from GitHub>, or --pat/\$GITHUB_TOKEN, or log in with the gh CLI"
+  tok="$(gh api --method POST "$path/actions/runners/registration-token" --jq .token 2>/dev/null)" \
+    || die "gh could not mint a registration token for $path — 'gh auth status' to check the login, or pass --token/--pat"
+  [ -n "$tok" ] || die "gh returned no token for $path"
+  printf '%s' "$tok"
+}
+
+provision_usage() {
+  cat <<'PROVISION'
+Usage: runnerctl provision N [options]
+
+Installs and registers runner slots until this host has N of them, then hands
+over to `scale`/`apply`. Existing slots are left alone; nothing is ever
+deregistered (removing a runner from GitHub needs a removal token — GHR-46).
+
+  --url URL              org, repo or enterprise to register against, e.g.
+                         https://github.com/acme or https://github.com/acme/app
+                         (default: RUNNER_URL from the config file)
+  --token TOKEN          a registration token from GitHub (Settings -> Actions
+                         -> Runners -> New self-hosted runner). Valid 1 hour,
+                         registers any number of runners.
+  --pat TOKEN            a PAT to mint the registration token with, instead of
+                         pasting one. Defaults to $GITHUB_TOKEN; with neither,
+                         the gh CLI's login is used if it is present.
+  --labels a,b           extra labels, on top of the ones the runner sets for
+                         itself (self-hosted, OS, architecture)
+  --runner-group NAME    GitHub runner group to register into (org/enterprise)
+  --name-prefix NAME     runner names are <prefix>-<n> (default: the host's
+                         short name)
+  --runner-user USER     account the runners run as (default: github-runner,
+                         created as a system user when missing)
+  --runner-root DIR      one directory per slot under here (default:
+                         /opt/actions-runner)
+  --runner-version X.Y.Z pin the runner release (default: the latest)
+  --sha256 SUM           expected SHA-256 of the tarball, instead of the one
+                         published with the release
+  --no-verify-checksum   install even when no published checksum can be found
+  --work DIR             the runner's _work directory, relative to its own
+  --replace              re-register a runner name GitHub already knows
+  --dry-run              print what would happen; download and change nothing
+
+Every value above except --token/--pat has a config-file default — see
+`runnerctl config-example`.
+PROVISION
+}
+
+cmd_provision() {
+  local n="" url="$RUNNER_URL" token="" pat="${GITHUB_TOKEN:-}" labels="$RUNNER_LABELS"
+  local root="$RUNNER_ROOT" user="$RUNNER_USER" group="$RUNNER_GROUP"
+  local prefix="$RUNNER_NAME_PREFIX" version="$RUNNER_VERSION" work="$RUNNER_WORK"
+  local rgroup="$RUNNER_GROUP_NAME" sha_pin="" verify=true dry_run=false replace=false
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)            provision_usage; return 0 ;;
+      --url)                need_val "$@"; url="$2"; shift 2 ;;
+      --token)              need_val "$@"; token="$2"; shift 2 ;;
+      --pat)                need_val "$@"; pat="$2"; shift 2 ;;
+      --labels)             need_val "$@"; labels="$2"; shift 2 ;;
+      --runner-group)       need_val "$@"; rgroup="$2"; shift 2 ;;
+      --name-prefix)        need_val "$@"; prefix="$2"; shift 2 ;;
+      --runner-user)        need_val "$@"; user="$2"; shift 2 ;;
+      --runner-root)        need_val "$@"; root="${2%/}"; shift 2 ;;
+      --runner-version)     need_val "$@"; version="$2"; shift 2 ;;
+      --sha256)             need_val "$@"; sha_pin="$2"; shift 2 ;;
+      --no-verify-checksum) verify=false; shift ;;
+      --work)               need_val "$@"; work="$2"; shift 2 ;;
+      --replace)            replace=true; shift ;;
+      --dry-run)            dry_run=true; shift ;;
+      -*)                   die "unknown option: $1 ('runnerctl provision --help' lists them)" ;;
+      *)                    [ -z "$n" ] || die "unexpected argument: $1"; n="$1"; shift ;;
+    esac
+  done
+
+  [ -n "$n" ] || die "provision needs N, e.g. 'provision 2 --url https://github.com/<org>'"
+  [[ "$n" =~ ^[0-9]+$ ]] || die "N must be an integer"
+  # An upper bound because this registers real runners with GitHub: a slipped
+  # digit should not be 400 registrations that then have to be removed by hand.
+  { [ "$n" -ge 1 ] && [ "$n" -le 64 ]; } || die "N must be 1..64"
+  [[ "$work" != /* && -n "$work" ]] || die "--work '$work' is invalid — want a path relative to the runner's own directory"
+  [ -z "$sha_pin" ] || [[ "$sha_pin" =~ ^[0-9a-f]{64}$ ]] || die "--sha256 '$sha_pin' is invalid — want 64 lowercase hex characters"
+  valid_user_name "$user" || die "--runner-user '$user' is invalid — want a POSIX user name"
+  [[ "$root" == /* ]] || die "--runner-root '$root' is invalid — want an absolute path"
+  [ -z "$version" ] || valid_runner_version "$version" || die "--runner-version '$version' is invalid — want X.Y.Z"
+
+  local have; have="$(discover | wc -l)"
+  echo "Host has $have runner slot(s); target $n."
+  if [ "$have" -ge "$n" ]; then
+    echo "Nothing to provision. ('scale' enables and disables the slots that exist;"
+    echo "removing one from GitHub is not automated — see the note in 'scale'.)"
+    return 0
+  fi
+  local want=$((n - have))
+
+  [ -n "$url" ] || die "no --url and no RUNNER_URL in $CONFIG_FILE — provision needs to know what to register against, e.g. --url https://github.com/<org>"
+  valid_runner_url "$url" || die "--url '$url' is invalid — want https://github.com/<org>, .../<org>/<repo> or .../enterprises/<slug>"
+  read -r scope_kind scope_path <<<"$(runner_scope "$url")"
+  [ -z "$prefix" ] && prefix="$(hostname -s 2>/dev/null || hostname)"
+  valid_runner_name "$prefix" || die "runner name prefix '$prefix' is invalid — want letters, digits, dot, dash or underscore (pass --name-prefix)"
+  [ -n "$group" ] || group="$user"
+
+  local arch; arch="$(runner_arch)"
+  echo "  scope:   $scope_kind — $url"
+  echo "  names:   $prefix-<n>, arch $arch"
+
+  # Which indexes to create: the first `want` that are not already a unit or a
+  # directory, so a re-run after a half-finished one does not collide.
+  mapfile -t units < <(discover)
+  local existing_units=" ${units[*]} "
+  local -a slots=() ; local i=1
+  while [ "${#slots[@]}" -lt "$want" ] && [ "$i" -le 200 ]; do
+    local name="$prefix-$i" dir="$root/$prefix-$i"
+    if [[ "$existing_units" == *".$name.service "* ]] || { [ -e "$dir" ] && ! $replace; }; then
+      i=$((i + 1)); continue
+    fi
+    slots+=("$i"); i=$((i + 1))
+  done
+  [ "${#slots[@]}" -eq "$want" ] || die "could not find $want free runner name(s) under prefix '$prefix' — pass --name-prefix, or --replace to reuse an existing directory"
+  echo "  new:     $want slot(s) — ${slots[*]/#/$prefix-}"
+
+  # Resolve the release before touching the host, so a bad version or an
+  # unreachable API fails with nothing half-created.
+  local release_json="" asset sha_want=""
+  RELEASE_TMP=""
+  if [ -z "$version" ]; then
+    release_json="$RUNNER_API_URL/repos/actions/runner/releases/latest"
+  else
+    release_json="$RUNNER_API_URL/repos/actions/runner/releases/tags/v$version"
+  fi
+  if $dry_run && [ -n "$version" ] && ! $verify; then
+    : # nothing to ask the API for
+  else
+    RELEASE_TMP="$(mktemp)"
+    trap 'rm -f "$RELEASE_TMP"' EXIT
+    http_api GET "$release_json" "$pat" >"$RELEASE_TMP" \
+      || die "could not read the runner release metadata from $release_json${version:+ (is v$version a real actions/runner release?)} — pass --runner-version and --sha256 to work offline"
+    [ -n "$version" ] || version="$(json_field tag_name <"$RELEASE_TMP")"
+    version="${version#v}"
+    valid_runner_version "$version" || die "the release metadata carried no usable version (got '$version') — pass --runner-version X.Y.Z"
+  fi
+  asset="actions-runner-linux-$arch-$version.tar.gz"
+  local tarball_url="$RUNNER_DOWNLOAD_URL/v$version/$asset"
+  echo "  release: $version ($asset)"
+
+  if [ -n "$sha_pin" ]; then
+    sha_want="$sha_pin"
+  elif [ -n "$RELEASE_TMP" ]; then
+    sha_want="$(runner_release_sha "$RELEASE_TMP" "$asset" "$arch")"
+  fi
+  if [ -z "$sha_want" ]; then
+    $verify && die "no published SHA-256 found for $asset — pass --sha256 <hex>, or --no-verify-checksum to install without verifying"
+    echo "  sha256:  NOT VERIFIED (--no-verify-checksum)"
+  else
+    echo "  sha256:  ${sha_want:0:12}… (from the release metadata)"
+  fi
+
+  if $dry_run; then
+    echo
+    echo "(dry run — nothing downloaded, nothing changed)"
+    echo "would download: $tarball_url"
+    echo "would create:   $user (if missing), $root/$prefix-<n> for n in ${slots[*]}"
+    local s
+    for s in "${slots[@]}"; do
+      echo "would register: $prefix-$s via config.sh --unattended --url $url --token *** --name $prefix-$s${labels:+ --labels $labels}${rgroup:+ --runnergroup $rgroup}"
+      echo "would install:  svc.sh install $user   (in $root/$prefix-$s)"
+    done
+    return 0
+  fi
+
+  # Only now, with everything resolved, is a credential needed — a dry run and
+  # every refusal above get there without one.
+  [ -n "$token" ] || token="$(runner_registration_token "$scope_path" "$pat")"
+
+  ensure_runner_user "$user" "$group" false
+  run_priv mkdir -p "$root"
+
+  echo "Downloading $asset…"
+  # Its own name, not cmd_install's DOWNLOAD_TMP: that one is a file and this
+  # one a directory, and the two traps would disagree about how to clean up.
+  PROVISION_TMP="$(mktemp -d)"
+  trap 'rm -rf "$PROVISION_TMP"; rm -f "$RELEASE_TMP"' EXIT
+  local tarball="$PROVISION_TMP/$asset"
+  runner_fetch_tarball "$tarball_url" "$tarball"
+  if [ -n "$sha_want" ]; then
+    local sha_got; sha_got="$(runner_sha256 "$tarball")"
+    [ "$sha_got" = "$sha_want" ] || die "checksum mismatch for $asset — expected $sha_want, got $sha_got. NOT installing."
+    echo "  checksum ok"
+  fi
+
+  local s name dir made=() failed=()
+  for s in "${slots[@]}"; do
+    name="$prefix-$s"; dir="$root/$name"
+    echo "[$name] unpacking into $dir"
+    run_priv mkdir -p "$dir"
+    run_priv tar -xzf "$tarball" -C "$dir" || { failed+=("$name"); echo "  [FAILED] unpack"; continue; }
+    run_priv chown -R "$user:$group" "$dir"
+    echo "[$name] registering with GitHub"
+    local cfg_args=(./config.sh --unattended --url "$url" --token "$token" --name "$name" --work "$work")
+    [ -z "$labels" ] || cfg_args+=(--labels "$labels")
+    [ -z "$rgroup" ] || cfg_args+=(--runnergroup "$rgroup")
+    $replace && cfg_args+=(--replace)
+    if ! runner_exec "$dir" "$user" "${cfg_args[@]}"; then
+      failed+=("$name"); echo "  [FAILED] config.sh — the directory is left in place for inspection"; continue
+    fi
+    echo "[$name] installing the service"
+    if ! runner_exec "$dir" root ./svc.sh install "$user"; then
+      failed+=("$name"); echo "  [FAILED] svc.sh install"; continue
+    fi
+    if ! runner_exec "$dir" root ./svc.sh start; then
+      failed+=("$name"); echo "  [FAILED] svc.sh start"; continue
+    fi
+    made+=("$name")
+    echo "  [ok] $name"
+  done
+
+  run_priv systemctl daemon-reload
+  echo
+  if [ "${#made[@]}" -gt 0 ]; then
+    echo "Provisioned ${#made[@]} runner(s): ${made[*]}"
+    echo "Next:"
+    echo "  runnerctl status                     # the new slots should be running"
+    echo "  runnerctl scale $n --max 26G --high 25G   # apply a profile and set the pool size"
+  fi
+  if [ "${#failed[@]}" -gt 0 ]; then
+    echo "runnerctl: provision: ${#failed[@]} slot(s) failed: ${failed[*]}" >&2
+    echo "runnerctl: their directories are left under $root for inspection; re-run provision once fixed." >&2
+    exit 1
+  fi
+}
+
 cmd_config_example() {
   cat <<'EXAMPLE'
 # runnerctl config — sourced as bash. Install as /etc/runnerctl/config
@@ -3343,6 +3814,44 @@ cmd_config_example() {
 # never killed by `kill` — everything else in the slot's cgroup is the job.
 # Narrower than RUNNER_OWN_PATTERN on purpose: Runner.Worker IS the job.
 #RUNNER_LISTENER_PATTERN='runsvc\.sh|RunnerService\.js|Runner\.Listener'
+
+# --- Provisioning -----------------------------------------------------------
+# `runnerctl provision N` installs and registers runner slots on a host that
+# has none (or tops an existing host up to N). Only RUNNER_URL is really site
+# data; the rest have defaults that work unchanged on most boxes.
+
+# The org, repo or enterprise the runners register against. Setting it here
+# means `provision N` needs no --url on this host.
+#RUNNER_URL="https://github.com/your-org"
+
+# One directory per slot is created under this root, as <prefix>-<n>.
+#RUNNER_ROOT="/opt/actions-runner"
+
+# The unprivileged account the runners run as, created as a system user when
+# it does not exist. config.sh refuses to run as root, so this is never root.
+#RUNNER_USER="github-runner"
+#RUNNER_GROUP=""          # empty = a group named after RUNNER_USER
+
+# Runner names are <prefix>-<n>; empty = the host's short name.
+#RUNNER_NAME_PREFIX=""
+
+# Extra labels (comma-separated) on top of the ones the runner sets itself.
+#RUNNER_LABELS="ci,linux"
+
+# The runner's _work directory, relative to the runner's own directory.
+#RUNNER_WORK="_work"
+
+# Runner group to register into. Empty = the account's default group, which
+# is the only valid choice for a repo-scoped runner.
+#RUNNER_GROUP_NAME=""
+
+# Empty = install the latest release. Pin it on a host that must not move.
+#RUNNER_VERSION=""
+
+# Where the release metadata and the tarball come from — change both for a
+# mirror or for GitHub Enterprise Server (e.g. https://ghes.example.com/api/v3).
+#RUNNER_API_URL="https://api.github.com"
+#RUNNER_DOWNLOAD_URL="https://github.com/actions/runner/releases/download"
 
 # --- Fleet mode -------------------------------------------------------------
 # `runnerctl fleet status` runs this tool from one central node against
@@ -3946,6 +4455,7 @@ main() {
   fi
   case "$cmd" in
     install)            cmd_install "$@" ;;
+    provision)          cmd_provision "$@" ;;
     status)             cmd_status "$@" ;;
     watch)              cmd_status --watch "$@" ;;
     apply)              cmd_apply "$@" ;;
@@ -3966,7 +4476,7 @@ main() {
     upgrade)            cmd_upgrade "$@" ;;
     version|--version)  echo "runnerctl $RUNNERCTL_VERSION" ;;
     -h|--help|help)     usage ;;
-    *) die "unknown command '$cmd' (status watch health fleet apply scale env-init start stop restart drain enable disable logs remove-limits reap kill profiles config-example migrate install upgrade version)" ;;
+    *) die "unknown command '$cmd' (status watch health fleet provision apply scale env-init start stop restart drain enable disable logs remove-limits reap kill profiles config-example migrate install upgrade version)" ;;
   esac
 }
 
