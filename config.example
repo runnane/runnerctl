@@ -47,6 +47,44 @@
 # Narrower than RUNNER_OWN_PATTERN on purpose: Runner.Worker IS the job.
 #RUNNER_LISTENER_PATTERN='runsvc\.sh|RunnerService\.js|Runner\.Listener'
 
+# --- Provisioning -----------------------------------------------------------
+# `runnerctl provision N` installs and registers runner slots on a host that
+# has none (or tops an existing host up to N). Only RUNNER_URL is really site
+# data; the rest have defaults that work unchanged on most boxes.
+
+# The org, repo or enterprise the runners register against. Setting it here
+# means `provision N` needs no --url on this host.
+#RUNNER_URL="https://github.com/your-org"
+
+# One directory per slot is created under this root, as <prefix>-<n>.
+#RUNNER_ROOT="/opt/actions-runner"
+
+# The unprivileged account the runners run as, created as a system user when
+# it does not exist. config.sh refuses to run as root, so this is never root.
+#RUNNER_USER="github-runner"
+#RUNNER_GROUP=""          # empty = a group named after RUNNER_USER
+
+# Runner names are <prefix>-<n>; empty = the host's short name.
+#RUNNER_NAME_PREFIX=""
+
+# Extra labels (comma-separated) on top of the ones the runner sets itself.
+#RUNNER_LABELS="ci,linux"
+
+# The runner's _work directory, relative to the runner's own directory.
+#RUNNER_WORK="_work"
+
+# Runner group to register into. Empty = the account's default group, which
+# is the only valid choice for a repo-scoped runner.
+#RUNNER_GROUP_NAME=""
+
+# Empty = install the latest release. Pin it on a host that must not move.
+#RUNNER_VERSION=""
+
+# Where the release metadata and the tarball come from — change both for a
+# mirror or for GitHub Enterprise Server (e.g. https://ghes.example.com/api/v3).
+#RUNNER_API_URL="https://api.github.com"
+#RUNNER_DOWNLOAD_URL="https://github.com/actions/runner/releases/download"
+
 # --- Fleet mode -------------------------------------------------------------
 # `runnerctl fleet status` runs this tool from one central node against
 # several runner hosts over ssh. Uncomment FLEET_HOSTS on the central node

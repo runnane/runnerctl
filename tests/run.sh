@@ -37,7 +37,7 @@
 #   expect_rc N                    exit code
 #   expect_out P / expect_no_out P some stdout line matches / none does
 #   expect_out_count P N           exactly N stdout lines match
-#   expect_err P                   some stderr line matches
+#   expect_err P / expect_no_err P some stderr line matches / none does
 #   expect_log P / expect_no_log P some privileged call matches / none does
 #   expect_log_count P N           exactly N privileged calls match
 #   expect_log_order P1 P2 ...     matches occur in this order (subsequence)
@@ -73,6 +73,11 @@ if locale -a 2>/dev/null | grep -qiE '^C\.utf-?8$'; then export LC_ALL=C.UTF-8; 
 # matching. The colour cases pass `--color always`, or `NO_COLOR=` (empty =
 # unset, per no-color.org) to exercise the auto decision.
 export NO_COLOR=1
+# `provision` falls back to $GITHUB_TOKEN as its PAT (GHR-45). A developer box
+# usually has one exported, which would silently authenticate the stubbed API
+# calls and make the "no credentials" cases pass for the wrong reason — so the
+# run decides, not the caller's environment. A case that wants one sets it.
+unset GITHUB_TOKEN
 RUNNERCTL="${RUNNERCTL:-./runnerctl}"
 STUB="tests/stub.config"
 
@@ -167,6 +172,14 @@ expect_out_count() {
 expect_err() {
   _expect
   grep -Eq -- "$1" <<<"$ERR" || FAILS+=("stderr has no line matching /$1/")
+}
+
+# The negative of expect_err. Added for GHR-45, where the claim under test is
+# that a credential reaches NEITHER stream — asserting only on stdout would
+# pass a version that printed the token in an error message.
+expect_no_err() {
+  _expect
+  ! grep -Eq -- "$1" <<<"$ERR" || FAILS+=("stderr has a line matching /$1/ and should not")
 }
 
 expect_log() {
@@ -2970,6 +2983,304 @@ case_fleet_unknown_subcommand_dies() {
   expect_no_log '^probe:ssh_run '
 }
 
+
+# --- GHR-45: provision ---------------------------------------------------------
+# The stub shadows the three network calls (tests/stub.config); everything else
+# provision does is a host mutation and so is already in the call log.
+PROV_URL="https://github.com/acme"
+PROV_TOKEN="STUB-REG-TOKEN-DO-NOT-PRINT"
+
+case_provision_fresh_host_installs_and_registers() {
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 2 --url "$PROV_URL" \
+    --name-prefix slot --token "$PROV_TOKEN" --labels ci,linux
+  expect_rc 0
+  expect_out '^Host has 0 runner slot\(s\); target 2\.$'
+  expect_out '^  scope:   org — https://github\.com/acme$'
+  expect_out '^  new:     2 slot\(s\) — slot-1 slot-2$'
+  expect_out '^  release: 2\.337\.0 \(actions-runner-linux-x64-2\.337\.0\.tar\.gz\)$'
+  expect_out '^Provisioned 2 runner\(s\): slot-1 slot-2$'
+  # The account is created before anything is unpacked into its directories.
+  expect_log '^useradd --system --create-home .* github-runner$'
+  # Per slot: unpack, own, register, install the unit, start it.
+  expect_log '^mkdir -p /opt/actions-runner/slot-1$'
+  expect_log '^tar -xzf .*/actions-runner-linux-x64-2\.337\.0\.tar\.gz -C /opt/actions-runner/slot-1$'
+  expect_log '^chown -R github-runner:github-runner /opt/actions-runner/slot-1$'
+  expect_log 'config\.sh --unattended --url https://github\.com/acme --token .* --name slot-1 --work _work --labels ci,linux$'
+  expect_log 'config\.sh --unattended --url https://github\.com/acme --token .* --name slot-2 --work _work --labels ci,linux$'
+  expect_log '/opt/actions-runner/slot-1 \./svc\.sh install github-runner$'
+  expect_log '/opt/actions-runner/slot-2 \./svc\.sh start$'
+  expect_log_order \
+    '^useradd ' \
+    '^mkdir -p /opt/actions-runner/slot-1$' \
+    'slot-1 \./config\.sh ' \
+    'slot-1 \./svc\.sh install ' \
+    'slot-1 \./svc\.sh start$' \
+    'slot-2 \./svc\.sh start$' \
+    '^systemctl daemon-reload$'
+  # config.sh must not run as root — it refuses to, and a root runner would let
+  # any job rewrite the runner. svc.sh install must, since it writes the unit.
+  expect_log '^runuser -u github-runner -- bash -c .* \./config\.sh '
+  expect_no_log '^runuser -u root '
+  # provision never writes a unit file itself: svc.sh owns that.
+  expect_no_file "/etc/systemd/system/actions.runner.example.slot-1.service"
+}
+
+case_provision_is_idempotent_against_the_target_count() {
+  # The stub host already has three slots.
+  run provision 3 --url "$PROV_URL" --token "$PROV_TOKEN"
+  expect_rc 0
+  expect_out '^Host has 3 runner slot\(s\); target 3\.$'
+  expect_out '^Nothing to provision\.'
+  expect_no_log '^(mkdir|tar|useradd|chown) '
+  expect_no_log 'config\.sh '
+  expect_no_log '^api: '
+  # Fewer than it has is equally a no-op: provision never deregisters.
+  run provision 1 --url "$PROV_URL" --token "$PROV_TOKEN"
+  expect_rc 0
+  expect_out '^Nothing to provision\.'
+  expect_no_log 'config\.sh '
+}
+
+case_provision_tops_an_existing_host_up() {
+  # 3 -> 5 adds exactly two, and skips the names the existing units hold.
+  run provision 5 --url "$PROV_URL" --name-prefix slot --token "$PROV_TOKEN"
+  expect_rc 0
+  expect_out '^  new:     2 slot\(s\) — slot-4 slot-5$'
+  expect_out '^Provisioned 2 runner\(s\): slot-4 slot-5$'
+  expect_log_count 'config\.sh --unattended ' 2
+  expect_log 'config\.sh .* --name slot-4 '
+  expect_log 'config\.sh .* --name slot-5 '
+  # The slots that already exist are never touched.
+  expect_no_log '/opt/actions-runner/slot-1'
+  expect_no_log '/opt/actions-runner/slot-2'
+  expect_no_log '/opt/actions-runner/slot-3'
+}
+
+case_provision_dry_run_changes_nothing() {
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 2 --url https://github.com/acme/app \
+    --name-prefix slot --token "$PROV_TOKEN" --dry-run
+  expect_rc 0
+  expect_out '^  scope:   repo — https://github\.com/acme/app$'
+  expect_out '^\(dry run — nothing downloaded, nothing changed\)$'
+  expect_out '^would download: https://github\.com/actions/runner/releases/download/v2\.337\.0/'
+  expect_out '^would register: slot-1 via config\.sh .* --token \*\*\* --name slot-1$'
+  expect_out '^would install:  svc\.sh install github-runner   \(in /opt/actions-runner/slot-1\)$'
+  # Reading the release metadata is allowed; changing the host is not.
+  expect_log '^api: GET .*/releases/latest'
+  expect_no_log '^fetch: '
+  expect_no_log '^(mkdir|tar|chown|useradd|groupadd|systemctl) '
+  expect_no_log 'config\.sh '
+  expect_no_log '^api: POST '
+}
+
+case_provision_verifies_the_published_checksum() {
+  # The tarball hashes to something other than what the release published.
+  RUNNERCTL_STUB_NO_UNITS=1 RUNNERCTL_STUB_TARBALL_SHA=deadbeef \
+    run provision 1 --url "$PROV_URL" --name-prefix slot --token "$PROV_TOKEN"
+  expect_rc 1
+  expect_err 'checksum mismatch for actions-runner-linux-x64-2\.337\.0\.tar\.gz'
+  expect_err 'NOT installing\.'
+  # Nothing was unpacked or registered from a tarball that failed the check.
+  expect_no_log '^tar '
+  expect_no_log 'config\.sh '
+  # A release with no published checksum is refused rather than trusted...
+  RUNNERCTL_STUB_NO_UNITS=1 RUNNERCTL_STUB_RELEASE_SHA='' \
+    run provision 1 --url "$PROV_URL" --name-prefix slot --token "$PROV_TOKEN"
+  expect_rc 1
+  expect_err 'no published SHA-256 found for actions-runner-linux-x64-2\.337\.0\.tar\.gz'
+  expect_no_log '^fetch: '
+  # ...unless the operator says so explicitly, or pins one by hand.
+  RUNNERCTL_STUB_NO_UNITS=1 RUNNERCTL_STUB_RELEASE_SHA='' \
+    run provision 1 --url "$PROV_URL" --name-prefix slot --token "$PROV_TOKEN" --no-verify-checksum
+  expect_rc 0
+  expect_out '^  sha256:  NOT VERIFIED \(--no-verify-checksum\)$'
+  expect_log 'config\.sh '
+}
+
+case_provision_sha256_pin_overrides_the_release() {
+  local pin=70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613
+  RUNNERCTL_STUB_NO_UNITS=1 RUNNERCTL_STUB_RELEASE_SHA='' \
+    run provision 1 --url "$PROV_URL" --name-prefix slot --token "$PROV_TOKEN" --sha256 "$pin"
+  expect_rc 0
+  expect_out '^  sha256:  70920811a4f8… \(from the release metadata\)$'
+  expect_log 'config\.sh '
+  # A pin that is not a SHA-256 is refused before anything is fetched.
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" --token "$PROV_TOKEN" --sha256 nope
+  expect_rc 1
+  expect_err "--sha256 'nope' is invalid"
+  expect_no_log '^fetch: '
+}
+
+case_provision_token_sources() {
+  # --token is used as given: no token is minted.
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" \
+    --name-prefix slot --token "$PROV_TOKEN"
+  expect_rc 0
+  expect_no_log '^api: POST .*registration-token'
+  # A PAT mints one, against the path the URL's scope decides.
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" \
+    --name-prefix slot --pat ghp_EXAMPLE_PAT
+  expect_rc 0
+  expect_log '^api: POST https://api\.github\.com/orgs/acme/actions/runners/registration-token \(authenticated\)$'
+  expect_log 'config\.sh .* --token STUB-REGISTRATION-TOKEN '
+  # $GITHUB_TOKEN is the same path without the flag.
+  RUNNERCTL_STUB_NO_UNITS=1 GITHUB_TOKEN=ghp_FROM_THE_ENV \
+    run provision 1 --url "$PROV_URL" --name-prefix slot
+  expect_rc 0
+  expect_log '^api: POST .*registration-token \(authenticated\)$'
+  # With no token, no PAT and no gh, the refusal names all three ways.
+  RUNNERCTL_STUB_NO_UNITS=1 RUNNERCTL_STUB_NO_GH=1 \
+    run provision 1 --url "$PROV_URL" --name-prefix slot
+  expect_rc 1
+  expect_err 'no registration token: pass --token .*, or --pat/.GITHUB_TOKEN, or log in with the gh CLI'
+  expect_no_log '^(mkdir|tar|useradd) '
+  expect_no_log 'config\.sh '
+}
+
+case_provision_never_prints_the_token() {
+  # config.sh takes the registration token in argv — that is GitHub's own
+  # documented install and is why the log carries it. What runnerctl controls
+  # is its OWN output, which must never carry it.
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" \
+    --name-prefix slot --token "$PROV_TOKEN"
+  expect_rc 0
+  expect_no_out "$PROV_TOKEN"
+  expect_no_err "$PROV_TOKEN"
+  # The PAT is stronger: it is passed to curl on stdin, so it reaches neither
+  # the output nor argv — the stub asserts the latter by not logging it.
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" \
+    --name-prefix slot --pat ghp_EXAMPLE_PAT
+  expect_rc 0
+  expect_no_out 'ghp_EXAMPLE_PAT'
+  expect_no_err 'ghp_EXAMPLE_PAT'
+  expect_no_log 'ghp_EXAMPLE_PAT'
+}
+
+case_provision_scope_comes_from_the_url() {
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url https://github.com/acme \
+    --name-prefix slot --pat p --dry-run
+  expect_out '^  scope:   org — https://github\.com/acme$'
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url https://github.com/acme/app \
+    --name-prefix slot --pat p --dry-run
+  expect_out '^  scope:   repo — https://github\.com/acme/app$'
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url https://github.com/enterprises/acme \
+    --name-prefix slot --pat p --dry-run
+  expect_out '^  scope:   enterprise — https://github\.com/enterprises/acme$'
+  # The minted-token path uses the scope's own API prefix.
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url https://github.com/acme/app \
+    --name-prefix slot --pat p
+  expect_log '^api: POST https://api\.github\.com/repos/acme/app/actions/runners/registration-token'
+  # Too many segments is a refusal, not a guess at which ones matter.
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url https://github.com/a/b/c --token t
+  expect_rc 1
+  expect_err "--url 'https://github.com/a/b/c' is invalid"
+  expect_no_log '^api: '
+}
+
+case_provision_pins_a_runner_version() {
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" --name-prefix slot \
+    --token "$PROV_TOKEN" --runner-version 2.300.0 --no-verify-checksum
+  expect_rc 0
+  expect_log '^api: GET https://api\.github\.com/repos/actions/runner/releases/tags/v2\.300\.0'
+  expect_out '^  release: 2\.300\.0 \(actions-runner-linux-x64-2\.300\.0\.tar\.gz\)$'
+  expect_log '^fetch: https://github\.com/actions/runner/releases/download/v2\.300\.0/actions-runner-linux-x64-2\.300\.0\.tar\.gz'
+  # A version that is not X.Y.Z never reaches the API.
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" --token t --runner-version latest
+  expect_rc 1
+  expect_err "--runner-version 'latest' is invalid"
+  expect_no_log '^api: '
+}
+
+case_provision_unreachable_api_is_explained() {
+  RUNNERCTL_STUB_NO_UNITS=1 RUNNERCTL_STUB_API_FAIL='releases' \
+    run provision 1 --url "$PROV_URL" --name-prefix slot --token "$PROV_TOKEN"
+  expect_rc 1
+  expect_err 'could not read the runner release metadata'
+  expect_err 'pass --runner-version and --sha256 to work offline'
+  expect_no_log '^fetch: '
+  expect_no_log 'config\.sh '
+  # A tag that does not exist says which one it asked for.
+  RUNNERCTL_STUB_NO_UNITS=1 RUNNERCTL_STUB_API_FAIL='tags' \
+    run provision 1 --url "$PROV_URL" --token t --runner-version 9.9.9
+  expect_rc 1
+  expect_err 'is v9\.9\.9 a real actions/runner release'
+}
+
+case_provision_refuses_a_bad_invocation() {
+  run provision --url "$PROV_URL"
+  expect_rc 1
+  expect_err "provision needs N, e\.g\. 'provision 2 --url https://github\.com/<org>'"
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 0 --url "$PROV_URL" --token t
+  expect_rc 1
+  expect_err 'N must be 1\.\.64'
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 99 --url "$PROV_URL" --token t
+  expect_rc 1
+  expect_err 'N must be 1\.\.64'
+  RUNNERCTL_STUB_NO_UNITS=1 run provision two --url "$PROV_URL" --token t
+  expect_rc 1
+  expect_err 'N must be an integer'
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --bogus
+  expect_rc 1
+  expect_err "unknown option: --bogus \('runnerctl provision --help' lists them\)"
+  # No --url and no RUNNER_URL: the refusal says where the value can come from.
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --token t
+  expect_rc 1
+  expect_err 'no --url and no RUNNER_URL'
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" --token t --runner-root rel/ative
+  expect_rc 1
+  expect_err "--runner-root 'rel/ative' is invalid"
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" --token t --work /absolute
+  expect_rc 1
+  expect_err "--work '/absolute' is invalid"
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" --token t --runner-user 0bad
+  expect_rc 1
+  expect_err "--runner-user '0bad' is invalid"
+  # A value flag with nothing after it dies rather than eating the next one.
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url
+  expect_rc 1
+  expect_err '[-][-]url needs a value'
+  # Every one of these refuses before touching the host or the network.
+  expect_no_log '^(api:|fetch:|mkdir |tar |useradd |chown )'
+}
+
+case_provision_help_and_defaults() {
+  run provision --help
+  expect_rc 0
+  expect_out '^Usage: runnerctl provision N \[options\]$'
+  expect_out '^  --token TOKEN '
+  expect_out '^  --pat TOKEN '
+  expect_out '^  --no-verify-checksum '
+  expect_no_log '^(api|fetch): '
+  # The default name prefix is the host's short name, so runner lists stay
+  # readable across boxes.
+  local h; h="$(hostname -s 2>/dev/null || hostname)"
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" --token t --dry-run
+  expect_rc 0
+  expect_out "^  names:   $h-<n>, arch x64\$"
+  # The default runner user and root are the documented ones.
+  expect_out '^would create:   github-runner \(if missing\), /opt/actions-runner/'
+}
+
+case_provision_is_named_when_a_host_has_no_runners() {
+  # The error that sent a real operator looking for a command that did not
+  # exist: every runner-requiring command now names the one that fixes it.
+  RUNNERCTL_STUB_NO_UNITS=1 run scale 4 --max 30G --high 25G
+  expect_rc 1
+  expect_err "no 'actions\.runner\.\*\.service' units found on this host\."
+  expect_err "runnerctl provision N --url https://github\.com/<org>"
+  RUNNERCTL_STUB_NO_UNITS=1 run status
+  expect_rc 1
+  expect_err "runnerctl provision N --url"
+}
+
+case_provision_is_excluded_from_fleet() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet provision 2
+  expect_rc 1
+  expect_err 'fleet provision is not supported'
+  expect_err 'copies a credential to every host'
+  expect_no_log '^probe:ssh_run '
+}
+
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
 t "status: EnvironmentFiles value with embedded '=' survives"       case_status_envfile_value_with_embedded_equals
@@ -3221,6 +3532,24 @@ t "fleet budgets: a percentage never rounds to a deadlocking zero"     case_flee
 t "fleet budgets: the slot inventory reads the real --json emitter"    case_fleet_slot_inventory_reads_the_real_json_emitter
 t "fleet: an unconfigured fleet says so and dials nothing"             case_fleet_unconfigured_says_so
 t "fleet bogus: unknown subcommand dies, dials nothing"                case_fleet_unknown_subcommand_dies
+
+
+# --- GHR-45: provision --------------------------------------------------------
+t "provision: fresh host installs, registers and starts every slot"    case_provision_fresh_host_installs_and_registers
+t "provision N: already at or above N changes nothing"                 case_provision_is_idempotent_against_the_target_count
+t "provision: tops an existing host up, skipping the names in use"     case_provision_tops_an_existing_host_up
+t "provision --dry-run: reads the release, changes nothing"            case_provision_dry_run_changes_nothing
+t "provision: a bad or missing published checksum stops the install"   case_provision_verifies_the_published_checksum
+t "provision --sha256: pins the digest, and refuses a non-digest"      case_provision_sha256_pin_overrides_the_release
+t "provision: --token, --pat, \$GITHUB_TOKEN, gh, and the refusal"      case_provision_token_sources
+t "provision: the token never reaches stdout, stderr or the PAT argv"  case_provision_never_prints_the_token
+t "provision: org/repo/enterprise scope comes from --url"              case_provision_scope_comes_from_the_url
+t "provision --runner-version: pins the release, rejects a non-X.Y.Z"  case_provision_pins_a_runner_version
+t "provision: an unreachable API or unknown tag is explained"          case_provision_unreachable_api_is_explained
+t "provision: bad invocations refuse before touching host or network"  case_provision_refuses_a_bad_invocation
+t "provision --help, and the default prefix/user/root"                 case_provision_help_and_defaults
+t "no units on this host: every command names provision"               case_provision_is_named_when_a_host_has_no_runners
+t "fleet provision: excluded, saying why"                              case_provision_is_excluded_from_fleet
 
 # --- Summary ------------------------------------------------------------------
 echo
