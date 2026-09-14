@@ -309,6 +309,11 @@ column's short name — an unambiguous prefix or substring of it also works
 
 ### Live view: `watch`
 
+> Watching **several** hosts at once? Use
+> [`fleet watch`](#a-live-fleet-view-fleet-watch), not `watch runnerctl fleet
+> status` — it holds one ssh connection per host open instead of reconnecting
+> to every one of them on every tick.
+
 `runnerctl watch` (or `status --watch` / `status -w`) redraws the same table
 in place every 2 seconds — `--interval N` for another whole number of
 seconds — until Ctrl-C, with a header line carrying the host, the time of
@@ -687,6 +692,62 @@ transfer on every command to solve a problem a fleet-wide upgrade solves once,
 and it would mean relaxing a deliberate refusal (`runnerctl` only accepts
 `install` when read from a pipe). Keep the hosts levelled with `runnerctl
 upgrade` instead.
+
+#### A live fleet view: `fleet watch`
+
+`fleet status` is the one-shot. `fleet watch` is the same table redrawn in
+place, with colour, over ssh connections that **stay open**:
+
+```
+$ runnerctl fleet watch --interval 5
+runnerctl fleet watch — 3 host(s) — 14:02:11 — every 5s (q to quit)
+HOST     IDX RUNNER          PROFILE  ACTIVE           SINCE  ENABLED  ...  WORKING-ON
+build-1  0   org.build-1-a   ci       active/running   3d 4h  enabled  ...  my-app:test (12m)
+build-1  1   org.build-1-b   ci       active/running   2d 7h  enabled  ...  idle 2h31m (7 jobs)
+build-2  0   org.build-2-a   ci       active/running   6d     enabled  ...  my-app:lint (2m)
+build-3  unreachable — ssh: connect to host build-3 port 22: No route to host
+
+q quit — this view is read-only; act with 'runnerctl fleet <command>' or on the host
+```
+
+**Do not build this out of `watch(1)`.** `watch runnerctl fleet status` works
+until it doesn't: a fan-out pays a TCP connect, a key exchange and an
+authentication *per host per call*, so six hosts at `watch`'s two-second
+default is around **180 full ssh logins a minute**. `sshd` starts refusing at
+`MaxStartups`, `fail2ban` reads the pattern as an attack, and rows begin coming
+back `unreachable` for reasons that have nothing to do with the hosts.
+
+`fleet watch` opens **one connection per host and holds it** for as long as it
+runs (`ControlMaster`, over a socket directory of its own). The first tick pays
+the handshake; every later tick is another channel on the same socket. It closes
+them on the way out rather than leaving them to expire.
+
+Three differences from `fleet status`, each worth knowing:
+
+- **The remotes paint, not this end.** `fleet status` asks every host for
+  `--color never` and colours what it adds locally. A live view wants the
+  per-cell colour the local `watch` has, and the only thing that knows a cell is
+  `STALLED` or memory-throttled is the host that drew it. `--color never` turns
+  it off at both ends together.
+- **`--stall-after` is forwarded**, for the same reason: the `STALLED` marker is
+  drawn at the far end or not at all.
+- **The default interval is 5 s**, not the local watch's 2 s. Every tick is a
+  round trip to every host, and a tick that has not finished before the next one
+  starts is not a faster view, it is a queue.
+
+`--host H` (repeatable) narrows the watch to named hosts, validated against
+`FLEET_HOSTS` exactly as it is for the mutating commands. A host that does not
+answer stays a **row** in every frame — a watch that died when one of six hosts
+rebooted would take the five that are fine off the screen with it.
+
+**It is read-only.** `q` quits; no key acts. The local `watch`'s action keys
+(`K` `R` `S` `T` `P` `L`) are not here, because a cursor that addresses a
+*(host, slot)* pair and runs a mutating command over ssh is a different feature
+with its own confirm and its own answer to the capacity rules below. Act with
+`runnerctl fleet <command>`, or on the host.
+
+`fleet logs` remains unsupported: it streams one journal, and that only makes
+sense against one host.
 
 #### One exit code for the fleet: `fleet health`
 

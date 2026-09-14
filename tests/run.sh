@@ -2968,12 +2968,259 @@ case_fleet_excluded_commands_say_why() {
   expect_rc 1
   expect_err 'fleet env-init is not supported and will not be: it writes an EnvironmentFile of secrets'
   expect_no_log '^probe:ssh_run '
-  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch
-  expect_rc 1
-  expect_err 'fleet watch is not supported: watch is interactive'
+  # `watch` used to be refused here alongside these two. It is a command now
+  # (GHR-54), and `logs` is the only streaming one left — so the refusal
+  # points at the fleet view rather than only at ssh.
   RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet logs
   expect_rc 1
-  expect_err 'fleet logs is not supported: logs is streaming'
+  expect_err "fleet logs is not supported: logs streams from one journal"
+  expect_err "Use 'runnerctl fleet watch' for a live fleet-wide view"
+  expect_no_log '^probe:ssh_run '
+}
+
+# --- GHR-54: fleet watch -------------------------------------------------------
+# The frame prefix, the header and the legend. `fleet watch` reuses cmd_watch's
+# loop shape, so the home+clear prefix is the same one the local watch's cases
+# count; what differs is what is in the frame and what it cost to fetch.
+FLEET_WATCH_LEGEND='^q quit — this view is read-only; act with '"'"'runnerctl fleet <command>'"'"' or on the host$'
+
+# A terminal is required for the same reason `watch` needs one: the loop
+# redraws in place. The refusal names the one-shot to use instead, and nothing
+# is dialled before it — a refusal that has already opened six ssh sessions is
+# not a refusal.
+case_fleet_watch_refuses_non_tty() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch
+  expect_rc 1
+  expect_err "^runnerctl: fleet watch needs a terminal \(stdout is not a tty\); use 'runnerctl fleet status'\$"
+  expect_no_out '.'
+  expect_no_log '^probe:(ssh_run|ssh_control|term_cursor|pause)'
+}
+
+# The point of the command: N ticks are N fan-outs over ONE connection per
+# host, opened once and closed once. `watch runnerctl fleet status` is N
+# fan-outs over N x hosts fresh logins, which is what sshd throttles.
+case_fleet_watch_polls_every_host_over_one_held_connection() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    run fleet watch --iterations 3 --interval 4 --color never
+  expect_rc 0
+  expect_out_count "${FRAME_PREFIX}runnerctl fleet watch — 2 host\(s\) — [0-9]{2}:[0-9]{2}:[0-9]{2} — every 4s \(q to quit\)\$" 3
+  expect_out_count "$FRAME_PREFIX" 3
+  # one HOST-prefixed table per frame, both hosts in each
+  expect_out_count '^HOST +IDX +RUNNER +PROFILE .* WORKING-ON$' 3
+  expect_out_count '^build-1 +0 +example\.slot-1 .* my-app:test \(12m\)$' 3
+  expect_out_count '^build-2 +0 +example\.slot-1 .* my-app:test \(12m\)$' 3
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 3
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 3
+  expect_log_count '^probe:pause 4$' 3
+  # the session: master options on EVERY call (6), opened once, closed once
+  # per host. ControlPersist comfortably exceeds the 4 s interval, or the gap
+  # between two redraws would drop the connection the next redraw reuses.
+  expect_log_count '^probe:ssh_control_opts -o ControlMaster=auto -o ControlPath=/.+/%C -o ControlPersist=64$' 6
+  expect_log_count '^probe:ssh_control build-1 exit$' 1
+  expect_log_count '^probe:ssh_control build-2 exit$' 1
+  expect_log_order '^probe:term_cursor hide$' '^probe:pause 4$' '^probe:term_cursor show$' '^probe:ssh_control build-1 exit$'
+  expect_log_count '^probe:term_cursor ' 2
+  # read-only, and nothing reached `ssh` outside the two sanctioned paths
+  expect_no_log '^direct:'
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+}
+
+# Colour comes from the REMOTE, which is the opposite of `fleet status`. The
+# host that drew a cell is the only thing that knows it is STALLED, so the
+# flag is forwarded and this end only paints the HOST column it added.
+#
+# Two things this proves that a plain run cannot: the column header keeps the
+# remote's own bold after the local HOST cell closes its SGR, and a painted
+# `note:` line is still recognised as a note — collected once for the whole
+# fleet rather than printed as a slot row on each host.
+case_fleet_watch_colour_comes_from_the_remote_and_notes_still_dedupe() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    run fleet watch --iterations 1 --color always --stall-after 600
+  expect_rc 0
+  # --stall-after is forwarded: STALLED is drawn at the far end or not at all
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color always --stall-after 600$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color always --stall-after 600$' 1
+  expect_out_count "${FRAME_PREFIX}$ESC\[1mrunnerctl fleet watch — 2 host\(s\) — .* — every 5s \(q to quit\)$ESC\[0m\$" 1
+  # HOST is ours and ends its bold; the remote's header follows with its own
+  expect_out_count "^$ESC\[1mHOST   $ESC\[0m $ESC\[1mIDX +RUNNER .* WORKING-ON$ESC\[0m\$" 1
+  # the remote painted the cells, both hosts
+  expect_out_count "^build-1 +0 +example\.slot-1 .* $ESC\[1m$ESC\[31mmy-app:test \(12m\) STALLED$ESC\[0m\$" 1
+  expect_out_count "^build-2 +0 +example\.slot-1 .* $ESC\[1m$ESC\[31mmy-app:test \(12m\) STALLED$ESC\[0m\$" 1
+  # ONE note for the fleet, painted, not one per host and not a slot row
+  expect_out_count "^$ESC\[31mnote: STALLED = a job running longer than 10m .*$ESC\[0m\$" 1
+  expect_no_out '^build-[12] +.*note: STALLED'
+}
+
+# A host that does not answer is a row in EVERY frame. The loop must not stop
+# on it: a watch that dies when one of six hosts reboots is worse than no
+# watch, because the five that are fine stop being visible too.
+case_fleet_watch_an_unreachable_host_stays_a_row_every_tick() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-unreachable" \
+    run fleet watch --iterations 2 --interval 1 --color never
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 2
+  expect_out_count '^gw-unreachable unreachable — ssh: connect to host gw-unreachable port 22: No route to host$' 2
+  expect_out_count '^build-1 +0 +example\.slot-1 .* my-app:test \(12m\)$' 2
+  # and it is still closed down cleanly: a host with no master is not an error
+  expect_log_count '^probe:ssh_control gw-unreachable exit$' 1
+}
+
+# --host narrows the watch exactly as it narrows a mutating fan-out, and the
+# header counts what is actually being watched. An unknown host dies before
+# anything is dialled, reusing fleet_select_hosts' own refusal.
+case_fleet_watch_host_narrows_the_fleet() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    run fleet watch --host build-2 --iterations 1 --color never
+  expect_rc 0
+  expect_out '— 1 host\(s\) —'
+  expect_out_count '^build-2 +0 +example\.slot-1 ' 1
+  expect_no_out '^build-1 '
+  expect_log_count '^probe:ssh_run build-2 -- ' 1
+  expect_no_log '^probe:ssh_run build-1 -- '
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet watch --host nope
+  expect_rc 1
+  expect_err "--host 'nope' is not in FLEET_HOSTS"
+  expect_no_log '^probe:(ssh_run|ssh_control)'
+}
+
+# Interactive: the wait between redraws is a key read, so `q` quits at once
+# rather than after the interval. Also pins the 5 s default, which is higher
+# than the local watch's 2 s because every tick is a round trip per host.
+case_fleet_watch_q_quits_and_the_default_interval_is_five() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='q' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 1
+  expect_out '— every 5s \(q to quit\)$'
+  expect_out "$FLEET_WATCH_LEGEND"
+  expect_log_order '^probe:term_cursor hide$' '^probe:tty_read_char 5 q$' '^probe:term_cursor show$' '^probe:ssh_control build-1 exit$'
+  expect_log_count '^probe:ssh_run build-1 -- ' 1
+  # a key that is not q redraws rather than quitting: one more frame, one
+  # more fan-out, then Q ends it (uppercase counts too)
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='xQ' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 2
+  expect_log_count '^probe:ssh_run build-1 -- ' 2
+}
+
+# The control session itself, driven directly: opened it exists and carries
+# the master options, closed it is gone. %C rather than %r@%h:%p is the
+# load-bearing part — a unix socket path is capped near 104 bytes and ssh
+# stops multiplexing SILENTLY past it, which would turn the poll back into
+# the reconnect-per-tick this command exists to remove.
+case_fleet_watch_control_session_opens_and_tears_down() {
+  # SC2016 disabled deliberately, twice: the single quotes are the POINT.
+  # run_fn hands this string to `bash -c` after sourcing the script, so the
+  # $1 and $FLEET_SSH_CONTROL_DIR in it must reach THAT shell unexpanded —
+  # expanding them here would substitute this harness's values instead.
+  # shellcheck disable=SC2016
+  run_fn eval '
+    ssh_control() { echo "closed $1 $2"; }
+    FLEET_HOSTS=(build-1 build-2)
+    fleet_ssh_control_open 90
+    printf "%s\n" "${FLEET_SSH_CONTROL_OPTS[@]}"
+    test -d "$FLEET_SSH_CONTROL_DIR" && echo "dir-exists"
+    case "$FLEET_SSH_CONTROL_DIR" in "") echo "dir-unset" ;; esac
+    d="$FLEET_SSH_CONTROL_DIR"
+    fleet_ssh_control_close
+    test -d "$d" || echo "dir-gone"
+    echo "opts-left=${#FLEET_SSH_CONTROL_OPTS[@]} dir-left=[$FLEET_SSH_CONTROL_DIR]"
+  '
+  expect_rc 0
+  # printf one per element: `-o` and its value are separate argv words, which
+  # is the whole reason this is an array and not a string
+  expect_out_count '^-o$' 3
+  expect_out '^ControlMaster=auto$'
+  expect_out '^ControlPath=/.+/%C$'
+  expect_out '^ControlPersist=90$'
+  expect_out '^dir-exists$'
+  expect_out '^closed build-1 exit$'
+  expect_out '^closed build-2 exit$'
+  expect_out '^dir-gone$'
+  expect_out '^opts-left=0 dir-left=\[\]$'
+  # closing a session that was never opened is a no-op, not a failure: the
+  # EXIT trap runs whatever the loop got as far as
+  # shellcheck disable=SC2016
+  run_fn eval 'ssh_control() { echo "closed $1"; }; FLEET_HOSTS=(build-1); fleet_ssh_control_close; echo ok'
+  expect_rc 0
+  expect_out '^ok$'
+  expect_no_out '^closed '
+}
+
+# The one thing every other case here CANNOT see. tests/stub.config shadows
+# ssh_run wholesale, so no sim case ever runs its body — and a `fleet watch`
+# that assembled perfect master options and then never put them on the ssh
+# command line would poll exactly as badly as `watch runnerctl fleet status`,
+# with every assertion above still green. (It did: the mutation that deleted
+# the expansion from ssh_run left the whole suite passing.)
+#
+# So this drives the REAL ssh_run with `ssh` and `timeout` shadowed inside the
+# eval, and reads the argv. It also pins the ORDER, which is a contract of its
+# own: FLEET_SSH_OPTS comes LAST so a site can override the watch's sockets.
+case_fleet_ssh_run_puts_the_session_options_on_the_ssh_command_line() {
+  # shellcheck disable=SC2016
+  run_fn eval '
+    f="$(mktemp)"
+    timeout() { shift; "$@"; }
+    ssh() { printf "%s\n" "$*" >>"$f"; }
+    FLEET_TIMEOUT=30
+    FLEET_SSH_OPTS=(-o SiteOption=yes)
+    ssh_run host-a runnerctl status
+    fleet_ssh_control_open 90
+    ssh_run host-a runnerctl status
+    ssh_control host-a exit
+    fleet_ssh_control_close
+    cat "$f"
+    rm -f "$f"
+  '
+  expect_rc 0
+  # no session open: byte-for-byte what a one-shot fan-out sent before GHR-54
+  expect_out '^-o BatchMode=yes -o ConnectTimeout=10 -o SiteOption=yes -- host-a runnerctl status$'
+  # session open: the master options are ON the command line, ahead of the
+  # site's own options
+  expect_out '^-o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPath=/.+/%C -o ControlPersist=90 -o SiteOption=yes -- host-a runnerctl status$'
+  # and the teardown is a control-socket operation carrying no remote command
+  expect_out '^-o BatchMode=yes -o ControlMaster=auto -o ControlPath=/.+/%C -o ControlPersist=90 -O exit -- host-a$'
+}
+
+# Every other command leaves the control options EMPTY, so nothing but the
+# watch pays for a socket directory — and a one-shot fan-out's ssh command
+# line is byte-identical to what it was before GHR-54.
+case_fleet_one_shot_commands_open_no_control_session() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status
+  expect_rc 0
+  expect_no_log '^probe:ssh_control'
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet health
+  expect_rc 0
+  expect_no_log '^probe:ssh_control'
+}
+
+# Option validation happens before anything is dialled, and the two numeric
+# flags reject the same shapes the local watch rejects.
+case_fleet_watch_bad_options_die_before_dialling() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --interval 0
+  expect_rc 1
+  expect_err "--interval value '0' is invalid"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --interval abc
+  expect_rc 1
+  expect_err "--interval value 'abc' is invalid"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --bogus
+  expect_rc 1
+  expect_err 'unknown option: --bogus'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color bogus
+  expect_rc 1
+  expect_err "--color value 'bogus' is invalid"
+  expect_no_log '^probe:(ssh_run|ssh_control)'
+  # --interval=N, the =-form every other command takes
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet watch --interval=7 --iterations=1 --color=never
+  expect_rc 0
+  expect_out '— every 7s \(q to quit\)$'
+  # an unconfigured fleet is the manifest-shaped refusal, before the tty one
+  run fleet watch
+  expect_rc 1
+  expect_err 'fleet mode is not configured — set FLEET_HOSTS='
 }
 
 # --- GHR-44: capacity budgets ------------------------------------------------
@@ -3650,7 +3897,7 @@ t "fleet --host: an unknown host dies before anything is dialled"      case_flee
 t "fleet stop/drain/disable: refused fleet-wide without explicit scope" case_fleet_capacity_removal_refused_without_explicit_scope
 t "fleet drain: allowed with --host or --all-hosts"                    case_fleet_capacity_removal_allowed_when_scoped_or_acknowledged
 t "fleet <mutating>: a sudo failure is a named row with the remedy"    case_fleet_sudo_failure_is_a_named_row_with_the_remedy
-t "fleet env-init/watch/logs: excluded, each saying why"               case_fleet_excluded_commands_say_why
+t "fleet env-init/logs: excluded, each saying why"                     case_fleet_excluded_commands_say_why
 # --- GHR-44: capacity budgets -------------------------------------------------
 t "fleet --max-unavailable: re-reads fleet state between slots"        case_fleet_max_unavailable_repolls_between_slots
 t "fleet --min-available: stops at the floor, names what it left"      case_fleet_min_available_stops_at_the_floor
@@ -3659,6 +3906,18 @@ t "fleet budgets: a percentage never rounds to a deadlocking zero"     case_flee
 t "fleet budgets: the slot inventory reads the real --json emitter"    case_fleet_slot_inventory_reads_the_real_json_emitter
 t "fleet: an unconfigured fleet says so and dials nothing"             case_fleet_unconfigured_says_so
 t "fleet bogus: unknown subcommand dies, dials nothing"                case_fleet_unknown_subcommand_dies
+
+# --- GHR-54: fleet watch -------------------------------------------------------
+t "fleet watch: needs a terminal, dials nothing without one"           case_fleet_watch_refuses_non_tty
+t "fleet watch: N ticks, one held connection per host"                 case_fleet_watch_polls_every_host_over_one_held_connection
+t "fleet watch: the remote paints; a note still dedupes fleet-wide"    case_fleet_watch_colour_comes_from_the_remote_and_notes_still_dedupe
+t "fleet watch: an unreachable host is a row in every frame"           case_fleet_watch_an_unreachable_host_stays_a_row_every_tick
+t "fleet watch --host: narrows the watch; unknown host dies first"     case_fleet_watch_host_narrows_the_fleet
+t "fleet watch: q quits at once, and the default interval is 5s"       case_fleet_watch_q_quits_and_the_default_interval_is_five
+t "fleet watch: the control session opens, then tears itself down"     case_fleet_watch_control_session_opens_and_tears_down
+t "fleet watch: the session options reach the real ssh command line"   case_fleet_ssh_run_puts_the_session_options_on_the_ssh_command_line
+t "fleet one-shots: no control session, ssh line unchanged"            case_fleet_one_shot_commands_open_no_control_session
+t "fleet watch: bad options die before anything is dialled"            case_fleet_watch_bad_options_die_before_dialling
 
 
 # --- GHR-45: provision --------------------------------------------------------
