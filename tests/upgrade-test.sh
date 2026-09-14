@@ -50,6 +50,24 @@ no_sudo() { # FILE CONTEXT
   ! grep -q "TEST TRIED TO SUDO" "$1" || fail "$2 escalated: $(cat "$1")"
 }
 
+# A remedy we tell a HUMAN to run has to actually run (GHR-53). Matching the
+# sentence only proves the sentence is there — `sudo runnerctl install` shipped
+# green through 252 tests and died with "command not found" on the first real
+# host, because sudo resets PATH to secure_path and ~/.local/bin is not on it.
+#
+# So: assert the named command is ABSOLUTE (the invariant), and then prove it
+# by resolving it in a reconstructed sudo environment (the demonstration). A
+# bare name fails the second check even when it passes a grep for the text.
+SECURE_PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+remedy_runs() { # NAMED-COMMAND CONTEXT
+  case "$1" in
+    /*) ;;
+    *) fail "$2: the remedy names '$1', which is not an absolute path — sudo would resolve it against secure_path" ;;
+  esac
+  env -i "PATH=$SECURE_PATH" sh -c "command -v '$1' >/dev/null 2>&1" \
+    || fail "$2: the remedy names '$1', which does not resolve under sudo's secure_path"
+}
+
 # 1. A copy outside any home upgrades exactly where it stands, and says
 #    nothing new. This is the pre-GHR-52 contract, pinned so the placement
 #    work cannot quietly change it.
@@ -116,7 +134,13 @@ rm -f "$HOME/.local/bin/runnerctl.retired"
 mkdir -p "$tmp/ro5"; old_at "$HOME/.local/bin/runnerctl" 0.0.1; chmod 555 "$tmp/ro5"
 "$HOME/.local/bin/runnerctl" --config "$cfg" upgrade --prefix "$tmp/ro5" >"$tmp/o5" 2>&1 \
   || fail "no-privilege upgrade exited $? — $(cat "$tmp/o5")"
-grep -q "To move it: sudo runnerctl install" "$tmp/o5" || fail "5: remedy not named: $(cat "$tmp/o5")"
+grep -q "To move it: sudo " "$tmp/o5" || fail "5: remedy not named: $(cat "$tmp/o5")"
+# Not "is the sentence present" but "does the command work": the whole point of
+# GHR-53. This must be the path of the copy being upgraded, absolute.
+r5="$(sed -n "s/.*To move it: sudo \\([^ ]*\\) install.*/\\1/p" "$tmp/o5")"
+[ -n "$r5" ] || fail "5: could not read a command out of the remedy: $(cat "$tmp/o5")"
+[ "$r5" = "$HOME/.local/bin/runnerctl" ] || fail "5: remedy names '$r5', want this copy's own path"
+remedy_runs "$r5" "5"
 grep -q "^Upgraded 0.0.1 -> $ver at $HOME/.local/bin/runnerctl$" "$tmp/o5" || fail "5: did not upgrade in place: $(cat "$tmp/o5")"
 grep -qE "^(relocated|retired):" "$tmp/o5" && fail "5: moved something without privilege: $(cat "$tmp/o5")"
 [ ! -e "$tmp/ro5/runnerctl" ] || fail "5: wrote into an unwritable prefix"
@@ -142,7 +166,9 @@ same_at "$tmp/ro7/runnerctl"; chmod 555 "$tmp/ro7"
 old_at "$HOME/.local/bin/runnerctl" 0.0.1
 "$HOME/.local/bin/runnerctl" --config "$cfg" upgrade --prefix "$tmp/ro7" >"$tmp/o7" 2>&1 \
   || fail "retire-only upgrade exited $? — $(cat "$tmp/o7")"
-grep -q "run 'sudo runnerctl upgrade' to move" "$tmp/o7" || fail "7: did not name the remaining step: $(cat "$tmp/o7")"
+grep -q "run 'sudo $tmp/ro7/runnerctl upgrade' to move it on" "$tmp/o7" || fail "7: did not name the remaining step: $(cat "$tmp/o7")"
+r7="$(sed -n "s/.*run 'sudo \\([^ ]*\\) upgrade'.*/\\1/p" "$tmp/o7")"
+remedy_runs "$r7" "7"
 grep -q "^retired: $HOME/.local/bin/runnerctl.retired$" "$tmp/o7" || fail "7: shadow not retired: $(cat "$tmp/o7")"
 [ ! -e "$HOME/.local/bin/runnerctl" ] || fail "7: shadow left in place"
 grep -q "^Already up to date\.$" "$tmp/o7" || fail "7: $sys already had these bytes, so this is up to date: $(cat "$tmp/o7")"
@@ -192,8 +218,14 @@ old_at "$HOME/.local/bin/runnerctl" 0.5.0
 "$HOME/.local/bin/runnerctl" --config "$cfg" upgrade --prefix "$tmp/ro11" >"$tmp/o11" 2>&1 \
   || fail "outstanding-work upgrade exited $? — $(cat "$tmp/o11")"
 grep -q "^retired: $HOME/.local/bin/runnerctl.retired$" "$tmp/o11" || fail "11: shadow not retired: $(cat "$tmp/o11")"
-grep -q "^Update available\. Run: sudo runnerctl upgrade$" "$tmp/o11" || fail "11: did not report the remaining work: $(cat "$tmp/o11")"
+grep -q "^Update available\. Run: sudo $tmp/ro11/runnerctl upgrade$" "$tmp/o11" || fail "11: did not report the remaining work: $(cat "$tmp/o11")"
+# The final sentence is a remedy too, and it broke the same way.
+rf11="$(sed -n "s/^Update available\. Run: sudo \\([^ ]*\\) upgrade$/\\1/p" "$tmp/o11")"
+remedy_runs "$rf11" "11 final line"
 grep -q "^Upgraded " "$tmp/o11" && fail "11: claimed an upgrade it never performed: $(cat "$tmp/o11")"
+r11="$(sed -n "s/.*run 'sudo \\([^ ]*\\) upgrade'.*/\\1/p" "$tmp/o11")"
+[ "$r11" = "$tmp/ro11/runnerctl" ] || fail "11: remedy names '$r11', want the system copy's own path"
+remedy_runs "$r11" "11"
 grep -q '^RUNNERCTL_VERSION="0.5.0"' "$tmp/ro11/runnerctl" || fail "11: unwritable system copy changed"
 no_sudo "$tmp/o11" "11"
 chmod 755 "$tmp/ro11"
