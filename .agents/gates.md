@@ -92,6 +92,21 @@ the current one.
 
 Traps:
 
+- **A shadowed function is asserted through its stub, so the stub's contract
+  and the real one can diverge in silence.** Every case that goes through
+  `tests/stub.config` tests the stub — so a bug in the real `discover`,
+  `prop`, `unit_props` or a `/proc` hook is invisible to all of them, however
+  many are green. GHR-48 is the worked example: the real `discover` returned
+  1 on a host with no units (`systemctl list-unit-files` exits 1 when its
+  glob matches nothing, and `pipefail` propagated it), which under `set -e`
+  killed `provision` before its first `echo` — silent, exit 1, on the only
+  host `provision` exists for. The stub's `RUNNERCTL_STUB_NO_UNITS=1` path
+  returned empty and 0, so `case_provision_fresh_host_installs_and_registers`
+  was green against a command that emitted nothing at all. **When you change
+  a shadowed function, check the stub still models it, and cover the real one
+  separately** — `run_fn` sources the script with no config, so `discover`
+  stays real there, and a fake binary first on `PATH` (restore `PATH` in the
+  case) pins what it does with a `systemctl` that fails.
 - `tests/stub.config` must stay mode `0644`: `load_config` refuses a
   world-writable config, and the gate would fail on every case with the
   refusal message. `git` preserves the mode; a `chmod` on the checkout would
