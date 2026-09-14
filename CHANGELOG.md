@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/runnane/runnerctl/compare/v0.11.0...v0.11.1) (2026-09-14)
+
+
+### Bug Fixes
+
+* name an absolute path in every sudo remedy (GHR-53) ([#57](https://github.com/runnane/runnerctl/issues/57)) ([135f13c](https://github.com/runnane/runnerctl/commit/135f13c9dbbc600d952de1b1bec42600b003936f))
+
 ## [0.11.0](https://github.com/runnane/runnerctl/compare/v0.10.3...v0.11.0) (2026-09-14)
 
 
