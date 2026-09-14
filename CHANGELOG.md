@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.2](https://github.com/runnane/runnerctl/compare/v0.10.1...v0.10.2) (2026-09-14)
+
+
+### Bug Fixes
+
+* `provision` exits 1 with no output on a host with no runners (GHR-48) ([#51](https://github.com/runnane/runnerctl/issues/51)) ([d90a533](https://github.com/runnane/runnerctl/commit/d90a533a673fa13636bf74937347dae0b1d0fc49))
+
 ## [0.10.1](https://github.com/runnane/runnerctl/compare/v0.10.0...v0.10.1) (2026-09-14)
 
 
