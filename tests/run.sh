@@ -3281,6 +3281,50 @@ case_provision_is_excluded_from_fleet() {
   expect_no_log '^probe:ssh_run '
 }
 
+# --- GHR-48: the REAL discover(), against a fake systemctl -------------------
+# Every other case reaches discover through tests/stub.config, which SHADOWS
+# it — so the stub's contract (no units = empty, exit 0) was asserted while
+# the real function's diverged from it silently. `list-unit-files` exits 1
+# when the glob matches nothing, `pipefail` made that discover's own status,
+# and `provision`'s bare `have="$(discover | wc -l)"` therefore tripped
+# `set -e` before its first echo: no output at all, exit 1, on exactly the
+# bare host provision exists to fix. So these two go through run_fn (which
+# sources the script with no config, leaving discover real) with a fake
+# systemctl first on PATH.
+_ghr48_fake_systemctl() {
+  local dir="$TMP/ghr48-bin"
+  mkdir -p "$dir"
+  printf '#!/usr/bin/env bash\n%s\n' "$1" >"$dir/systemctl"
+  chmod +x "$dir/systemctl"
+  echo "$dir"
+}
+
+case_discover_no_matching_units_is_empty_not_a_failure() {
+  local bin saved="$PATH"
+  bin="$(_ghr48_fake_systemctl 'exit 1')"
+  PATH="$bin:$PATH"
+  run_fn discover
+  PATH="$saved"
+  expect_rc 0
+  expect_out_count '.' 0
+  expect_no_err '.'
+}
+
+case_discover_still_returns_the_units_when_systemctl_succeeds() {
+  # Swallowing the status must not swallow the output: the units still come
+  # back, and still only the first column — the rest is list-unit-files'
+  # STATE/PRESET, which discover drops.
+  local bin saved="$PATH"
+  bin="$(_ghr48_fake_systemctl \
+    'printf "%s enabled enabled\n" actions.runner.example.slot-10.service actions.runner.example.slot-2.service; exit 0')"
+  PATH="$bin:$PATH"
+  run_fn discover
+  PATH="$saved"
+  expect_rc 0
+  expect_out_count '^actions\.runner\.example\.slot-(2|10)\.service$' 2
+  expect_no_out ' enabled'
+}
+
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
 t "status: EnvironmentFiles value with embedded '=' survives"       case_status_envfile_value_with_embedded_equals
@@ -3550,6 +3594,10 @@ t "provision: bad invocations refuse before touching host or network"  case_prov
 t "provision --help, and the default prefix/user/root"                 case_provision_help_and_defaults
 t "no units on this host: every command names provision"               case_provision_is_named_when_a_host_has_no_runners
 t "fleet provision: excluded, saying why"                              case_provision_is_excluded_from_fleet
+
+# --- GHR-48: the real discover(), not the stub's stand-in -------------------
+t "discover: no matching units is empty and exit 0, not a failure"     case_discover_no_matching_units_is_empty_not_a_failure
+t "discover: units still come back, first column only"                 case_discover_still_returns_the_units_when_systemctl_succeeds
 
 # --- Summary ------------------------------------------------------------------
 echo

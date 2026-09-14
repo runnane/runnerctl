@@ -495,8 +495,15 @@ set_timeout() {
 }
 
 # --- Runner discovery / inspection -------------------------------------------
+# `list-unit-files` exits 1 when the glob matches nothing, and under `pipefail`
+# that became discover's own status — so `have="$(discover | wc -l)"` in
+# `provision` inherited it and `set -e` killed the script before its first
+# echo: no output, exit 1, on precisely the bare host provision exists for
+# (GHR-48). A host with no runner units is an answer, not a failure, so the
+# status is swallowed here rather than at each of the sixteen call sites.
 discover() {
-  systemctl list-unit-files --no-legend "$UNIT_GLOB" 2>/dev/null | awk '{print $1}' | sort -V
+  { systemctl list-unit-files --no-legend "$UNIT_GLOB" 2>/dev/null || true; } \
+    | awk '{print $1}' | sort -V
 }
 
 # A host with no runner units is the normal state of a NEW box, not a broken
