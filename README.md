@@ -614,9 +614,66 @@ come from, so a quiet remote would leave nothing to report.
 passwordless sudo there. Without it the call fails fast and says so, per host
 — it never hangs, because the fan-out runs ssh with `BatchMode=yes`.
 
-Only `status` and `health` fan out today. Mutating commands, and the `sudo`
-contract they need, are tracked separately; `watch` and `logs -f` stay
-per-host, being interactive and streaming respectively.
+#### Keeping the fleet on one version: `fleet upgrade`
+
+A host only picks up a new `runnerctl` when `upgrade` runs on it, so a fleet
+drifts quietly — it behaves two ways and nothing says so until something
+misbehaves on one box. `fleet status` notices the drift; `fleet upgrade`
+fixes it.
+
+```
+$ runnerctl fleet upgrade --check
+build-1  0.8.1 -> 0.8.2  update available
+build-2  0.8.2           up to date
+build-3  —               unreachable — ssh: connect to host build-3 port 22: No route to host
+3 host(s): 1 up to date, 1 would change, 1 unreachable or unclear
+
+$ runnerctl fleet upgrade
+build-1  0.8.1 -> 0.8.2  upgraded
+build-2  0.8.2           up to date
+2 host(s): 1 already level, 1 upgraded, 0 unreachable or unclear
+```
+
+`--check` writes nothing; it reports each host's installed and available
+version and whether it would change. `--ref <branch|tag>` is passed through,
+as it is for the single-host command.
+
+**A host that fails is a reported row, never an abort.** A partly upgraded
+fleet is the normal outcome of a flaky network, and which host is still
+behind is exactly the thing you must not lose. The exit code is non-zero when
+any host failed, so a cron job still notices.
+
+An answer this does not recognise is shown verbatim rather than folded into
+"up to date" — quietly reporting a host as level when it said something else
+is what sends someone to the wrong box.
+
+##### The sudo requirement
+
+`upgrade` writes the installed script, which on a normal host needs root, so
+**this is the first fan-out that needs passwordless sudo on each runner
+host.** Grant it for the write only, e.g.:
+
+```
+# /etc/sudoers.d/runnerctl  (on each runner host)
+# `upgrade` stages the new script beside the old one and swaps it in, so the
+# write path is cp + chown + chmod + mv. Check the binary paths on your own
+# distribution before pasting this — they are not the same everywhere.
+%runnerctl ALL=(root) NOPASSWD: /usr/bin/cp, /usr/bin/chown, /usr/bin/chmod, /usr/bin/mv
+```
+
+Without it the call **fails fast and names the host** rather than hanging —
+the fan-out runs ssh with `BatchMode=yes` precisely so a password prompt
+cannot wedge it. Adjust paths and the group to your own hosts; nothing here
+is site-specific on purpose.
+
+If you would rather keep sudo out of it entirely, install `runnerctl`
+somewhere the ssh user owns and point `FLEET_RUNNERCTL` at it — `upgrade`
+writes directly when the destination is writable and never escalates.
+
+Only `status`, `health` and `upgrade` fan out today. The remaining mutating
+commands, and the general `sudo` contract they need, are tracked separately;
+`watch` and `logs -f` stay per-host, being interactive and streaming
+respectively.
 
 ### Profiles
 
