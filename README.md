@@ -753,9 +753,59 @@ exact sudoers line
   sense against one host. Each says so rather than reporting "unknown
   command".
 
-A fleet-wide rolling budget — restart at most N slots at once, or never drain
-below K running — is tracked separately; today the controls are the serial
-sequencing, `--host`, and the `--all-hosts` acknowledgement above.
+##### Capacity budgets: `--max-unavailable` and `--min-available`
+
+The controls above are blunt. These are graded — and they are **two different
+flags because the operations have opposite dynamics**, which is the part worth
+reading before reaching for one.
+
+**`--max-unavailable N` — for `restart`, `apply`, `scale`.** A restarted slot
+goes out and *comes back*, so the count of unavailable slots rises and falls
+and a **ceiling** throttles the rate. This is the rolling-update shape:
+
+```
+$ runnerctl fleet restart --max-unavailable 1
+build-1 slot 0: restart ok
+build-1 slot 1: restart ok
+build-2 slot 0: restart ok
+fleet restart: 4 slot(s) done, 0 failed
+```
+
+It walks one slot at a time and **re-reads fleet state between slots**, so it
+waits for the last one to come back before taking the next out. `N` may be a
+percentage (`--max-unavailable 25%`), resolved against the fleet's total slots
+and never rounded down to 0 — a budget of zero would block on the first slot
+and look exactly like a hung fleet.
+
+**`--min-available K` — for `stop`, `drain`, `disable`.** These take capacity
+away and never give it back, so the unavailable count only ever *rises*. A
+ceiling would take out N slots and then have nothing to wait for. What fits is
+a **floor**:
+
+```
+$ runnerctl fleet drain --min-available 2 ; echo "exit $?"
+build-1 slot 0: drain ok
+build-1 slot 1: drain ok
+fleet drain: 2 slot(s) done, 0 failed, 2 left running at the floor
+left running to hold --min-available 2: build-2/0 build-2/1
+exit 2
+```
+
+**Exit 2 means it deliberately did less than you asked** — neither success (0)
+nor failure (1). A drain that silently stops short is worse than one that says
+which slots it left running, and where.
+
+Each flag is **refused on the commands it cannot help**, rather than accepted
+and quietly ignored, and the two cannot be combined. Passing `--min-available`
+counts as naming your scope, so it satisfies the `--all-hosts` gate on its own.
+
+Both walk **one slot per remote call**, not one command per host: a budget is
+a statement about slots, and a per-host call would take a whole host's worth
+of capacity out in a single step whatever the number said.
+
+A host that does not answer contributes no slots to the arithmetic — its
+capacity is unknown, and guessing either way is worse than leaving it out. The
+walk says up front how many hosts it could not count.
 
 ### Profiles
 

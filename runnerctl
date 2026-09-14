@@ -52,7 +52,8 @@
 #   runnerctl fleet upgrade [--check] [--ref <branch|tag>]
 #   runnerctl fleet <apply|scale|start|stop|restart|drain|kill|reap| \
 #                    remove-limits|enable|disable> [--host H]... \
-#                   [--all-hosts] [<the command's own flags and targets>]
+#                   [--all-hosts] [--max-unavailable N|N%] [--min-available K] \
+#                   [<the command's own flags and targets>]
 #   runnerctl profiles
 #   runnerctl config-example
 #   runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
@@ -187,6 +188,18 @@
 # stays best-effort per host, and a fleet does not make it a fleet-wide
 # guarantee. `env-init` is excluded permanently (it would copy secrets over
 # ssh); `watch` and `logs` stay per-host.
+# Two graded capacity budgets (GHR-44), and they are two flags rather than
+# one because the operations have OPPOSITE dynamics. `--max-unavailable N`
+# (restart/apply/scale) is a CEILING: a restarted slot comes back, so the
+# unavailable count rises and falls and the ceiling throttles the rate — the
+# walk re-reads fleet state between slots and waits. `--min-available K`
+# (stop/drain/disable) is a FLOOR: that capacity is not returned, so the
+# count only rises and a ceiling would have nothing to wait for; the walk
+# stops before crossing the floor, names what it left running and exits 2 —
+# neither success nor failure, but deliberately less than was asked. N may be
+# a percentage, never rounded down to a deadlocking 0. Each flag is refused
+# on the commands it cannot help rather than quietly ignored. Both walk one
+# SLOT per call, since a per-host call would take a whole host out in a step.
 #
 # Recommended baselines:
 #   CI host:      runnerctl scale 2 --max 26G --high 25G
@@ -2806,17 +2819,155 @@ fleet_capacity_gate() { # SUBCOMMAND HOST-COUNT ALL-HOSTS
   die "'fleet $1' across every host would take the whole pool's capacity down at once — each host draining politely one slot at a time still lands them all at zero together. Name the hosts with --host H (repeatable), or pass --all-hosts if you do mean the entire fleet."
 }
 
+# --- Fleet capacity budgets (GHR-44) -----------------------------------------
+# GHR-43's controls are blunt: serial hosts, --host, and an --all-hosts
+# acknowledgement. These are the graded ones, and they are TWO DIFFERENT
+# SHAPES because the operations have opposite dynamics:
+#
+#   --max-unavailable N   for restart: a slot goes out and COMES BACK, so the
+#                         unavailable count rises and falls and a ceiling
+#                         throttles the rate. The rolling-update shape.
+#   --min-available K     for stop/drain/disable: capacity is removed and NOT
+#                         returned, so the unavailable count only ever rises.
+#                         A ceiling here would take out N slots and then have
+#                         nothing to wait for — it would block forever or
+#                         stop silently half-done. What these need is a
+#                         FLOOR: stop before crossing it, and say so.
+#
+# Conflating the two is the error GHR-42 was originally written around; see
+# that issue for the full reasoning.
+
+# "HOST IDX ACTIVE-STATE", one line per slot across the fleet.
+#
+# Extracted with one sed rather than a JSON parser: render_status_json emits
+# each slot as a single line and this script owns that emitter, so idx and
+# active are always on it together. That is a different thing from parsing
+# the status TABLE, which the fleet renderer refuses to do by column position
+# because an over-wide cell shifts everything after it on the row.
+#
+# A host that did not answer contributes no slots: its capacity is unknown,
+# and guessing either way is worse than leaving it out of the arithmetic. The
+# caller is told how many hosts were skipped.
+FLEET_SLOTS_SKIPPED=0
+fleet_slots() {
+  local i host
+  FLEET_SLOTS_SKIPPED=0
+  fleet_fanout "$FLEET_RUNNERCTL" status --json
+  for i in "${!FLEET_HOSTS[@]}"; do
+    host="${FLEET_HOSTS[$i]}"
+    if [ "$(fleet_rc "$i")" != 0 ]; then
+      FLEET_SLOTS_SKIPPED=$((FLEET_SLOTS_SKIPPED + 1))
+      continue
+    fi
+    sed -n "s/.*\"idx\":\([0-9]*\).*\"active\":\"\([a-z]*\)\".*/$host \1 \2/p" "$FLEET_DIR/$i.out"
+  done
+  fleet_cleanup
+}
+
+# Slots counted as serving work. `activating` and `reloading` are NOT
+# available: a slot on its way up cannot take a job yet, and counting it
+# would let a roll run ahead of itself.
+fleet_count_available() { # SLOT-LINES
+  printf '%s\n' "$1" | awk '$3 == "active"' | grep -c . || true
+}
+
+fleet_count_unavailable() { # SLOT-LINES
+  printf '%s\n' "$1" | awk 'NF == 3 && $3 != "active"' | grep -c . || true
+}
+
+# Percentage forms resolve against the fleet's total slots and NEVER round to
+# zero: a budget of 0 would deadlock the roll on its first slot, which looks
+# exactly like a hung fleet.
+fleet_resolve_budget() { # VALUE TOTAL
+  local v="$1" total="$2" n
+  case "$v" in
+    *%) n=$(( total * ${v%\%} / 100 )); [ "$n" -ge 1 ] || n=1 ;;
+    *)  n="$v" ;;
+  esac
+  echo "$n"
+}
+
 # Fan a MUTATING command out. Everything here is deliberately different from
 # the read-only commands above.
+# Walk the fleet's slots one at a time, holding a capacity budget.
+#
+# One slot per remote call, rather than one command per host: a budget is a
+# statement about SLOTS, and a per-host call would take a whole host's worth
+# of capacity out in one step regardless of the number.
+#
+# Returns 0 when every targeted slot was acted on, 2 when a floor stopped it
+# early (a distinct code because "I deliberately did less than you asked" is
+# neither success nor failure), 1 when a slot failed.
+fleet_budget_walk() { # SUBCOMMAND MODE BUDGET [REMOTE-ARGS...]
+  local sub="$1" mode="$2" budget="$3"; shift 3
+  local slots host idx state n total waited acted=0 nbad=0 stopped_at_floor=false
+  local -a left=()
+  slots="$(fleet_slots)"
+  total="$(printf '%s\n' "$slots" | grep -c . || true)"
+  [ "$total" -gt 0 ] || die "no slots found on the fleet — nothing to $sub (are the hosts reachable? try 'runnerctl fleet status')"
+  n="$(fleet_resolve_budget "$budget" "$total")"
+  [[ "$n" =~ ^[0-9]+$ ]] || die "budget '$budget' is invalid — want a whole number or a percentage like 25%"
+  if [ "$FLEET_SLOTS_SKIPPED" -gt 0 ]; then
+    # Said once, up front: a budget computed from a partial fleet is a
+    # different promise from one computed over all of it, and the operator
+    # should know which they are getting before anything moves.
+    echo "warning: $FLEET_SLOTS_SKIPPED host(s) did not answer — the budget is being held over the $total slot(s) that did"
+  fi
+  while IFS=' ' read -r host idx state; do
+    [ -n "$host" ] || continue
+    if [ "$mode" = floor ]; then
+      # Would acting take the fleet below the floor? Re-read rather than
+      # decrementing a local counter: another operator, or a crashing job,
+      # can move the number underneath a long roll.
+      local avail; avail="$(fleet_count_available "$(fleet_slots)")"
+      if [ "$((avail - 1))" -lt "$n" ]; then
+        stopped_at_floor=true
+        left+=("$host/$idx")
+        continue
+      fi
+    else
+      # Ceiling: wait for the fleet to come back under budget.
+      waited=0
+      while :; do
+        local unavail; unavail="$(fleet_count_unavailable "$(fleet_slots)")"
+        [ "$unavail" -ge "$n" ] || break
+        [ "$waited" -lt "$WAIT_TIMEOUT" ] || die "waited ${waited}s for the fleet to come back under --max-unavailable $n and it did not — $acted slot(s) already ${sub}ed; 'runnerctl fleet status' shows what is still out"
+        pause "$POLL_SEC"
+        waited=$((waited + POLL_SEC))
+      done
+    fi
+    local rc1=0
+    ssh_run "$host" "$FLEET_RUNNERCTL" "$sub" "$idx" "$@" >/dev/null 2>&1 || rc1=$?
+    if [ "$rc1" = 0 ]; then
+      acted=$((acted + 1)); echo "$host slot $idx: $sub ok"
+    else
+      nbad=$((nbad + 1)); echo "$host slot $idx: $sub FAILED (exit $rc1)"
+    fi
+  done <<<"$slots"
+  # Not ${stopped_at_floor:+...}: the variable holds the STRING "false" when
+  # the floor was never hit, which is non-empty and would expand anyway.
+  if $stopped_at_floor; then
+    echo "fleet $sub: $acted slot(s) done, $nbad failed, ${#left[@]} left running at the floor"
+    echo "left running to hold --min-available $n: ${left[*]}"
+  else
+    echo "fleet $sub: $acted slot(s) done, $nbad failed"
+  fi
+  [ "$nbad" -eq 0 ] || return 1
+  $stopped_at_floor && return 2
+  return 0
+}
+
 cmd_fleet_run() { # SUBCOMMAND [--host H]... [--all-hosts] [REMOTE-ARGS...]
   local sub="$1"; shift
-  local all_hosts=false rc=0
+  local all_hosts=false rc=0 max_unavail="" min_avail=""
   local -a hosts=() fwd=()
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     case "$1" in
       --host)      need_val "$@"; hosts+=("$2"); shift 2 ;;
       --all-hosts) all_hosts=true; shift ;;
+      --max-unavailable) need_val "$@"; max_unavail="$2"; shift 2 ;;
+      --min-available)   need_val "$@"; min_avail="$2"; shift 2 ;;
       # Everything else is the remote command's own flag and is forwarded
       # untouched. Re-implementing each command's parser here would be a
       # second copy to keep in step, and the host that runs it is the one
@@ -2826,6 +2977,35 @@ cmd_fleet_run() { # SUBCOMMAND [--host H]... [--all-hosts] [REMOTE-ARGS...]
   done
   require_fleet
   [ "${#hosts[@]}" -eq 0 ] || fleet_select_hosts "${hosts[@]}"
+  # Which budget suits which command is not a preference — see the block
+  # above fleet_slots. A ceiling on a command that never gives capacity back
+  # cannot make progress, and a floor on a rolling restart is meaningless
+  # because the roll returns what it takes. Refuse the wrong pairing rather
+  # than accepting a flag that would quietly do nothing.
+  # Checked BEFORE the per-command pairing below: "you asked for both" is the
+  # more fundamental mistake, and reporting the pairing error first would
+  # describe a flag the user is about to be told they cannot use anyway.
+  [ -z "$max_unavail" ] || [ -z "$min_avail" ] || die "--max-unavailable and --min-available cannot be combined: one throttles a roll that gives capacity back, the other holds a floor under capacity being removed"
+  if [ -n "$max_unavail" ]; then
+    case "$sub" in
+      restart|apply|scale) ;;
+      *) die "--max-unavailable applies to restart, apply and scale, not '$sub': it is a ceiling on slots that are temporarily out, and '$sub' does not give the capacity back. Use --min-available K to hold a floor instead." ;;
+    esac
+  fi
+  if [ -n "$min_avail" ]; then
+    case "$sub" in
+      stop|drain|disable) ;;
+      *) die "--min-available applies to stop, drain and disable, not '$sub': it is a floor under capacity that is being taken away, and '$sub' returns what it takes. Use --max-unavailable N to throttle the roll instead." ;;
+    esac
+  fi
+  if [ -n "$max_unavail" ]; then
+    fleet_budget_walk "$sub" ceiling "$max_unavail" ${fwd[@]+"${fwd[@]}"} || rc=$?
+    return "$rc"
+  fi
+  if [ -n "$min_avail" ]; then
+    fleet_budget_walk "$sub" floor "$min_avail" ${fwd[@]+"${fwd[@]}"} || rc=$?
+    return "$rc"
+  fi
   fleet_capacity_gate "$sub" "${#hosts[@]}" "$all_hosts"
   # ONE HOST AT A TIME. FLEET_PARALLEL is ignored for mutating commands on
   # purpose: with the existing per-host --when-idle (one slot at a time

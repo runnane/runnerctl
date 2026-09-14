@@ -2885,6 +2885,84 @@ case_fleet_excluded_commands_say_why() {
   expect_err 'fleet logs is not supported: logs is streaming'
 }
 
+# --- GHR-44: capacity budgets ------------------------------------------------
+# The assertion the whole issue exists for: the roll must RE-READ fleet state
+# between slots rather than firing them off back to back. Asserted from the
+# recorded call sequence — a status poll between two consecutive restarts —
+# not from the end state, which looks identical either way.
+case_fleet_max_unavailable_repolls_between_slots() {
+  RUNNERCTL_STUB_FLEET_SLOTS=2 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    run fleet restart --max-unavailable 1
+  expect_rc 0
+  expect_out '^build-1 slot 0: restart ok$'
+  expect_out '^build-2 slot 1: restart ok$'
+  expect_out '^fleet restart: 4 slot\(s\) done, 0 failed$'
+  expect_log_order '^probe:ssh_run build-1 -- runnerctl restart 0$' \
+                   '^probe:ssh_run build-1 -- runnerctl status --json$' \
+                   '^probe:ssh_run build-1 -- runnerctl restart 1$'
+  # one slot per remote call, never a whole host at once
+  expect_no_log '^probe:ssh_run build-1 -- runnerctl restart$'
+}
+
+# A floor, not a ceiling: stop/drain/disable take capacity away and never give
+# it back, so the budget that fits them stops the walk instead of throttling
+# it, and says what it deliberately left running.
+case_fleet_min_available_stops_at_the_floor() {
+  RUNNERCTL_STUB_FLEET_SLOTS=2 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    run fleet drain --min-available 2
+  # 2 is neither success nor failure: it did less than asked, on purpose
+  expect_rc 2
+  expect_out '^fleet drain: 2 slot\(s\) done, 0 failed, 2 left running at the floor$'
+  expect_out '^left running to hold --min-available 2: build-2/0 build-2/1$'
+  # and it really stopped — the held-back slots were never dialled
+  expect_no_log '^probe:ssh_run build-2 -- runnerctl drain '
+}
+
+# Offering a flag that would quietly do nothing is worse than refusing it.
+case_fleet_budget_flags_refuse_the_wrong_command() {
+  RUNNERCTL_STUB_FLEET_SLOTS=2 RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet drain --max-unavailable 1
+  expect_rc 1
+  expect_err "--max-unavailable applies to restart, apply and scale, not 'drain'"
+  expect_no_log '^probe:ssh_run build-1 -- runnerctl drain '
+  RUNNERCTL_STUB_FLEET_SLOTS=2 RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet restart --min-available 1
+  expect_rc 1
+  expect_err "--min-available applies to stop, drain and disable, not 'restart'"
+  RUNNERCTL_STUB_FLEET_SLOTS=2 RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet restart --max-unavailable 1 --min-available 1
+  expect_rc 1
+  expect_err '--max-unavailable and --min-available cannot be combined'
+}
+
+# A budget of 0 would deadlock the roll on its first slot and look exactly
+# like a hung fleet, so a percentage that rounds down to nothing clamps to 1.
+case_fleet_percentage_budget_never_rounds_to_zero() {
+  RUNNERCTL_STUB_FLEET_SLOTS=2 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    run fleet restart --max-unavailable 10%
+  expect_rc 0
+  expect_out '^fleet restart: 4 slot\(s\) done, 0 failed$'
+  run_fn fleet_resolve_budget 10% 4
+  expect_out '^1$'
+  run_fn fleet_resolve_budget 50% 4
+  expect_out '^2$'
+  run_fn fleet_resolve_budget 3 99
+  expect_out '^3$'
+}
+
+# The slot inventory is extracted from status --json with a sed, on the
+# strength of render_status_json printing one line per slot. This case runs
+# the walk against the REAL renderer rather than the budget fixture, so the
+# two cannot drift apart unnoticed: if the emitter ever splits a slot across
+# lines, or renames idx/active, this goes red.
+case_fleet_slot_inventory_reads_the_real_json_emitter() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet restart --max-unavailable 9
+  expect_rc 0
+  # the stub host has three slots and the walk found all three, by index
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart [012]$' 3
+  expect_out '^fleet restart: 3 slot\(s\) done, 0 failed$'
+}
+
 case_fleet_unknown_subcommand_dies() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet bogus
   expect_rc 1
@@ -3135,6 +3213,12 @@ t "fleet stop/drain/disable: refused fleet-wide without explicit scope" case_fle
 t "fleet drain: allowed with --host or --all-hosts"                    case_fleet_capacity_removal_allowed_when_scoped_or_acknowledged
 t "fleet <mutating>: a sudo failure is a named row with the remedy"    case_fleet_sudo_failure_is_a_named_row_with_the_remedy
 t "fleet env-init/watch/logs: excluded, each saying why"               case_fleet_excluded_commands_say_why
+# --- GHR-44: capacity budgets -------------------------------------------------
+t "fleet --max-unavailable: re-reads fleet state between slots"        case_fleet_max_unavailable_repolls_between_slots
+t "fleet --min-available: stops at the floor, names what it left"      case_fleet_min_available_stops_at_the_floor
+t "fleet budgets: each refuses the command it cannot help"             case_fleet_budget_flags_refuse_the_wrong_command
+t "fleet budgets: a percentage never rounds to a deadlocking zero"     case_fleet_percentage_budget_never_rounds_to_zero
+t "fleet budgets: the slot inventory reads the real --json emitter"    case_fleet_slot_inventory_reads_the_real_json_emitter
 t "fleet: an unconfigured fleet says so and dials nothing"             case_fleet_unconfigured_says_so
 t "fleet bogus: unknown subcommand dies, dials nothing"                case_fleet_unknown_subcommand_dies
 
