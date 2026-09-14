@@ -50,6 +50,9 @@
 #   runnerctl fleet health [--quiet] [--max-restarts N] [--stall-after N] \
 #                          [--restart-stalled]
 #   runnerctl fleet upgrade [--check] [--ref <branch|tag>]
+#   runnerctl fleet <apply|scale|start|stop|restart|drain|kill|reap| \
+#                    remove-limits|enable|disable> [--host H]... \
+#                   [--all-hosts] [<the command's own flags and targets>]
 #   runnerctl profiles
 #   runnerctl config-example
 #   runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
@@ -173,6 +176,17 @@
 # and which host is still behind is the thing you must not lose. Writing the
 # script needs root on a normal host, so this is the first fan-out that
 # needs passwordless sudo there.
+# The MUTATING commands fan out too (GHR-43), and differ from the read-only
+# ones in three ways. They go ONE HOST AT A TIME (FLEET_PARALLEL is ignored),
+# so with the per-host --when-idle the blast radius is a single host at any
+# moment. `--host H` (repeatable, validated against FLEET_HOSTS) narrows the
+# target. And `stop`, `drain` and `disable` are REFUSED fleet-wide unless
+# given --host or --all-hosts: they take capacity away and do not give it
+# back, and per-host politeness does not compose — every host draining one
+# slot at a time still lands the fleet at zero together. Note --when-idle
+# stays best-effort per host, and a fleet does not make it a fleet-wide
+# guarantee. `env-init` is excluded permanently (it would copy secrets over
+# ssh); `watch` and `logs` stay per-host.
 #
 # Recommended baselines:
 #   CI host:      runnerctl scale 2 --max 26G --high 25G
@@ -2612,13 +2626,21 @@ fleet_reachable() { # RC
 }
 
 fleet_error_text() { # RC ERRFILE
-  local rc="$1" err=""
+  local rc="$1" err="" hint=""
   [ ! -s "$2" ] || err="$(head -1 "$2")"
+  # A sudo refusal is accurate but leaves the reader to work out the fix, and
+  # it is the single most likely failure of a mutating fan-out. Name the
+  # remedy where it is read. BatchMode=yes is what makes this a failure to
+  # report at all rather than a fan-out hung on a password prompt.
+  case "$err" in
+    *sudo:*|*"a password is required"*|*"may not run"*|*"no tty present"*)
+      hint=" — the ssh login needs passwordless sudo on that host; see the fleet section of the README for the exact sudoers line" ;;
+  esac
   case "$rc" in
     0)   echo "" ;;
     124) echo "timed out after ${FLEET_TIMEOUT}s${err:+ — $err}" ;;
     255) echo "unreachable${err:+ — $err}" ;;
-    *)   echo "remote exit $rc${err:+ — $err}" ;;
+    *)   echo "remote exit $rc${err:+ — $err}$hint" ;;
   esac
 }
 
@@ -2735,8 +2757,107 @@ cmd_fleet() {
     status)  cmd_fleet_status "$@" ;;
     health)  cmd_fleet_health "$@" ;;
     upgrade) cmd_fleet_upgrade "$@" ;;
-    *)       die "unknown fleet command '$sub' (status health upgrade)" ;;
+    apply|scale|start|stop|restart|drain|kill|reap|remove-limits|enable|disable)
+             cmd_fleet_run "$sub" "$@" ;;
+    # env-init is PERMANENTLY excluded, not merely unimplemented: it writes an
+    # EnvironmentFile of secrets, and fanning it out means pushing secrets
+    # over ssh. watch and logs are interactive and streaming, so they stay
+    # per-host. Saying which of the three it is beats "unknown command".
+    env-init)
+             die "fleet env-init is not supported and will not be: it writes an EnvironmentFile of secrets, which fanning out means copying secrets over ssh. Run 'runnerctl env-init' on each host." ;;
+    watch|logs)
+             die "fleet $sub is not supported: $sub is $([ "$sub" = watch ] && echo interactive || echo streaming) and only makes sense against one host. Use 'runnerctl fleet status' for an overview, or ssh to the host." ;;
+    *)       die "unknown fleet command '$sub' (status health upgrade apply scale start stop restart drain kill reap remove-limits enable disable)" ;;
   esac
+}
+
+# --host H, repeatable, narrows the fan-out. Validated against FLEET_HOSTS
+# and dies naming an unknown one rather than dialling it: a typo that
+# silently targets nothing, on a command that stops runners, is worse than
+# an error.
+fleet_select_hosts() { # NAME...
+  local want h found
+  local -a sel=()
+  for want in "$@"; do
+    found=false
+    for h in "${FLEET_HOSTS[@]}"; do
+      if [ "$h" = "$want" ]; then found=true; break; fi
+    done
+    $found || die "--host '$want' is not in FLEET_HOSTS (configured: ${FLEET_HOSTS[*]})"
+    sel+=("$want")
+  done
+  FLEET_HOSTS=("${sel[@]}")
+}
+
+# stop, drain and disable take fleet capacity away and do not give it back.
+# Run across every host with no thought, they are an outage — and the whole
+# reason this needs its own gate is that the per-host --when-idle politeness
+# does NOT compose: every host draining one-slot-at-a-time still converges on
+# zero fleet capacity at roughly the same moment.
+#
+# So they are refused fleet-wide unless the operator was explicit: --host H
+# (a bounded target) or --all-hosts (an acknowledgement). restart and kill
+# are transient — the unit comes back — and apply/scale/reap/remove-limits/
+# enable/start do not remove capacity, so none of them need this.
+fleet_capacity_gate() { # SUBCOMMAND HOST-COUNT ALL-HOSTS
+  case "$1" in stop|drain|disable) ;; *) return 0 ;; esac
+  [ "$2" -eq 0 ] || return 0
+  $3 && return 0
+  die "'fleet $1' across every host would take the whole pool's capacity down at once — each host draining politely one slot at a time still lands them all at zero together. Name the hosts with --host H (repeatable), or pass --all-hosts if you do mean the entire fleet."
+}
+
+# Fan a MUTATING command out. Everything here is deliberately different from
+# the read-only commands above.
+cmd_fleet_run() { # SUBCOMMAND [--host H]... [--all-hosts] [REMOTE-ARGS...]
+  local sub="$1"; shift
+  local all_hosts=false rc=0
+  local -a hosts=() fwd=()
+  while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    case "$1" in
+      --host)      need_val "$@"; hosts+=("$2"); shift 2 ;;
+      --all-hosts) all_hosts=true; shift ;;
+      # Everything else is the remote command's own flag and is forwarded
+      # untouched. Re-implementing each command's parser here would be a
+      # second copy to keep in step, and the host that runs it is the one
+      # that should reject a bad flag.
+      *)           fwd+=("$1"); shift ;;
+    esac
+  done
+  require_fleet
+  [ "${#hosts[@]}" -eq 0 ] || fleet_select_hosts "${hosts[@]}"
+  fleet_capacity_gate "$sub" "${#hosts[@]}" "$all_hosts"
+  # ONE HOST AT A TIME. FLEET_PARALLEL is ignored for mutating commands on
+  # purpose: with the existing per-host --when-idle (one slot at a time
+  # within a host), serial hosts bound the blast radius to a single host at
+  # any moment. It is slow on a large fleet, and that is the right trade for
+  # something that can take CI capacity down.
+  FLEET_PARALLEL=1
+  fleet_fanout "$FLEET_RUNNERCTL" "$sub" ${fwd[@]+"${fwd[@]}"}
+  fleet_run_report "$sub" || rc=$?
+  fleet_cleanup
+  return "$rc"
+}
+
+# One block per host: whatever that host said, prefixed, then a count. A
+# host's own output is reused rather than summarised, because these commands
+# already say useful per-slot things ("2 stalled slot(s)", "nothing to reap").
+fleet_run_report() { # SUBCOMMAND
+  local sub="$1" i host rc line ok=0 bad=0
+  for i in "${!FLEET_HOSTS[@]}"; do
+    host="${FLEET_HOSTS[$i]}"
+    rc="$(fleet_rc "$i")"
+    if [ "$rc" = 0 ]; then ok=$((ok + 1)); else bad=$((bad + 1)); fi
+    # stdout first even when the host failed: a command that got part way
+    # through says so there, and losing that would hide a half-applied host.
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      printf '%s: %s\n' "$host" "$line"
+    done <"$FLEET_DIR/$i.out"
+    [ "$rc" = 0 ] || printf '%s: %s\n' "$host" "$(fleet_error_text "$rc" "$FLEET_DIR/$i.err")"
+  done
+  echo "fleet $sub: $ok host(s) ok, $bad failed"
+  [ "$bad" -eq 0 ]
 }
 
 # `fleet upgrade`: hold every host on one runnerctl version from one place.

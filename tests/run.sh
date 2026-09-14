@@ -2766,6 +2766,125 @@ case_fleet_upgrade_ref_is_forwarded_and_bad_option_dies() {
   expect_no_log '^probe:ssh_run '
 }
 
+case_fleet_mutating_fans_out_and_forwards_flags() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet restart --when-idle --timeout 60
+  expect_rc 0
+  expect_out '^build-1: restart done\.$'
+  expect_out '^build-2: restart done\.$'
+  expect_out '^fleet restart: 2 host\(s\) ok, 0 failed$'
+  # the remote command's own flags go through untouched
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart --when-idle --timeout 60$' 1
+}
+
+# Mutating commands go ONE HOST AT A TIME; read-only ones do not.
+#
+# This asserts it with the stub's overlap detector rather than with entry/exit
+# ordering. Ordering alone does NOT discriminate: the stub is fast enough that
+# parallel calls often fail to overlap, and the first version of this case
+# passed against a deliberately parallel fan-out. The detector holds a lock
+# for a window, so a parallel caller reliably collides and a serial one
+# cannot.
+#
+# The `status` half is not decoration — it fires the detector, proving the
+# detector can fire at all. Without it, "no overlap" would be consistent with
+# a detector that never works.
+case_fleet_mutating_is_serial_while_status_is_parallel() {
+  RUNNERCTL_STUB_DETECT_OVERLAP=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 build-3" \
+    run fleet restart
+  expect_rc 0
+  expect_no_log '^probe:ssh_run_overlap '
+  expect_log_order '^probe:ssh_run build-1 -- ' '^probe:ssh_run_done build-1$' \
+                   '^probe:ssh_run build-2 -- ' '^probe:ssh_run_done build-2$' \
+                   '^probe:ssh_run build-3 -- ' '^probe:ssh_run_done build-3$'
+  # the read-only path really is parallel, which is what shows the detector
+  # is capable of firing
+  RUNNERCTL_STUB_DETECT_OVERLAP=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 build-3" \
+    run fleet status
+  expect_rc 0
+  expect_log '^probe:ssh_run_overlap '
+}
+
+case_fleet_host_targets_exactly_that_host() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 build-3" run fleet restart --host build-2
+  expect_rc 0
+  expect_out '^build-2: restart done\.$'
+  expect_out '^fleet restart: 1 host\(s\) ok, 0 failed$'
+  expect_log_count '^probe:ssh_run ' 1
+  expect_no_log '^probe:ssh_run build-1 '
+  expect_no_log '^probe:ssh_run build-3 '
+  # repeatable
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 build-3" run fleet restart --host build-1 --host build-3
+  expect_rc 0
+  expect_log_count '^probe:ssh_run ' 2
+  expect_no_log '^probe:ssh_run build-2 '
+}
+
+# A typo that silently targets nothing, on a command that stops runners, is
+# worse than an error — so an unknown host dies BEFORE anything is dialled.
+case_fleet_host_unknown_dies_before_dialling() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet restart --host typo-1
+  expect_rc 1
+  expect_err "--host 'typo-1' is not in FLEET_HOSTS \(configured: build-1 build-2\)"
+  expect_no_log '^probe:ssh_run '
+}
+
+# The footgun this slice exists to prevent: per-host --when-idle politeness
+# does not compose, so every host draining one slot at a time still lands the
+# fleet at zero capacity together.
+case_fleet_capacity_removal_refused_without_explicit_scope() {
+  local c
+  for c in stop drain disable; do
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet "$c"
+    expect_rc 1
+    expect_err "'fleet $c' across every host would take the whole pool's capacity down at once"
+    expect_err 'Name the hosts with --host H \(repeatable\), or pass --all-hosts'
+    expect_no_log '^probe:ssh_run '
+  done
+  # transient and non-capacity commands are NOT gated
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet restart
+  expect_rc 0
+  expect_log_count '^probe:ssh_run ' 2
+}
+
+case_fleet_capacity_removal_allowed_when_scoped_or_acknowledged() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet drain --host build-1
+  expect_rc 0
+  expect_out '^build-1: drain done\.$'
+  expect_log_count '^probe:ssh_run ' 1
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet drain --all-hosts
+  expect_rc 0
+  expect_out '^fleet drain: 2 host\(s\) ok, 0 failed$'
+  expect_log_count '^probe:ssh_run ' 2
+}
+
+# The most likely failure of a mutating fan-out, and the one BatchMode=yes
+# turns into a report instead of a hang. `run` kills the case after
+# RUN_TIMEOUT, so a regression that reintroduces the hang fails here rather
+# than wedging the gate.
+case_fleet_sudo_failure_is_a_named_row_with_the_remedy() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-nosudo" run fleet restart
+  expect_rc 1
+  expect_out '^box-nosudo: remote exit 1 — sudo: a password is required — the ssh login needs passwordless sudo on that host; see the fleet section of the README for the exact sudoers line$'
+  # the healthy host still did its work, and the count is honest
+  expect_out '^build-1: restart done\.$'
+  expect_out '^fleet restart: 1 host\(s\) ok, 1 failed$'
+}
+
+# Not "unknown command": these are three different deliberate exclusions and
+# the message says which, so nobody re-files them as missing features.
+case_fleet_excluded_commands_say_why() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet env-init
+  expect_rc 1
+  expect_err 'fleet env-init is not supported and will not be: it writes an EnvironmentFile of secrets'
+  expect_no_log '^probe:ssh_run '
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch
+  expect_rc 1
+  expect_err 'fleet watch is not supported: watch is interactive'
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet logs
+  expect_rc 1
+  expect_err 'fleet logs is not supported: logs is streaming'
+}
+
 case_fleet_unknown_subcommand_dies() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet bogus
   expect_rc 1
@@ -3008,6 +3127,14 @@ t "fleet upgrade: applies and says what changed"                       case_flee
 t "fleet upgrade: a failed host is a row, the rest still upgrade"      case_fleet_upgrade_failed_host_is_a_row_not_an_abort
 t "fleet upgrade: an unrecognised answer is shown, not guessed at"     case_fleet_upgrade_unrecognised_answer_is_shown_not_guessed
 t "fleet upgrade: --ref forwarded; unknown option dies before dialling" case_fleet_upgrade_ref_is_forwarded_and_bad_option_dies
+t "fleet <mutating>: fans out and forwards the remote's own flags"     case_fleet_mutating_fans_out_and_forwards_flags
+t "fleet <mutating>: serial one host at a time; status stays parallel" case_fleet_mutating_is_serial_while_status_is_parallel
+t "fleet --host: targets exactly those hosts, repeatable"              case_fleet_host_targets_exactly_that_host
+t "fleet --host: an unknown host dies before anything is dialled"      case_fleet_host_unknown_dies_before_dialling
+t "fleet stop/drain/disable: refused fleet-wide without explicit scope" case_fleet_capacity_removal_refused_without_explicit_scope
+t "fleet drain: allowed with --host or --all-hosts"                    case_fleet_capacity_removal_allowed_when_scoped_or_acknowledged
+t "fleet <mutating>: a sudo failure is a named row with the remedy"    case_fleet_sudo_failure_is_a_named_row_with_the_remedy
+t "fleet env-init/watch/logs: excluded, each saying why"               case_fleet_excluded_commands_say_why
 t "fleet: an unconfigured fleet says so and dials nothing"             case_fleet_unconfigured_says_so
 t "fleet bogus: unknown subcommand dies, dials nothing"                case_fleet_unknown_subcommand_dies
 
