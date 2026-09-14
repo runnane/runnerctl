@@ -280,7 +280,7 @@ memory values); no `jq` needed to produce it, and the table and the JSON are
 rendered from one collector, so they cannot disagree on a value:
 
 ```json
-{"runnerctl":"0.7.0","host":{"cores":16,"mem_total":64424509440,"mem_available":51539607552},
+{"runnerctl":"0.7.0","host":{"name":"build-1","cores":16,"mem_total":64424509440,"mem_available":51539607552},
  "slots":[
   {"idx":0,"unit":"actions.runner.org.host-1.service","name":"org.host-1",
    "active":"active","sub":"running","enabled":"enabled",
@@ -319,11 +319,25 @@ read), `memory_events` (`{"high","max","oom_kill"}` from the cgroup's
 (`{"full_avg10","full_avg60","full_total"}` from `memory.pressure` —
 percentages and total stall microseconds; the `PRESS` column is
 `full_avg10`), each object null when the file could not be read. `host`
-carries `cores`
+carries `name` (the host's own `hostname`, null when it cannot be read),
+`cores`
 (`nproc`) and `mem_total` / `mem_available` (bytes, from `/proc/meminfo`);
 `runnerctl` is the version of the script that produced the object, for
 inventorying a fleet.
 `--json` is one-shot and refuses `--watch`; poll it instead.
+
+`host.name` is what makes a saved payload self-describing — a file or a
+monitoring record says which host produced it with no out-of-band label.
+It is deliberately the host's *own* name rather than one a caller passes in:
+where it disagrees with the alias something dialled to reach the box, that
+disagreement is worth seeing.
+
+Unlike the table, `--json` **never dies on a host with no runner units** — it
+prints `"slots": []` and exits 0. A host drained to zero slots, or inventoried
+before its runners are installed, is a legitimate state, and exiting non-zero
+there would be indistinguishable from the host being unreachable. Typing
+`runnerctl status` on such a box still gets the error, because that is
+usually a wrong-box mistake rather than a fact worth recording.
 ### Health checks for cron / uptime monitors: `health`
 
 `runnerctl status` always exits 0, so nothing on the host can notice "slot

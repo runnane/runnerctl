@@ -1487,6 +1487,21 @@ host_facts() {
   ' /proc/meminfo 2>/dev/null || echo "$cores"
 }
 
+# The host's own name for the JSON `host` object (GHR-38) — `hostname`, then
+# `uname -n`, empty if neither answers. Behind a function so a test config can
+# pin it, like host_facts and host_line above.
+#
+# It is deliberately the host's OWN idea of its name rather than something a
+# caller passes in: a central node fanning `status --json` out over ssh knows
+# only the alias it dialled, and where the alias and the hostname disagree —
+# one box reachable under two names, or an alias pointing somewhere other than
+# where its name suggests — that is worth seeing rather than papering over.
+# It also makes a saved payload self-describing: a file or a monitoring record
+# says which host produced it, with no out-of-band label.
+host_name() {
+  hostname 2>/dev/null || uname -n 2>/dev/null || true
+}
+
 # `status --json`: the same SLOT facts as raw bytes, epoch seconds and null
 # — formatting is the consumer's job. The top-level object carries
 # `runnerctl` (the version of the script that produced it, GHR-32) and
@@ -1507,12 +1522,23 @@ host_facts() {
 # is {"high","max","oom_kill"} from the cgroup's memory.events and
 # `memory_pressure` {"full_avg10","full_avg60","full_total"} from its
 # memory.pressure, each object null when nothing could be read (GHR-31).
+# `host` carries `name` (the host's own hostname, null when it cannot be
+# read — GHR-38) alongside `cores`, `mem_total` and `mem_available`.
+# Unlike the table, this never dies on a host with no runner units: it
+# prints `"slots": []` and exits 0 (GHR-38).
 render_status_json() {
-  require_runners
+  # No require_runners here, unlike render_status (GHR-38). A host with no
+  # runner units is a well-formed `"slots": []` object and exit 0, not a die:
+  # a fleet member drained to zero slots, or inventoried before its runners
+  # are installed, is a legitimate state, and aborting makes it indistinguish-
+  # able from an ssh failure — two very different things to be paged about.
+  # The table path keeps dying, because an operator who typed `status` on the
+  # wrong box should be told so.
   local cores mem_total mem_avail i=0 u sep="" job idle_since completed
   read -r cores mem_total mem_avail < <(host_facts) || true
-  printf '{"runnerctl":%s,"host":{"cores":%s,"mem_total":%s,"mem_available":%s},\n "slots":[' \
-    "$(json_str "$RUNNERCTL_VERSION")" "$(json_num "$cores")" "$(json_num "$mem_total")" "$(json_num "$mem_avail")"
+  printf '{"runnerctl":%s,"host":{"name":%s,"cores":%s,"mem_total":%s,"mem_available":%s},\n "slots":[' \
+    "$(json_str "$RUNNERCTL_VERSION")" "$(json_strn "$(host_name)")" \
+    "$(json_num "$cores")" "$(json_num "$mem_total")" "$(json_num "$mem_avail")"
   while read -r u; do
     [ -n "$u" ] || continue
     collect_slot "$u" "$i"
