@@ -2710,6 +2710,62 @@ case_fleet_health_unknown_option_dies() {
   expect_no_log '^probe:ssh_run '
 }
 
+case_fleet_upgrade_check_reports_each_host_and_counts() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver box-ahead" run fleet upgrade --check
+  expect_rc 0
+  expect_out '^build-1 +1\.0\.0 +up to date$'
+  expect_out '^build-2-oldver +0\.0\.1 -> 9\.9\.9 +update available$'
+  expect_out '^box-ahead +9\.9\.9 -> 1\.0\.0 +ahead of the source — left alone$'
+  expect_out '^3 host\(s\): 2 up to date, 1 would change, 0 unreachable or unclear$'
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl upgrade --check$' 1
+  # --check writes nothing anywhere
+  expect_no_log '^(systemctl|sudo|tee|rm|mkdir|chown|chmod) '
+}
+
+case_fleet_upgrade_applies_and_says_what_changed() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver" run fleet upgrade
+  expect_rc 0
+  expect_out '^build-2-oldver +0\.0\.1 -> 9\.9\.9 +upgraded$'
+  expect_out '^2 host\(s\): 1 already level, 1 upgraded, 0 unreachable or unclear$'
+  # no --check reached the hosts this time
+  expect_log_count '^probe:ssh_run build-2-oldver -- runnerctl upgrade$' 1
+}
+
+# A partly upgraded fleet is the normal outcome of a flaky network. Losing
+# which host is still behind is the failure that matters, so a bad host is a
+# row and the rest still upgrade.
+case_fleet_upgrade_failed_host_is_a_row_not_an_abort() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver gw-unreachable slow-timeout" run fleet upgrade
+  expect_rc 1
+  expect_out '^build-2-oldver +0\.0\.1 -> 9\.9\.9 +upgraded$'
+  expect_out '^gw-unreachable +— +unreachable — '
+  expect_out '^slow-timeout +— +timed out after 30s$'
+  expect_out '^3 host\(s\): 0 already level, 1 upgraded, 2 unreachable or unclear$'
+}
+
+# An answer the reporter does not recognise is SHOWN, never folded into "up
+# to date" — a silent pass for a host that said something else is what sends
+# someone to the wrong box.
+case_fleet_upgrade_unrecognised_answer_is_shown_not_guessed() {
+  RUNNERCTL_STUB_FLEET_HOSTS="node-weird" run fleet upgrade --check
+  expect_rc 1
+  expect_out '^node-weird +1\.0\.0 +unrecognised: something this tool has never said before$'
+  # the ROW must not claim a state the host never reported (the summary line
+  # legitimately contains the words "0 up to date")
+  expect_no_out '^node-weird .*up to date'
+  expect_out '^1 host\(s\): 0 up to date, 0 would change, 1 unreachable or unclear$'
+}
+
+case_fleet_upgrade_ref_is_forwarded_and_bad_option_dies() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet upgrade --ref v1.2.3
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl upgrade --ref v1\.2\.3$' 1
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet upgrade --bogus
+  expect_rc 1
+  expect_err 'unknown option: --bogus'
+  expect_no_log '^probe:ssh_run '
+}
+
 case_fleet_unknown_subcommand_dies() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet bogus
   expect_rc 1
@@ -2947,6 +3003,11 @@ t "fleet health: an unreachable host is a problem, never a pass"       case_flee
 t "fleet health: a remote die with empty stdout is still a problem"    case_fleet_health_remote_die_with_empty_stdout_is_still_a_problem
 t "fleet health --quiet: silent, exit code kept, not forwarded"        case_fleet_health_quiet_keeps_the_exit_code
 t "fleet health: unknown option and bad value die before dialling"     case_fleet_health_unknown_option_dies
+t "fleet upgrade --check: per-host versions and a count, writes nothing" case_fleet_upgrade_check_reports_each_host_and_counts
+t "fleet upgrade: applies and says what changed"                       case_fleet_upgrade_applies_and_says_what_changed
+t "fleet upgrade: a failed host is a row, the rest still upgrade"      case_fleet_upgrade_failed_host_is_a_row_not_an_abort
+t "fleet upgrade: an unrecognised answer is shown, not guessed at"     case_fleet_upgrade_unrecognised_answer_is_shown_not_guessed
+t "fleet upgrade: --ref forwarded; unknown option dies before dialling" case_fleet_upgrade_ref_is_forwarded_and_bad_option_dies
 t "fleet: an unconfigured fleet says so and dials nothing"             case_fleet_unconfigured_says_so
 t "fleet bogus: unknown subcommand dies, dials nothing"                case_fleet_unknown_subcommand_dies
 

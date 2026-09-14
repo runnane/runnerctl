@@ -49,6 +49,7 @@
 #   runnerctl fleet status [--json] [--color auto|always|never]
 #   runnerctl fleet health [--quiet] [--max-restarts N] [--stall-after N] \
 #                          [--restart-stalled]
+#   runnerctl fleet upgrade [--check] [--ref <branch|tag>]
 #   runnerctl profiles
 #   runnerctl config-example
 #   runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
@@ -164,6 +165,14 @@
 # problem lines come from. --restart-stalled is forwarded and acts on each
 # host, which needs passwordless sudo there — without it BatchMode makes it
 # fail fast and say so rather than hang.
+# `fleet upgrade [--check] [--ref R]` holds every host on one version, which
+# is what the skew note under `fleet status` is asking for. --check reports
+# each host's installed and available version and whether it would change,
+# without writing anything. A host that fails is a reported row, never an
+# abort: a partly upgraded fleet is the normal outcome of a flaky network,
+# and which host is still behind is the thing you must not lose. Writing the
+# script needs root on a normal host, so this is the first fan-out that
+# needs passwordless sudo there.
 #
 # Recommended baselines:
 #   CI host:      runnerctl scale 2 --max 26G --high 25G
@@ -2723,10 +2732,124 @@ cmd_fleet() {
   local sub="${1:-status}"
   shift || true
   case "$sub" in
-    status) cmd_fleet_status "$@" ;;
-    health) cmd_fleet_health "$@" ;;
-    *)      die "unknown fleet command '$sub' (status health)" ;;
+    status)  cmd_fleet_status "$@" ;;
+    health)  cmd_fleet_health "$@" ;;
+    upgrade) cmd_fleet_upgrade "$@" ;;
+    *)       die "unknown fleet command '$sub' (status health upgrade)" ;;
   esac
+}
+
+# `fleet upgrade`: hold every host on one runnerctl version from one place.
+#
+# Version skew is the fleet's quietest failure — a host only picks up a new
+# script when `upgrade` runs on it, so until then the fleet behaves two ways
+# and nothing says so. `fleet status` notices the drift; this fixes it.
+#
+# This is the first MUTATING fan-out, so it is also where the privilege
+# question lands. `upgrade` writes the installed script, which on a normal
+# host needs root — install_file already picks run_priv only when the
+# destination is not writable. The requirement is therefore passwordless sudo
+# on each host for that write, and BatchMode=yes (GHR-39) is what turns its
+# absence into a fast, named failure instead of a fan-out that hangs once per
+# host. No new privilege machinery is needed here; see the README.
+#
+# A host that fails to upgrade is a REPORTED ROW, not an abort. A partly
+# upgraded fleet is the normal outcome of a flaky network, and the one thing
+# you must not lose in that case is which host is still behind.
+cmd_fleet_upgrade() { # [--check] [--ref REF]
+  local check=false rc=0
+  local -a fwd=()
+  while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    case "$1" in
+      --check) check=true; fwd+=(--check); shift ;;
+      --ref)   need_val "$@"; fwd+=(--ref "$2"); shift 2 ;;
+      *)       die "unknown option: $1" ;;
+    esac
+  done
+  require_fleet
+  fleet_fanout "$FLEET_RUNNERCTL" upgrade ${fwd[@]+"${fwd[@]}"}
+  fleet_upgrade_report "$check" || rc=$?
+  fleet_cleanup
+  return "$rc"
+}
+
+# First capture group of "KEY: <value> (...)" in a host's upgrade output.
+# Pad TEXT to WIDTH columns. Not printf '%-*s': that counts BYTES, so a
+# 3-byte em dash lands two columns short and shifts the rest of the row —
+# the same trap GHR-21 fixed in status_row. ${#v} counts characters, which
+# is what a terminal actually renders.
+fleet_pad() { # WIDTH TEXT
+  local pad=""
+  [ "${#2}" -ge "$1" ] || printf -v pad '%*s' $(( $1 - ${#2} )) ''
+  printf '%s%s' "$2" "$pad"
+}
+
+fleet_upgrade_field() { # INDEX KEY
+  sed -n "s/^$2: \([^ ]*\).*/\1/p" "$FLEET_DIR/$1.out" 2>/dev/null | head -1
+}
+
+# One row per host, then a count. The state word comes from the verdict line
+# `upgrade` already prints rather than from comparing versions here: the
+# remote is the only thing that knows whether it actually wrote the file, and
+# re-deriving that locally would be a second implementation to keep in step.
+fleet_upgrade_report() { # CHECK
+  local check="$1" i host rc cur avail state vers
+  local level=0 changed=0 bad=0
+  # Three parallel arrays rather than one delimited string per row: a state
+  # word carrying the delimiter would otherwise split a row in half, and the
+  # states include remote text this code does not control.
+  local -a r_host=() r_vers=() r_state=()
+  for i in "${!FLEET_HOSTS[@]}"; do
+    host="${FLEET_HOSTS[$i]}"
+    rc="$(fleet_rc "$i")"
+    if [ "$rc" != 0 ]; then
+      bad=$((bad + 1))
+      r_host+=("$host"); r_vers+=("—")
+      r_state+=("$(fleet_error_text "$rc" "$FLEET_DIR/$i.err")")
+      continue
+    fi
+    cur="$(fleet_upgrade_field "$i" installed)"
+    avail="$(fleet_upgrade_field "$i" available)"
+    if grep -q '^Upgraded ' "$FLEET_DIR/$i.out"; then
+      state="upgraded"; changed=$((changed + 1))
+    elif grep -q '^Update available\.' "$FLEET_DIR/$i.out"; then
+      state="update available"; changed=$((changed + 1))
+    elif grep -q '^Already up to date\.' "$FLEET_DIR/$i.out"; then
+      state="up to date"; level=$((level + 1))
+    elif grep -q 'not downgrading' "$FLEET_DIR/$i.out"; then
+      state="ahead of the source — left alone"; level=$((level + 1))
+    else
+      # An answer this does not recognise is shown, not guessed at: a silent
+      # "up to date" for a host that said something else is the one outcome
+      # that would send someone to the wrong box.
+      state="unrecognised: $(tail -1 "$FLEET_DIR/$i.out" 2>/dev/null || true)"
+      bad=$((bad + 1))
+    fi
+    if [ -n "$cur" ] && [ -n "$avail" ] && [ "$cur" != "$avail" ]; then
+      vers="$cur -> $avail"
+    else
+      vers="${cur:-?}"
+    fi
+    r_host+=("$host"); r_vers+=("$vers"); r_state+=("$state")
+  done
+  local hostw=4 versw=7
+  for host in "${FLEET_HOSTS[@]}"; do
+    [ "${#host}" -le "$hostw" ] || hostw="${#host}"
+  done
+  for i in "${!r_vers[@]}"; do
+    [ "${#r_vers[$i]}" -le "$versw" ] || versw="${#r_vers[$i]}"
+  done
+  for i in "${!r_host[@]}"; do
+    printf '%s %s %s\n' "$(fleet_pad "$hostw" "${r_host[$i]}")" \
+      "$(fleet_pad "$versw" "${r_vers[$i]}")" "${r_state[$i]}"
+  done
+  if $check; then
+    echo "${#FLEET_HOSTS[@]} host(s): $level up to date, $changed would change, $bad unreachable or unclear"
+  else
+    echo "${#FLEET_HOSTS[@]} host(s): $level already level, $changed upgraded, $bad unreachable or unclear"
+  fi
+  [ "$bad" -eq 0 ]
 }
 
 # `fleet health`: one exit code for the whole fleet, so a central node needs
