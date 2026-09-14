@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/runnane/runnerctl/compare/v0.11.1...v0.12.0) (2026-09-14)
+
+
+### Features
+
+* fleet watch keeps one ssh connection per host open and polls (GHR-54) ([#59](https://github.com/runnane/runnerctl/issues/59)) ([fa29e8b](https://github.com/runnane/runnerctl/commit/fa29e8bd44947677b74369dbac04c9242db4d3b2))
+
 ## [0.11.1](https://github.com/runnane/runnerctl/compare/v0.11.0...v0.11.1) (2026-09-14)
 
 

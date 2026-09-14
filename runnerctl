@@ -265,7 +265,7 @@ set -euo pipefail
 # `*([0-9;])` (GHR-27); extglob is what makes that pattern legal.
 shopt -s extglob
 
-RUNNERCTL_VERSION="0.11.1" # x-release-please-version
+RUNNERCTL_VERSION="0.12.0" # x-release-please-version
 
 # --- Defaults (all overridable from the config file) -------------------------
 # The BUILTIN_* copies stay untouched by the config so `migrate` can tell a
