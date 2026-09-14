@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/runnane/runnerctl/compare/v0.10.0...v0.10.1) (2026-09-14)
+
+
+### Bug Fixes
+
+* install the script a+rx, not at whatever the umask leaves (GHR-47) ([#49](https://github.com/runnane/runnerctl/issues/49)) ([6964e28](https://github.com/runnane/runnerctl/commit/6964e285bdf333aa5772e338b9cff418ebe79de7))
+
 ## [0.10.0](https://github.com/runnane/runnerctl/compare/v0.9.0...v0.10.0) (2026-09-14)
 
 
