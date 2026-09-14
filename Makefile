@@ -1,9 +1,9 @@
 SHELL := bash
 SHELLCHECK ?= shellcheck
 
-.PHONY: gates lint example-drift version-drift smoke sim migrate-test install-test
+.PHONY: gates lint example-drift version-drift smoke sim migrate-test install-test upgrade-test
 
-gates: lint example-drift version-drift smoke sim migrate-test install-test
+gates: lint example-drift version-drift smoke sim migrate-test install-test upgrade-test
 
 # tests/stub.config has no shebang (it is sourced), hence -s bash for the set.
 lint:
@@ -51,3 +51,9 @@ migrate-test:
 # makes any escalation a failure.
 install-test:
 	@bash tests/install-test.sh
+
+# `upgrade` against a file:// UPGRADE_URL: the in-place path, and the placement
+# healing (relocate a home copy, retire a shadow, refuse to escalate). Same
+# fake-sudo tripwire as install-test; never needs root or network.
+upgrade-test:
+	@bash tests/upgrade-test.sh

@@ -1,14 +1,21 @@
 # Gates
 
 `make gates` = `lint` + `example-drift` + `version-drift` + `smoke` + `sim` +
-`migrate-test` + `install-test`. All seven run without systemd runner units,
-root or network, so they are green on any dev box and in CI.
+`migrate-test` + `install-test` + `upgrade-test`. All eight run without systemd
+runner units, root or network, so they are green on any dev box and in CI.
 
-**No test may escalate.** `migrate-test` and `install-test` put a fake `sudo`
-first on `PATH` that exits 97, so a code path that reaches for `run_priv` under
-a caller-owned temp prefix fails the test instead of leaving a root-owned file
-behind (which happened once, and needed a real `sudo rm` to clean up). Keep
-that tripwire in any new test that exercises a writing command.
+**No test may escalate.** `migrate-test`, `install-test` and `upgrade-test` put
+a fake `sudo` first on `PATH` that exits 97, so a code path that reaches for
+`run_priv` under a caller-owned temp prefix fails the test instead of leaving a
+root-owned file behind (which happened once, and needed a real `sudo rm` to
+clean up). Keep that tripwire in any new test that exercises a writing command.
+
+In `upgrade-test` that fake `sudo` is load-bearing twice over: it is also the
+"sudo is not free" fixture, because `priv_is_free` probes with `sudo -n true`
+and gets 97 back. So a case that means to test the refusal path gets it for
+free, and a case that accidentally escalates fails loudly — which is how the
+staging-directory bug in `priv_is_free` was caught (it checked the destination
+file, while `install_file` also needs to write `$dir/.runnerctl.new.$$`).
 
 ## lint — shellcheck
 
