@@ -33,9 +33,9 @@
 #                    [--color auto|always|never] [--stall-after N]
 #   runnerctl watch  [--interval N] [--color auto|always|never] [--stall-after N]
 #   runnerctl apply  [--profile NAME] [--max 26G] [--high 25G] \
-#                    [--restart-sec N] [--env-file PATH] [--restart] \
+#                    [--restart-sec N] [--env-file PATH] [--save] [--restart] \
 #                    [--when-idle] [--timeout N] [<unit|slot-index|name> ...]
-#   runnerctl scale N [--profile NAME] [--max 26G] [--high 25G] \
+#   runnerctl scale N [--profile NAME] [--max 26G] [--high 25G] [--save] \
 #                     [--restart] [--when-idle] [--timeout N]
 #   runnerctl env-init [--profile NAME] [--env-file PATH]
 #   runnerctl start|stop|restart [--when-idle] [--timeout N] \
@@ -360,6 +360,7 @@ RESTART_SEC="10"
 ENV_FILE=""
 ENV_TEMPLATE=""
 do_restart=false
+do_save=false
 when_idle=false
 REMAINING=()
 TARGETS=()
@@ -509,6 +510,7 @@ parse_opts() {
       --restart-sec) need_val "$@"; [[ "$2" =~ ^[0-9]+$ ]] || die "--restart-sec value '$2' is invalid — want an integer"; RESTART_SEC="$2"; shift 2 ;;
       --env-file)    need_val "$@"; ENV_FILE="$2"; shift 2 ;;
       --restart)     do_restart=true; shift ;;
+      --save)        do_save=true; shift ;;
       --when-idle)   when_idle=true; shift ;;
       --timeout)     need_val "$@"; set_timeout "$2"; shift 2 ;;
       -*)            die "unknown option: $1" ;;
@@ -1343,6 +1345,147 @@ guard_env_file() {
   run_priv test -f "$ENV_FILE" || die "EnvironmentFile $ENV_FILE missing — run: runnerctl env-init --profile $PROFILE"
 }
 
+# --- Saving a profile back to the config (GHR-58) -----------------------------
+# `apply --save` and `scale N --save` write the profile AS APPLIED — the profile
+# function's values with the CLI flags layered on top — back into $CONFIG_FILE.
+# Without it a `--high infinity` is durable in the drop-in and NOT durable as
+# policy: the next `apply --profile ci` re-renders MEM_HIGH from the profile
+# function and the override is silently gone. The alternative is hand-editing
+# the config on every host, which is the step that gets skipped.
+#
+# The config is bash and is SOURCED, so this rewrites a BLOCK rather than
+# parsing the language. Three outcomes, and the third is the point:
+#   * the file defines profile_<name> in the canonical form  -> replace it;
+#   * the file defines it nowhere                            -> append it;
+#   * anything else (a one-line body, `function profile_x {`, two definitions
+#     of one name, no closing `}` in column 1)               -> REFUSE, naming
+#     the line, leaving the config untouched.
+# Appending past a definition it could not parse would "work" — the last
+# definition sourced wins — and leave a config whose profile is defined twice
+# for somebody to find weeks later. A refusal is the honest outcome.
+render_profile_block() { # COMMAND
+  echo "profile_${PROFILE}() {"
+  echo "  # Saved by \`runnerctl $1 --save\` on $(date +%F). Hand-edits are expected;"
+  echo "  # the next --save rewrites this block and leaves the rest of the file."
+  echo "  PROFILE_DESC=$(sq "$PROFILE_DESC")"
+  echo "  MEM_MAX=$(sq "$MEM_MAX")"
+  echo "  MEM_HIGH=$(sq "$MEM_HIGH")"
+  echo "  RESTART_SEC=$(sq "$RESTART_SEC")"
+  echo "  ENV_FILE=$(sq "$ENV_FILE")"
+  # Only when the profile carries one: emitting an empty ENV_TEMPLATE in every
+  # saved block would be noise, and dropping a set one would be data loss that
+  # the verify below cannot see — render_dropin never reads ENV_TEMPLATE, so a
+  # lost one renders an identical drop-in and env-init breaks later instead.
+  [ -z "$ENV_TEMPLATE" ] || echo "  ENV_TEMPLATE=$(sq "$ENV_TEMPLATE")"
+  echo "}"
+}
+
+save_profile() { # COMMAND
+  local cmd="$1" f="$CONFIG_FILE" tmpd blk cand head_line start end existed=false
+  tmpd="$(mktemp -d)"; blk="$tmpd/block"; cand="$tmpd/config"
+  render_profile_block "$cmd" >"$blk"
+
+  if [ ! -e "$f" ]; then
+    {
+      echo "# runnerctl config — created by \`runnerctl $cmd --save\` on $(date +%F)."
+      echo "# Sourced as bash: keep it root-owned and not world-writable."
+      echo "# \`runnerctl config-example\` documents every knob."
+      echo
+      cat "$blk"
+    } >"$cand"
+  else
+    existed=true
+    [ -f "$f" ] || { rm -rf "$tmpd"; die "--save: $f is not a regular file — refusing to write it"; }
+    [ -r "$f" ] || { rm -rf "$tmpd"; die "--save: $f is not readable by $(id -un) — run as root to save into it"; }
+    local hits=()
+    # Any definition-ish mention, not only the rewritable form: finding one it
+    # cannot rewrite must refuse rather than fall through to the append path.
+    mapfile -t hits < <(grep -nE "^[[:space:]]*(function[[:space:]]+)?profile_${PROFILE}([[:space:]]|\(|\{|$)" "$f" || true)
+    if [ "${#hits[@]}" -eq 0 ]; then
+      { cat "$f"; echo; cat "$blk"; } >"$cand"
+    elif [ "${#hits[@]}" -gt 1 ]; then
+      local lines="" h
+      for h in "${hits[@]}"; do lines+="${lines:+, }${h%%:*}"; done
+      rm -rf "$tmpd"
+      die "--save: $f defines profile_$PROFILE more than once (lines $lines) — the last one sourced wins, which is ambiguous enough that this will not guess. Delete the duplicates and re-run."
+    else
+      start="${hits[0]%%:*}"; head_line="${hits[0]#*:}"
+      grep -qE "^profile_${PROFILE}[[:space:]]*\(\)[[:space:]]*\{[[:space:]]*$" <<<"$head_line" || {
+        rm -rf "$tmpd"
+        die "--save: $f line $start defines profile_$PROFILE in a form this cannot rewrite ('$head_line') — want 'profile_$PROFILE() {' alone on its line, closed by '}' in column 1. Reformat it, or edit the values by hand."
+      }
+      end="$(awk -v s="$start" 'NR > s && /^\}[[:space:]]*$/ { print NR; exit }' "$f")"
+      [ -n "$end" ] || { rm -rf "$tmpd"; die "--save: profile_$PROFILE starts at $f line $start and has no closing '}' in column 1 — refusing to guess where it ends."; }
+      # The rewrite REPLACES the block, so anything in it that is not one of
+      # the profile knobs would be flattened away — a computed MEM_MAX, a
+      # conditional, a variable this does not know about. A saved profile that
+      # silently lost the logic that produced its values is worse than no
+      # --save at all, and the verify below cannot catch it: it compares the
+      # rendered drop-in, which is the same either way.
+      local stray
+      stray="$(awk -v s="$start" -v e="$end" '
+        NR > s && NR < e && $0 !~ /^[[:space:]]*(#|$)/ &&
+        $0 !~ /^[[:space:]]*(PROFILE_DESC|MEM_MAX|MEM_HIGH|RESTART_SEC|ENV_FILE|ENV_TEMPLATE)=/ { print NR ": " $0; exit }
+      ' "$f")"
+      if [ -n "$stray" ]; then
+        rm -rf "$tmpd"
+        die "--save: profile_$PROFILE ($f lines $start-$end) holds more than the profile knobs (line $stray) — rewriting the block would flatten that. Edit the values by hand, or re-run without --save."
+      fi
+      awk -v s="$start" -v e="$end" -v b="$blk" '
+        NR == s { while ((getline l < b) > 0) print l; next }
+        NR > s && NR <= e { next }
+        { print }
+      ' "$f" >"$cand"
+    fi
+  fi
+
+  # Prove it BEFORE installing it: source the candidate, load the profile back
+  # out of it, and render — the result must be byte-identical to the drop-in
+  # this command just wrote. A candidate that fails is never installed, so a
+  # bad save costs nothing. Rendering from the FILE rather than from the
+  # variables in hand is the whole point: it is the file that has to reproduce
+  # the drop-in, not this process's memory of what it applied.
+  local want got rc=0
+  want="$(render_dropin)"
+  # A fresh bash rather than a subshell of this one: it starts from the
+  # script's own defaults, so a knob the saved block failed to write shows up
+  # as a difference instead of being masked by the value still in hand — and
+  # it is the same two steps the NEXT invocation will take (source the script,
+  # source the config), rather than an approximation of them.
+  got="$(RUNNERCTL_NO_MAIN=1 bash -c '. "$1"; . "$2"; PROFILE="$3"; load_profile; render_dropin' \
+         bash "${BASH_SOURCE[0]}" "$cand" "$PROFILE" 2>/dev/null)" || rc=$?
+  if [ "$rc" -ne 0 ] || [ "$got" != "$want" ]; then
+    rm -rf "$tmpd"
+    die "--save: the saved profile_$PROFILE does not re-render the drop-in just applied — $f left unchanged. The drop-ins on disk are correct; nothing else was touched."
+  fi
+
+  local priv=()
+  ! needs_priv "$f" || priv=(run_priv)
+  if $existed; then
+    # tee onto the existing file keeps its inode, owner and mode — the ones
+    # load_config already accepted when it sourced it this run.
+    "${priv[@]}" cp -p "$f" "$f.bak"
+    "${priv[@]}" tee "$f" <"$cand" >/dev/null
+  else
+    "${priv[@]}" mkdir -p "$(dirname "$f")"
+    "${priv[@]}" tee "$f" <"$cand" >/dev/null
+    [ "${#priv[@]}" -eq 0 ] || run_priv chown root:root "$f"
+    "${priv[@]}" chmod 644 "$f"
+  fi
+  if [ -r "$f" ] && ! cmp -s "$cand" "$f"; then
+    rm -rf "$tmpd"
+    die "--save: $f on disk is not the content that was verified — nothing else was touched"
+  fi
+  rm -rf "$tmpd"
+
+  if $existed; then
+    echo "Saved profile '$PROFILE' to $f (previous version: $f.bak)."
+  else
+    echo "Created $f with profile '$PROFILE'."
+  fi
+  echo "  verified: $f re-renders the drop-in just applied."
+}
+
 # What profile (if any) manages this slot, read from the first line of its
 # drop-in (`# Managed by runnerctl (profile: NAME) — DO NOT EDIT BY HAND.`,
 # see render_dropin) — a plain read, no run_priv: the file is root-owned but
@@ -1809,6 +1952,7 @@ cmd_apply() {
   else
     echo "Applied profile '$PROFILE': Restart=always RestartSec=$RESTART_SEC OOMPolicy=continue${MEM_MAX:+ MemoryMax=$MEM_MAX MemoryHigh=$MEM_HIGH MemorySwapMax=0}${ENV_FILE:+ EnvironmentFile=$ENV_FILE}"
   fi
+  if $do_save; then save_profile apply; fi
   if $do_restart; then
     local i
     for i in "${!units[@]}"; do
@@ -1868,6 +2012,7 @@ cmd_scale() {
   echo "Note: stopped slots stay REGISTERED with GitHub (they show offline). Full"
   echo "deregister = 'svc.sh uninstall' + './config.sh remove' in the runner's dir"
   echo "(needs a GitHub removal token) — not automated: destructive, irreversible."
+  if $do_save; then save_profile scale; fi
   if $do_restart; then
     for i in "${!units[@]}"; do
       [ "$i" -lt "$n" ] || break
@@ -4158,6 +4303,13 @@ cmd_config_example() {
 
 # A profile is a function that sets these variables. Defining profile_ci or
 # profile_deploy replaces the built-in of the same name.
+#
+# `apply --save` / `scale --save` rewrite one of these blocks in place, with the
+# values they just applied — so a one-off `--high infinity` becomes the profile
+# instead of being re-rendered away by the next apply. A block is rewritable
+# when it opens with `profile_<name>() {` alone on its line, closes with `}` in
+# column 1, and holds nothing but these knobs; --save refuses anything else
+# rather than flattening it, and keeps the previous file as <config>.bak.
 profile_ci() {
   PROFILE_DESC="CI build/test pool — memory-capped, auto-restart."
   MEM_MAX="26G"        # hard cap per slot (MemoryMax)
