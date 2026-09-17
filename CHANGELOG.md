@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0](https://github.com/runnane/runnerctl/compare/v0.12.0...v0.13.0) (2026-09-17)
+
+
+### Features
+
+* apply/scale --save writes the applied profile back to the config (GHR-58) ([#61](https://github.com/runnane/runnerctl/issues/61)) ([8e49d41](https://github.com/runnane/runnerctl/commit/8e49d41b36dbda1cec83ab0a0c5e55ed2040eae4))
+
 ## [0.12.0](https://github.com/runnane/runnerctl/compare/v0.11.1...v0.12.0) (2026-09-14)
 
 
