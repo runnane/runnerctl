@@ -145,9 +145,9 @@ runnerctl status [--json] [--watch|-w] [--interval N] [--once] \
                  [--color auto|always|never] [--stall-after N]
 runnerctl watch  [--interval N] [--color auto|always|never] [--stall-after N]
 runnerctl apply  [--profile NAME] [--max 26G] [--high 25G] \
-                 [--restart-sec N] [--env-file PATH] [--restart] \
+                 [--restart-sec N] [--env-file PATH] [--save] [--restart] \
                  [--when-idle] [--timeout N] [<unit|slot-index|name> ...]
-runnerctl scale N [--profile NAME] [--max 26G] [--high 25G] \
+runnerctl scale N [--profile NAME] [--max 26G] [--high 25G] [--save] \
                   [--restart] [--when-idle] [--timeout N]
 runnerctl env-init [--profile NAME] [--env-file PATH]
 runnerctl start|stop|restart [--when-idle] [--timeout N] \
@@ -1001,7 +1001,8 @@ than from GitHub Actions secrets — the point being to shrink the blast radius
 of a runner that can reach production.
 
 Flags (`--max`, `--high`, `--restart-sec`, `--env-file`) override a profile's
-values for one invocation.
+values for one invocation — add `--save` to keep them
+([below](#saving-a-profile-back-into-the-config---save)).
 
 Typical baselines:
 
@@ -1046,6 +1047,45 @@ runnerctl profiles                                          # see what resolved
 [`config.example`](config.example) is the same output, checked in for browsing.
 Keep real hostnames, paths and secret names in the config on the host; keep
 the config out of any repository.
+
+### Saving a profile back into the config: `--save`
+
+A flag override is durable in the *drop-in* and not durable as *policy*: the
+next `runnerctl apply --profile ci` re-renders `MemoryHigh` from the profile
+function in the config, and the override is gone. Keeping it meant hand-editing
+the config on every host, which is the step that gets skipped. `--save` writes
+the profile **as applied** — the profile function's values with the flags
+layered on top — back into the config:
+
+```sh
+runnerctl apply --profile ci --high infinity --save
+# Applied profile 'ci': … MemoryMax=26G MemoryHigh=infinity MemorySwapMax=0
+# Saved profile 'ci' to /etc/runnerctl/config (previous version: /etc/runnerctl/config.bak).
+#   verified: /etc/runnerctl/config re-renders the drop-in just applied.
+```
+
+Across a fleet, each host saves its own copy — the config is per host, so this
+is the only form that makes an override stick everywhere:
+
+```sh
+runnerctl fleet apply --profile ci --high infinity --save
+```
+
+The config is bash and is sourced, so `--save` rewrites a *block* rather than
+parsing the language. It **replaces** `profile_<name>() { … }` where the file
+defines one on its own line closed by `}` in column 1, **appends** a block
+where the file defines none, **creates** the config (root-owned, `644`) where
+there is none, and **refuses** everything else: a one-line body, `function
+profile_x {`, two definitions of one name, or a block holding more than the
+profile knobs — a computed `MEM_MAX`, a conditional — which a rewrite would
+silently flatten. A refusal names the line and leaves the config untouched;
+the drop-ins that were applied stay applied either way.
+
+The saved config is proved before it is installed: the candidate is sourced,
+the profile loaded back out of it, and the drop-in re-rendered — it must come
+out byte-identical to the one just written, or nothing is saved at all. The
+previous file is kept at `<config>.bak`. `scale N --save` saves the same way,
+and without the flag the config is never written.
 
 ### Migrating from an inline-configured runnerctl
 
@@ -1172,6 +1212,10 @@ MemorySwapMax=0
 `remove-limits` deletes the managed drop-ins again. `scale` stops and disables
 slots beyond `N` but never deregisters them from GitHub — that needs a removal
 token and is irreversible, so it stays a manual step.
+
+With `--save` it also writes the config itself — one `profile_<name>()` block
+in `/etc/runnerctl/config`, the previous version alongside it as
+`config.bak`. Nothing else in the file is touched.
 
 ## Development
 

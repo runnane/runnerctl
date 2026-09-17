@@ -144,6 +144,75 @@ run_fn() {
   ERR="$(cat "$TMP/err")"
 }
 
+# --- Running against a config of the case's own (GHR-58) ----------------------
+# `--save` REWRITES the config it is handed, so the --save cases cannot use
+# $STUB — they would rewrite a tracked file. Each builds a config of its own
+# that sources the stub (so the systemd shadows are still in force) and points
+# the run at that. Their assertions read that real file rather than the
+# writes-mirror: a config the invoking user owns needs no run_priv, so it is
+# written for real, which is the path an operator is on too.
+save_config() { # PATH   (further config body on stdin)
+  { echo ". $PWD/$STUB"; cat; } >"$1"
+}
+
+run_cfg() { # CONFIG-PATH ARGS...
+  local cfg="$1"; shift
+  : >"$LOG"
+  rm -rf "$WRITES"; mkdir -p "$WRITES"
+  RC=0
+  OUT="$(RUNNERCTL_CONFIG="$cfg" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
+         timeout "$RUN_TIMEOUT" "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
+  ERR="$(cat "$TMP/err")"
+}
+
+# Source the script's functions plus the stub, then eval SNIPPET with
+# CONFIG-PATH in force. The white-box hatch for a path no CLI run can reach:
+# save_profile's create-the-config branch is one, because under the stub the
+# config file IS the stub and therefore always exists, and a run with no
+# config at all dies at require_runners long before the save.
+run_snippet() { # CONFIG-PATH SNIPPET
+  : >"$LOG"
+  RC=0
+  # shellcheck disable=SC2016  # the child expands $1/$2/$3, not this shell
+  OUT="$(RUNNERCTL_NO_MAIN=1 RUNNERCTL_CONFIG="$1" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
+         timeout "$RUN_TIMEOUT" bash -c '. "$1"; . "$2"; eval "$3"' bash "$RUNNERCTL" "$STUB" "$2" 2>"$TMP/err")" || RC=$?
+  ERR="$(cat "$TMP/err")"
+}
+
+# expect_file and friends resolve through the writes-mirror; these take a real
+# path, for the config files the --save cases write and read back.
+expect_cfg() { # PATH PATTERN
+  _expect
+  grep -Eq -- "$2" "$1" 2>/dev/null || FAILS+=("$1 has no line matching /$2/")
+}
+
+expect_cfg_lacks() { # PATH PATTERN
+  _expect
+  ! grep -Eq -- "$2" "$1" 2>/dev/null || FAILS+=("$1 has a line matching /$2/")
+}
+
+expect_cfg_count() { # PATH PATTERN N
+  _expect
+  local n; n="$(grep -Ec -- "$2" "$1" 2>/dev/null || true)"
+  [ "$n" -eq "$3" ] || FAILS+=("$1 lines matching /$2/: want $3, got $n")
+}
+
+expect_same_file() { # PATH PATH
+  _expect
+  cmp -s "$1" "$2" || FAILS+=("$1 differs from $2")
+}
+
+expect_no_path() { # PATH
+  _expect
+  [ ! -e "$1" ] || FAILS+=("$1 exists and should not")
+}
+
+expect_mode() { # PATH MODE
+  _expect
+  local m; m="$(stat -c '%a' "$1" 2>/dev/null || echo none)"
+  [ "$m" = "$2" ] || FAILS+=("$1 mode: want $2, got $m")
+}
+
 # --- Expectations -------------------------------------------------------------
 _expect() { NEXPECT=$((NEXPECT + 1)); }
 
@@ -3650,6 +3719,232 @@ case_discover_still_returns_the_units_when_systemctl_succeeds() {
   expect_no_out ' enabled'
 }
 
+# --- GHR-58: apply/scale --save -----------------------------------------------
+# The drop-in is durable; the OVERRIDE is not, until the profile goes back into
+# the config. These cover the three outcomes (replace, append, refuse), the
+# round trip that is the whole point, and the two things a green save could
+# still have got wrong: a dropped ENV_TEMPLATE, which renders an identical
+# drop-in, and a candidate installed before it was checked.
+
+case_save_appends_when_the_config_names_no_such_profile() {
+  local cfg="$TMP/save-append.config"
+  save_config "$cfg" <<'BODY'
+FLEET_HOSTS=(build-1 build-2)
+profile_deploy() {
+  PROFILE_DESC='Deploy'
+  MEM_MAX=''
+  MEM_HIGH=''
+  RESTART_SEC='15'
+  ENV_FILE='/etc/runnerctl/deploy.env'
+}
+BODY
+  cp "$cfg" "$cfg.before"
+  run_cfg "$cfg" apply --profile ci --max 30G --high infinity --save
+  expect_rc 0
+  expect_out "^Saved profile 'ci' to $cfg \(previous version: $cfg\.bak\)\.$"
+  expect_out "^  verified: $cfg re-renders the drop-in just applied\.$"
+  expect_cfg "$cfg" "^profile_ci\(\) \{$"
+  expect_cfg "$cfg" "^  MEM_MAX='30G'$"
+  expect_cfg "$cfg" "^  MEM_HIGH='infinity'$"
+  # Everything that was already in the file is still in it.
+  expect_cfg "$cfg" '^FLEET_HOSTS=\(build-1 build-2\)$'
+  expect_cfg_count "$cfg" "^profile_deploy\(\) \{$" 1
+  expect_cfg "$cfg" "^  ENV_FILE='/etc/runnerctl/deploy\.env'$"
+  expect_same_file "$cfg.bak" "$cfg.before"
+}
+
+case_save_replaces_the_block_and_the_next_apply_reads_it_back() {
+  local cfg="$TMP/save-replace.config"
+  save_config "$cfg" <<'BODY'
+profile_ci() {
+  PROFILE_DESC='CI pool'
+  MEM_MAX='30G'
+  MEM_HIGH='26G'
+  RESTART_SEC='10'
+  ENV_FILE=''
+}
+profile_deploy() {
+  PROFILE_DESC='Deploy'
+  MEM_MAX=''
+  MEM_HIGH=''
+  RESTART_SEC='15'
+  ENV_FILE='/etc/runnerctl/deploy.env'
+}
+BODY
+  run_cfg "$cfg" apply --profile ci --high infinity --save
+  expect_rc 0
+  # Twice: the SECOND save is the one that would leave two definitions behind,
+  # and the file is sourced top to bottom, so a duplicate would still "work".
+  run_cfg "$cfg" apply --profile ci --high 29G --save
+  expect_rc 0
+  expect_cfg_count "$cfg" "^profile_ci\(\) \{$" 1
+  expect_cfg "$cfg" "^  MEM_HIGH='29G'$"
+  expect_cfg_lacks "$cfg" "^  MEM_HIGH='26G'$"
+  expect_cfg "$cfg" "^  PROFILE_DESC='CI pool'$"
+  expect_cfg_count "$cfg" "^profile_deploy\(\) \{$" 1
+  # The claim of the whole feature: a later apply carrying NO flags renders
+  # what was saved. The drop-in alone could never give you this — the next
+  # config-driven apply would re-render MEM_HIGH from the old block.
+  run_cfg "$cfg" apply --profile ci
+  expect_rc 0
+  expect_file "$DROPIN_DIR/$U1.d/10-runnerctl.conf" '^MemoryHigh=29G$'
+  expect_file "$DROPIN_DIR/$U1.d/10-runnerctl.conf" '^MemoryMax=30G$'
+}
+
+case_save_keeps_a_profiles_env_template() {
+  local cfg="$TMP/save-env-template.config"
+  save_config "$cfg" <<'BODY'
+profile_ci() {
+  PROFILE_DESC='CI pool'
+  MEM_MAX='30G'
+  MEM_HIGH='26G'
+  RESTART_SEC='10'
+  ENV_FILE=''
+  ENV_TEMPLATE='/etc/runnerctl/ci.env.example'
+}
+BODY
+  run_cfg "$cfg" apply --profile ci --high infinity --save
+  expect_rc 0
+  # ENV_TEMPLATE is a profile knob render_dropin never reads, so losing it
+  # renders an IDENTICAL drop-in and the save still verifies — env-init would
+  # be the thing that broke, weeks later.
+  expect_cfg "$cfg" "^  ENV_TEMPLATE='/etc/runnerctl/ci\.env\.example'$"
+  expect_cfg "$cfg" "^  MEM_HIGH='infinity'$"
+}
+
+case_save_refuses_a_block_it_cannot_rewrite() {
+  local cfg="$TMP/save-oneliner.config"
+  save_config "$cfg" <<'BODY'
+profile_ci() { MEM_MAX='30G'; MEM_HIGH='26G'; RESTART_SEC='10'; ENV_FILE=''; }
+BODY
+  cp "$cfg" "$cfg.before"
+  run_cfg "$cfg" apply --profile ci --high infinity --save
+  expect_rc 1
+  expect_err 'defines profile_ci in a form this cannot rewrite'
+  expect_err "want 'profile_ci\(\) \{' alone on its line"
+  # The drop-ins still landed: the refusal is about the config, and the
+  # applied change is on disk either way.
+  expect_file "$DROPIN_DIR/$U1.d/10-runnerctl.conf" '^MemoryHigh=infinity$'
+  expect_same_file "$cfg" "$cfg.before"
+  expect_no_path "$cfg.bak"
+}
+
+case_save_refuses_two_definitions_of_one_profile() {
+  local cfg="$TMP/save-twice.config"
+  save_config "$cfg" <<'BODY'
+profile_ci() {
+  MEM_MAX='30G'
+  MEM_HIGH='26G'
+  RESTART_SEC='10'
+  ENV_FILE=''
+}
+profile_ci() {
+  MEM_MAX='20G'
+  MEM_HIGH='19G'
+  RESTART_SEC='10'
+  ENV_FILE=''
+}
+BODY
+  cp "$cfg" "$cfg.before"
+  run_cfg "$cfg" apply --profile ci --high infinity --save
+  expect_rc 1
+  expect_err 'defines profile_ci more than once \(lines 2, 8\)'
+  expect_same_file "$cfg" "$cfg.before"
+  expect_no_path "$cfg.bak"
+}
+
+case_save_refuses_a_profile_with_logic_in_it() {
+  local cfg="$TMP/save-logic.config"
+  save_config "$cfg" <<'BODY'
+profile_ci() {
+  PROFILE_DESC='CI pool'
+  case "$(hostname)" in big-*) MEM_MAX='60G' ;; *) MEM_MAX='30G' ;; esac
+  MEM_HIGH='26G'
+  RESTART_SEC='10'
+  ENV_FILE=''
+}
+BODY
+  cp "$cfg" "$cfg.before"
+  run_cfg "$cfg" apply --profile ci --high infinity --save
+  expect_rc 1
+  # Flattening this to literal values would be silent, and the verify could
+  # not see it: the flattened block renders the same drop-in on this host.
+  expect_err 'holds more than the profile knobs \(line 4: '
+  expect_same_file "$cfg" "$cfg.before"
+}
+
+case_save_creates_a_config_that_does_not_exist() {
+  local cfg="$TMP/fresh-host/config"
+  rm -rf "$TMP/fresh-host"
+  run_snippet "$cfg" 'PROFILE=ci; load_profile; MEM_HIGH=infinity; save_profile apply'
+  expect_rc 0
+  expect_out "^Created $cfg with profile 'ci'\.$"
+  expect_cfg "$cfg" '^# runnerctl config — created by .runnerctl apply --save. on [0-9]{4}-[0-9]{2}-[0-9]{2}\.$'
+  expect_cfg "$cfg" "^profile_ci\(\) \{$"
+  expect_cfg "$cfg" "^  MEM_MAX='26G'$"
+  expect_cfg "$cfg" "^  MEM_HIGH='infinity'$"
+  # load_config refuses a group- or world-writable config, so a save that
+  # created one nobody can source would be worse than no save at all.
+  expect_mode "$cfg" 644
+}
+
+case_save_refuses_a_candidate_that_would_not_re_render() {
+  local cfg="$TMP/save-verify.config" shadow="$TMP/save-verify-shadow.sh"
+  save_config "$cfg" <<'BODY'
+profile_ci() {
+  PROFILE_DESC='CI pool'
+  MEM_MAX='30G'
+  MEM_HIGH='26G'
+  RESTART_SEC='10'
+  ENV_FILE=''
+}
+BODY
+  cp "$cfg" "$cfg.before"
+  # The negative control for the verify step: a block renderer that writes a
+  # value the applied profile does not have. Nothing a CLI run can do reaches
+  # it, and that is the point — the check must refuse BEFORE the config is
+  # touched, so a save that would not reproduce the drop-in costs nothing.
+  cat >"$shadow" <<'BODY'
+render_profile_block() {
+  echo "profile_ci() {"
+  echo "  PROFILE_DESC='CI pool'"
+  echo "  MEM_MAX='1G'"
+  echo "  MEM_HIGH='infinity'"
+  echo "  RESTART_SEC='10'"
+  echo "  ENV_FILE=''"
+  echo "}"
+}
+BODY
+  run_snippet "$cfg" ". $shadow; PROFILE=ci; load_profile; MEM_HIGH=infinity; save_profile apply"
+  expect_rc 1
+  expect_err 'does not re-render the drop-in just applied'
+  expect_same_file "$cfg" "$cfg.before"
+  expect_no_path "$cfg.bak"
+}
+
+case_apply_without_save_leaves_the_config_alone() {
+  local cfg="$TMP/no-save.config"
+  save_config "$cfg" </dev/null
+  cp "$cfg" "$cfg.before"
+  run_cfg "$cfg" apply --profile ci --high infinity
+  expect_rc 0
+  expect_out 'MemoryHigh=infinity'
+  expect_no_out 'Saved profile'
+  expect_same_file "$cfg" "$cfg.before"
+  expect_no_path "$cfg.bak"
+}
+
+case_scale_save_writes_the_profile_it_scaled_with() {
+  local cfg="$TMP/save-scale.config"
+  save_config "$cfg" </dev/null
+  run_cfg "$cfg" scale 2 --profile ci --max 40G --high infinity --save
+  expect_rc 0
+  expect_out "^Saved profile 'ci' to $cfg"
+  expect_cfg "$cfg" "^  MEM_MAX='40G'$"
+  expect_cfg "$cfg" "^  MEM_HIGH='infinity'$"
+  expect_cfg "$cfg" "^  # Saved by \`runnerctl scale --save\` on [0-9]{4}-[0-9]{2}-[0-9]{2}\."
+}
+
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
 t "status: EnvironmentFiles value with embedded '=' survives"       case_status_envfile_value_with_embedded_equals
@@ -3663,6 +3958,17 @@ t "apply --profile=deploy: = form reaches the deploy profile"      case_apply_pr
 t "apply --max=30G --restart-sec=5: = form writes both values"     case_apply_max_and_restart_sec_equals_form
 t "apply --max lots: invalid value rejected"                       case_apply_max_invalid_value_rejected
 t "apply --restart-sec soon: invalid value rejected"               case_apply_restart_sec_invalid_value_rejected
+# GHR-58: --save writes the applied profile back into the config
+t "apply --save: appends where the config names no such profile"   case_save_appends_when_the_config_names_no_such_profile
+t "apply --save: replaces the block; a later apply reads it back"  case_save_replaces_the_block_and_the_next_apply_reads_it_back
+t "apply --save: a profile's ENV_TEMPLATE survives the rewrite"    case_save_keeps_a_profiles_env_template
+t "apply --save: refuses a block it cannot rewrite; drop-ins kept" case_save_refuses_a_block_it_cannot_rewrite
+t "apply --save: refuses two definitions of one profile"           case_save_refuses_two_definitions_of_one_profile
+t "apply --save: refuses a profile with logic in it"               case_save_refuses_a_profile_with_logic_in_it
+t "apply --save: creates a config that does not exist yet, 644"    case_save_creates_a_config_that_does_not_exist
+t "apply --save: a candidate that would not re-render is refused"  case_save_refuses_a_candidate_that_would_not_re_render
+t "apply without --save: the config is not touched"                case_apply_without_save_leaves_the_config_alone
+t "scale --save: saves the profile it scaled with"                 case_scale_save_writes_the_profile_it_scaled_with
 t "upgrade --ref: missing value dies before any download"          case_upgrade_ref_missing_value
 t "resolve_url: no ref leaves UPGRADE_URL unchanged"                case_resolve_url_no_ref_unchanged
 t "resolve_url: release URL + vX.Y.Z maps to that release asset"    case_resolve_url_release_version_ref

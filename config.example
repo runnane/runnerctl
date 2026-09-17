@@ -115,6 +115,13 @@
 
 # A profile is a function that sets these variables. Defining profile_ci or
 # profile_deploy replaces the built-in of the same name.
+#
+# `apply --save` / `scale --save` rewrite one of these blocks in place, with the
+# values they just applied — so a one-off `--high infinity` becomes the profile
+# instead of being re-rendered away by the next apply. A block is rewritable
+# when it opens with `profile_<name>() {` alone on its line, closes with `}` in
+# column 1, and holds nothing but these knobs; --save refuses anything else
+# rather than flattening it, and keeps the previous file as <config>.bak.
 profile_ci() {
   PROFILE_DESC="CI build/test pool — memory-capped, auto-restart."
   MEM_MAX="26G"        # hard cap per slot (MemoryMax)
