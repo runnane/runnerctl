@@ -3868,6 +3868,18 @@ case_deprovision_already_deregistered_still_cleans_up() {
   expect_out '^--local-only: still registered with GitHub \(offline\)\. Remove them under Settings -> Actions -> Runners\.$'
 }
 
+# A credential GitHub refuses is not a runner GitHub forgot: the mint fails
+# before the first slot is touched, so nothing is stopped, uninstalled or
+# deleted on the strength of a bad PAT.
+case_deprovision_failed_mint_changes_nothing() {
+  RUNNERCTL_STUB_API_FAIL='remove-token' \
+    run deprovision 1 --url "$PROV_URL" --pat ghp_EXAMPLE_PAT --yes
+  expect_rc 1
+  expect_err 'could not mint a removal token for orgs/acme'
+  expect_log '^api: POST .*/actions/runners/remove-token'
+  expect_no_log "$DEPROV_CHANGES"
+}
+
 case_deprovision_confirms_unless_yes() {
   # No terminal and no --yes: refused, nothing touched, nothing minted.
   run deprovision 1 --url "$PROV_URL" --pat ghp_EXAMPLE_PAT
@@ -4577,6 +4589,7 @@ t "deprovision --when-idle: waits for the job, or times out untouched" case_depr
 t "deprovision --dry-run: prints the commands, mints and changes none" case_deprovision_dry_run_changes_nothing
 t "deprovision: the removal token reaches no stream and no argv"       case_deprovision_never_prints_the_removal_token
 t "deprovision: a runner GitHub forgot is still cleaned up locally"    case_deprovision_already_deregistered_still_cleans_up
+t "deprovision: a refused removal-token mint changes nothing"       case_deprovision_failed_mint_changes_nothing
 t "deprovision: y/N unless --yes; refused without a terminal"          case_deprovision_confirms_unless_yes
 t "deprovision: bad invocations refuse before touching the host"       case_deprovision_refuses_a_bad_invocation
 t "deprovision --help, and the top-level usage"                        case_deprovision_help
