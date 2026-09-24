@@ -189,8 +189,9 @@ runnerctl deprovision <unit|slot-index|name>... [--token TOK | --pat TOK] \
                       [--url URL] [--local-only] [--when-idle] [--timeout N] \
                       [--yes] [--dry-run]
 runnerctl status [--json] [--watch|-w] [--interval N] [--once] \
-                 [--color auto|always|never] [--stall-after N]
-runnerctl watch  [--interval N] [--color auto|always|never] [--stall-after N]
+                 [--color auto|always|never] [--stall-after N] [--narrow]
+runnerctl watch  [--interval N] [--color auto|always|never] [--stall-after N] \
+                 [--narrow]
 runnerctl apply  [--profile NAME] [--max 26G] [--high 25G] \
                  [--restart-sec N] [--env-file PATH] [--save] [--restart] \
                  [--when-idle] [--timeout N] [<unit|slot-index|name> ...]
@@ -398,7 +399,11 @@ The redraws keep coming at `--interval` while a confirm line is up, so the
 table under it is current when you answer. On a terminal narrower than the
 table the `MAX`, `HIGH` and `ENVFILE` columns are dropped, never
 `WORKING-ON` — its `idle 2h31m (7 jobs)` is what tells you a slot is safe to
-act on.
+act on. They come back once the full table fits with 22 columns to spare, so
+a terminal near the edge does not flip the table on every redraw.
+`--narrow` asks for that narrow table outright — `status --narrow` prints it
+once, and `watch --narrow` keeps it whatever the width. It is a table shape,
+so `status --json --narrow` is refused.
 
 ### Machine-readable output: `status --json`
 
@@ -783,6 +788,22 @@ Two differences from `fleet status`, each worth knowing:
 `--stall-after` is forwarded by both — the `STALLED` marker (and, for
 `--json`, the `stalled` field) is computed wherever it is drawn, which is
 always the remote.
+
+**Narrow terminals.** The `HOST` column makes the fleet table wider than a
+local one, and a wrapped row in a redraw loop makes the frame jump. So
+`fleet watch` measures the assembled frame — `HOST` included, colour codes
+not counted — and when it is wider than the terminal it asks every host for
+`status --narrow` on the next tick, dropping `MAX`, `HIGH` and `ENVFILE`
+exactly as the local `watch` does, with the same 22-column margin before it
+puts them back. `fleet watch --narrow` keeps the narrow table from the first
+tick; `fleet status --narrow` is the one-shot form (a one-shot never narrows
+itself — it is as likely to be piped as read).
+
+A host on a runnerctl older than `--narrow` refuses the flag as an unknown
+option. That host is asked again without it in the same fan-out, so it shows
+its full-width rows (under its own column header) rather than a
+`remote exit 1` row, and a `fleet watch` remembers it and stops sending it the
+flag. `runnerctl upgrade` on that host gives it the narrow table too.
 
 `--host H` (repeatable) narrows the watch to named hosts, validated against
 `FLEET_HOSTS` exactly as it is for the mutating commands. A host that does not
