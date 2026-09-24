@@ -33,8 +33,9 @@
 #                         [--url URL] [--local-only] [--when-idle] [--timeout N] \
 #                         [--yes] [--dry-run]
 #   runnerctl status [--json] [--watch|-w] [--interval N] [--once] \
-#                    [--color auto|always|never] [--stall-after N]
-#   runnerctl watch  [--interval N] [--color auto|always|never] [--stall-after N]
+#                    [--color auto|always|never] [--stall-after N] [--narrow]
+#   runnerctl watch  [--interval N] [--color auto|always|never] [--stall-after N] \
+#                    [--narrow]
 #   runnerctl apply  [--profile NAME] [--max 26G] [--high 25G] \
 #                    [--restart-sec N] [--env-file PATH] [--save] [--restart] \
 #                    [--when-idle] [--timeout N] [<unit|slot-index|name> ...]
@@ -53,9 +54,10 @@
 #   runnerctl kill [--dry-run] [--if-stalled] [--stall-after N] \
 #                  [<unit|slot-index|name> ...]
 #   runnerctl health [--quiet] [--max-restarts N] [--stall-after N] [--restart-stalled]
-#   runnerctl fleet status [--json] [--color auto|always|never] [--stall-after N]
+#   runnerctl fleet status [--json] [--color auto|always|never] [--stall-after N] \
+#                          [--narrow]
 #   runnerctl fleet watch  [--interval N] [--host H]... \
-#                          [--color auto|always|never] [--stall-after N]
+#                          [--color auto|always|never] [--stall-after N] [--narrow]
 #   runnerctl fleet health [--quiet] [--max-restarts N] [--stall-after N] \
 #                          [--restart-stalled]
 #   runnerctl fleet upgrade [--check] [--ref <branch|tag>]
@@ -107,7 +109,8 @@
 # in flight), S/T stop/start it, P reaps its `+N leaked` processes, L opens
 # `logs <slot> -n 50` in $PAGER. Privileged keys go through sudo like the
 # commands do. Too narrow a terminal drops MAX, HIGH and ENVFILE from the
-# table, never WORKING-ON.
+# table, never WORKING-ON; --narrow (GHR-56, on `status` too) asks for that
+# narrow table outright.
 #
 # The table is coloured by meaning when stdout is a terminal (--color auto;
 # NO_COLOR in the environment turns it off, --color always/never override):
@@ -193,6 +196,9 @@
 # PAINT (the host that drew a cell is the only thing that knows it is STALLED
 # or throttled), and its default interval is 5 s, because every tick is a
 # round trip to every host. It is VIEW-ONLY — `q` quits and no key acts.
+# A frame wider than the terminal makes the next tick ask the hosts for
+# `status --narrow` (GHR-56), with the local watch's hysteresis; a host too
+# old for the flag is asked again without it and shows its full-width rows.
 # `fleet health` reduces the same fan-out to ONE exit code, so a central node
 # needs one cron entry and one push URL rather than one per host: exit 0 only
 # when every host was reached and reported healthy, else one line per problem
@@ -1588,7 +1594,23 @@ STATUS_WIDTHS=(3 40 8 19 8 9 6 6 12 6 8 7)
 # of every row — `watch` drops MAX, HIGH and ENVFILE (6 7 11) when the table
 # is wider than the terminal, so WORKING-ON never has to go. Empty for
 # `status`, which is what keeps its rows byte-identical.
+#
+# STATUS_NARROW_DROP is that set, and `status --narrow` (GHR-56) is the flag
+# that asks for it — the one a `fleet watch` forwards to the remotes, which
+# otherwise had no way to ask a host for anything but its full-width table.
+# The flag is deliberately a boolean rather than a list of column indices:
+# which columns are dispensable is a fact about the table the REMOTE draws,
+# and an index list chosen by a central node on another version would drop
+# the wrong columns the first time a column is added. STATUS_NARROW_MARGIN is
+# the hysteresis both watches use to put the columns back: the table has to
+# fit with this many columns to spare, or a terminal a few columns either
+# side of the threshold would flip the table on every redraw.
 STATUS_DROP=""
+STATUS_NARROW_DROP="6 7 11"
+STATUS_NARROW_MARGIN=22
+status_narrow() { # [true|false]
+  if "${1:-true}"; then STATUS_DROP="$STATUS_NARROW_DROP"; else STATUS_DROP=""; fi
+}
 status_row() {
   local w v n c=0 out=""
   for w in "${STATUS_WIDTHS[@]}"; do
@@ -2156,8 +2178,8 @@ cmd_logs() {
 # (GHR-16) prints the same facts as one JSON object instead of the table; it
 # is a one-shot format, so it refuses --watch rather than streaming frames.
 # --color and --stall-after (GHR-27) are parsed here for both shapes.
-cmd_status() { # [--json] [--watch|-w] [--once] [--interval N] [--color WHEN] [--stall-after N]
-  local watch=false json=false args=()
+cmd_status() { # [--json] [--watch|-w] [--once] [--interval N] [--color WHEN] [--stall-after N] [--narrow]
+  local watch=false json=false narrow=false args=()
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     view_opt "$@"
@@ -2166,14 +2188,20 @@ cmd_status() { # [--json] [--watch|-w] [--once] [--interval N] [--color WHEN] [-
       --watch|-w) watch=true; shift ;;
       --once)     watch=false; shift ;;
       --json)     json=true; shift ;;
+      --narrow)   narrow=true; shift ;;
       *)          args+=("$1"); shift ;;
     esac
   done
+  # --narrow is a table shape; JSON has no columns to drop, and accepting it
+  # there would be a flag that silently does nothing.
+  ! { $json && $narrow; } || die "--narrow cannot be combined with --json; the JSON object has no columns to drop"
   if $watch; then
     ! $json || die "--json cannot be combined with --watch; poll 'runnerctl status --json' instead"
+    ! $narrow || args+=(--narrow)
     cmd_watch ${args[@]+"${args[@]}"}
   else
     [ "${#args[@]}" -eq 0 ] || die "unknown option: ${args[0]}"
+    ! $narrow || status_narrow
     if $json; then render_status_json; else color_setup "$COLOR_MODE"; render_status; fi
   fi
 }
@@ -2260,32 +2288,49 @@ watch_highlight() { # TABLE NAME
 }
 # The widest table row (header or slot row) in TABLE, in characters with the
 # SGR sequences stripped — the note lines are long by design and do not count.
-watch_table_width() { # TABLE
-  local line n w=0
+# PREFIX is a regex for what comes before the IDX cell: nothing for the local
+# table, the HOST cell for the fleet one (GHR-56) — whose error rows (`build-3
+# unreachable — …`) are long by design too, and are not narrowed by dropping
+# a column, so they must not count either.
+watch_table_width() { # TABLE [PREFIX-RE]
+  local line n w=0 re="^${2:-}(IDX|[0-9]+) "
   while IFS= read -r line; do
     strip_sgr "$line"; n="$SGR_STRIPPED"
-    ! [[ "$n" =~ ^(IDX|[0-9]+)\  ]] || [ "${#n}" -le "$w" ] || w="${#n}"
+    [[ "$n" != note:* ]] || continue
+    ! [[ "$n" =~ $re ]] || [ "${#n}" -le "$w" ] || w="${#n}"
   done <<<"$1"
   echo "$w"
+}
+# Whether a table of WIDTH should be narrow on a terminal of COLS, given
+# whether it is narrow now (true/false): too wide narrows it, and it only
+# widens again once it fits with STATUS_NARROW_MARGIN columns to spare. The
+# local watch and `fleet watch` both decide through this, so the two cannot
+# disagree about when a table flips. A width of 0 (unknown) never narrows.
+narrow_wanted() { # NARROW-NOW WIDTH COLS
+  [ "$3" -gt 0 ] || return 1
+  if "$1"; then
+    [ $(($2 + STATUS_NARROW_MARGIN)) -gt "$3" ]
+  else
+    [ "$2" -gt "$3" ]
+  fi
 }
 # The table for one frame, into WATCH_TABLE (not stdout: STATUS_DROP has to
 # outlive the call). Narrower than the terminal, or MAX/HIGH/ENVFILE are
 # dropped (STATUS_DROP) and it is rendered again — once, on the transition,
 # and back when the terminal is wide enough for all of them again. A width
-# of 0 (unknown) never drops anything.
+# of 0 (unknown) never drops anything. WATCH_NARROW_FORCED (`watch
+# --narrow`) pins the narrow table and skips the measuring.
 WATCH_TABLE=""
+WATCH_NARROW_FORCED=false
 watch_table() {
-  local cols
+  local now=false want=false
   WATCH_TABLE="$(render_status)"
-  cols="$(term_cols)"
-  [ "$cols" -gt 0 ] || return 0
-  if [ -z "$STATUS_DROP" ] && [ "$(watch_table_width "$WATCH_TABLE")" -gt "$cols" ]; then
-    STATUS_DROP="6 7 11"
-    WATCH_TABLE="$(render_status)"
-  elif [ -n "$STATUS_DROP" ] && [ $(( $(watch_table_width "$WATCH_TABLE") + 22 )) -le "$cols" ]; then
-    STATUS_DROP=""
-    WATCH_TABLE="$(render_status)"
-  fi
+  ! $WATCH_NARROW_FORCED || return 0
+  [ -z "$STATUS_DROP" ] || now=true
+  if narrow_wanted "$now" "$(watch_table_width "$WATCH_TABLE")" "$(term_cols)"; then want=true; fi
+  [ "$now" != "$want" ] || return 0
+  status_narrow "$want"
+  WATCH_TABLE="$(render_status)"
 }
 
 # The facts an action decides on, fresh: the memoised journal for UNIT is
@@ -2439,13 +2484,15 @@ watch_handle_key() { # KEY UNITS...
 # line (a notice, or the pending confirm), and the wait between redraws is
 # a key read with the interval as its timeout: a key redraws at once, a
 # timeout is a tick. The journal memo counts ticks, not keys.
-cmd_watch() { # [--interval N] [--iterations N] [--color WHEN] [--stall-after N]
+cmd_watch() { # [--interval N] [--iterations N] [--color WHEN] [--stall-after N] [--narrow]
   local interval=2 iterations="" tick=0 refreshed=-1 out header units=() status
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     view_opt "$@"
     if [ "$VIEW_SHIFT" -gt 0 ]; then shift "$VIEW_SHIFT"; continue; fi
     case "$1" in
+      --narrow)
+        WATCH_NARROW_FORCED=true; status_narrow; shift ;;
       --interval)
         need_val "$@"
         [[ "$2" =~ ^0*[1-9][0-9]*$ ]] || die "--interval value '$2' is invalid — want a whole number of seconds, at least 1"
@@ -2942,21 +2989,27 @@ fleet_cleanup() {
 # time. Each host's stdout, stderr and exit status land in their own files,
 # indexed by position in FLEET_HOSTS so the render order is the config order
 # rather than whichever host answered first.
+#
+# Version skew (GHR-56). FLEET_OPTIONAL_ARG names ONE flag the caller would
+# like every host to take but can do without — `status --narrow` — and a host
+# older than that flag rejects it the way every runnerctl rejects an unknown
+# option: `runnerctl: unknown option: <flag>` on stderr, exit 1. Such a host
+# is asked again WITHOUT the flag in the same fan-out, so it shows its
+# full-width table rather than a `remote exit 1` row, and it is remembered in
+# FLEET_OPTIONAL_REJECTED so a watch does not pay that second round trip on
+# every tick. Detected by the refusal itself rather than by a minimum
+# version: release-please assigns a change its version AFTER it merges, so a
+# number written here would be a guess, and a probe would cost a round trip
+# per host before the first frame.
+FLEET_OPTIONAL_ARG=""
+FLEET_OPTIONAL_REJECTED=" "
 fleet_fanout() { # REMOTE-ARGS...
-  local i host running=0 hrc
+  local i host running=0
+  local -a retry=()
   FLEET_DIR="$(mktemp -d)"
   trap fleet_cleanup EXIT
   for i in "${!FLEET_HOSTS[@]}"; do
-    host="${FLEET_HOSTS[$i]}"
-    {
-      # `|| hrc=$?` rather than a bare call plus `echo $?`: under `set -e` a
-      # non-zero ssh_run kills this subshell before the status can be
-      # recorded, so every failure would read as the missing-file fallback
-      # and a timeout would be indistinguishable from an unreachable host.
-      hrc=0
-      ssh_run "$host" "$@" >"$FLEET_DIR/$i.out" 2>"$FLEET_DIR/$i.err" || hrc=$?
-      echo "$hrc" >"$FLEET_DIR/$i.rc"
-    } &
+    fleet_fanout_one "$i" "$@" &
     running=$((running + 1))
     if [ "$running" -ge "$FLEET_PARALLEL" ]; then
       wait -n 2>/dev/null || true
@@ -2964,6 +3017,43 @@ fleet_fanout() { # REMOTE-ARGS...
     fi
   done
   wait
+  [ -n "$FLEET_OPTIONAL_ARG" ] || return 0
+  for i in "${!FLEET_HOSTS[@]}"; do
+    host="${FLEET_HOSTS[$i]}"
+    [ "$(fleet_rc "$i")" = 1 ] || continue
+    grep -qF -- "unknown option: $FLEET_OPTIONAL_ARG" "$FLEET_DIR/$i.err" 2>/dev/null || continue
+    FLEET_OPTIONAL_REJECTED+="$host "
+    retry+=("$i")
+  done
+  running=0
+  for i in ${retry[@]+"${retry[@]}"}; do
+    fleet_fanout_one "$i" "$@" &
+    running=$((running + 1))
+    if [ "$running" -ge "$FLEET_PARALLEL" ]; then
+      wait -n 2>/dev/null || true
+      running=$((running - 1))
+    fi
+  done
+  wait
+}
+# One host's call into its three files. Runs in the background, so nothing it
+# sets survives; FLEET_OPTIONAL_ARG is left out of the argv of a host already
+# known to reject it.
+fleet_fanout_one() { # INDEX REMOTE-ARGS...
+  local i="$1" host a hrc=0
+  shift
+  host="${FLEET_HOSTS[$i]}"
+  local -a args=("$@")
+  if [ -n "$FLEET_OPTIONAL_ARG" ] && [[ "$FLEET_OPTIONAL_REJECTED" == *" $host "* ]]; then
+    args=()
+    for a in "$@"; do [ "$a" = "$FLEET_OPTIONAL_ARG" ] || args+=("$a"); done
+  fi
+  # `|| hrc=$?` rather than a bare call plus `echo $?`: under `set -e` a
+  # non-zero ssh_run kills this subshell before the status can be
+  # recorded, so every failure would read as the missing-file fallback
+  # and a timeout would be indistinguishable from an unreachable host.
+  ssh_run "$host" "${args[@]}" >"$FLEET_DIR/$i.out" 2>"$FLEET_DIR/$i.err" || hrc=$?
+  echo "$hrc" >"$FLEET_DIR/$i.rc"
 }
 
 fleet_rc() { # INDEX
@@ -3090,7 +3180,7 @@ fleet_status_json() {
 # on every host instead of being collected and deduped once.
 FLEET_REMOTE_COLOR=false
 fleet_status_table() {
-  local i host rc hostw=4 ver first_ver="" skew=false bad=0 n=0
+  local i host rc hostw=4 ver first_ver="" skew=false bad=0 n=0 hdr=""
   local -a lines notes=()
   for host in "${FLEET_HOSTS[@]}"; do
     [ "${#host}" -le "$hostw" ] || hostw="${#host}"
@@ -3120,7 +3210,14 @@ fleet_status_table() {
     if [ -z "$first_ver" ]; then first_ver="$ver"
     elif [ "$ver" != "$first_ver" ]; then skew=true
     fi
-    if [ "$n" -eq 0 ]; then
+    # The column header is printed once, from the first host that answered —
+    # and again whenever a host's differs from the one above it (GHR-56): a
+    # host too old for `status --narrow` answers with the full-width table
+    # among narrow ones, and its rows under a narrow header would put every
+    # value after ENABLED under the wrong column name.
+    strip_sgr "${lines[2]}"
+    if [ "$n" -eq 0 ] || [ "$SGR_STRIPPED" != "$hdr" ]; then
+      hdr="$SGR_STRIPPED"
       if $FLEET_REMOTE_COLOR; then
         # The remote drew its own column header bold and ended it with a
         # reset, so wrapping the whole line would switch bold off partway
@@ -3656,8 +3753,8 @@ fleet_health_report() { # QUIET
   return 1
 }
 
-cmd_fleet_status() { # [--json] [--color WHEN] [--stall-after N]
-  local json=false rc=0
+cmd_fleet_status() { # [--json] [--color WHEN] [--stall-after N] [--narrow]
+  local json=false narrow=false rc=0
   local -a fwd=()
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
@@ -3673,10 +3770,17 @@ cmd_fleet_status() { # [--json] [--color WHEN] [--stall-after N]
       shift "$VIEW_SHIFT"; continue
     fi
     case "$1" in
-      --json) json=true; shift ;;
-      *)      die "unknown option: $1" ;;
+      --json)   json=true; shift ;;
+      # GHR-56: forwarded, because the columns are dropped where the table
+      # is drawn. Never switched on by measuring, unlike `fleet watch`: that
+      # would cost a second fan-out, and a one-shot table is as likely to be
+      # piped as read, which is why the local `status` never narrows itself
+      # either. A host too old for the flag answers full-width (fleet_fanout).
+      --narrow) narrow=true; fwd+=(--narrow); FLEET_OPTIONAL_ARG=--narrow; shift ;;
+      *)        die "unknown option: $1" ;;
     esac
   done
+  ! { $json && $narrow; } || die "--narrow cannot be combined with --json; the JSON object has no columns to drop"
   require_fleet
   if $json; then
     fleet_fanout "$FLEET_RUNNERCTL" status --json ${fwd[@]+"${fwd[@]}"}
@@ -3726,9 +3830,10 @@ fleet_watch_cleanup() {
   fleet_ssh_control_close
 }
 
-cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] [--stall-after N]
+cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] [--stall-after N] [--narrow]
   local interval=5 iterations="" tick=0 header frame remote_color=never
-  local -a hosts=() fwd=()
+  local narrow=false forced=false wide
+  local -a hosts=() fwd=() narrow_arg=()
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     view_opt "$@"
@@ -3753,12 +3858,16 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
       --host)
         need_val "$@"
         hosts+=("$2"); shift 2 ;;
+      --narrow) narrow=true; forced=true; shift ;;
       *) die "unknown option: $1" ;;
     esac
   done
   require_fleet
   [ "${#hosts[@]}" -eq 0 ] || fleet_select_hosts "${hosts[@]}"
   stdout_is_tty || die "fleet watch needs a terminal (stdout is not a tty); use 'runnerctl fleet status'"
+  # For the whole session, so a host that rejects --narrow once is asked
+  # without it on every later tick instead of twice per tick (fleet_fanout).
+  FLEET_OPTIONAL_ARG=--narrow
   color_setup "$COLOR_MODE"
   # Whether the REMOTE paints is the same question as whether this end does:
   # under --color never a remote SGR sequence would be the one thing in the
@@ -3774,7 +3883,9 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
   term_cursor hide
   while :; do
     header="$(paint "$C_BOLD" "runnerctl fleet watch — ${#FLEET_HOSTS[@]} host(s) — $(date +%H:%M:%S) — every ${interval}s (q to quit)")"
-    fleet_fanout "$FLEET_RUNNERCTL" status --color "$remote_color" ${fwd[@]+"${fwd[@]}"}
+    narrow_arg=()
+    ! $narrow || narrow_arg=(--narrow)
+    fleet_fanout "$FLEET_RUNNERCTL" status --color "$remote_color" ${fwd[@]+"${fwd[@]}"} ${narrow_arg[@]+"${narrow_arg[@]}"}
     # fleet_fanout arms its OWN EXIT trap on every call, so ours has to go
     # back afterwards. Without this the last thing to run on exit is the
     # tmpdir removal alone — cursor still hidden, and every ssh master left
@@ -3785,6 +3896,17 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
     # a reason to stop watching the ones that answered.
     frame="$(fleet_status_table || true)"
     fleet_cleanup
+    # GHR-56: the local watch's narrowing, measured on the ASSEMBLED frame —
+    # HOST column included, SGR stripped, error rows and notes not counted —
+    # and acted on by asking the remotes for the narrow table on the NEXT
+    # tick rather than re-fanning out now: a second round trip to every host
+    # to redraw one frame is the cost this command exists to avoid. The same
+    # hysteresis as the local watch, so a terminal near the threshold does
+    # not flip the table on every tick. --narrow pins it.
+    if ! $forced; then
+      wide="$(watch_table_width "$frame" '[^ ]+ +')"
+      if narrow_wanted "$narrow" "$wide" "$(term_cols)"; then narrow=true; else narrow=false; fi
+    fi
     if [ -n "$iterations" ]; then
       printf '\033[H\033[2J%s\n%s\n' "$header" "$frame"
       pause "$interval"

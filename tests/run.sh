@@ -102,7 +102,7 @@ XFAIL_KEYS=""  # issue keys of the xfail cases that failed as expected
 RUN_TIMEOUT="${RUN_TIMEOUT:-30}"
 
 run() {
-  : >"$LOG"
+  : >"$LOG"; rm -f "$LOG.cols"
   rm -rf "$WRITES"; mkdir -p "$WRITES"
   RC=0
   OUT="$(RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
@@ -114,7 +114,7 @@ run() {
 # that seeds the writes-mirror tree with seed_dropin before running a
 # read-only command that reads it back (status's PROFILE column).
 run_keep() {
-  : >"$LOG"
+  : >"$LOG"; rm -f "$LOG.cols"
   RC=0
   OUT="$(RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
          timeout "$RUN_TIMEOUT" "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
@@ -138,7 +138,7 @@ seed_dropin() {
 # define its functions and return instead of running main, so nothing is
 # sourced from a config and nothing touches the host.
 run_fn() {
-  : >"$LOG"
+  : >"$LOG"; rm -f "$LOG.cols"
   RC=0
   OUT="$(RUNNERCTL_NO_MAIN=1 bash -c '. "$0" && "$@"' "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
   ERR="$(cat "$TMP/err")"
@@ -157,7 +157,7 @@ save_config() { # PATH   (further config body on stdin)
 
 run_cfg() { # CONFIG-PATH ARGS...
   local cfg="$1"; shift
-  : >"$LOG"
+  : >"$LOG"; rm -f "$LOG.cols"
   rm -rf "$WRITES"; mkdir -p "$WRITES"
   RC=0
   OUT="$(RUNNERCTL_CONFIG="$cfg" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
@@ -171,7 +171,7 @@ run_cfg() { # CONFIG-PATH ARGS...
 # config file IS the stub and therefore always exists, and a run with no
 # config at all dies at require_runners long before the save.
 run_snippet() { # CONFIG-PATH SNIPPET
-  : >"$LOG"
+  : >"$LOG"; rm -f "$LOG.cols"
   RC=0
   # shellcheck disable=SC2016  # the child expands $1/$2/$3, not this shell
   OUT="$(RUNNERCTL_NO_MAIN=1 RUNNERCTL_CONFIG="$1" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
@@ -3323,6 +3323,145 @@ case_fleet_watch_bad_options_die_before_dialling() {
   expect_err 'fleet mode is not configured — set FLEET_HOSTS='
 }
 
+# --- GHR-56: the narrow table, as a flag the fleet can forward -----------------
+# The full and narrow column headers, with and without the fleet's HOST cell.
+# MAX, HIGH and ENVFILE are the columns --narrow drops (STATUS_NARROW_DROP).
+HDR_FULL='IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$'
+HDR_NARROW='IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +USED +PRESS +RESTART +WORKING-ON$'
+
+# `status --narrow` draws exactly the table the local watch narrows to, so a
+# fleet has something to ask a remote for. It is a table shape: --json has no
+# columns, and refuses it rather than accepting a flag that does nothing.
+# `watch --narrow` (and `status --watch --narrow`) pins the narrow table even
+# on a terminal wide enough for the full one.
+case_status_narrow_drops_max_high_envfile() {
+  run status --narrow
+  expect_rc 0
+  expect_out "^$HDR_NARROW"
+  expect_no_out 'MAX|HIGH|ENVFILE|/etc/x'
+  expect_out '^1 +example\.slot-2 .* +always +idle 2h31m \(2 jobs\)$'
+  run status --narrow --json
+  expect_rc 1
+  expect_err '^runnerctl: --narrow cannot be combined with --json'
+  expect_no_out '.'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run watch --narrow --iterations 2
+  expect_rc 0
+  expect_out_count "^$HDR_NARROW" 2
+  expect_no_out 'MAX|HIGH|ENVFILE'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run status --watch --narrow --iterations 1
+  expect_rc 0
+  expect_out_count "^$HDR_NARROW" 1
+}
+
+# `fleet status --narrow` forwards the flag, and the narrow table is what
+# ARRIVES — asserted on the rendered rows, not only on the argv, because the
+# stub's remote acts on the flag rather than echoing it. Never narrowed by
+# measuring (a one-shot is as likely piped as read), and refused with --json.
+case_fleet_status_narrow_is_forwarded_and_arrives() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_COLS=80 run fleet status --narrow
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --narrow$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --narrow$' 1
+  expect_out_count "^HOST +$HDR_NARROW" 1
+  expect_out '^build-2 +1 +example\.slot-2 .* +always +idle 2h31m \(2 jobs\)$'
+  expect_no_out 'MAX|HIGH|ENVFILE|/etc/x'
+  # no flag, no narrowing, however narrow the terminal
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_COLS=80 run fleet status
+  expect_rc 0
+  expect_out_count "^HOST +$HDR_FULL" 1
+  expect_no_log ' --narrow'
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet status --narrow --json
+  expect_rc 1
+  expect_err '^runnerctl: --narrow cannot be combined with --json'
+  expect_no_log '^probe:ssh_run'
+}
+
+# `fleet watch` measures the ASSEMBLED frame — HOST column included — and asks
+# the remotes for the narrow table on the NEXT tick. 180 columns is between
+# the two widths (narrow ~164 with HOST, full ~204), and less than the narrow
+# width plus the 22-column margin: so the table narrows once and then STAYS
+# narrow, where a watch without the hysteresis would put the columns back on
+# the next tick and flip on every one after it.
+case_fleet_watch_narrows_on_the_next_tick_and_holds() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_COLS=180 \
+    run fleet watch --iterations 4 --color never
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 4
+  # frame 1 is full-width (nothing measured yet), frames 2-4 narrow
+  expect_out_count "^HOST +$HDR_FULL" 1
+  expect_out_count "^HOST +$HDR_NARROW" 3
+  expect_out_count '^build-1 +1 +example\.slot-2 .* +always +idle 2h31m \(2 jobs\)$' 3
+  expect_out_count '^build-1 +1 +example\.slot-2 .* /etc/x \(ignore_errors=no\) idle 2h31m \(2 jobs\)$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --narrow$' 3
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --narrow$' 3
+  # one fan-out per tick: narrowing never costs a second round trip
+  expect_log_count '^probe:ssh_run build-[12] -- ' 8
+  # measured with colour on it is the same decision: SGR is stripped first
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_COLS=180 \
+    run fleet watch --iterations 2 --color always
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color always --narrow$' 1
+  expect_out_count "^$ESC\[1mHOST +$ESC\[0m $ESC\[1mIDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +USED " 1
+}
+
+# And back: once the terminal is wide enough for the full table WITH the margin
+# to spare, the next tick asks for it again. `--narrow` pins the narrow table
+# whatever the width, and an unknown width (0) never narrows at all.
+case_fleet_watch_widens_again_and_narrow_pins_it() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_COLS=150,150,300 \
+    run fleet watch --iterations 4 --color never
+  expect_rc 0
+  expect_log_order '^probe:ssh_run build-1 -- runnerctl status --color never$' \
+                   '^probe:ssh_run build-1 -- runnerctl status --color never --narrow$' \
+                   '^probe:ssh_run build-1 -- runnerctl status --color never --narrow$' \
+                   '^probe:ssh_run build-1 -- runnerctl status --color never$'
+  expect_out_count "^HOST +$HDR_FULL" 2
+  expect_out_count "^HOST +$HDR_NARROW" 2
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_COLS=400 \
+    run fleet watch --narrow --iterations 2 --color never
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --narrow$' 2
+  expect_out_count "^HOST +$HDR_NARROW" 2
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet watch --iterations 2 --color never
+  expect_rc 0
+  expect_no_log ' --narrow'
+}
+
+# Version skew, the design point. A host older than --narrow refuses it like
+# any unknown option (exit 1, `unknown option: --narrow`), which would make
+# it a `remote exit 1` row. Instead it is asked again without the flag in the
+# same fan-out — so it shows its full-width rows — and is remembered, so the
+# rest of the watch sends it the plain call once per tick, not twice. Its
+# column header is printed above its own rows, because the narrow one above
+# would put every value after ENABLED under the wrong name. A host that fails
+# rc 1 for any OTHER reason is not retried: it is a row, as before.
+case_fleet_narrow_an_old_host_renders_full_width_not_an_error() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-oldver gw-norunners" \
+    run fleet watch --narrow --iterations 3 --color never
+  expect_rc 0
+  expect_no_out 'unknown option'
+  expect_out_count '^gw-oldver +1 +example\.slot-2 .* /etc/x \(ignore_errors=no\) idle 2h31m \(2 jobs\)$' 3
+  expect_out_count '^build-1 +1 +example\.slot-2 .* +always +idle 2h31m \(2 jobs\)$' 3
+  expect_out_count "^HOST +$HDR_NARROW" 3
+  expect_out_count "^HOST +$HDR_FULL" 3
+  expect_out_count '^gw-norunners +remote exit 1 — ' 3
+  expect_out_count '^note: the hosts are not all on one runnerctl version' 3
+  # asked with the flag ONCE, then without it for the rest of the session
+  expect_log_count '^probe:ssh_run gw-oldver -- runnerctl status --color never --narrow$' 1
+  expect_log_count '^probe:ssh_run gw-oldver -- runnerctl status --color never$' 3
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --narrow$' 3
+  expect_log_count '^probe:ssh_run gw-norunners -- ' 3
+  # the one-shot takes the same path, and its exit code is not spoiled by it
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-oldver" run fleet status --narrow
+  expect_rc 0
+  expect_out '^gw-oldver +0 +example\.slot-1 .* 26\.0G +22\.0G .* my-app:test \(12m\)$'
+  expect_out '^build-1 +0 +example\.slot-1 .* +enabled +1\.0G/25\.0G .* my-app:test \(12m\)$'
+  expect_no_out 'remote exit'
+  expect_log_count '^probe:ssh_run gw-oldver -- ' 2
+}
+
 # --- GHR-44: capacity budgets ------------------------------------------------
 # The assertion the whole issue exists for: the roll must RE-READ fleet state
 # between slots rather than firing them off back to back. Asserted from the
@@ -4563,6 +4702,11 @@ t "fleet watch: the control session opens, then tears itself down"     case_flee
 t "fleet watch: the session options reach the real ssh command line"   case_fleet_ssh_run_puts_the_session_options_on_the_ssh_command_line
 t "fleet one-shots: no control session, ssh line unchanged"            case_fleet_one_shot_commands_open_no_control_session
 t "fleet watch: bad options die before anything is dialled"            case_fleet_watch_bad_options_die_before_dialling
+t "status --narrow: drops MAX/HIGH/ENVFILE; refused with --json"      case_status_narrow_drops_max_high_envfile
+t "fleet status --narrow: forwarded, and the narrow table arrives"     case_fleet_status_narrow_is_forwarded_and_arrives
+t "fleet watch: a too-wide frame narrows next tick and stays narrow"   case_fleet_watch_narrows_on_the_next_tick_and_holds
+t "fleet watch: widens again with room to spare; --narrow pins it"    case_fleet_watch_widens_again_and_narrow_pins_it
+t "fleet --narrow: a host too old for it renders full-width, no error" case_fleet_narrow_an_old_host_renders_full_width_not_an_error
 
 
 # --- GHR-45: provision --------------------------------------------------------
