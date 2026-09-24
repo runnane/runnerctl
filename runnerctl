@@ -4040,7 +4040,7 @@ fleet_watch_key_action() { # KEY
   fi
   lbl="$name on $host"
   if [ "$1" = L ]; then
-    (ssh_run "$host" "$FLEET_RUNNERCTL" logs "$name" -n 50) >"$FW_TMP/logs" 2>"$FW_TMP/err" || rc=$?
+    (ssh_run "$host" "$FLEET_RUNNERCTL" logs "$(printf %q "$name")" -n 50) >"$FW_TMP/logs" 2>"$FW_TMP/err" || rc=$?
     if [ "$rc" != 0 ]; then
       FW_NOTICE="$lbl: logs — $(fleet_error_text "$rc" "$FW_TMP/err")"
       return 0
@@ -4107,10 +4107,13 @@ fleet_watch_key_action() { # KEY
 # remedy (a sudo refusal says what sudoers needs), never fatal to the watch.
 # FW_REFRESH asks the loop for a fresh fan-out, so the frame after an action
 # shows its effect rather than the table from before it.
+# The slot name was read off the host's own frame, and ssh hands its argv to
+# the remote shell as one string: %q keeps a systemd-escaped name (`\x2d`)
+# or anything else odd a single argument there. A plain name is unchanged.
 fleet_watch_run_action() {
   local rc=0 last
   printf '\nrunning on %s: %s %s %s\n' "$FW_ACT_HOST" "$FLEET_RUNNERCTL" "$FW_ACTION" "$FW_ACT_NAME"
-  (ssh_run "$FW_ACT_HOST" "$FLEET_RUNNERCTL" "$FW_ACTION" "$FW_ACT_NAME") >"$FW_TMP/out" 2>"$FW_TMP/err" || rc=$?
+  (ssh_run "$FW_ACT_HOST" "$FLEET_RUNNERCTL" "$FW_ACTION" "$(printf %q "$FW_ACT_NAME")") >"$FW_TMP/out" 2>"$FW_TMP/err" || rc=$?
   if [ "$rc" = 0 ]; then
     last="$(grep . "$FW_TMP/out" | tail -1 || true)"
     FW_NOTICE="$FW_ACT_NAME on $FW_ACT_HOST: ${last:-$FW_ACTION done}"
