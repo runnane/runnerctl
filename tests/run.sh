@@ -3726,6 +3726,25 @@ case_fleet_max_unavailable_repolls_between_slots() {
   expect_no_log '^probe:ssh_run build-1 -- runnerctl restart$'
 }
 
+# GHR-59: FLEET_SLOTS_SKIPPED is set inside fleet_slots, and a caller that
+# reads it through $(fleet_slots) runs the function in a subshell, losing the
+# count the moment that subshell exits — so the warning below never fired and
+# the budget was silently held over a partial fleet. Assert both halves: the
+# warning line itself, and that the total (and everything the walk acts on)
+# counts only the reachable host's slots.
+case_fleet_budget_walk_warns_when_a_host_does_not_answer() {
+  RUNNERCTL_STUB_FLEET_SLOTS=2 RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-unreachable" \
+    run fleet restart --max-unavailable 1
+  expect_rc 0
+  expect_out '^warning: 1 host\(s\) did not answer — the budget is being held over the 2 slot\(s\) that did$'
+  expect_out '^build-1 slot 0: restart ok$'
+  expect_out '^build-1 slot 1: restart ok$'
+  expect_out '^fleet restart: 2 slot\(s\) done, 0 failed$'
+  # the unreachable host's slots do not exist to the walk, so nothing is ever
+  # dialled against it beyond the status polls that find it unreachable
+  expect_no_log '^probe:ssh_run gw-unreachable -- runnerctl restart '
+}
+
 # A floor, not a ceiling: stop/drain/disable take capacity away and never give
 # it back, so the budget that fits them stops the walk instead of throttling
 # it, and says what it deliberately left running.
@@ -4929,6 +4948,7 @@ t "fleet <mutating>: a sudo failure is a named row with the remedy"    case_flee
 t "fleet env-init/logs: excluded, each saying why"                     case_fleet_excluded_commands_say_why
 # --- GHR-44: capacity budgets -------------------------------------------------
 t "fleet --max-unavailable: re-reads fleet state between slots"        case_fleet_max_unavailable_repolls_between_slots
+t "fleet budget walk: warns when a host did not answer (GHR-59)"       case_fleet_budget_walk_warns_when_a_host_does_not_answer
 t "fleet --min-available: stops at the floor, names what it left"      case_fleet_min_available_stops_at_the_floor
 t "fleet budgets: each refuses the command it cannot help"             case_fleet_budget_flags_refuse_the_wrong_command
 t "fleet budgets: a percentage never rounds to a deadlocking zero"     case_fleet_percentage_budget_never_rounds_to_zero
