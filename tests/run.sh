@@ -3706,6 +3706,300 @@ case_provision_is_excluded_from_fleet() {
   expect_no_log '^probe:ssh_run '
 }
 
+# --- GHR-46: deprovision -------------------------------------------------------
+# The stub's fixed picture: slot-1 (index 0) is BUSY on my-app:test, slot-2
+# (index 1) is idle, slot-3 (index 2) is stopped. The stub's `prop` answers
+# WorkingDirectory=/opt/actions-runner/slot-N and User=github-runner, as the
+# unit svc.sh writes would. The removal token goes to config.sh on stdin, which
+# the stub writes to $WRITES/.config-remove-stdin and never to the log.
+DEPROV_TOKEN="STUB-RM-TOKEN-DO-NOT-PRINT"
+DEPROV_STDIN="$WRITES/.config-remove-stdin"
+DEPROV_CHANGES='^(bash -c|runuser |rm |rmdir |systemctl )'
+
+case_deprovision_removes_each_target_in_order() {
+  # A slot index, a runner name, and the same slot again by its unit name:
+  # two slots, the duplicate folded.
+  run deprovision 1 slot-3 actions.runner.example.slot-2.service \
+    --url "$PROV_URL" --pat ghp_EXAMPLE_PAT --yes
+  expect_rc 0
+  expect_out '^Deprovision 2 runner slot\(s\) — deregistered from GitHub and removed from this host:$'
+  expect_out '^  example\.slot-2  \(/opt/actions-runner/slot-2, runs as github-runner\)$'
+  expect_out '^Deprovisioned 2 runner slot\(s\): example\.slot-2 example\.slot-3$'
+  # One removal token for the run, from the endpoint the --url scope decides.
+  expect_log_count '^api: POST ' 1
+  expect_log '^api: POST https://api\.github\.com/orgs/acme/actions/runners/remove-token \(authenticated\)$'
+  expect_no_log 'registration-token'
+  # Per slot, in the order the runner insists on: the service goes first
+  # (config.sh refuses while it is installed), then GitHub, then the files.
+  local s
+  for s in 2 3; do
+    expect_log "^bash -c .* runnerctl /opt/actions-runner/slot-$s \./svc\.sh stop\$"
+    expect_log "^runuser -u github-runner -- bash -c .* runnerctl /opt/actions-runner/slot-$s \./config\.sh remove\$"
+    expect_log "^rm -rf -- /opt/actions-runner/slot-$s\$"
+    expect_log "^rm -f .*/actions\.runner\.example\.slot-$s\.service\.d/10-runnerctl\.conf\$"
+  done
+  expect_log_order \
+    '^api: POST .*remove-token' \
+    'slot-2 \./svc\.sh stop$' \
+    'slot-2 \./svc\.sh uninstall$' \
+    'slot-2 \./config\.sh remove$' \
+    '^rm -rf -- /opt/actions-runner/slot-2$' \
+    'slot-3 \./svc\.sh stop$' \
+    'slot-3 \./svc\.sh uninstall$' \
+    'slot-3 \./config\.sh remove$' \
+    '^rm -rf -- /opt/actions-runner/slot-3$' \
+    '^systemctl daemon-reload$'
+  expect_log_count '\./config\.sh remove$' 2
+  # svc.sh needs root; config.sh refuses root, so it runs as the unit's user.
+  expect_no_log '^runuser .*svc\.sh'
+  # The token was DELIVERED — once per slot, on stdin — not merely absent.
+  expect_cfg "$DEPROV_STDIN" '^STUB-REMOVAL-TOKEN$'
+  expect_cfg_count "$DEPROV_STDIN" '^STUB-REMOVAL-TOKEN$' 2
+  # The busy slot was never a target and is never touched.
+  expect_no_log 'slot-1'
+}
+
+case_deprovision_refuses_a_busy_slot() {
+  # slot-1 (index 0) has a job in flight. Named alongside an idle slot, the
+  # refusal still comes before EITHER is touched.
+  run deprovision 1 0 --token "$DEPROV_TOKEN" --yes
+  expect_rc 1
+  expect_err '^runnerctl: refusing: a job is in flight on example\.slot-1 \(my-app:test, 12m\) — deprovisioning would kill it'
+  expect_err 'Pass --when-idle to wait for each slot to finish\. Nothing was changed\.$'
+  expect_no_log "$DEPROV_CHANGES"
+  expect_no_log '^api: '
+  expect_no_path "$DEPROV_STDIN"
+  # A slot whose journal cannot be read cannot be proven idle: refused too.
+  RUNNERCTL_STUB_JOURNAL_ACCESS=0 run deprovision 1 --token "$DEPROV_TOKEN" --yes
+  expect_rc 1
+  expect_err 'refusing: a job is in flight on example\.slot-2 \(cannot tell — needs journal read access or root\)'
+  expect_no_log "$DEPROV_CHANGES"
+}
+
+case_deprovision_when_idle_waits_for_the_job() {
+  # Two busy polls, then slot-1's job completes and it is removed.
+  RUNNERCTL_STUB_BUSY_POLLS=2 run deprovision 0 --token "$DEPROV_TOKEN" --yes --when-idle
+  expect_rc 0
+  expect_out '^waiting for example\.slot-1 \(my-app:test, 12m\) …$'
+  expect_log_count '^probe:pause 5$' 2
+  expect_log_order '^probe:pause 5$' '^probe:pause 5$' 'slot-1 \./svc\.sh stop$' '^rm -rf -- /opt/actions-runner/slot-1$'
+  expect_out '^Deprovisioned 1 runner slot\(s\): example\.slot-1$'
+  # Busy for good: the wait times out, and nothing was stopped or removed.
+  RUNNERCTL_STUB_BUSY_POLLS=99 run deprovision 0 --token "$DEPROV_TOKEN" --yes --when-idle --timeout 10
+  expect_rc 1
+  expect_err '^runnerctl: timed out after 10s waiting for example\.slot-1 \(my-app:test, 12m\)$'
+  expect_err '^  busy or unreadable, not deprovisioned: example\.slot-1$'
+  expect_no_log "$DEPROV_CHANGES"
+}
+
+case_deprovision_dry_run_changes_nothing() {
+  # No --yes: a dry run needs no confirmation, and no terminal to ask on.
+  run deprovision 1 2 --url https://github.com/acme/app --pat ghp_EXAMPLE_PAT --dry-run
+  expect_rc 0
+  expect_out '^\(dry run — no token minted, nothing changed\)$'
+  expect_out '^would mint:  a removal token — POST https://api\.github\.com/repos/acme/app/actions/runners/remove-token \(repo\)$'
+  expect_out '^would run:   cd /opt/actions-runner/slot-2 && \./svc\.sh stop$'
+  expect_out '^would run:   cd /opt/actions-runner/slot-2 && \./svc\.sh uninstall$'
+  expect_out '^would run:   cd /opt/actions-runner/slot-2 && ACTIONS_RUNNER_INPUT_TOKEN=\*\*\* \./config\.sh remove   \(as github-runner\)$'
+  expect_out '^would run:   rm -rf -- /opt/actions-runner/slot-3$'
+  expect_out '^would run:   systemctl daemon-reload$'
+  expect_no_out '^Deprovisioned'
+  expect_no_log "$DEPROV_CHANGES"
+  expect_no_log '^api: '
+  expect_no_path "$DEPROV_STDIN"
+  # --yes alongside --dry-run: the confirm would no longer stop anything, so
+  # this is the run where only the dry-run short-circuit stands between the
+  # flags and a real removal.
+  run deprovision 1 --token "$DEPROV_TOKEN" --yes --dry-run
+  expect_rc 0
+  expect_out '^\(dry run — no token minted, nothing changed\)$'
+  expect_no_log "$DEPROV_CHANGES"
+  expect_no_path "$DEPROV_STDIN"
+  # --when-idle in a dry run says it would wait, and does not.
+  run deprovision 0 --token "$DEPROV_TOKEN" --dry-run --when-idle
+  expect_rc 0
+  expect_out '^would wait:  until example\.slot-1 is idle \(--when-idle, up to 1800s\)$'
+  expect_no_log '^probe:pause '
+  expect_no_log "$DEPROV_CHANGES"
+}
+
+case_deprovision_never_prints_the_removal_token() {
+  # A pasted removal token: not minted, delivered on stdin, and in none of
+  # stdout, stderr or the argv log.
+  run deprovision 1 --token "$DEPROV_TOKEN" --yes
+  expect_rc 0
+  expect_no_log '^api: '
+  expect_cfg "$DEPROV_STDIN" "^$DEPROV_TOKEN\$"
+  expect_no_out "$DEPROV_TOKEN"
+  expect_no_err "$DEPROV_TOKEN"
+  expect_no_log "$DEPROV_TOKEN"
+  # The failing path too: the warning must not quote the credential.
+  RUNNERCTL_STUB_CONFIG_REMOVE_FAIL=1 run deprovision 1 --token "$DEPROV_TOKEN" --yes
+  expect_rc 0
+  expect_no_out "$DEPROV_TOKEN"
+  expect_no_err "$DEPROV_TOKEN"
+  expect_no_log "$DEPROV_TOKEN"
+  # A minted one, and the PAT that minted it: neither reaches any stream or
+  # argv (the PAT goes to curl on stdin, the removal token to config.sh's).
+  run deprovision 1 --url "$PROV_URL" --pat ghp_EXAMPLE_PAT --yes
+  expect_rc 0
+  expect_cfg "$DEPROV_STDIN" '^STUB-REMOVAL-TOKEN$'
+  expect_no_log 'STUB-REMOVAL-TOKEN|ghp_EXAMPLE_PAT'
+  expect_no_out 'STUB-REMOVAL-TOKEN|ghp_EXAMPLE_PAT'
+  expect_no_err 'STUB-REMOVAL-TOKEN|ghp_EXAMPLE_PAT'
+}
+
+case_deprovision_already_deregistered_still_cleans_up() {
+  # GitHub has already forgotten slot-2, so config.sh remove fails (the real
+  # runner's DELETE 404s). The unit and directory are still removed.
+  RUNNERCTL_STUB_CONFIG_REMOVE_FAIL=1 run deprovision 1 --token "$DEPROV_TOKEN" --yes
+  expect_rc 0
+  expect_err '^runnerctl: warning: example\.slot-2: config\.sh remove failed — GitHub may already have forgotten this runner\. Cleaning up locally anyway\.$'
+  expect_log_order 'slot-2 \./svc\.sh uninstall$' 'slot-2 \./config\.sh remove$' '^rm -rf -- /opt/actions-runner/slot-2$' '^systemctl daemon-reload$'
+  expect_out '^Deprovisioned 1 runner slot\(s\): example\.slot-2$'
+  expect_out '^GitHub did not confirm removing: example\.slot-2\. If still listed under Settings -> Actions -> Runners, remove them there\.$'
+  # --local-only never asks GitHub at all, and needs no credential.
+  run deprovision 1 --local-only --yes
+  expect_rc 0
+  expect_out '^Deprovision 1 runner slot\(s\) — removed from this host only \(--local-only\):$'
+  expect_no_log '^api: '
+  expect_no_log 'config\.sh'
+  expect_log '^rm -rf -- /opt/actions-runner/slot-2$'
+  expect_out '^--local-only: still registered with GitHub \(offline\)\. Remove them under Settings -> Actions -> Runners\.$'
+}
+
+case_deprovision_confirms_unless_yes() {
+  # No terminal and no --yes: refused, nothing touched, nothing minted.
+  run deprovision 1 --url "$PROV_URL" --pat ghp_EXAMPLE_PAT
+  expect_rc 1
+  expect_err 'refusing to deprovision without confirmation: stdin is not a terminal\. Pass --yes to confirm, or --dry-run to see the commands\.$'
+  expect_no_log "$DEPROV_CHANGES"
+  expect_no_log '^api: '
+  # A terminal answering anything but yes: refused the same way.
+  RUNNERCTL_STUB_STDIN_TTY=1 run deprovision 1 --url "$PROV_URL" --pat ghp_EXAMPLE_PAT <<<"n"
+  expect_rc 1
+  expect_err 'This cannot be undone\. Deprovision example\.slot-2\? \[y/N\]'
+  expect_err 'not confirmed — nothing was changed\.$'
+  expect_no_log "$DEPROV_CHANGES"
+  expect_no_log '^api: '
+  # ...and a yes goes ahead.
+  RUNNERCTL_STUB_STDIN_TTY=1 run deprovision 1 --url "$PROV_URL" --pat ghp_EXAMPLE_PAT <<<"y"
+  expect_rc 0
+  expect_log '^rm -rf -- /opt/actions-runner/slot-2$'
+}
+
+case_deprovision_refuses_a_bad_invocation() {
+  # Bare: never "all".
+  run deprovision --yes --token t
+  expect_rc 1
+  expect_err "deprovision needs an explicit target — a unit, slot index or runner name, e\.g\. 'deprovision 2'\. It never means 'all'"
+  run deprovision 1 --bogus
+  expect_rc 1
+  expect_err "unknown option: --bogus \('runnerctl deprovision --help' lists them\)"
+  run deprovision 9 --token t --yes
+  expect_rc 1
+  expect_err 'slot index 9 out of range'
+  # A good target and a bad one: the bad one stops the run before the good
+  # one is touched.
+  run deprovision 1 nosuchslot --token t --yes
+  expect_rc 1
+  expect_err "no runner slot matches 'nosuchslot'"
+  run deprovision 1 --yes
+  expect_rc 1
+  expect_err 'no --url and no RUNNER_URL'
+  run deprovision 1 --url https://github.com/a/b/c --pat p --yes
+  expect_rc 1
+  expect_err "--url 'https://github.com/a/b/c' is invalid"
+  run deprovision 1 --local-only --token t --yes
+  expect_rc 1
+  expect_err '--local-only does not talk to GitHub, so --token has nothing to do'
+  run deprovision 1 --token
+  expect_rc 1
+  expect_err '[-][-]token needs a value'
+  # The unit's WorkingDirectory is what gets `rm -rf`: refuse one that is
+  # missing, or that is not a runner's tree.
+  RUNNERCTL_STUB_NO_WORKDIR=1 run deprovision 1 --token t --yes
+  expect_rc 1
+  expect_err "example\.slot-2: its unit names no runner directory \(WorkingDirectory=''\)"
+  RUNNERCTL_STUB_NOT_RUNNER_DIR=1 run deprovision 1 --token t --yes
+  expect_rc 1
+  expect_err 'example\.slot-2: /opt/actions-runner/slot-2 has no config\.sh and svc\.sh — refusing to delete a directory that is not a runner'
+  # No credential anywhere: refused after the confirm but before any change.
+  RUNNERCTL_STUB_NO_GH=1 run deprovision 1 --url "$PROV_URL" --yes
+  expect_rc 1
+  expect_err 'no removal token: pass --token <token from GitHub>, or --pat/.GITHUB_TOKEN, or log in with the gh CLI'
+  # Every one of these refuses before touching the host.
+  expect_no_log "$DEPROV_CHANGES"
+}
+
+case_deprovision_help() {
+  run deprovision --help
+  expect_rc 0
+  expect_out '^Usage: runnerctl deprovision <unit\|slot-index\|name>\.\.\. \[options\]$'
+  expect_out '^  --token TOKEN '
+  expect_out '^  --local-only '
+  expect_out '^  --when-idle '
+  expect_out '^  --yes, -y '
+  expect_out '^  --dry-run '
+  expect_no_log "$DEPROV_CHANGES"
+  # The top-level usage lists it too.
+  run help
+  expect_out '^  runnerctl deprovision <unit\|slot-index\|name>\.\.\. '
+}
+
+case_deprovision_is_named_where_removal_was_manual() {
+  # scale's note used to say full deregistration was "not automated".
+  run scale 2 --max 26G --high 25G
+  expect_rc 0
+  expect_out "^'runnerctl deprovision <slot>' — destructive and irreversible\.$"
+  expect_no_out 'not automated'
+  # ...and provision's no-op pointed at that note.
+  run provision 1 --url "$PROV_URL" --token t
+  expect_rc 0
+  expect_out "^removing one for good is 'runnerctl deprovision <slot>'\.\)$"
+}
+
+case_deprovision_is_excluded_from_fleet() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet deprovision 1 --yes
+  expect_rc 1
+  expect_err 'fleet deprovision is not supported'
+  expect_err 'a slot index or name means a different runner on each host'
+  expect_no_log '^probe:ssh_run '
+}
+
+# The two host questions the stub answers, asked of the REAL functions (the
+# GHR-48 lesson: a shadow's contract can drift from the real one). The real
+# runner_exec_with_token is run with run_priv replaced by a plain exec and
+# the root user (so no runuser), against a fake config.sh that reports what
+# it was given: the token must arrive in its environment and not its argv.
+case_deprovision_real_helpers() {
+  local d="$TMP/ghr46-runner"
+  rm -rf "$d"; mkdir -p "$d"
+  run_fn runner_dir_is_runner "$d"
+  expect_rc 1
+  : >"$d/config.sh"
+  run_fn runner_dir_is_runner "$d"
+  expect_rc 1
+  : >"$d/svc.sh"
+  run_fn runner_dir_is_runner "$d"
+  expect_rc 0
+  cat >"$d/config.sh" <<'FAKE'
+#!/usr/bin/env bash
+echo "argv=$*"
+echo "env=${ACTIONS_RUNNER_INPUT_TOKEN:-unset}"
+echo "cwd=$PWD"
+FAKE
+  chmod +x "$d/config.sh"
+  # The stub is sourced by run_snippet, so its logging run_priv is replaced
+  # here by one that actually runs the command — as the invoking user, root
+  # being the user argument only so no runuser is involved.
+  run_snippet "$STUB" "run_priv() { \"\$@\"; }; runner_exec_with_token '$DEPROV_TOKEN' '$d' root ./config.sh remove"
+  expect_rc 0
+  expect_out '^argv=remove$'
+  expect_out "^env=$DEPROV_TOKEN\$"
+  expect_out "^cwd=$d\$"
+}
+
 # --- GHR-48: the REAL discover(), against a fake systemctl -------------------
 # Every other case reaches discover through tests/stub.config, which SHADOWS
 # it — so the stub's contract (no units = empty, exit 0) was asserted while
@@ -4275,6 +4569,20 @@ t "provision: bad invocations refuse before touching host or network"  case_prov
 t "provision --help, and the default prefix/user/root"                 case_provision_help_and_defaults
 t "no units on this host: every command names provision"               case_provision_is_named_when_a_host_has_no_runners
 t "fleet provision: excluded, saying why"                              case_provision_is_excluded_from_fleet
+
+# --- GHR-46: deprovision ------------------------------------------------------
+t "deprovision: stop, uninstall, deregister, delete — per target"      case_deprovision_removes_each_target_in_order
+t "deprovision: a busy or unreadable slot is refused, nothing touched" case_deprovision_refuses_a_busy_slot
+t "deprovision --when-idle: waits for the job, or times out untouched" case_deprovision_when_idle_waits_for_the_job
+t "deprovision --dry-run: prints the commands, mints and changes none" case_deprovision_dry_run_changes_nothing
+t "deprovision: the removal token reaches no stream and no argv"       case_deprovision_never_prints_the_removal_token
+t "deprovision: a runner GitHub forgot is still cleaned up locally"    case_deprovision_already_deregistered_still_cleans_up
+t "deprovision: y/N unless --yes; refused without a terminal"          case_deprovision_confirms_unless_yes
+t "deprovision: bad invocations refuse before touching the host"       case_deprovision_refuses_a_bad_invocation
+t "deprovision --help, and the top-level usage"                        case_deprovision_help
+t "scale/provision notes point at deprovision, not 'not automated'"    case_deprovision_is_named_where_removal_was_manual
+t "fleet deprovision: excluded, saying why"                            case_deprovision_is_excluded_from_fleet
+t "deprovision: the real dir check and token hand-off"                 case_deprovision_real_helpers
 
 # --- GHR-48: the real discover(), not the stub's stand-in -------------------
 t "discover: no matching units is empty and exit 0, not a failure"     case_discover_no_matching_units_is_empty_not_a_failure

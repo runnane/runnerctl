@@ -29,6 +29,9 @@
 #                         [--name-prefix P] [--runner-user U] [--runner-root DIR] \
 #                         [--runner-version X.Y.Z] [--sha256 SUM] [--replace] \
 #                         [--dry-run]     ('provision --help' for all of them)
+#   runnerctl deprovision <unit|slot-index|name>... [--token TOK | --pat TOK] \
+#                         [--url URL] [--local-only] [--when-idle] [--timeout N] \
+#                         [--yes] [--dry-run]
 #   runnerctl status [--json] [--watch|-w] [--interval N] [--once] \
 #                    [--color auto|always|never] [--stall-after N]
 #   runnerctl watch  [--interval N] [--color auto|always|never] [--stall-after N]
@@ -249,6 +252,16 @@
 # run. Note that `config.sh` takes the token as a command-line argument — as
 # it does in GitHub's own documented install — so it is briefly visible in
 # `ps` to other users on the box; runnerctl itself never prints or stores it.
+#
+# `deprovision <target>...` (GHR-46) is the inverse, for a slot that should
+# stop existing rather than merely stop: svc.sh stop + uninstall, `config.sh
+# remove` with a removal token (minted like the registration one, from
+# --token, --pat/$GITHUB_TOKEN or gh), then the runner's directory is
+# deleted. Irreversible, so it takes explicit targets only, asks y/N unless
+# --yes (and refuses without a terminal), refuses a slot with a job in
+# flight unless --when-idle, and --dry-run prints the commands. A runner
+# GitHub already forgot still gets cleaned up locally. The removal token
+# reaches config.sh through its environment, never argv.
 #
 # Recommended baselines:
 #   New host:     runnerctl provision 2 --url https://github.com/<org>
@@ -2009,9 +2022,9 @@ cmd_scale() {
     exit 1
   fi
   echo "Scaled to $n active runner(s), profile '$PROFILE'${MEM_MAX:+ @ MemoryMax=$MEM_MAX}."
-  echo "Note: stopped slots stay REGISTERED with GitHub (they show offline). Full"
-  echo "deregister = 'svc.sh uninstall' + './config.sh remove' in the runner's dir"
-  echo "(needs a GitHub removal token) — not automated: destructive, irreversible."
+  echo "Note: stopped slots stay REGISTERED with GitHub (they show offline). To"
+  echo "remove one for good (deregister, uninstall the unit, delete its directory):"
+  echo "'runnerctl deprovision <slot>' — destructive and irreversible."
   if $do_save; then save_profile scale; fi
   if $do_restart; then
     for i in "${!units[@]}"; do
@@ -3165,6 +3178,12 @@ cmd_fleet() {
     # single fleet-wide command cannot supply.
     provision)
              die "fleet provision is not supported: it takes a registration token (fanning it out copies a credential to every host) and each host needs its own runner names. Run 'runnerctl provision N' on each host." ;;
+    # deprovision for the same credential reason, plus its own: it is
+    # irreversible and asks y/N per run, and slot indexes and names mean
+    # different runners on different hosts, so one fleet-wide target list
+    # would delete different things everywhere.
+    deprovision)
+             die "fleet deprovision is not supported: it takes a removal token (fanning it out copies a credential to every host), it is irreversible, and a slot index or name means a different runner on each host. Run 'runnerctl deprovision <slot>' on the host." ;;
     logs)
              die "fleet logs is not supported: logs streams from one journal and only makes sense against one host. Use 'runnerctl fleet watch' for a live fleet-wide view, or ssh to the host." ;;
     *)       die "unknown fleet command '$sub' (status watch health upgrade apply scale start stop restart drain kill reap remove-limits enable disable)" ;;
@@ -3809,8 +3828,8 @@ cmd_profiles() {
 #
 # It is idempotent against a TARGET COUNT, like `scale`: slots that exist are
 # left alone, so `provision 4` on a host with 2 adds two and `provision 2` on
-# a host with 4 changes nothing. It never removes a runner: deregistering
-# needs a removal token from GitHub and is GHR-46.
+# a host with 4 changes nothing. It never removes a runner: that is
+# `deprovision` (GHR-46), below.
 
 valid_user_name() { [[ "$1" =~ ^[a-z_][a-z0-9_-]*$ ]]; }
 valid_runner_name() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; }
@@ -3955,19 +3974,31 @@ ensure_runner_user() { # USER GROUP DRY-RUN
 # registration tokens last an hour and register any number of runners, so one
 # is minted per RUN, not per slot.
 runner_registration_token() { # API-PATH PAT
-  local path="$1" pat="$2" body tok
+  runner_api_token "$1" "$2" registration
+}
+
+# The shared half of the registration token (provision) and the removal token
+# (deprovision, GHR-46): the same three credential sources and the same scope
+# path, differing only in the endpoint — .../registration-token or
+# .../remove-token. KIND is `registration` or `removal`.
+runner_api_token() { # API-PATH PAT KIND
+  local path="$1" pat="$2" kind="$3" endpoint body tok
+  case "$kind" in
+    registration) endpoint=registration-token ;;
+    *)            endpoint=remove-token ;;
+  esac
   if [ -n "$pat" ]; then
-    body="$(http_api POST "$RUNNER_API_URL/$path/actions/runners/registration-token" "$pat")" \
-      || die "could not mint a registration token for $path — check the token's scope (a classic PAT needs 'repo' for a repo runner, 'admin:org' for an org one) and that it has not expired"
+    body="$(http_api POST "$RUNNER_API_URL/$path/actions/runners/$endpoint" "$pat")" \
+      || die "could not mint a $kind token for $path — check the token's scope (a classic PAT needs 'repo' for a repo runner, 'admin:org' for an org one) and that it has not expired"
     tok="$(printf '%s' "$body" | json_field token)"
-    [ -n "$tok" ] || die "the registration-token response for $path carried no token"
+    [ -n "$tok" ] || die "the $endpoint response for $path carried no token"
     printf '%s' "$tok"
     return 0
   fi
   # gh already holds a login on plenty of boxes; --jq keeps the token off argv.
-  runner_have_gh || die "no registration token: pass --token <token from GitHub>, or --pat/\$GITHUB_TOKEN, or log in with the gh CLI"
-  tok="$(gh api --method POST "$path/actions/runners/registration-token" --jq .token 2>/dev/null)" \
-    || die "gh could not mint a registration token for $path — 'gh auth status' to check the login, or pass --token/--pat"
+  runner_have_gh || die "no $kind token: pass --token <token from GitHub>, or --pat/\$GITHUB_TOKEN, or log in with the gh CLI"
+  tok="$(gh api --method POST "$path/actions/runners/$endpoint" --jq .token 2>/dev/null)" \
+    || die "gh could not mint a $kind token for $path — 'gh auth status' to check the login, or pass --token/--pat"
   [ -n "$tok" ] || die "gh returned no token for $path"
   printf '%s' "$tok"
 }
@@ -3978,7 +4009,7 @@ Usage: runnerctl provision N [options]
 
 Installs and registers runner slots until this host has N of them, then hands
 over to `scale`/`apply`. Existing slots are left alone; nothing is ever
-deregistered (removing a runner from GitHub needs a removal token — GHR-46).
+deregistered — removing a runner for good is `runnerctl deprovision`.
 
   --url URL              org, repo or enterprise to register against, e.g.
                          https://github.com/acme or https://github.com/acme/app
@@ -4053,7 +4084,7 @@ cmd_provision() {
   echo "Host has $have runner slot(s); target $n."
   if [ "$have" -ge "$n" ]; then
     echo "Nothing to provision. ('scale' enables and disables the slots that exist;"
-    echo "removing one from GitHub is not automated — see the note in 'scale'.)"
+    echo "removing one for good is 'runnerctl deprovision <slot>'.)"
     return 0
   fi
   local want=$((n - have))
@@ -4190,6 +4221,241 @@ cmd_provision() {
   if [ "${#failed[@]}" -gt 0 ]; then
     echo "runnerctl: provision: ${#failed[@]} slot(s) failed: ${failed[*]}" >&2
     echo "runnerctl: their directories are left under $root for inspection; re-run provision once fixed." >&2
+    exit 1
+  fi
+}
+
+# --- Deprovisioning: removing a runner for good (GHR-46) ---------------------
+# The inverse of `provision`, and the step `scale` deliberately stops short
+# of: `scale` disables a slot, which leaves it registered with GitHub (offline)
+# and on disk. `deprovision <target>...` runs the runner's own teardown in the
+# order the runner insists on — `svc.sh stop`, `svc.sh uninstall` (config.sh
+# refuses to remove a runner whose service is still installed: "Uninstall
+# service first"), then `config.sh remove` with a REMOVAL token — and deletes
+# the runner's directory.
+#
+# Destructive and irreversible, so: only explicit targets (a bare
+# `deprovision` is a refusal, never "all"); a y/N confirm unless --yes, and a
+# refusal when there is no terminal to ask; a slot with a job in flight is
+# refused unless --when-idle waits for it; --dry-run prints the commands.
+#
+# A runner GitHub has already forgotten (removed in the UI, or expired) makes
+# `config.sh remove` FAIL — the DELETE 404s and the runner's own code rethrows
+# without touching its local files — so that failure is a warning here, never
+# a stop: the local unit and directory are what this command owns, and a host
+# left with a dead runner on it because GitHub already agreed it was gone
+# would be the worst of both. --local-only skips GitHub altogether, for a
+# host with no credential at hand.
+
+# Is DIR a runner's own tree? The check between a unit's WorkingDirectory and
+# `rm -rf`: a unit that points anywhere else is refused, not trusted.
+runner_dir_is_runner() { # DIR
+  [ -f "$1/config.sh" ] && [ -f "$1/svc.sh" ]
+}
+
+# Can someone answer a y/N on stdin? Its own function so a config can answer
+# it — the sim's stdin is never a terminal.
+stdin_is_tty() { [ -t 0 ]; }
+
+# runner_exec, with TOKEN handed to the runner as ACTIONS_RUNNER_INPUT_TOKEN
+# rather than `--token` in argv. The runner reads any ACTIONS_RUNNER_INPUT_<arg>
+# as that argument and masks it as a secret (CommandSettings.cs, read
+# 2026-09-24). sudo resets the environment, so the value cannot simply be
+# exported: the inner shell reads it from STDIN, which reaches neither argv
+# nor any log — /proc/<pid>/environ is readable only by the runner user and
+# root.
+runner_exec_with_token() { # TOKEN DIR USER CMD...
+  local token="$1" dir="$2" user="$3"; shift 3
+  local as=()
+  [ "$user" = root ] || as=(runuser -u "$user" --)
+  # SC2016 for runner_exec's reason: the $1/$@ belong to the inner bash.
+  # shellcheck disable=SC2016
+  run_priv ${as+"${as[@]}"} bash -c 'IFS= read -r ACTIONS_RUNNER_INPUT_TOKEN || exit 1; export ACTIONS_RUNNER_INPUT_TOKEN; cd "$1" || exit 1; shift; exec "$@"' runnerctl "$dir" "$@" <<<"$token"
+}
+
+deprovision_usage() {
+  cat <<'DEPROVISION'
+Usage: runnerctl deprovision <unit|slot-index|name>... [options]
+
+Removes runner slots for good: stops and uninstalls each one's service
+(svc.sh stop + svc.sh uninstall), deregisters it from GitHub (config.sh remove,
+with a removal token) and deletes its directory. Irreversible. There is no
+"all": every slot to remove is named.
+
+  --token TOKEN   a removal token from GitHub (a runner's "Remove" dialog
+                  under Settings -> Actions -> Runners). Valid 1 hour.
+  --pat TOKEN     a PAT to mint the removal token with, instead of pasting
+                  one. Defaults to $GITHUB_TOKEN; with neither, the gh CLI's
+                  login is used if it is present.
+  --url URL       org, repo or enterprise the runners are registered to, for
+                  minting (default: RUNNER_URL from the config file). Not
+                  needed with --token or --local-only.
+  --local-only    do not talk to GitHub: remove the service and directory
+                  only. The runner stays listed (offline) until removed there.
+  --when-idle     wait for each slot's job to finish instead of refusing a
+                  busy slot; --timeout N (seconds) bounds the wait
+  --yes, -y       do not ask for confirmation (required without a terminal)
+  --dry-run       print the exact commands; mint nothing, change nothing
+
+A runner GitHub has already forgotten is still cleaned up locally: a failing
+config.sh remove is a warning, not a stop.
+DEPROVISION
+}
+
+cmd_deprovision() {
+  local url="$RUNNER_URL" token="" pat="${GITHUB_TOKEN:-}" cred_flag=""
+  local dry_run=false yes=false local_only=false
+  local targets=() t u
+  while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    case "$1" in
+      -h|--help)    deprovision_usage; return 0 ;;
+      --url)        need_val "$@"; url="$2"; shift 2 ;;
+      --token)      need_val "$@"; token="$2"; cred_flag=--token; shift 2 ;;
+      --pat)        need_val "$@"; pat="$2"; cred_flag=--pat; shift 2 ;;
+      --local-only) local_only=true; shift ;;
+      --when-idle)  when_idle=true; shift ;;
+      --timeout)    need_val "$@"; set_timeout "$2"; shift 2 ;;
+      -y|--yes)     yes=true; shift ;;
+      --dry-run)    dry_run=true; shift ;;
+      -*)           die "unknown option: $1 ('runnerctl deprovision --help' lists them)" ;;
+      *)            targets+=("$1"); shift ;;
+    esac
+  done
+
+  [ "${#targets[@]}" -gt 0 ] || die "deprovision needs an explicit target — a unit, slot index or runner name, e.g. 'deprovision 2'. It never means 'all'; 'runnerctl status' lists the slots."
+  if $local_only && [ -n "$cred_flag" ]; then
+    die "--local-only does not talk to GitHub, so $cred_flag has nothing to do — drop one of them"
+  fi
+  require_runners
+
+  # Resolve every target, and read where each runner lives, before anything is
+  # touched: a typo in the third target must not leave the first two removed.
+  local units=() seen=" "
+  for t in "${targets[@]}"; do
+    # Resolve on its own line: a die inside "$(...)" only exits the subshell.
+    u="$(resolve "$t")"
+    [[ "$seen" == *" $u "* ]] && continue
+    seen+="$u "
+    units+=("$u")
+  done
+  local dirs=() users=() dir user short i
+  for u in "${units[@]}"; do
+    short="$(short_name "$u")"
+    # svc.sh writes WorkingDirectory=<the runner's dir> and User=<its user>.
+    dir="$(prop "$u" WorkingDirectory)"; dir="${dir%/}"
+    user="$(prop "$u" User)"; [ -n "$user" ] || user="$RUNNER_USER"
+    [[ "$dir" == /?* ]] || die "$short: its unit names no runner directory (WorkingDirectory='$dir') — was it installed by svc.sh? Nothing was changed."
+    runner_dir_is_runner "$dir" || die "$short: $dir has no config.sh and svc.sh — refusing to delete a directory that is not a runner's. Nothing was changed."
+    dirs+=("$dir"); users+=("$user")
+  done
+
+  # Minting needs to know the scope; a pasted --token and --local-only do not.
+  local scope_kind="" scope_path=""
+  if ! $local_only && [ -z "$token" ]; then
+    [ -n "$url" ] || die "no --url and no RUNNER_URL in $CONFIG_FILE — minting a removal token needs the org, repo or enterprise the runners are registered to (or pass --token <removal token>, or --local-only)"
+    valid_runner_url "$url" || die "--url '$url' is invalid — want https://github.com/<org>, .../<org>/<repo> or .../enterprises/<slug>"
+    read -r scope_kind scope_path <<<"$(runner_scope "$url")"
+    [ -n "$scope_path" ] || exit 1   # runner_scope already said why
+  fi
+
+  # A busy slot is refused outright unless --when-idle, which waits per slot
+  # below instead. Checked for EVERY target before any is touched.
+  if ! $when_idle; then
+    local busy=""
+    for u in "${units[@]}"; do
+      slot_is_idle "$u" && continue
+      if [ "$SLOT_JOB" = "(no access)" ]; then
+        busy+="${busy:+, }$(short_name "$u") (cannot tell — needs journal read access or root)"
+      else
+        busy+="${busy:+, }$(short_name "$u") ($(job_desc "$SLOT_JOB"))"
+      fi
+    done
+    [ -z "$busy" ] || die "refusing: a job is in flight on $busy — deprovisioning would kill it and GitHub would mark it failed. Pass --when-idle to wait for each slot to finish. Nothing was changed."
+  fi
+
+  if $local_only; then
+    echo "Deprovision ${#units[@]} runner slot(s) — removed from this host only (--local-only):"
+  else
+    echo "Deprovision ${#units[@]} runner slot(s) — deregistered from GitHub and removed from this host:"
+  fi
+  for i in "${!units[@]}"; do
+    echo "  $(short_name "${units[$i]}")  (${dirs[$i]}, runs as ${users[$i]})"
+  done
+
+  if $dry_run; then
+    echo
+    echo "(dry run — no token minted, nothing changed)"
+    [ -z "$scope_path" ] || echo "would mint:  a removal token — POST $RUNNER_API_URL/$scope_path/actions/runners/remove-token ($scope_kind)"
+    for i in "${!units[@]}"; do
+      u="${units[$i]}"; dir="${dirs[$i]}"
+      ! $when_idle || echo "would wait:  until $(short_name "$u") is idle (--when-idle, up to ${WAIT_TIMEOUT}s)"
+      echo "would run:   cd $dir && ./svc.sh stop"
+      echo "would run:   cd $dir && ./svc.sh uninstall"
+      $local_only || echo "would run:   cd $dir && ACTIONS_RUNNER_INPUT_TOKEN=*** ./config.sh remove   (as ${users[$i]})"
+      echo "would run:   rm -rf -- $dir"
+      echo "would run:   rm -f $SYSTEMD_DIR/$u.d/$DROPIN_NAME"
+    done
+    echo "would run:   systemctl daemon-reload"
+    return 0
+  fi
+
+  if ! $yes; then
+    stdin_is_tty || die "refusing to deprovision without confirmation: stdin is not a terminal. Pass --yes to confirm, or --dry-run to see the commands."
+    local ans=""
+    printf 'This cannot be undone. Deprovision %s? [y/N] ' "$(join_short "${units[*]}")" >&2
+    IFS= read -r ans || true
+    case "$ans" in
+      y|Y|yes|Yes|YES) ;;
+      *) die "not confirmed — nothing was changed." ;;
+    esac
+  fi
+
+  # Only now, confirmed and with every target validated, is a credential used.
+  if ! $local_only && [ -z "$token" ]; then
+    token="$(runner_api_token "$scope_path" "$pat" removal)"
+  fi
+
+  local made=() failed=() unconfirmed=()
+  for i in "${!units[@]}"; do
+    u="${units[$i]}"; dir="${dirs[$i]}"; user="${users[$i]}"; short="$(short_name "$u")"
+    idle_gate "$u" deprovisioned "${units[*]:0:$i}" "${units[*]:$((i + 1))}"
+    echo "[$short] stopping and uninstalling the service"
+    if ! runner_exec "$dir" root ./svc.sh stop; then
+      failed+=("$short"); echo "  [FAILED] svc.sh stop — left in place"; continue
+    fi
+    if ! runner_exec "$dir" root ./svc.sh uninstall; then
+      failed+=("$short"); echo "  [FAILED] svc.sh uninstall — left in place"; continue
+    fi
+    if ! $local_only; then
+      echo "[$short] deregistering from GitHub"
+      if ! runner_exec_with_token "$token" "$dir" "$user" ./config.sh remove; then
+        unconfirmed+=("$short")
+        echo "runnerctl: warning: $short: config.sh remove failed — GitHub may already have forgotten this runner. Cleaning up locally anyway." >&2
+      fi
+    fi
+    echo "[$short] removing $dir"
+    if ! run_priv rm -rf -- "$dir"; then
+      failed+=("$short"); echo "  [FAILED] rm -rf $dir"; continue
+    fi
+    # runnerctl's own drop-in outlives the unit svc.sh just removed.
+    run_priv rm -f "$SYSTEMD_DIR/$u.d/$DROPIN_NAME" || true
+    if [ -d "$SYSTEMD_DIR/$u.d" ]; then run_priv rmdir --ignore-fail-on-non-empty "$SYSTEMD_DIR/$u.d" || true; fi
+    made+=("$short")
+    echo "  [ok] $short"
+  done
+
+  run_priv systemctl daemon-reload
+  echo
+  [ "${#made[@]}" -eq 0 ] || echo "Deprovisioned ${#made[@]} runner slot(s): ${made[*]}"
+  if [ "${#unconfirmed[@]}" -gt 0 ]; then
+    echo "GitHub did not confirm removing: ${unconfirmed[*]}. If still listed under Settings -> Actions -> Runners, remove them there."
+  fi
+  if $local_only && [ "${#made[@]}" -gt 0 ]; then
+    echo "--local-only: still registered with GitHub (offline). Remove them under Settings -> Actions -> Runners."
+  fi
+  if [ "${#failed[@]}" -gt 0 ]; then
+    echo "runnerctl: deprovision: ${#failed[@]} slot(s) failed: ${failed[*]}" >&2
     exit 1
   fi
 }
@@ -5088,6 +5354,7 @@ main() {
   case "$cmd" in
     install)            cmd_install "$@" ;;
     provision)          cmd_provision "$@" ;;
+    deprovision)        cmd_deprovision "$@" ;;
     status)             cmd_status "$@" ;;
     watch)              cmd_status --watch "$@" ;;
     apply)              cmd_apply "$@" ;;
@@ -5108,7 +5375,7 @@ main() {
     upgrade)            cmd_upgrade "$@" ;;
     version|--version)  echo "runnerctl $RUNNERCTL_VERSION" ;;
     -h|--help|help)     usage ;;
-    *) die "unknown command '$cmd' (status watch health fleet provision apply scale env-init start stop restart drain enable disable logs remove-limits reap kill profiles config-example migrate install upgrade version)" ;;
+    *) die "unknown command '$cmd' (status watch health fleet provision deprovision apply scale env-init start stop restart drain enable disable logs remove-limits reap kill profiles config-example migrate install upgrade version)" ;;
   esac
 }
 
