@@ -759,7 +759,7 @@ build-1  1   org.build-1-b   ci       active/running   2d 7h  enabled  ...  idle
 build-2  0   org.build-2-a   ci       active/running   6d     enabled  ...  my-app:lint (2m)
 build-3  unreachable — ssh: connect to host build-3 port 22: No route to host
 
-q quit — this view is read-only; act with 'runnerctl fleet <command>' or on the host
+↑↓/jk select  K kill job  R restart  S stop  T start  P reap  L logs  q quit
 ```
 
 **Do not build this out of `watch(1)`.** `watch runnerctl fleet status` works
@@ -810,14 +810,50 @@ flag. `runnerctl upgrade` on that host gives it the narrow table too.
 answer stays a **row** in every frame — a watch that died when one of six hosts
 rebooted would take the five that are fine off the screen with it.
 
-**It is read-only.** `q` quits; no key acts. The local `watch`'s action keys
-(`K` `R` `S` `T` `P` `L`) are not here, because a cursor that addresses a
-*(host, slot)* pair and runs a mutating command over ssh is a different feature
-with its own confirm and its own answer to the capacity rules below. Act with
-`runnerctl fleet <command>`, or on the host.
+**Action keys.** The local `watch`'s keys work here too, against the slot the
+cursor is on — and on a fleet that is a *(host, slot)* pair, because every host
+has its own `slot-1`:
+
+| key | does, on the selected slot's host |
+| --- | --- |
+| `↑` `↓` / `j` `k` | move the cursor, across host boundaries; no round trip |
+| `K` | kill the running job (`runnerctl kill <slot>` there) |
+| `R` / `S` / `T` | restart / stop / start the slot |
+| `P` | reap processes a finished job leaked |
+| `L` | page the slot's last 50 journal lines through your `$PAGER` |
+| `q` | quit |
+
+Each of `K` `R` `S` `T` `P` first reads that host's own `status --json` — one
+round trip over the held connection — and decides on *that*, not on the frame,
+which may be an interval old: a job that finished since the last redraw is not
+offered for killing. The confirm line quotes what the host said and names the
+exact remote command (`runs on build-2: runnerctl stop example.slot-1`); `y`
+runs it, anything else cancels. The result, or the remote's error with its
+remedy (a missing sudoers line, say), is the notice under the next frame, which
+is a fresh poll so it shows the effect.
+
+`S` has a **capacity floor**. A single-slot key is as bounded a target as
+there is, so it needs neither `--host` nor `--all-hosts` — but a cursor walked
+down the fleet pressing `S`, `y` on every row reaches zero capacity as surely as
+an unguarded `fleet stop`, one explicit confirm at a time. So `S` re-reads every
+watched host and refuses a stop that would leave fewer than `--min-available K`
+slots active across them (default **1**: the watch never stops the last running
+slot it can see; `0` turns the floor off). A host that is not answering counts
+as nothing available, and the confirm line says how many it left out. `R` and
+`K` are transient and `T`/`P` take nothing away, so they are not gated — the
+same split as the fleet commands below.
+
+The cursor survives the frame changing under it. A host that stops answering
+keeps the cursor on its error row (keys there act on nothing) and remembers the
+slot, so it is back on that slot when the host answers again; a slot that goes
+away drops the cursor to that host's first slot. `L` is not a stream: the host's
+`logs <slot> -n 50` runs to completion under `FLEET_TIMEOUT` and the result is
+paged locally. Every remote action needs what the same command needs run by
+hand over ssh: passwordless sudo on that host, `L` included (`logs` reads the
+journal through it). The facts read is a plain `status --json` and needs none.
 
 `fleet logs` remains unsupported: it streams one journal, and that only makes
-sense against one host.
+sense against one host. For a slot's recent lines, `L` in `fleet watch`.
 
 #### One exit code for the fleet: `fleet health`
 
