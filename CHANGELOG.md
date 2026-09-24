@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.14.0](https://github.com/runnane/runnerctl/compare/v0.13.0...v0.14.0) (2026-09-24)
+
+
+### Features
+
+* deprovision deregisters a runner from GitHub and removes its unit (GHR-46) ([#64](https://github.com/runnane/runnerctl/issues/64)) ([e2a84d6](https://github.com/runnane/runnerctl/commit/e2a84d68ea931673dd58d55b9503a4fd7d338e38))
+* fleet watch action keys against the selected (host, slot) (GHR-55) ([#67](https://github.com/runnane/runnerctl/issues/67)) ([fe1191b](https://github.com/runnane/runnerctl/commit/fe1191b795836320a91d7a349f2e6777f0d8d7b4))
+* status --narrow, and fleet watch narrows a too-wide table (GHR-56) ([#66](https://github.com/runnane/runnerctl/issues/66)) ([d101a50](https://github.com/runnane/runnerctl/commit/d101a50254b88ecd44a62981a8a3c1c60f44ce99))
+
+
+### Bug Fixes
+
+* fleet status forwards --stall-after to the remote (GHR-57) ([#63](https://github.com/runnane/runnerctl/issues/63)) ([9eaf986](https://github.com/runnane/runnerctl/commit/9eaf9863aa6c031b19e78c3ed02925f7711529eb))
+* the fleet budget walk warns when hosts did not answer (GHR-59) ([#68](https://github.com/runnane/runnerctl/issues/68)) ([f83c348](https://github.com/runnane/runnerctl/commit/f83c3481413f08109daca2f6b00c4ff15ab32f71))
+
 ## [0.13.0](https://github.com/runnane/runnerctl/compare/v0.12.0...v0.13.0) (2026-09-17)
 
 
