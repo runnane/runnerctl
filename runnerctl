@@ -57,7 +57,8 @@
 #   runnerctl fleet status [--json] [--color auto|always|never] [--stall-after N] \
 #                          [--narrow]
 #   runnerctl fleet watch  [--interval N] [--host H]... \
-#                          [--color auto|always|never] [--stall-after N] [--narrow]
+#                          [--color auto|always|never] [--stall-after N] [--narrow] \
+#                          [--min-available K]
 #   runnerctl fleet health [--quiet] [--max-restarts N] [--stall-after N] \
 #                          [--restart-stalled]
 #   runnerctl fleet upgrade [--check] [--ref <branch|tag>]
@@ -195,7 +196,14 @@
 # it. Two smaller differences from `fleet status`: it asks the remotes to
 # PAINT (the host that drew a cell is the only thing that knows it is STALLED
 # or throttled), and its default interval is 5 s, because every tick is a
-# round trip to every host. It is VIEW-ONLY — `q` quits and no key acts.
+# round trip to every host. Its cursor is a (host, slot) pair, and the local
+# watch's keys act on it over the held connection (GHR-55): K kill job, R
+# restart, S stop, T start, P reap, each decided on facts read from that host
+# at the keypress and confirmed with a line naming the exact remote command,
+# and L pages that slot's last 50 journal lines. S keeps a floor: it refuses
+# a stop that would leave fewer than --min-available K (default 1) slots
+# active across the watched hosts, so a cursor walked down the fleet pressing
+# S cannot take it to zero. `q` quits.
 # A frame wider than the terminal makes the next tick ask the hosts for
 # `status --narrow` (GHR-56), with the local watch's hysteresis; a host too
 # old for the flag is asked again without it and shows its full-width rows.
@@ -228,7 +236,8 @@
 # stays best-effort per host, and a fleet does not make it a fleet-wide
 # guarantee. `env-init` is excluded permanently (it would copy secrets over
 # ssh); `logs` stays per-host because it streams from one journal, while
-# `watch` has a fleet form of its own, described above.
+# `watch` has a fleet form of its own, described above — whose L pages one
+# slot's recent journal from its host.
 # Two graded capacity budgets (GHR-44), and they are two flags rather than
 # one because the operations have OPPOSITE dynamics. `--max-unavailable N`
 # (restart/apply/scale) is a CEILING: a restarted slot comes back, so the
@@ -3265,7 +3274,8 @@ cmd_fleet() {
              cmd_fleet_run "$sub" "$@" ;;
     # env-init is PERMANENTLY excluded, not merely unimplemented: it writes an
     # EnvironmentFile of secrets, and fanning it out means pushing secrets
-    # over ssh. `logs` stays per-host because it streams. Saying which of the
+    # over ssh. `logs` stays per-host because it streams (`fleet watch`'s L
+    # pages one slot's last lines, which is not a stream). Saying which of the
     # two it is beats "unknown command".
     env-init)
              die "fleet env-init is not supported and will not be: it writes an EnvironmentFile of secrets, which fanning out means copying secrets over ssh. Run 'runnerctl env-init' on each host." ;;
@@ -3282,7 +3292,7 @@ cmd_fleet() {
     deprovision)
              die "fleet deprovision is not supported: it takes a removal token (fanning it out copies a credential to every host), it is irreversible, and a slot index or name means a different runner on each host. Run 'runnerctl deprovision <slot>' on the host." ;;
     logs)
-             die "fleet logs is not supported: logs streams from one journal and only makes sense against one host. Use 'runnerctl fleet watch' for a live fleet-wide view, or ssh to the host." ;;
+             die "fleet logs is not supported: logs streams from one journal and only makes sense against one host. In 'runnerctl fleet watch', L on a slot pages its recent journal from its host; or ssh to the host." ;;
     *)       die "unknown fleet command '$sub' (status watch health upgrade apply scale start stop restart drain kill reap remove-limits enable disable)" ;;
   esac
 }
@@ -3811,15 +3821,13 @@ cmd_fleet_status() { # [--json] [--color WHEN] [--stall-after N] [--narrow]
 #     `never` and paints locally. A watch wants the per-cell colour the local
 #     watch has, and the only thing that knows a cell is STALLED, throttled
 #     or running is the host that drew it.
-#   * It is VIEW-ONLY. `q` quits and no key acts. A cursor that addresses a
-#     (host, slot) pair and runs a mutating command over ssh is a different
-#     feature, with its own confirm and its own answer to the capacity gate
-#     (GHR-43/44) — filed as GHR-55 rather than half-built here.
+#   * Its cursor addresses a (host, slot) PAIR, and the action keys (GHR-55)
+#     run the remote host's own runnerctl over the held connection — see the
+#     block below.
 #
 # The default interval is 5 s rather than the local watch's 2 s: every tick is
 # a network round trip to every host, and a tick that has not finished before
 # the next one starts is not a faster view, it is a queue.
-FLEET_WATCH_LEGEND="q quit — this view is read-only; act with 'runnerctl fleet <command>' or on the host"
 
 # Restores the terminal, drops the fan-out's buffer directory and closes every
 # ssh master. Ordering is deliberate: the cursor comes back first, so a slow
@@ -3827,12 +3835,318 @@ FLEET_WATCH_LEGEND="q quit — this view is read-only; act with 'runnerctl fleet
 fleet_watch_cleanup() {
   term_cursor show
   fleet_cleanup
+  [ -z "$FW_TMP" ] || rm -rf "$FW_TMP"
   fleet_ssh_control_close
 }
 
-cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] [--stall-after N] [--narrow]
-  local interval=5 iterations="" tick=0 header frame remote_color=never
-  local narrow=false forced=false wide
+# --- Fleet watch action keys (GHR-55) -----------------------------------------
+# The local watch's K/R/S/T/P/L, against the slot the cursor is on — which on a
+# fleet is not the local feature with a host name bolted on, in three ways:
+#
+#   * THE CURSOR IS A PAIR. A unit name is unique on one host and not across a
+#     fleet, so the cursor is (FW_HOST, FW_NAME), FW_NAME being the RUNNER cell.
+#     The rows are read off the assembled frame by their two LEFTMOST cells
+#     (HOST, then IDX and RUNNER), which is safe where parsing by column
+#     position is not: an over-wide cell only shifts what is to its right.
+#     It survives both ways a row can leave a frame. A host that stops
+#     answering keeps the cursor on its error row and REMEMBERS the slot, so
+#     the next frame it answers in puts the cursor back where it was; a slot
+#     that goes away (scaled down) drops it to that host's first slot.
+#   * THE FACTS ARE REMOTE. An action is decided on the host's own `status
+#     --json`, fetched when the key is pressed — one round trip to that host
+#     over the held connection — never on the frame, which is up to an
+#     interval old. The confirm line quotes what came back, and names the
+#     exact remote command. `status --json` has been there since long before
+#     `fleet`, so an older host needs no new flag to answer it.
+#   * S HAS A CAPACITY FLOOR. `fleet stop` is refused fleet-wide without
+#     --host or --all-hosts (GHR-43), and a single-slot key is as bounded a
+#     target as there is, so it does not need either. But a watch that walks
+#     the cursor down every host pressing S, y, S, y reaches zero capacity
+#     just as surely as an unguarded `fleet stop` — each confirm is explicit,
+#     and none of them is about the fleet. So S re-reads every watched host's
+#     slots (a fan-out over the held connections) and refuses a stop that
+#     would leave fewer than --min-available K slots active across them,
+#     default 1: the watch never stops the last running slot you can see. A
+#     host that did not answer counts as NOTHING available, so an outage does
+#     not make the floor easier to cross. The confirm line states what the
+#     stop leaves. R and K are transient (the unit comes back) and T/P give
+#     nothing away, which is GHR-43's classification unchanged; they are not
+#     gated.
+#
+# L pages the slot's last 50 journal lines, like the local L. Not a stream: the
+# remote `logs -n 50` runs to completion into a file under FLEET_TIMEOUT and
+# that file is handed to the local pager, so a slow host can hold the key up
+# for at most that long, and never with a pager already on the screen.
+FW_HOST="" FW_NAME="" FW_POS=-1 FW_TMP="" FW_REFRESH=false
+FW_NOTICE="" FW_PROMPT="" FW_ACTION="" FW_ACT_HOST="" FW_ACT_NAME=""
+FW_ROWS=() FW_LINES=()
+FLEET_WATCH_MIN_AVAILABLE=1
+declare -A FF=()
+
+# This frame's selectable rows, in order: "HOST<TAB>NAME" for a slot row and
+# "HOST<TAB>" for a host that did not answer, with the frame line each is on.
+# Only a first word that IS a watched host counts, so the column header, a
+# note and the skew line are never rows.
+fleet_watch_rows() { # FRAME
+  local line n=0 h re_slot='^([^ ]+) +[0-9]+ +([^ ]+)( |$)' re_host='^([^ ]+) '
+  local -A known=()
+  for h in "${FLEET_HOSTS[@]}"; do known[$h]=1; done
+  FW_ROWS=() FW_LINES=()
+  while IFS= read -r line; do
+    n=$((n + 1))
+    strip_sgr "$line"
+    if [[ "$SGR_STRIPPED" =~ $re_slot ]] && [ -n "${known[${BASH_REMATCH[1]}]:-}" ]; then
+      FW_ROWS+=("${BASH_REMATCH[1]}"$'\t'"${BASH_REMATCH[2]}"); FW_LINES+=("$n")
+    elif [[ "$SGR_STRIPPED" =~ $re_host ]] && [ -n "${known[${BASH_REMATCH[1]}]:-}" ]; then
+      FW_ROWS+=("${BASH_REMATCH[1]}"$'\t'); FW_LINES+=("$n")
+    fi
+  done <<<"$1"
+}
+
+# Put the cursor on this frame's rows: its own pair if it is there; the host's
+# error row if the host did not answer (FW_NAME kept, so it comes back); the
+# host's first slot if the slot went away; else the first row.
+fleet_watch_place() {
+  local i h n first=-1 down=-1
+  FW_POS=-1
+  for i in "${!FW_ROWS[@]}"; do
+    h="${FW_ROWS[$i]%%$'\t'*}"; n="${FW_ROWS[$i]#*$'\t'}"
+    [ "$h" = "$FW_HOST" ] || continue
+    if [ -n "$n" ] && [ "$n" = "$FW_NAME" ]; then FW_POS="$i"; return 0; fi
+    if [ -z "$n" ]; then down="$i"; elif [ "$first" -lt 0 ]; then first="$i"; fi
+  done
+  if [ "$down" -ge 0 ]; then FW_POS="$down"; return 0; fi
+  if [ "$first" -ge 0 ]; then FW_POS="$first"
+  elif [ "${#FW_ROWS[@]}" -gt 0 ]; then FW_POS=0
+  else return 0
+  fi
+  fleet_watch_select "$FW_POS"
+}
+fleet_watch_select() { # ROW-INDEX
+  FW_POS="$1"
+  FW_HOST="${FW_ROWS[$1]%%$'\t'*}"; FW_NAME="${FW_ROWS[$1]#*$'\t'}"
+}
+
+# watch_highlight's reverse video, on a frame line picked by NUMBER: a RUNNER
+# name repeats on every host, so matching the row by its name would light up
+# the same slot on all of them.
+fleet_watch_highlight() { # FRAME LINE-NO
+  local line n=0 rev=$'\e[7m' reset=$'\e[0m'
+  while IFS= read -r line; do
+    n=$((n + 1))
+    if [ "$n" = "$2" ]; then
+      printf '%s%s%s\n' "$rev" "${line//"$reset"/$reset$rev}" "$reset"
+    else
+      printf '%s\n' "$line"
+    fi
+  done <<<"$1"
+}
+
+# One field of a one-line JSON object, first occurrence: a string's contents,
+# a number or boolean as written, nothing for null or a missing key (an older
+# host that does not report it). render_status_json writes each slot on one
+# line and this script owns it — the same footing fleet_slots reads it on.
+json_line_field() { # LINE KEY
+  local re="\"$2\":(\"(([^\"\\\\]|\\\\.)*)\"|[-0-9.a-z]+)"
+  [[ "$1" =~ $re ]] || return 0
+  case "${BASH_REMATCH[1]}" in
+    \"*) printf '%s\n' "${BASH_REMATCH[2]}" ;;
+    null) ;;
+    *)   printf '%s\n' "${BASH_REMATCH[1]}" ;;
+  esac
+}
+
+# The selected slot's facts, fresh from its host, into FF. 1 with FW_NOTICE
+# set when there is nothing to decide on: the host did not answer, or the slot
+# is no longer there. A remote runs in a subshell of its own here, as it would
+# in reality, so nothing it sets can reach this process.
+fleet_watch_facts() { # HOST NAME
+  local rc=0 line job
+  FF=()
+  (ssh_run "$1" "$FLEET_RUNNERCTL" status --json) >"$FW_TMP/facts" 2>"$FW_TMP/err" || rc=$?
+  if [ "$rc" != 0 ]; then
+    FW_NOTICE="$2 on $1: could not read its current state — $(fleet_error_text "$rc" "$FW_TMP/err")"
+    return 1
+  fi
+  # `,"name":"X","active":` is the slot's own name: a job's name is followed
+  # by "since", so a job called the same as a runner cannot match here.
+  line="$(grep -F -m1 ",\"name\":$(json_str "$2"),\"active\":" "$FW_TMP/facts" || true)"
+  if [ -z "$line" ]; then
+    FW_NOTICE="$2 on $1: no longer on that host — nothing run"
+    return 1
+  fi
+  FF[active]="$(json_line_field "$line" active)"
+  FF[sub]="$(json_line_field "$line" sub)"
+  FF[access]="$(json_line_field "$line" working_on_access)"
+  FF[leaked]="$(json_line_field "$line" leaked_procs)"
+  FF[job]="" FF[job_cell]=""
+  job=null
+  [[ ! "$line" =~ \"job\":(.*),\"idle_since\": ]] || job="${BASH_REMATCH[1]}"
+  if [ "$job" != null ]; then
+    local repo name since stalled
+    repo="$(json_line_field "$job" repo)"; name="$(json_line_field "$job" name)"
+    since="$(json_line_field "$job" since)"; stalled="$(json_line_field "$job" stalled)"
+    FF[job]=yes
+    if [ -z "$name" ]; then
+      FF[job_cell]="(starting)"
+    else
+      FF[job_cell]="${repo:+$repo:}$name"
+      [[ ! "$since" =~ ^[0-9]+$ ]] || FF[job_cell]+=" ($(fmt_dur $(($(now_epoch) - since))))"
+      [ "$stalled" != true ] || FF[job_cell]+=" STALLED"
+    fi
+  fi
+}
+
+# The `warning:` line R and S carry when the host says a job is in flight.
+fleet_watch_job_warning() { # VERB
+  [ -n "${FF[job]}" ] || return 0
+  printf '\nwarning: a job is running (%s) — it will be killed and GitHub marks it failed; runnerctl %s --when-idle on the host waits for it instead' "${FF[job_cell]}" "$1"
+}
+
+# S's capacity floor (see the block above). 0 with FW_CAPACITY describing what
+# the stop leaves; 1 with FW_NOTICE when it would cross --min-available.
+FW_CAPACITY=""
+fleet_watch_floor() { # HOST NAME ACTIVE-STATE
+  local slots total avail after note=""
+  fleet_slots >"$FW_TMP/slots"
+  # fleet_fanout arms its own EXIT trap; the session's goes back on.
+  trap fleet_watch_cleanup EXIT
+  slots="$(cat "$FW_TMP/slots")"
+  total="$(printf '%s\n' "$slots" | grep -c . || true)"
+  avail="$(fleet_count_available "$slots")"
+  after="$avail"
+  [ "$3" != active ] || after=$((avail - 1))
+  [ "$after" -ge 0 ] || after=0
+  [ "$FLEET_SLOTS_SKIPPED" -eq 0 ] || note=", $FLEET_SLOTS_SKIPPED host(s) not answering and not counted"
+  if [ "$after" -lt "$FLEET_WATCH_MIN_AVAILABLE" ]; then
+    FW_NOTICE="$2 on $1: not stopped — it would leave $after of $total slot(s) active across the watched hosts$note, under --min-available $FLEET_WATCH_MIN_AVAILABLE; restart --min-available lower (0 turns the floor off), or run 'runnerctl stop $2' on $1"
+    return 1
+  fi
+  FW_CAPACITY="leaves $after of $total slot(s) active across the watched hosts$note"
+}
+
+# A key on the selected row: FW_NOTICE (a refusal, nothing runs) or FW_PROMPT +
+# FW_ACTION (a confirm line naming the exact remote command, run on `y`). L
+# runs at once — reading logs changes nothing.
+fleet_watch_key_action() { # KEY
+  local host="$FW_HOST" name="$FW_NAME" lbl rc=0 runs
+  FW_NOTICE="" FW_PROMPT="" FW_ACTION="" FW_ACT_HOST="$host" FW_ACT_NAME="$name"
+  if [ "$FW_POS" -lt 0 ]; then FW_NOTICE="no slot to act on"; return 0; fi
+  # What the cursor is ON, not the slot it remembers: a host that is not
+  # answering has no slot on the screen to act on.
+  if [ -z "${FW_ROWS[$FW_POS]#*$'\t'}" ]; then
+    FW_NOTICE="$host: not answering — no slot there to act on"
+    return 0
+  fi
+  lbl="$name on $host"
+  if [ "$1" = L ]; then
+    (ssh_run "$host" "$FLEET_RUNNERCTL" logs "$(printf %q "$name")" -n 50) >"$FW_TMP/logs" 2>"$FW_TMP/err" || rc=$?
+    if [ "$rc" != 0 ]; then
+      FW_NOTICE="$lbl: logs — $(fleet_error_text "$rc" "$FW_TMP/err")"
+      return 0
+    fi
+    # The pager owns the screen until it quits; the next frame repaints.
+    term_cursor show
+    page <"$FW_TMP/logs"
+    term_cursor hide
+    return 0
+  fi
+  fleet_watch_facts "$host" "$name" || return 0
+  runs="runs on $host: $FLEET_RUNNERCTL"
+  case "$1" in
+    K)
+      if [ "${FF[active]}" = deactivating ]; then
+        FW_ACTION="kill"
+        FW_PROMPT="$lbl is stuck stopping (${FF[active]}/${FF[sub]:-?}) — SIGKILL the whole unit? $runs kill $name  [y/n]"
+      elif [ -n "${FF[job]}" ]; then
+        FW_ACTION="kill"
+        FW_PROMPT="Kill the job on $lbl (${FF[job_cell]})? $runs kill $name — the job's processes; the runner stays up and reports it failed  [y/n]"
+      elif [ "${FF[access]}" = no-access ]; then
+        FW_NOTICE="$lbl: cannot tell whether a job is running — the ssh login needs journal read access (systemd-journal group) or root there"
+      else
+        case "${FF[active]}" in
+          active|activating|reloading) FW_NOTICE="$lbl: no job running — nothing to kill" ;;
+          *) FW_NOTICE="$lbl: not running — nothing to kill" ;;
+        esac
+      fi ;;
+    R)
+      case "${FF[active]}" in
+        active|activating|reloading)
+          FW_ACTION=restart
+          FW_PROMPT="Restart $lbl? $runs restart $name  [y/n]$(fleet_watch_job_warning restart)" ;;
+        *) FW_NOTICE="$lbl: not active (${FF[active]:-unknown}) — T starts it" ;;
+      esac ;;
+    S)
+      case "${FF[active]}" in
+        active|activating|reloading)
+          fleet_watch_floor "$host" "$name" "${FF[active]}" || return 0
+          FW_ACTION=stop
+          FW_PROMPT="Stop $lbl? $runs stop $name — $FW_CAPACITY  [y/n]$(fleet_watch_job_warning stop)" ;;
+        *) FW_NOTICE="$lbl: already stopped (${FF[active]:-unknown})" ;;
+      esac ;;
+    T)
+      case "${FF[active]}" in
+        active|activating|reloading) FW_NOTICE="$lbl: already active — R restarts it" ;;
+        *) FW_ACTION=start
+           FW_PROMPT="Start $lbl? $runs start $name  [y/n]" ;;
+      esac ;;
+    P)
+      if [[ "${FF[leaked]}" =~ ^[0-9]+$ ]] && [ "${FF[leaked]}" -gt 0 ]; then
+        FW_ACTION=reap
+        FW_PROMPT="Reap ${FF[leaked]} leaked process(es) on $lbl? $runs reap $name — TERM, then KILL what is still alive after the grace  [y/n]"
+      elif [ -n "${FF[job]}" ]; then
+        FW_NOTICE="$lbl: busy (${FF[job_cell]}) — a running job's processes are not leaks"
+      else
+        FW_NOTICE="$lbl: no leaked processes shown — nothing to reap"
+      fi ;;
+  esac
+}
+
+# The confirmed action, over the held connection. The remote's last line is
+# the next frame's notice; a failure is a notice carrying fleet_error_text's
+# remedy (a sudo refusal says what sudoers needs), never fatal to the watch.
+# FW_REFRESH asks the loop for a fresh fan-out, so the frame after an action
+# shows its effect rather than the table from before it.
+# The slot name was read off the host's own frame, and ssh hands its argv to
+# the remote shell as one string: %q keeps a systemd-escaped name (`\x2d`)
+# or anything else odd a single argument there. A plain name is unchanged.
+fleet_watch_run_action() {
+  local rc=0 last
+  printf '\nrunning on %s: %s %s %s\n' "$FW_ACT_HOST" "$FLEET_RUNNERCTL" "$FW_ACTION" "$FW_ACT_NAME"
+  (ssh_run "$FW_ACT_HOST" "$FLEET_RUNNERCTL" "$FW_ACTION" "$(printf %q "$FW_ACT_NAME")") >"$FW_TMP/out" 2>"$FW_TMP/err" || rc=$?
+  if [ "$rc" = 0 ]; then
+    last="$(grep . "$FW_TMP/out" | tail -1 || true)"
+    FW_NOTICE="$FW_ACT_NAME on $FW_ACT_HOST: ${last:-$FW_ACTION done}"
+  else
+    FW_NOTICE="$FW_ACT_NAME on $FW_ACT_HOST: $FW_ACTION failed — $(fleet_error_text "$rc" "$FW_TMP/err")"
+  fi
+  FW_ACTION="" FW_PROMPT="" FW_REFRESH=true
+}
+
+# One key against the watch. Returns 1 on `q`. At a confirm only `y` runs it
+# and anything else — `q` included — cancels, as in the local watch.
+fleet_watch_handle_key() { # KEY
+  local n="${#FW_ROWS[@]}"
+  if [ -n "$FW_ACTION" ]; then
+    case "$1" in
+      y|Y) fleet_watch_run_action ;;
+      *)   FW_NOTICE="cancelled — nothing run"; FW_ACTION="" FW_PROMPT="" ;;
+    esac
+    return 0
+  fi
+  FW_NOTICE=""
+  case "$1" in
+    q|Q)    return 1 ;;
+    down|j) [ "$FW_POS" -lt 0 ] || [ "$FW_POS" -ge $((n - 1)) ] || fleet_watch_select $((FW_POS + 1)) ;;
+    up|k)   [ "$FW_POS" -le 0 ] || fleet_watch_select $((FW_POS - 1)) ;;
+    K|R|S|T|P|L) fleet_watch_key_action "$1" ;;
+  esac
+  return 0
+}
+
+cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] [--stall-after N] [--narrow] [--min-available K]
+  local interval=5 iterations="" tick=0 header="" frame="" remote_color=never
+  local narrow=false forced=false wide fetch=true hl
   local -a hosts=() fwd=() narrow_arg=()
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
@@ -3859,6 +4173,12 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
         need_val "$@"
         hosts+=("$2"); shift 2 ;;
       --narrow) narrow=true; forced=true; shift ;;
+      # GHR-55: S's floor. A whole number of slots, not GHR-44's percentage:
+      # it is checked one keypress at a time against what the watch can see.
+      --min-available)
+        need_val "$@"
+        [[ "$2" =~ ^[0-9]+$ ]] || die "--min-available value '$2' is invalid — want a whole number of slots (0 turns the floor off)"
+        FLEET_WATCH_MIN_AVAILABLE="$2"; shift 2 ;;
       *) die "unknown option: $1" ;;
     esac
   done
@@ -3877,35 +4197,43 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
   # FLEET_TIMEOUT caps that second part; the margin on top means a master is
   # never expiring at the moment the next tick wants it.
   fleet_ssh_control_open "$((interval + FLEET_TIMEOUT + 30))"
+  # Where the action keys buffer a remote's answer (facts, logs, output).
+  FW_TMP="$(mktemp -d)"
   # Ctrl-C exits 0 through the EXIT trap, which tears the session down either way.
   trap fleet_watch_cleanup EXIT
   trap 'exit 0' INT TERM
   term_cursor hide
   while :; do
-    header="$(paint "$C_BOLD" "runnerctl fleet watch — ${#FLEET_HOSTS[@]} host(s) — $(date +%H:%M:%S) — every ${interval}s (q to quit)")"
-    narrow_arg=()
-    ! $narrow || narrow_arg=(--narrow)
-    fleet_fanout "$FLEET_RUNNERCTL" status --color "$remote_color" ${fwd[@]+"${fwd[@]}"} ${narrow_arg[@]+"${narrow_arg[@]}"}
-    # fleet_fanout arms its OWN EXIT trap on every call, so ours has to go
-    # back afterwards. Without this the last thing to run on exit is the
-    # tmpdir removal alone — cursor still hidden, and every ssh master left
-    # alive until ControlPersist expires.
-    trap fleet_watch_cleanup EXIT
-    # A frame is rendered whatever the hosts said: an unreachable host is a
-    # row (fleet_status_table's own contract), and its non-zero return is not
-    # a reason to stop watching the ones that answered.
-    frame="$(fleet_status_table || true)"
-    fleet_cleanup
-    # GHR-56: the local watch's narrowing, measured on the ASSEMBLED frame —
-    # HOST column included, SGR stripped, error rows and notes not counted —
-    # and acted on by asking the remotes for the narrow table on the NEXT
-    # tick rather than re-fanning out now: a second round trip to every host
-    # to redraw one frame is the cost this command exists to avoid. The same
-    # hysteresis as the local watch, so a terminal near the threshold does
-    # not flip the table on every tick. --narrow pins it.
-    if ! $forced; then
-      wide="$(watch_table_width "$frame" '[^ ]+ +')"
-      if narrow_wanted "$narrow" "$wide" "$(term_cols)"; then narrow=true; else narrow=false; fi
+    # A fan-out per TICK, and after an action ran — not per key. Moving the
+    # cursor, a confirm line or a refusal redraws the frame in hand: a round
+    # trip to every host to move a highlight one row is the cost this command
+    # exists to avoid.
+    if $fetch; then
+      header="$(paint "$C_BOLD" "runnerctl fleet watch — ${#FLEET_HOSTS[@]} host(s) — $(date +%H:%M:%S) — every ${interval}s (q to quit)")"
+      narrow_arg=()
+      ! $narrow || narrow_arg=(--narrow)
+      fleet_fanout "$FLEET_RUNNERCTL" status --color "$remote_color" ${fwd[@]+"${fwd[@]}"} ${narrow_arg[@]+"${narrow_arg[@]}"}
+      # fleet_fanout arms its OWN EXIT trap on every call, so ours has to go
+      # back afterwards. Without this the last thing to run on exit is the
+      # tmpdir removal alone — cursor still hidden, and every ssh master left
+      # alive until ControlPersist expires.
+      trap fleet_watch_cleanup EXIT
+      # A frame is rendered whatever the hosts said: an unreachable host is a
+      # row (fleet_status_table's own contract), and its non-zero return is not
+      # a reason to stop watching the ones that answered.
+      frame="$(fleet_status_table || true)"
+      fleet_cleanup
+      # GHR-56: the local watch's narrowing, measured on the ASSEMBLED frame —
+      # HOST column included, SGR stripped, error rows and notes not counted —
+      # and acted on by asking the remotes for the narrow table on the NEXT
+      # tick rather than re-fanning out now: a second round trip to every host
+      # to redraw one frame is the cost this command exists to avoid. The same
+      # hysteresis as the local watch, so a terminal near the threshold does
+      # not flip the table on every tick. --narrow pins it.
+      if ! $forced; then
+        wide="$(watch_table_width "$frame" '[^ ]+ +')"
+        if narrow_wanted "$narrow" "$wide" "$(term_cols)"; then narrow=true; else narrow=false; fi
+      fi
     fi
     if [ -n "$iterations" ]; then
       printf '\033[H\033[2J%s\n%s\n' "$header" "$frame"
@@ -3914,9 +4242,19 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
       [ "$tick" -lt "$iterations" ] || break
       continue
     fi
-    printf '\033[H\033[2J%s\n%s\n\n%s\n' "$header" "$frame" "$(paint "$C_DIM" "$FLEET_WATCH_LEGEND")"
+    fleet_watch_rows "$frame"
+    fleet_watch_place
+    hl=0
+    [ "$FW_POS" -lt 0 ] || hl="${FW_LINES[$FW_POS]}"
+    printf '\033[H\033[2J%s\n%s\n\n%s\n%s\n' "$header" \
+      "$(fleet_watch_highlight "$frame" "$hl")" \
+      "$(paint "$C_DIM" "$WATCH_LEGEND")" "${FW_PROMPT:-$FW_NOTICE}"
     if read_key "$interval"; then
-      case "$KEY" in q|Q) break ;; esac
+      FW_REFRESH=false
+      fleet_watch_handle_key "$KEY" || break
+      fetch="$FW_REFRESH"
+    else
+      fetch=true
     fi
   done
 }

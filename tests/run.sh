@@ -3070,11 +3070,12 @@ case_fleet_excluded_commands_say_why() {
   expect_no_log '^probe:ssh_run '
   # `watch` used to be refused here alongside these two. It is a command now
   # (GHR-54), and `logs` is the only streaming one left — so the refusal
-  # points at the fleet view rather than only at ssh.
+  # points at the fleet view rather than only at ssh: since GHR-55, at its
+  # L key, which pages one slot's recent journal from its host.
   RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet logs
   expect_rc 1
   expect_err "fleet logs is not supported: logs streams from one journal"
-  expect_err "Use 'runnerctl fleet watch' for a live fleet-wide view"
+  expect_err "In 'runnerctl fleet watch', L on a slot pages its recent journal from its host; or ssh to the host\.$"
   expect_no_log '^probe:ssh_run '
 }
 
@@ -3082,7 +3083,8 @@ case_fleet_excluded_commands_say_why() {
 # The frame prefix, the header and the legend. `fleet watch` reuses cmd_watch's
 # loop shape, so the home+clear prefix is the same one the local watch's cases
 # count; what differs is what is in the frame and what it cost to fetch.
-FLEET_WATCH_LEGEND='^q quit — this view is read-only; act with '"'"'runnerctl fleet <command>'"'"' or on the host$'
+# GHR-55: the local watch's legend — the same keys, now against a (host, slot)
+FLEET_WATCH_LEGEND='^↑↓/jk select  K kill job  R restart  S stop  T start  P reap  L logs  q quit$'
 
 # A terminal is required for the same reason `watch` needs one: the loop
 # redraws in place. The refusal names the one-shot to use instead, and nothing
@@ -3195,12 +3197,13 @@ case_fleet_watch_q_quits_and_the_default_interval_is_five() {
   expect_out "$FLEET_WATCH_LEGEND"
   expect_log_order '^probe:term_cursor hide$' '^probe:tty_read_char 5 q$' '^probe:term_cursor show$' '^probe:ssh_control build-1 exit$'
   expect_log_count '^probe:ssh_run build-1 -- ' 1
-  # a key that is not q redraws rather than quitting: one more frame, one
-  # more fan-out, then Q ends it (uppercase counts too)
-  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='xQ' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+  # a key that is not q redraws rather than quitting: one more frame, then Q
+  # ends it (uppercase counts too). GHR-55: a key redraws the frame in hand —
+  # only a tick (the `-`) or an action that ran costs another fan-out
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='x-Q' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
     run fleet watch --color never
   expect_rc 0
-  expect_out_count "$FRAME_PREFIX" 2
+  expect_out_count "$FRAME_PREFIX" 3
   expect_log_count '^probe:ssh_run build-1 -- ' 2
 }
 
@@ -3311,6 +3314,10 @@ case_fleet_watch_bad_options_die_before_dialling() {
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color bogus
   expect_rc 1
   expect_err "--color value 'bogus' is invalid"
+  # GHR-55: S's floor is a whole number of slots
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --min-available 25%
+  expect_rc 1
+  expect_err "--min-available value '25%' is invalid — want a whole number of slots \(0 turns the floor off\)$"
   expect_no_log '^probe:(ssh_run|ssh_control)'
   # --interval=N, the =-form every other command takes
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
@@ -3321,6 +3328,228 @@ case_fleet_watch_bad_options_die_before_dialling() {
   run fleet watch
   expect_rc 1
   expect_err 'fleet mode is not configured — set FLEET_HOSTS='
+}
+
+# --- GHR-55: fleet watch action keys -------------------------------------------
+# The cursor is a (host, slot) pair, highlighted on ONE frame line: every host
+# has an example.slot-1, so a row matched by its RUNNER name would light up
+# the same slot on every host. The stub's hosts each have three slots: slot-1
+# active with a job, slot-2 active and idle, slot-3 inactive.
+fw_row() { echo "^${REV}$1 +$2 +example\.slot-$3 .*$ESC\[0m\$"; }
+FW2="build-1 build-2"
+
+# j/k walk the pairs across host boundaries and clamp at both ends; a key
+# redraws the frame in hand, so walking the cursor costs no fan-out at all.
+case_fleet_watch_cursor_walks_host_slot_pairs() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='kjjjkjjjjjq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 11
+  expect_out_count "$FLEET_WATCH_LEGEND" 11
+  # exactly one highlighted line per frame, and never the same slot on the
+  # other host: k (clamped) j j j k j j j j j (clamped)
+  expect_out_count "^${REV}" 11
+  expect_out_count "$(fw_row build-1 0 1)" 2
+  expect_out_count "$(fw_row build-1 1 2)" 1
+  expect_out_count "$(fw_row build-1 2 3)" 2
+  expect_out_count "$(fw_row build-2 0 1)" 2
+  expect_out_count "$(fw_row build-2 1 2)" 1
+  expect_out_count "$(fw_row build-2 2 3)" 3
+  expect_out_count '^build-2 +0 +example\.slot-1 .*my-app:test \(12m\)$' 9
+  expect_log_count '^probe:ssh_run build-1 -- ' 1
+  expect_log_count '^probe:ssh_run build-2 -- ' 1
+  expect_no_log '^direct:'
+}
+
+# A host that stops answering keeps the cursor on its error row and REMEMBERS
+# the slot: the frame it answers in again has the cursor back on build-2's
+# slot-2, not on its first slot and not back at the top of the fleet. A key
+# on the error row acts on nothing and dials nothing.
+case_fleet_watch_cursor_survives_a_host_dropping_out() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjj-S-q' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_DOWN="build-2:2" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 8
+  expect_out_count "^${REV}build-2 unreachable — ssh: connect to host build-2 port 22: No route to host$ESC\[0m\$" 2
+  expect_out_count "$(fw_row build-2 1 2)" 2
+  expect_out_count "$(fw_row build-2 0 1)" 1
+  expect_out_count "$(fw_row build-1 0 1)" 1
+  # a notice stays up until the next key, so the tick after S shows it too
+  expect_out_count '^build-2: not answering — no slot there to act on$' 2
+  expect_no_out '\[y/n\]'
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 3
+  expect_no_log ' status --json'
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap|logs) '
+}
+
+# A slot that goes away (the host scaled down) drops the cursor to THAT
+# host's first slot — the local watch's "drop to the top", scoped to the host
+# the operator was looking at.
+case_fleet_watch_cursor_on_a_slot_that_scaled_away_stays_on_its_host() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjjj-q' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_SCALED="build-2:2" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 7
+  expect_out_count "$(fw_row build-2 2 3)" 1
+  expect_out_count "$(fw_row build-2 0 1)" 2
+  expect_out_count "$(fw_row build-1 0 1)" 1
+  # the frame after the tick really has no slot-3 on build-2
+  expect_out_count '^build-2 +2 +example\.slot-3 ' 5
+}
+
+# S on build-2's slot-1: the facts come from build-2 itself (status --json),
+# the floor re-reads every watched host, the confirm names the exact remote
+# command and what the stop leaves, and `y` runs it on build-2 ONLY. The frame
+# after it is a fresh fan-out, so it shows build-2's slot-1 stopped and
+# build-1's still running.
+case_fleet_watch_S_stops_the_selected_pair_on_its_own_host() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjSyq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 6
+  expect_out_count '^Stop example\.slot-1 on build-2\? runs on build-2: runnerctl stop example\.slot-1 — leaves 3 of 6 slot\(s\) active across the watched hosts  \[y/n\]$' 1
+  expect_out_count '^warning: a job is running \(my-app:test \(12m\)\) — it will be killed and GitHub marks it failed; runnerctl stop --when-idle on the host waits for it instead$' 1
+  expect_out_count '^running on build-2: runnerctl stop example\.slot-1$' 1
+  expect_out_count '^example\.slot-1 on build-2: stop done\.$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl stop example\.slot-1$' 1
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap) ' 1
+  expect_log_order '^probe:tty_read_char 5 S$' '^probe:ssh_run build-2 -- runnerctl status --json$' \
+                   '^probe:ssh_run build-[12] -- runnerctl status --json$' '^probe:tty_read_char 5 y$' \
+                   '^probe:ssh_run build-2 -- runnerctl stop example\.slot-1$' '^probe:ssh_run build-2 -- runnerctl status --color never$'
+  # one facts read of build-2, plus the floor's read of both hosts
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 2
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 1
+  # and what the watch shows afterwards: the stop landed on build-2 alone,
+  # with the cursor still on it
+  expect_out_count "^${REV}build-2 +0 +example\.slot-1 +[^ ]+ +inactive/dead " 1
+  expect_no_out '^build-1 +0 +example\.slot-1 +[^ ]+ +inactive/dead '
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 2
+  expect_no_log '^direct:'
+}
+
+# The decision is made on facts read from the host AT THE KEY, not on the
+# frame. The frame says slot-1 is running my-app:test; by the time K is
+# pressed the host's journal says the job completed (BUSY_POLLS=1 answers
+# busy to the frame's read and idle to every read after it) — so K refuses,
+# where acting on the frame would have offered a kill. R quotes the job the
+# host reports while it is still running.
+case_fleet_watch_K_decides_on_facts_read_at_the_key() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_BUSY_POLLS=1 RUNNERCTL_STUB_KEYS='Kq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^${REV}build-1 +0 +example\\.slot-1 .*my-app:test \\(12m\\)$ESC\\[0m\$" 2
+  expect_out_count '^example\.slot-1 on build-1: no job running — nothing to kill$' 1
+  expect_no_out '\[y/n\]'
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 1
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl kill '
+  # with the job still running: the confirm quotes it, `y` kills on build-1
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='KyRnq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^Kill the job on example\.slot-1 on build-1 \(my-app:test \(12m\)\)\? runs on build-1: runnerctl kill example\.slot-1 — the job's processes; the runner stays up and reports it failed  \[y/n\]\$" 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl kill example\.slot-1$' 1
+  expect_out_count '^example\.slot-1 on build-1: kill done\.$' 1
+  expect_out_count '^Restart example\.slot-1 on build-1\? runs on build-1: runnerctl restart example\.slot-1  \[y/n\]$' 1
+  expect_out_count '^warning: a job is running \(my-app:test \(12m\)\) — .* runnerctl restart --when-idle on the host waits for it instead$' 1
+  expect_out_count '^cancelled — nothing run$' 1
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl restart '
+  # a deactivating slot: the unit-kill confirm, from the host's own sub-state
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_DEACTIVATING=1 RUNNERCTL_STUB_KEYS='Knq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^example\.slot-1 on build-1 is stuck stopping \(deactivating/stop-sigterm\) — SIGKILL the whole unit\? runs on build-1: runnerctl kill example\.slot-1  \[y/n\]$' 1
+}
+
+# The capacity floor, walked the way the issue fears: S, y on slot-1, then
+# j, S on slot-2 — the host's last active slot. The second S re-reads the
+# fleet, sees slot-1 already stopped, and refuses: nothing is dialled for it.
+# The S pressed again on slot-1 in between is the hostile input for the facts
+# read: only a read made AT that key knows the stop just landed — facts kept
+# from the first S would still say active.
+case_fleet_watch_S_walking_the_fleet_stops_at_the_floor() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='SySjSq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^Stop example\.slot-1 on build-1\? runs on build-1: runnerctl stop example\.slot-1 — leaves 1 of 3 slot\(s\) active across the watched hosts  \[y/n\]$' 1
+  expect_out_count '^example\.slot-1 on build-1: already stopped \(inactive\)$' 1
+  expect_out_count "^example\.slot-2 on build-1: not stopped — it would leave 0 of 3 slot\(s\) active across the watched hosts, under --min-available 1; restart --min-available lower \(0 turns the floor off\), or run 'runnerctl stop example\.slot-2' on build-1\$" 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl stop ' 1
+  expect_no_log '^probe:ssh_run build-1 -- runnerctl stop example\.slot-2'
+  # --min-available 0 turns it off: the same walk stops both
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='SyjSyq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet watch --color never --min-available 0
+  expect_rc 0
+  expect_out_count '^Stop example\.slot-2 on build-1\? .* — leaves 0 of 3 slot\(s\) active across the watched hosts  \[y/n\]$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl stop ' 2
+  # a higher floor refuses the first stop outright
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Sq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet watch --color never --min-available 2
+  expect_rc 0
+  expect_out_count '^example\.slot-1 on build-1: not stopped — it would leave 1 of 3 slot\(s\) active .* under --min-available 2; ' 1
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl stop '
+  # a host that does not answer counts as nothing available, and says so
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Snq' RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-unreachable" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^Stop example\.slot-1 on build-1\? .* — leaves 1 of 3 slot\(s\) active across the watched hosts, 1 host\(s\) not answering and not counted  \[y/n\]$' 1
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl stop '
+}
+
+# T starts a stopped slot, P reaps a slot's leaks — neither takes capacity
+# away, so neither reads the fleet for a floor. The no-op directions refuse.
+case_fleet_watch_T_starts_and_P_reaps_on_the_selected_host() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 \
+    RUNNERCTL_STUB_KEYS='TjjjjjTyPkPyq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^example\.slot-1 on build-1: already active — R restarts it$' 1
+  expect_out_count '^Start example\.slot-3 on build-2\? runs on build-2: runnerctl start example\.slot-3  \[y/n\]$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl start example\.slot-3$' 1
+  expect_out_count '^example\.slot-3 on build-2: start done\.$' 1
+  # the frame after the start shows it running on build-2, not on build-1
+  expect_out "^${REV}build-2 +2 +example\.slot-3 +[^ ]+ +active/running "
+  expect_no_out '^build-1 +2 +example\.slot-3 +[^ ]+ +active/running '
+  expect_out_count '^example\.slot-3 on build-2: no leaked processes shown — nothing to reap$' 1
+  expect_out_count "^Reap 2 leaked process\(es\) on example\.slot-2 on build-2\? runs on build-2: runnerctl reap example\.slot-2 — TERM, then KILL what is still alive after the grace  \[y/n\]\$" 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl reap example\.slot-2$' 1
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap) ' 2
+  # T and P never read the fleet for a floor: the only --json read of build-1
+  # is the facts read for the T pressed on its own slot
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 1
+}
+
+# L pages the selected slot's journal FROM ITS HOST through the local pager,
+# at once (no confirm), with no fan-out; a host whose sudo refuses is a notice
+# carrying the remedy, and the pager is never opened on nothing.
+case_fleet_watch_L_pages_the_remote_journal() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjLq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 5
+  expect_no_out '\[y/n\]'
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl logs example\.slot-1 -n 50$' 1
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl logs ' 1
+  expect_out_count '^-- journal of example\.slot-1 on build-2 \(-n 50\) --$' 1
+  expect_log_order '^probe:tty_read_char 5 L$' '^probe:term_cursor show$' '^probe:page$' '^probe:term_cursor hide$' '^probe:tty_read_char 5 q$'
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 1
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_NOSUDO=build-2 RUNNERCTL_STUB_KEYS='jjjLq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^example\.slot-1 on build-2: logs — remote exit 1 — sudo: a password is required — the ssh login needs passwordless sudo on that host; see the fleet section of the README for the exact sudoers line$' 1
+  expect_no_log '^probe:page$'
+}
+
+# A remote action that fails is a notice with fleet_error_text's remedy, and
+# the watch carries on; a host that cannot be read at the key acts on nothing.
+case_fleet_watch_a_failed_action_is_a_notice_not_an_exit() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_NOSUDO=build-1 RUNNERCTL_STUB_KEYS='jRy-q' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart example\.slot-2$' 1
+  # on the frame after the action, and still on the tick after that
+  expect_out_count '^example\.slot-2 on build-1: restart failed — remote exit 1 — sudo: a password is required — the ssh login needs passwordless sudo on that host; see the fleet section of the README for the exact sudoers line$' 2
+  # the watch went on: the tick after it fanned out again
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 3
+  expect_log_order '^probe:tty_read_char 5 q$' '^probe:term_cursor show$' '^probe:ssh_control build-1 exit$'
 }
 
 # --- GHR-56: the narrow table, as a flag the fleet can forward -----------------
@@ -4724,6 +4953,15 @@ t "watch: once narrowed, holds until the margin fits"                  case_watc
 t "fleet watch: a too-wide frame narrows next tick and stays narrow"   case_fleet_watch_narrows_on_the_next_tick_and_holds
 t "fleet watch: widens again with room to spare; --narrow pins it"    case_fleet_watch_widens_again_and_narrow_pins_it
 t "fleet --narrow: a host too old for it renders full-width, no error" case_fleet_narrow_an_old_host_renders_full_width_not_an_error
+t "fleet watch: j/k walk (host, slot) pairs, clamp, and cost no fan-out" case_fleet_watch_cursor_walks_host_slot_pairs
+t "fleet watch: a host dropping out keeps the cursor, which comes back" case_fleet_watch_cursor_survives_a_host_dropping_out
+t "fleet watch: a slot scaled away drops the cursor to its host's first" case_fleet_watch_cursor_on_a_slot_that_scaled_away_stays_on_its_host
+t "fleet watch: S, y stops the pair on its own host; the frame shows it" case_fleet_watch_S_stops_the_selected_pair_on_its_own_host
+t "fleet watch: K decides on the host's facts read at the key"         case_fleet_watch_K_decides_on_facts_read_at_the_key
+t "fleet watch: walking S down the fleet stops at --min-available"      case_fleet_watch_S_walking_the_fleet_stops_at_the_floor
+t "fleet watch: T starts and P reaps on the selected host only"         case_fleet_watch_T_starts_and_P_reaps_on_the_selected_host
+t "fleet watch: L pages the host's journal; a sudo refusal is a notice"  case_fleet_watch_L_pages_the_remote_journal
+t "fleet watch: a failed remote action is a notice, the watch goes on"  case_fleet_watch_a_failed_action_is_a_notice_not_an_exit
 
 
 # --- GHR-45: provision --------------------------------------------------------
