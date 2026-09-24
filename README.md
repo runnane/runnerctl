@@ -88,8 +88,8 @@ the units the rest of this tool already manages through drop-ins.
 
 It is **idempotent against a target count**, like `scale`. `provision 4` on a
 host with 2 slots adds two and leaves the existing ones untouched; `provision 2`
-on a host with 4 changes nothing. It never deregisters a runner: removing one
-from GitHub needs a removal token and is not automated.
+on a host with 4 changes nothing. It never deregisters a runner — that is
+[`deprovision`](#removing-runners-deprovision).
 
 ### Credentials
 
@@ -132,6 +132,50 @@ Provisioning is deliberately **excluded from `fleet`**: fanning it out would
 copy a registration token to every host, and each host needs its own runner
 names. Run it per host.
 
+### Removing runners: `deprovision`
+
+`scale` stops a slot but leaves it registered with GitHub (it shows offline)
+and on disk. `deprovision` removes it for good:
+
+```sh
+sudo runnerctl deprovision 3 --url https://github.com/your-org   # by slot index
+sudo runnerctl deprovision host-4 --token <removal token> --yes    # by runner name
+sudo runnerctl deprovision 2 3 --dry-run                           # print the commands only
+```
+
+Per slot, in the order the runner itself requires: `svc.sh stop`, `svc.sh
+uninstall` (the runner refuses to deregister while its service is installed),
+`config.sh remove` with a **removal token**, then the runner's directory — the
+unit's `WorkingDirectory`, which must hold `config.sh` and `svc.sh` or the slot
+is refused — and runnerctl's own drop-in are deleted.
+
+It is **destructive and irreversible**, so:
+
+- **Explicit targets only.** A unit, slot index or runner name, as for `stop`;
+  a bare `deprovision` is a refusal, never "all".
+- **y/N confirmation** unless `--yes` — and without a terminal to ask on, it
+  refuses rather than assuming yes.
+- **A slot with a job in flight is refused**, all targets checked before any is
+  touched. `--when-idle` waits for each slot's job instead (bounded by
+  `--timeout N`), as `drain` does.
+- `--dry-run` prints the exact commands and mints no token.
+
+The removal token comes from the same three places as the registration token
+(`--token`, `--pat`/`$GITHUB_TOKEN`, or the `gh` CLI — minted from
+`.../actions/runners/remove-token` for the scope `--url` or `RUNNER_URL`
+names). It reaches `config.sh` through the runner's own
+`ACTIONS_RUNNER_INPUT_TOKEN` environment variable on stdin, **not** its command
+line, so unlike the registration token it never shows up in `ps`.
+
+A runner GitHub has **already forgotten** — removed in the UI, say — makes
+`config.sh remove` fail. That is a warning, not a stop: the unit and directory
+are still removed, and the summary names the runners GitHub did not confirm so
+you can check **Settings → Actions → Runners**. `--local-only` skips GitHub
+altogether (no credential needed) and leaves the runner listed there as offline.
+
+Like `provision`, it is **excluded from `fleet`**: it takes a credential, and a
+slot index or name means a different runner on every host.
+
 ## Usage
 
 ```
@@ -141,6 +185,9 @@ runnerctl provision N [--url URL] [--token TOK | --pat TOK] [--labels a,b] \
                       [--name-prefix P] [--runner-user U] [--runner-root DIR] \
                       [--runner-version X.Y.Z] [--sha256 SUM] [--replace] \
                       [--dry-run]
+runnerctl deprovision <unit|slot-index|name>... [--token TOK | --pat TOK] \
+                      [--url URL] [--local-only] [--when-idle] [--timeout N] \
+                      [--yes] [--dry-run]
 runnerctl status [--json] [--watch|-w] [--interval N] [--once] \
                  [--color auto|always|never] [--stall-after N]
 runnerctl watch  [--interval N] [--color auto|always|never] [--stall-after N]
@@ -918,6 +965,9 @@ exact sudoers line
 
 - **`env-init` never will.** It writes an EnvironmentFile of secrets, and
   fanning it out means copying secrets over ssh. Run it on each host.
+- **`provision` and `deprovision`** take a GitHub token, so fanning them out
+  copies a credential to every host — and a runner name or slot index means a
+  different runner on each host. Run them on the host.
 - **`watch`** is interactive and **`logs -f`** is streaming; both only make
   sense against one host. Each says so rather than reporting "unknown
   command".
@@ -1212,8 +1262,9 @@ MemorySwapMax=0
 ```
 
 `remove-limits` deletes the managed drop-ins again. `scale` stops and disables
-slots beyond `N` but never deregisters them from GitHub — that needs a removal
-token and is irreversible, so it stays a manual step.
+slots beyond `N` but never deregisters them from GitHub — that is irreversible,
+so it is a separate, explicitly targeted command:
+[`deprovision`](#removing-runners-deprovision).
 
 With `--save` it also writes the config itself — one `profile_<name>()` block
 in `/etc/runnerctl/config`, the previous version alongside it as
