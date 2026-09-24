@@ -3411,11 +3411,31 @@ fleet_resolve_budget() { # VALUE TOTAL
 # Returns 0 when every targeted slot was acted on, 2 when a floor stopped it
 # early (a distinct code because "I deliberately did less than you asked" is
 # neither success nor failure), 1 when a slot failed.
+# Reused across the three fleet_slots re-reads in fleet_budget_walk below.
+# GLOBAL, not local: the EXIT trap that cleans it up fires after the function
+# that declared it has returned, and a trap referencing a `local` is then
+# reading a variable out of scope — "unbound variable" under `set -u`, the
+# same reason FLEET_DIR (above) is global rather than local to fleet_fanout.
+FLEET_BUDGET_TMP=""
+fleet_budget_cleanup() {
+  [ -z "$FLEET_BUDGET_TMP" ] || rm -f "$FLEET_BUDGET_TMP"
+  FLEET_BUDGET_TMP=""
+}
+
 fleet_budget_walk() { # SUBCOMMAND MODE BUDGET [REMOTE-ARGS...]
   local sub="$1" mode="$2" budget="$3"; shift 3
   local slots host idx state n total waited acted=0 nbad=0 stopped_at_floor=false
   local -a left=()
-  slots="$(fleet_slots)"
+  # fleet_slots must run IN-PROCESS, never as $(...): FLEET_SLOTS_SKIPPED is
+  # set inside fleet_slots, and a command substitution runs the function in a
+  # subshell, so the count is set there and lost the moment the subshell
+  # exits (GHR-59). Route its slot lines through a tmp file instead, and
+  # re-arm the EXIT trap after every call: fleet_slots runs fleet_fanout,
+  # which arms its OWN EXIT trap — the same reason fleet_watch_floor re-arms
+  # its trap after calling fleet_slots.
+  FLEET_BUDGET_TMP="$(mktemp)"
+  fleet_slots >"$FLEET_BUDGET_TMP"; trap fleet_budget_cleanup EXIT
+  slots="$(cat "$FLEET_BUDGET_TMP")"
   total="$(printf '%s\n' "$slots" | grep -c . || true)"
   [ "$total" -gt 0 ] || die "no slots found on the fleet — nothing to $sub (are the hosts reachable? try 'runnerctl fleet status')"
   n="$(fleet_resolve_budget "$budget" "$total")"
@@ -3432,7 +3452,9 @@ fleet_budget_walk() { # SUBCOMMAND MODE BUDGET [REMOTE-ARGS...]
       # Would acting take the fleet below the floor? Re-read rather than
       # decrementing a local counter: another operator, or a crashing job,
       # can move the number underneath a long roll.
-      local avail; avail="$(fleet_count_available "$(fleet_slots)")"
+      local avail
+      fleet_slots >"$FLEET_BUDGET_TMP"; trap fleet_budget_cleanup EXIT
+      avail="$(fleet_count_available "$(cat "$FLEET_BUDGET_TMP")")"
       if [ "$((avail - 1))" -lt "$n" ]; then
         stopped_at_floor=true
         left+=("$host/$idx")
@@ -3442,7 +3464,9 @@ fleet_budget_walk() { # SUBCOMMAND MODE BUDGET [REMOTE-ARGS...]
       # Ceiling: wait for the fleet to come back under budget.
       waited=0
       while :; do
-        local unavail; unavail="$(fleet_count_unavailable "$(fleet_slots)")"
+        local unavail
+        fleet_slots >"$FLEET_BUDGET_TMP"; trap fleet_budget_cleanup EXIT
+        unavail="$(fleet_count_unavailable "$(cat "$FLEET_BUDGET_TMP")")"
         [ "$unavail" -ge "$n" ] || break
         [ "$waited" -lt "$WAIT_TIMEOUT" ] || die "waited ${waited}s for the fleet to come back under --max-unavailable $n and it did not — $acted slot(s) already ${sub}ed; 'runnerctl fleet status' shows what is still out"
         pause "$POLL_SEC"
@@ -3457,6 +3481,7 @@ fleet_budget_walk() { # SUBCOMMAND MODE BUDGET [REMOTE-ARGS...]
       nbad=$((nbad + 1)); echo "$host slot $idx: $sub FAILED (exit $rc1)"
     fi
   done <<<"$slots"
+  fleet_budget_cleanup
   # Not ${stopped_at_floor:+...}: the variable holds the STRING "false" when
   # the floor was never hit, which is non-empty and would expand anyway.
   if $stopped_at_floor; then
