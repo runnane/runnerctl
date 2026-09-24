@@ -3382,6 +3382,22 @@ case_fleet_status_narrow_is_forwarded_and_arrives() {
 # width plus the 22-column margin: so the table narrows once and then STAYS
 # narrow, where a watch without the hysteresis would put the columns back on
 # the next tick and flip on every one after it.
+# The LOCAL watch's hysteresis, on its own path through narrow_wanted (the
+# fleet case above cannot see it). 170 columns is between the local table's
+# widths (narrow 156, full 196) and under narrow + the 22-column margin, so
+# once narrowed the table holds; a watch without the margin widens on the
+# next frame and flips on every one after it. 300 then puts the columns back.
+case_watch_narrow_holds_inside_the_margin() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=170 run watch --iterations 4 --color never
+  expect_rc 0
+  expect_out_count "^$HDR_NARROW" 4
+  expect_no_out "^$HDR_FULL"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=170,170,300 run watch --iterations 3 --color never
+  expect_rc 0
+  expect_out_count "^$HDR_NARROW" 2
+  expect_out_count "^$HDR_FULL" 1
+}
+
 case_fleet_watch_narrows_on_the_next_tick_and_holds() {
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_COLS=180 \
     run fleet watch --iterations 4 --color never
@@ -4704,6 +4720,7 @@ t "fleet one-shots: no control session, ssh line unchanged"            case_flee
 t "fleet watch: bad options die before anything is dialled"            case_fleet_watch_bad_options_die_before_dialling
 t "status --narrow: drops MAX/HIGH/ENVFILE; refused with --json"      case_status_narrow_drops_max_high_envfile
 t "fleet status --narrow: forwarded, and the narrow table arrives"     case_fleet_status_narrow_is_forwarded_and_arrives
+t "watch: once narrowed, holds until the margin fits"                  case_watch_narrow_holds_inside_the_margin
 t "fleet watch: a too-wide frame narrows next tick and stays narrow"   case_fleet_watch_narrows_on_the_next_tick_and_holds
 t "fleet watch: widens again with room to spare; --narrow pins it"    case_fleet_watch_widens_again_and_narrow_pins_it
 t "fleet --narrow: a host too old for it renders full-width, no error" case_fleet_narrow_an_old_host_renders_full_width_not_an_error
