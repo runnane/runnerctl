@@ -2775,6 +2775,37 @@ case_fleet_status_json_rejects_a_non_object_payload() {
   expect_json '"no JSON object on stdout" in d["fleet"][0]["error"]'
 }
 
+# GHR-57: `--stall-after` was accepted and silently dropped on the way to the
+# remote — the STALLED marker is drawn wherever STALL_SEC is READ, which for
+# a fleet is the remote host, never the central node. Mirrors
+# case_fleet_watch_colour_comes_from_the_remote_and_notes_still_dedupe for the
+# one-shot table. --color is deliberately NOT forwarded here (unlike watch):
+# `fleet status` asks the remote for --color never and paints locally.
+case_fleet_status_forwards_stall_after_to_the_remote_table() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status --stall-after 600
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --stall-after 600$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --stall-after 600$' 1
+  expect_out_count '^build-1 +0 +example\.slot-1 .* my-app:test \(12m\) STALLED$' 1
+  expect_out_count '^build-2 +0 +example\.slot-1 .* my-app:test \(12m\) STALLED$' 1
+  # one deduped note for the fleet, not one per host
+  expect_out_count '^note: STALLED = a job running longer than 10m \(STALL_SEC=600\)' 1
+  expect_no_out '^build-[12] .*note: STALLED'
+}
+
+# The same threshold has to reach the --json fan-out too, or a consumer
+# reading `job.stalled` after passing `--stall-after` is asking two questions
+# instead of one (the issue's own reasoning for forwarding here as well).
+case_fleet_status_json_forwards_stall_after_to_the_remote() {
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: fleet --json stall-after assertions not run"; return 0; fi
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status --stall-after 600 --json
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json --stall-after 600$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json --stall-after 600$' 1
+  expect_json 'd["fleet"][0]["status"]["slots"][0]["job"]["stalled"] is True'
+  expect_json 'd["fleet"][1]["status"]["slots"][0]["job"]["stalled"] is True'
+}
+
 case_fleet_unconfigured_says_so() {
   run fleet status
   expect_rc 1
@@ -4184,6 +4215,8 @@ t "fleet health: a bootstrap failure carries its remedy too"            case_fle
 t "fleet: a sudo-wrapped missing runnerctl reads as a PATH fault"       case_fleet_a_sudo_wrapped_missing_runnerctl_is_a_path_fault_not_a_sudo_one
 t "fleet status --json: each host's payload nested unchanged"          case_fleet_status_json_nests_each_payload_unchanged
 t "fleet status --json: exit 0 with no object is an explained error"   case_fleet_status_json_rejects_a_non_object_payload
+t "fleet status: --stall-after is forwarded to the remote table"       case_fleet_status_forwards_stall_after_to_the_remote_table
+t "fleet status --json: --stall-after is forwarded too"                case_fleet_status_json_forwards_stall_after_to_the_remote
 t "fleet health: all healthy is one summary line, exit 0"              case_fleet_health_all_healthy_is_one_line_exit_zero
 t "fleet health: a problem keeps its wording and gains its host"       case_fleet_health_problem_is_attributed_to_its_host
 t "fleet health: an unreachable host is a problem, never a pass"       case_fleet_health_unreachable_host_is_a_problem_never_a_silent_pass
