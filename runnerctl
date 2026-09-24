@@ -50,7 +50,7 @@
 #   runnerctl kill [--dry-run] [--if-stalled] [--stall-after N] \
 #                  [<unit|slot-index|name> ...]
 #   runnerctl health [--quiet] [--max-restarts N] [--stall-after N] [--restart-stalled]
-#   runnerctl fleet status [--json] [--color auto|always|never]
+#   runnerctl fleet status [--json] [--color auto|always|never] [--stall-after N]
 #   runnerctl fleet watch  [--interval N] [--host H]... \
 #                          [--color auto|always|never] [--stall-after N]
 #   runnerctl fleet health [--quiet] [--max-restarts N] [--stall-after N] \
@@ -3637,12 +3637,22 @@ fleet_health_report() { # QUIET
   return 1
 }
 
-cmd_fleet_status() { # [--json] [--color WHEN]
+cmd_fleet_status() { # [--json] [--color WHEN] [--stall-after N]
   local json=false rc=0
+  local -a fwd=()
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     view_opt "$@"
-    if [ "$VIEW_SHIFT" -gt 0 ]; then shift "$VIEW_SHIFT"; continue; fi
+    if [ "$VIEW_SHIFT" -gt 0 ]; then
+      # --stall-after is only meaningful where the STALLED marker (table) or
+      # the job_stalled field (--json) is COMPUTED, which is the remote — so
+      # it is forwarded on both fan-outs, or it would be an accepted flag
+      # that silently does nothing (the bug this fixes). --color is NOT
+      # forwarded: `fleet status` asks the remote for --color never and
+      # paints locally, unlike `fleet watch`.
+      [ "$1" != --stall-after ] || fwd+=(--stall-after "$2")
+      shift "$VIEW_SHIFT"; continue
+    fi
     case "$1" in
       --json) json=true; shift ;;
       *)      die "unknown option: $1" ;;
@@ -3650,13 +3660,13 @@ cmd_fleet_status() { # [--json] [--color WHEN]
   done
   require_fleet
   if $json; then
-    fleet_fanout "$FLEET_RUNNERCTL" status --json
+    fleet_fanout "$FLEET_RUNNERCTL" status --json ${fwd[@]+"${fwd[@]}"}
     fleet_status_json || rc=$?
   else
     color_setup "$COLOR_MODE"
     # --color never on the remote: the fleet renderer paints locally, and a
     # remote SGR sequence would be measured as visible width by the prefix.
-    fleet_fanout "$FLEET_RUNNERCTL" status --color never
+    fleet_fanout "$FLEET_RUNNERCTL" status --color never ${fwd[@]+"${fwd[@]}"}
     fleet_status_table || rc=$?
   fi
   fleet_cleanup

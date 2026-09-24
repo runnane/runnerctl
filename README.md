@@ -722,18 +722,20 @@ runs (`ControlMaster`, over a socket directory of its own). The first tick pays
 the handshake; every later tick is another channel on the same socket. It closes
 them on the way out rather than leaving them to expire.
 
-Three differences from `fleet status`, each worth knowing:
+Two differences from `fleet status`, each worth knowing:
 
 - **The remotes paint, not this end.** `fleet status` asks every host for
   `--color never` and colours what it adds locally. A live view wants the
   per-cell colour the local `watch` has, and the only thing that knows a cell is
   `STALLED` or memory-throttled is the host that drew it. `--color never` turns
   it off at both ends together.
-- **`--stall-after` is forwarded**, for the same reason: the `STALLED` marker is
-  drawn at the far end or not at all.
 - **The default interval is 5 s**, not the local watch's 2 s. Every tick is a
   round trip to every host, and a tick that has not finished before the next one
   starts is not a faster view, it is a queue.
+
+`--stall-after` is forwarded by both — the `STALLED` marker (and, for
+`--json`, the `stalled` field) is computed wherever it is drawn, which is
+always the remote.
 
 `--host H` (repeatable) narrows the watch to named hosts, validated against
 `FLEET_HOSTS` exactly as it is for the mutating commands. A host that does not
