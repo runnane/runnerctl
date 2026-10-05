@@ -53,8 +53,8 @@
 #   runnerctl reap [--dry-run] [<unit|slot-index|name> ...]
 #   runnerctl kill [--dry-run] [--if-stalled] [--stall-after N] \
 #                  [<unit|slot-index|name> ...]
-#   runnerctl compose-reap [--apply] [--project NAME] [--max-age-hours N] \
-#                          [--grace-minutes N]
+#   runnerctl compose-reap [--apply] [--standalone] [--project NAME] \
+#                          [--max-age-hours N] [--grace-minutes N]
 #   runnerctl compose-reap-timer install|status|remove
 #   runnerctl health [--quiet] [--max-restarts N] [--stall-after N] [--restart-stalled]
 #   runnerctl fleet status [--json] [--color auto|always|never] [--stall-after N] \
@@ -174,8 +174,10 @@
 # when neither applies. Dry run unless --apply; --apply refuses on a host with
 # no runner units. `compose-reap-timer install` runs it hourly from a root
 # systemd timer, and refuses unless this runnerctl is root-owned and writable
-# by nobody else. Running containers without a compose label are counted in
-# its summary, never touched.
+# by nobody else. Containers without a compose label are only counted unless
+# --standalone (or COMPOSE_REAP_STANDALONE=1): then each is kept while any slot
+# runs a job older than it and reaped past --max-age-hours otherwise, and its
+# image is removed once no container uses it.
 # `health` is a yes/no for cron or an uptime monitor's push endpoint: exit 0
 # ("ok: N slot(s) healthy") when every enabled slot is running, no slot has
 # restarted --max-restarts times (default 5) or more and no job is STALLED,
@@ -347,6 +349,10 @@ COMPOSE_REAP_MAX_AGE_HOURS="3"
 COMPOSE_REAP_GRACE_MIN="10"
 COMPOSE_REAP_MIN_PID="300"
 COMPOSE_REAP_KEEP_LABEL="runnerctl.keep"
+# 1 = also judge containers with NO compose label (`docker run -d` leaks), and
+# remove the images reaped ones leave unused. Off by default: an unlabelled
+# container cannot say which job owns it, so this is a host's opt-in.
+COMPOSE_REAP_STANDALONE="0"
 # PRESS (memory pressure, PSI full avg10 in percent): yellow from WARN, red
 # and a `health` problem from CRIT (GHR-31).
 PRESSURE_WARN_PCT="10"
@@ -447,6 +453,7 @@ load_config() {
   [[ "$STALL_SEC" =~ ^[0-9]+$ ]] || die "STALL_SEC '$STALL_SEC' set in $CONFIG_FILE is invalid — want a whole number of seconds (0 disables the stalled flag)"
   [[ "$REAP_GRACE_SEC" =~ ^[0-9]+$ ]] || die "REAP_GRACE_SEC '$REAP_GRACE_SEC' set in $CONFIG_FILE is invalid — want a whole number of seconds"
   [[ "$COMPOSE_REAP_MAX_AGE_HOURS" =~ ^[0-9]+$ && "$COMPOSE_REAP_GRACE_MIN" =~ ^[0-9]+$ && "$COMPOSE_REAP_MIN_PID" =~ ^[0-9]+$ ]] || die "COMPOSE_REAP_MAX_AGE_HOURS/COMPOSE_REAP_GRACE_MIN/COMPOSE_REAP_MIN_PID set in $CONFIG_FILE are invalid — want whole numbers"
+  [[ "$COMPOSE_REAP_STANDALONE" =~ ^[01]$ ]] || die "COMPOSE_REAP_STANDALONE '$COMPOSE_REAP_STANDALONE' set in $CONFIG_FILE is invalid — want 0 or 1"
   [[ "$COMPOSE_REAP_KEEP_LABEL" =~ ^[A-Za-z0-9._/-]+$ ]] || die "COMPOSE_REAP_KEEP_LABEL '$COMPOSE_REAP_KEEP_LABEL' set in $CONFIG_FILE is invalid — want a Docker label key"
   [[ "$PRESSURE_WARN_PCT" =~ ^[0-9]+$ && "$PRESSURE_CRIT_PCT" =~ ^[0-9]+$ ]] || die "PRESSURE_WARN_PCT/PRESSURE_CRIT_PCT set in $CONFIG_FILE are invalid — want whole percentages"
   # Fleet settings (GHR-39). Validated here, once, rather than per host: a
@@ -2826,11 +2833,28 @@ compose_running_counts() {
 
 docker_available() { command -v docker >/dev/null 2>&1; }
 
-compose_rm() { # container|network|volume ID
+# ID|NAME|IMAGE-ID|IMAGE|CREATED|STARTED|KEEP, one line per container WITHOUT a
+# compose label, in any state. `with` guards a container whose Labels is nil.
+compose_standalone() {
+  local all composed ids
+  all="$(docker ps -aq --no-trunc 2>/dev/null | sort)"
+  composed="$(docker ps -aq --no-trunc --filter "label=com.docker.compose.project" 2>/dev/null | sort)"
+  mapfile -t ids < <(comm -23 <(printf '%s\n' "$all") <(printf '%s\n' "$composed") | grep -v '^$' || true)
+  [ "${#ids[@]}" -gt 0 ] || return 0
+  docker inspect -f "{{.Id}}|{{.Name}}|{{.Image}}|{{.Config.Image}}|{{.Created}}|{{.State.StartedAt}}|{{with .Config.Labels}}{{index . \"$COMPOSE_REAP_KEEP_LABEL\"}}{{end}}" "${ids[@]}" 2>/dev/null
+}
+
+# True when any container, in any state, still uses IMAGE-ID.
+compose_image_in_use() { # IMAGE-ID
+  [ -n "$(docker ps -aq --filter "ancestor=$1" 2>/dev/null)" ]
+}
+
+compose_rm() { # container|network|volume|image ID
   case "$1" in
     container) docker rm -f -v "$2" >/dev/null 2>&1 ;;
     network)   docker network rm "$2" >/dev/null 2>&1 ;;
     volume)    docker volume rm "$2" >/dev/null 2>&1 ;;
+    image)     docker rmi "$2" >/dev/null 2>&1 ;;
   esac
 }
 
@@ -2852,12 +2876,15 @@ proc_start_epoch() { # PID
   age_to_epoch "$age"
 }
 
-cmd_compose_reap() { # [--apply] [--project NAME] [--max-age-hours N] [--grace-minutes N]
+cmd_compose_reap() { # [--apply] [--standalone] [--project NAME] [--max-age-hours N] [--grace-minutes N]
   local apply=false only="" max_age="$COMPOSE_REAP_MAX_AGE_HOURS" grace="$COMPOSE_REAP_GRACE_MIN"
+  local standalone=false
+  [ "$COMPOSE_REAP_STANDALONE" != 1 ] || standalone=true
   while [ $# -gt 0 ]; do
     case "$1" in
       --apply)         apply=true; shift ;;
       --dry-run)       apply=false; shift ;;
+      --standalone)    standalone=true; shift ;;
       --project)       need_val "$@"; only="$2"; shift 2 ;;
       --max-age-hours) need_val "$@"; max_age="$2"; shift 2 ;;
       --grace-minutes) need_val "$@"; grace="$2"; shift 2 ;;
@@ -2972,9 +2999,54 @@ cmd_compose_reap() { # [--apply] [--project NAME] [--max-age-hours N] [--grace-m
     n_removed=$((n_removed + ok)); n_failed=$((n_failed + bad))
   done
 
+  # Containers with no compose label (opt-in). There is no project to judge and
+  # no working dir to tie to a slot, so ownership is the one question left: is
+  # any job running that is older than this container? If so it may be that
+  # job's, and it stays. Its image goes with it, once nothing else uses it.
+  local n_standalone=0 n_images=0 cid name img image
+  local -A freed_images=()
+  if $standalone; then
+    while IFS='|' read -r cid name img image created started k; do
+      [ -n "$cid" ] || continue
+      name="${name#/}"
+      [ -z "$only" ] || [ "$name" = "$only" ] || continue
+      n_standalone=$((n_standalone + 1))
+      seen="$(compose_epoch "$created")"; t="$(compose_epoch "$started")"
+      [ "$t" -le "$seen" ] || seen="$t"
+      alive=""
+      for start in "${slot_start[@]}"; do
+        if [ -n "$start" ] && [ "$start" -le "$seen" ]; then alive=1; break; fi
+      done
+      if [ "$k" = "true" ]; then action=keep reason=label
+      elif [ $((now - seen)) -lt $((grace * 60)) ]; then action=keep reason=grace
+      elif [ -n "$alive" ]; then action=keep reason=live:job
+      elif [ $((now - seen)) -ge $((max_age * 3600)) ]; then action=reap reason=age
+      else action=keep reason=young
+      fi
+      printf '%s container %s reason=%s idle=%sm image=%s\n' "$action" "$name" "$reason" "$(( (now - seen) / 60 ))" "$image"
+      if [ "$action" != reap ]; then kept=$((kept + 1)); continue; fi
+      reaped=$((reaped + 1))
+      $apply || continue
+      if compose_rm container "$cid"; then
+        n_removed=$((n_removed + 1)); freed_images[$img]="$image"
+      else
+        n_failed=$((n_failed + 1))
+      fi
+    done < <(compose_standalone)
+    for img in "${!freed_images[@]}"; do
+      if compose_image_in_use "$img"; then
+        echo "keep image ${freed_images[$img]} reason=in-use"
+      elif compose_rm image "$img"; then
+        n_images=$((n_images + 1)); echo "removed image ${freed_images[$img]}"
+      else
+        n_failed=$((n_failed + 1)); echo "failed image ${freed_images[$img]}"
+      fi
+    done
+  fi
+
   local running composed
   read -r running composed <<<"$(compose_running_counts)"
-  echo "compose-reap: mode=$mode projects=${#projects[@]} reap=$reaped keep=$kept removed=$n_removed failed=$n_failed slots=${#slot_start[@]} non-compose-running=$(( ${running:-0} - ${composed:-0} ))"
+  echo "compose-reap: mode=$mode projects=${#projects[@]} reap=$reaped keep=$kept removed=$n_removed failed=$n_failed slots=${#slot_start[@]} standalone=$n_standalone images-removed=$n_images non-compose-running=$(( ${running:-0} - ${composed:-0} ))"
   [ "$n_failed" -eq 0 ]
 }
 
@@ -5337,6 +5409,12 @@ cmd_config_example() {
 #COMPOSE_REAP_GRACE_MIN="10"
 #COMPOSE_REAP_MIN_PID="300"
 #COMPOSE_REAP_KEEP_LABEL="runnerctl.keep"
+#
+# 1 = also judge containers with no compose label — a `docker run -d` a dead
+# job left running — and remove each reaped one's image once nothing uses it.
+# An unlabelled container cannot name its owner, so it is kept while ANY slot
+# runs a job older than it, and otherwise reaped after MAX_AGE_HOURS.
+#COMPOSE_REAP_STANDALONE="0"
 
 # PRESS column (memory pressure, PSI full avg10 in percent): yellow from
 # WARN, red and a `health` problem from CRIT.

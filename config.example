@@ -42,6 +42,12 @@
 #COMPOSE_REAP_GRACE_MIN="10"
 #COMPOSE_REAP_MIN_PID="300"
 #COMPOSE_REAP_KEEP_LABEL="runnerctl.keep"
+#
+# 1 = also judge containers with no compose label — a `docker run -d` a dead
+# job left running — and remove each reaped one's image once nothing uses it.
+# An unlabelled container cannot name its owner, so it is kept while ANY slot
+# runs a job older than it, and otherwise reaped after MAX_AGE_HOURS.
+#COMPOSE_REAP_STANDALONE="0"
 
 # PRESS column (memory pressure, PSI full avg10 in percent): yellow from
 # WARN, red and a `health` problem from CRIT.
