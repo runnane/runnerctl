@@ -4688,7 +4688,7 @@ case_scale_save_writes_the_profile_it_scaled_with() {
 # --- compose-reap: compose stacks whose job is gone -----------------------------
 # The fixture in tests/stub.config holds one project per verdict path; these
 # pin each verdict, the removal order and scope, and the two refusals.
-CR_DRY='^compose-reap: mode=dry-run projects=12 reap=5 keep=7 removed=0 failed=0 slots=3 non-compose-running=4$'
+CR_DRY='^compose-reap: mode=dry-run projects=12 reap=5 keep=7 removed=0 failed=0 slots=3 standalone=0 images-removed=0 non-compose-running=4$'
 
 case_compose_reap_dry_run_judges_every_project() {
   RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_WORKER=1 run compose-reap
@@ -4781,7 +4781,7 @@ case_compose_reap_refuses_bad_input() {
 case_compose_reap_empty_daemon() {
   run compose-reap --apply
   expect_rc 0
-  expect_out '^compose-reap: mode=apply projects=0 reap=0 keep=0 removed=0 failed=0 slots=3 non-compose-running=0$'
+  expect_out '^compose-reap: mode=apply projects=0 reap=0 keep=0 removed=0 failed=0 slots=3 standalone=0 images-removed=0 non-compose-running=0$'
 }
 
 case_compose_reap_timer_refuses_a_user_writable_runnerctl() {
@@ -4853,6 +4853,99 @@ FAKE
   _expect
   grep -q 'runnerctl.keep' "$d/inspect.args" || FAILS+=("inspect template does not ask for the keep label")
   grep -q 'com.docker.compose.project.working_dir' "$d/inspect.args" || FAILS+=("inspect template does not ask for the working dir")
+  rm -rf "$d"
+}
+
+# --- compose-reap --standalone: containers with no compose label ----------------
+case_compose_reap_standalone_is_opt_in() {
+  RUNNERCTL_STUB_STANDALONE=1 run compose-reap --apply
+  expect_rc 0
+  expect_no_out '^(reap|keep) container '
+  expect_no_log '^docker rm (container s-|image )'
+  expect_out ' standalone=0 images-removed=0 '
+}
+
+case_compose_reap_standalone_dry_run_verdicts() {
+  RUNNERCTL_STUB_STANDALONE=1 run compose-reap --standalone
+  expect_rc 0
+  expect_out '^reap container verify-old reason=age idle=1200m image=verify:1$'
+  expect_out '^reap container verify-shared reason=age '
+  expect_out '^keep container keeper reason=young '
+  expect_out '^keep container svc-pinned reason=label '
+  expect_out '^keep container just-started reason=grace idle=2m '
+  expect_out '^keep container during-job reason=young '
+  expect_out ' reap=2 keep=4 removed=0 failed=0 slots=3 standalone=6 images-removed=0 '
+  expect_no_log '^docker rm'
+  expect_no_log '^probe:image_in_use'
+}
+
+case_compose_reap_standalone_apply_removes_unused_images_only() {
+  RUNNERCTL_STUB_STANDALONE=1 run compose-reap --standalone --apply
+  expect_rc 0
+  expect_log_order '^docker rm container s-old$' '^docker rm image sha-v1$'
+  expect_log '^docker rm container s-shared$'
+  expect_log '^probe:image_in_use sha-shared$'
+  expect_no_log '^docker rm image sha-shared$'
+  expect_no_log '^docker rm container s-(keeper|pinned|fresh|job)$'
+  expect_out '^keep image verify:shared reason=in-use$'
+  expect_out '^removed image verify:1$'
+  expect_out ' removed=2 failed=0 slots=3 standalone=6 images-removed=1 '
+}
+
+case_compose_reap_standalone_kept_while_an_older_job_runs() {
+  # during-job is ~67 min old; at --max-age-hours 1 it is old enough, unless a
+  # job that started BEFORE it is still running — then it may be that job's.
+  RUNNERCTL_STUB_STANDALONE=1 RUNNERCTL_STUB_COMPOSE_WORKER=1 run compose-reap --standalone --max-age-hours 1
+  expect_rc 0
+  expect_out '^keep container during-job reason=live:job '
+  expect_out '^reap container verify-old reason=age '
+  RUNNERCTL_STUB_STANDALONE=1 run compose-reap --standalone --max-age-hours 1
+  expect_out '^reap container during-job reason=age '
+}
+
+case_compose_reap_standalone_from_config_and_project_filter() {
+  local cfg="$TMP/standalone.config"
+  save_config "$cfg" <<<'COMPOSE_REAP_STANDALONE="1"'
+  RUNNERCTL_STUB_STANDALONE=1 run_cfg "$cfg" compose-reap --apply --project verify-old
+  expect_rc 0
+  expect_out_count '^(reap|keep) ' 1
+  expect_log '^docker rm container s-old$'
+  expect_log '^docker rm image sha-v1$'
+  expect_no_log '^docker rm container s-shared$'
+  save_config "$cfg" <<<'COMPOSE_REAP_STANDALONE="yes"'
+  run_cfg "$cfg" compose-reap
+  expect_rc 1
+  expect_err "COMPOSE_REAP_STANDALONE 'yes'"
+}
+
+case_compose_reap_standalone_failed_image_removal_fails_the_run() {
+  RUNNERCTL_STUB_STANDALONE=1 RUNNERCTL_STUB_IMAGE_RM_FAIL=sha-v1 run compose-reap --standalone --apply
+  expect_rc 1
+  expect_out '^failed image verify:1$'
+  expect_out ' removed=2 failed=1 '
+}
+
+case_compose_reap_standalone_real_hook() {
+  # compose_standalone against a fake docker: everything `ps -aq` lists minus
+  # the compose-labelled ids, then one inspect with the keep label guarded.
+  local d saved="$PATH"; d="$(mktemp -d)"
+  mkdir -p "$d/bin"
+  cat >"$d/bin/docker" <<'FAKE'
+#!/usr/bin/env bash
+case "$*" in
+  "ps -aq --no-trunc") printf 'aaa\nbbb\nccc\n' ;;
+  "ps -aq --no-trunc --filter label=com.docker.compose.project") echo bbb ;;
+  inspect*) printf '%s\n' "$*" >"${0%/*}/../inspect.args"; echo 'aaa|/x|sha-a|x:1|t|t|' ; echo 'ccc|/y|sha-c|y:1|t|t|' ;;
+esac
+FAKE
+  chmod 755 "$d/bin/docker"
+  PATH="$d/bin:$PATH"
+  run_fn compose_standalone
+  PATH="$saved"
+  expect_out '^aaa\|/x\|sha-a\|x:1\|t\|t\|$'
+  _expect
+  grep -q ' aaa ccc$' "$d/inspect.args" || FAILS+=("inspect was not asked for exactly the non-compose ids (aaa ccc): $(cat "$d/inspect.args")")
+  grep -q '{{with .Config.Labels}}' "$d/inspect.args" || FAILS+=("keep label read is not nil-guarded")
   rm -rf "$d"
 }
 
@@ -5214,6 +5307,13 @@ t "compose-reap-timer: refuses to run a user-writable runnerctl"       case_comp
 t "compose-reap-timer: install, status and remove"                     case_compose_reap_timer_install_status_remove
 t "compose-reap: the real epoch, work-folder, owner and docker hooks"  case_compose_reap_real_helpers
 t "compose-reap: listed in the usage and the unknown-command list"     case_compose_reap_in_usage
+t "compose-reap: standalone containers are untouched unless opted in" case_compose_reap_standalone_is_opt_in
+t "compose-reap --standalone: one verdict per unlabelled container"   case_compose_reap_standalone_dry_run_verdicts
+t "compose-reap --standalone --apply: an image goes only when unused" case_compose_reap_standalone_apply_removes_unused_images_only
+t "compose-reap --standalone: kept while a job older than it runs"    case_compose_reap_standalone_kept_while_an_older_job_runs
+t "compose-reap: COMPOSE_REAP_STANDALONE=1 opts in; --project; bad value" case_compose_reap_standalone_from_config_and_project_filter
+t "compose-reap --standalone: a failed image removal fails the run"   case_compose_reap_standalone_failed_image_removal_fails_the_run
+t "compose-reap: the real standalone hook lists only non-compose ids" case_compose_reap_standalone_real_hook
 
 # --- Summary ------------------------------------------------------------------
 echo

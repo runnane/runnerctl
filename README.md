@@ -209,8 +209,8 @@ runnerctl remove-limits [<unit|slot-index|name> ...]
 runnerctl reap [--dry-run] [<unit|slot-index|name> ...]
 runnerctl kill [--dry-run] [--if-stalled] [--stall-after N] \
                [<unit|slot-index|name> ...]
-runnerctl compose-reap [--apply] [--project NAME] [--max-age-hours N] \
-                       [--grace-minutes N]
+runnerctl compose-reap [--apply] [--standalone] [--project NAME] \
+                       [--max-age-hours N] [--grace-minutes N]
 runnerctl compose-reap-timer install|status|remove
 runnerctl health [--quiet] [--max-restarts N] [--stall-after N] [--restart-stalled]
 runnerctl profiles
@@ -355,7 +355,7 @@ $ sudo runnerctl compose-reap
 reap ci-harness-48211 reason=gone:pid:48211 idle=849m containers=2 networks=2 volumes=2
 keep ci-harness-51007 reason=live:pid:51007 idle=4m containers=3 networks=2 volumes=2
 keep pg-scratch reason=volume-only idle=781m containers=0 networks=0 volumes=1
-compose-reap: mode=dry-run projects=3 reap=1 keep=2 removed=0 failed=0 slots=4 non-compose-running=0
+compose-reap: mode=dry-run projects=3 reap=1 keep=2 removed=0 failed=0 slots=4 standalone=0 images-removed=0 non-compose-running=0
 ```
 
 It is a dry run unless `--apply`, and `--apply` refuses on a host with no
@@ -363,9 +363,28 @@ runner units, where the age guard would take a developer's own stacks. A
 reaped project loses its containers (with their anonymous volumes), then its
 networks, then its named volumes — by id, never a prune, because on a shared
 daemon a prune reaches other jobs. A project that is only volumes is never
-reaped. Running containers without a compose label are outside its reach:
-they are counted in the summary (`non-compose-running`) so a leak of that
-kind is visible, and never touched. Run it as root (the timer does) so it
+reaped. Running containers without a compose label are counted in the
+summary (`non-compose-running`) and, by default, never touched.
+
+#### Containers with no compose label: `--standalone`
+
+A plain `docker run -d` that a dead job left running pins its image just as
+firmly, and has no project or working dir to tie it to a job. With
+`--standalone` (or `COMPOSE_REAP_STANDALONE=1` in the config, which the timer
+reads) every container without a compose label is judged too: kept for the
+keep label or the grace window; kept while **any** slot runs a job that
+started before the container (`live:job` — an unlabelled container cannot say
+whose it is, so any older running job might own it); otherwise reaped past
+`--max-age-hours`. With `--apply`, each reaped container's image is removed by
+id once no container uses it, so a shared base image survives. It is opt-in
+because a host may run long-lived containers of its own outside CI.
+
+```
+keep container keeper reason=young idle=60m image=verify:shared
+reap container verify-old reason=age idle=1200m image=verify:1
+keep image verify:shared reason=in-use
+removed image verify:1
+``` Run it as root (the timer does) so it
 can read every slot's processes; a slot it cannot read can only look idle.
 
 Nothing inside a job survives its death to clean up after it, so the useful
