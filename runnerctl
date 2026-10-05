@@ -53,6 +53,9 @@
 #   runnerctl reap [--dry-run] [<unit|slot-index|name> ...]
 #   runnerctl kill [--dry-run] [--if-stalled] [--stall-after N] \
 #                  [<unit|slot-index|name> ...]
+#   runnerctl compose-reap [--apply] [--project NAME] [--max-age-hours N] \
+#                          [--grace-minutes N]
+#   runnerctl compose-reap-timer install|status|remove
 #   runnerctl health [--quiet] [--max-restarts N] [--stall-after N] [--restart-stalled]
 #   runnerctl fleet status [--json] [--color auto|always|never] [--stall-after N] \
 #                          [--narrow]
@@ -162,6 +165,17 @@
 # what is left) without touching the Listener; a busy slot is skipped, since
 # a running job's processes cannot be told from leaks. Needs to see the
 # cgroup: root or the runner user (GHR-29).
+# `compose-reap` is the same idea one level out, for the Docker daemon a
+# host's slots share: a job that dies before its teardown leaves its compose
+# stack RUNNING, so its images and volumes count as in use and no prune ever
+# frees them. It judges every compose project by whether the job that made it
+# is alive — the `-<pid>` suffix a harness names its stack after, or the
+# runner slot owning its working dir — and falls back to an age guard only
+# when neither applies. Dry run unless --apply; --apply refuses on a host with
+# no runner units. `compose-reap-timer install` runs it hourly from a root
+# systemd timer, and refuses unless this runnerctl is root-owned and writable
+# by nobody else. Running containers without a compose label are counted in
+# its summary, never touched.
 # `health` is a yes/no for cron or an uptime monitor's push endpoint: exit 0
 # ("ok: N slot(s) healthy") when every enabled slot is running, no slot has
 # restarted --max-restarts times (default 5) or more and no job is STALLED,
@@ -325,6 +339,14 @@ REAP_GRACE_SEC="5"
 # the job failed, before the whole unit's cgroup is SIGKILLed instead
 # (GHR-36). Counted in POLL_SEC steps, so a value below POLL_SEC is one poll.
 KILL_GRACE_SEC="10"
+# `compose-reap`: a compose project with no live owner is reaped once idle
+# this many hours; one younger than the grace is always kept (a stack mid
+# `up`); a `-<pid>` name suffix below MIN_PID is compose's numbering, not a
+# process; a container carrying KEEP_LABEL=true is never touched.
+COMPOSE_REAP_MAX_AGE_HOURS="3"
+COMPOSE_REAP_GRACE_MIN="10"
+COMPOSE_REAP_MIN_PID="300"
+COMPOSE_REAP_KEEP_LABEL="runnerctl.keep"
 # PRESS (memory pressure, PSI full avg10 in percent): yellow from WARN, red
 # and a `health` problem from CRIT (GHR-31).
 PRESSURE_WARN_PCT="10"
@@ -424,6 +446,8 @@ load_config() {
   [[ "$DEFAULT_PROFILE" =~ ^[A-Za-z0-9_]+$ ]] || die "DEFAULT_PROFILE '$DEFAULT_PROFILE' set in $CONFIG_FILE is invalid — must match ^[A-Za-z0-9_]+\$"
   [[ "$STALL_SEC" =~ ^[0-9]+$ ]] || die "STALL_SEC '$STALL_SEC' set in $CONFIG_FILE is invalid — want a whole number of seconds (0 disables the stalled flag)"
   [[ "$REAP_GRACE_SEC" =~ ^[0-9]+$ ]] || die "REAP_GRACE_SEC '$REAP_GRACE_SEC' set in $CONFIG_FILE is invalid — want a whole number of seconds"
+  [[ "$COMPOSE_REAP_MAX_AGE_HOURS" =~ ^[0-9]+$ && "$COMPOSE_REAP_GRACE_MIN" =~ ^[0-9]+$ && "$COMPOSE_REAP_MIN_PID" =~ ^[0-9]+$ ]] || die "COMPOSE_REAP_MAX_AGE_HOURS/COMPOSE_REAP_GRACE_MIN/COMPOSE_REAP_MIN_PID set in $CONFIG_FILE are invalid — want whole numbers"
+  [[ "$COMPOSE_REAP_KEEP_LABEL" =~ ^[A-Za-z0-9._/-]+$ ]] || die "COMPOSE_REAP_KEEP_LABEL '$COMPOSE_REAP_KEEP_LABEL' set in $CONFIG_FILE is invalid — want a Docker label key"
   [[ "$PRESSURE_WARN_PCT" =~ ^[0-9]+$ && "$PRESSURE_CRIT_PCT" =~ ^[0-9]+$ ]] || die "PRESSURE_WARN_PCT/PRESSURE_CRIT_PCT set in $CONFIG_FILE are invalid — want whole percentages"
   # Fleet settings (GHR-39). Validated here, once, rather than per host: a
   # typo in a fleet-wide config should fail before anything is dialled, not
@@ -2714,6 +2738,328 @@ cmd_kill() { # [--dry-run] [--if-stalled] [--stall-after N] [target ...]
   fi
 }
 
+# --- compose-reap: Docker Compose projects whose job is gone ------------------
+# A runner host's Docker daemon is shared by every repo whose CI lands on it,
+# and the only way a job leaks a compose stack is by dying before its own
+# teardown runs: SIGKILL, a cancelled workflow, a runner restart, the slot's
+# MemoryMax. A cleanup step inside the job cannot cover that, and an
+# age-filtered `docker * prune` cannot either — a leaked stack's containers
+# are still RUNNING, so its images and volumes count as in use and every prune
+# skips them while reporting success. So this judges each compose project by
+# whether the job that made it is still alive, not by its name or its age.
+#
+# Every compose project on the daemon (the `com.docker.compose.project`
+# label, never a name prefix) gets a verdict from these signals, in order:
+#
+#   keep label  a container labelled "$COMPOSE_REAP_KEEP_LABEL=true" — the only
+#               opt-out. Restart policies are deliberately NOT one: CI
+#               harnesses boot production compose files that carry
+#               `restart: unless-stopped`.
+#   grace       last activity younger than --grace-minutes: a stack mid-`up`.
+#   pid         the project name ends in `-<pid>` (a harness that names its
+#               stack after its own process), pid >= COMPOSE_REAP_MIN_PID —
+#               below that a `-2` / `-3` is compose numbering a copied
+#               checkout, not a process. Alive while that pid exists AND
+#               started no later than the project's last activity, so a
+#               recycled pid does not keep a dead stack alive.
+#   slot        the project's working dir is under a runner slot's work
+#               folder. Alive while that slot's Runner.Worker (one per job)
+#               exists and started no later than the project's last activity.
+#   age         no signal applies: reaped once idle longer than --max-age-hours.
+#
+# Any "alive" signal wins over a "gone" one. A project that is only volumes is
+# never reaped: a leaked stack's volumes go in the same pass as its
+# containers, and a guess must never delete a data volume whose stack was
+# merely stopped. A reaped project loses its containers (with their anonymous
+# volumes), then its networks, then its named volumes — that project's only,
+# by id. Never a prune: on a shared daemon a prune reaches live jobs.
+#
+# Dry run unless --apply, and --apply refuses on a host with no runner units,
+# where the age guard would take a developer's own stacks. One line per
+# project, then a summary, so a timer's journal shows the leak rate.
+# Running containers with no compose label are outside its reach: counted in
+# the summary (`non-compose-running=N`) so they are visible, never touched.
+#
+# The docker reads and removals go through the compose_* hooks below so a
+# config can stub them without replacing the logic.
+
+# Docker timestamp -> epoch seconds; unparseable -> 0. Containers and volumes
+# give RFC 3339; networks give Go's time.String() (`2026-08-26 22:12:51.64
+# +0200 CEST`), whose trailing zone name GNU date rejects alongside the
+# offset, so retry on the first three fields.
+compose_epoch() { # DOCKER-TIMESTAMP
+  date -d "$1" +%s 2>/dev/null && return 0
+  local a b c _
+  read -r a b c _ <<<"$1"
+  date -d "$a $b $c" +%s 2>/dev/null || echo 0
+}
+
+# PROJECT|ID|CREATED|STARTED|KEEP|WORKING-DIR, one line per compose container.
+compose_containers() {
+  local ids
+  mapfile -t ids < <(docker ps -aq --filter "label=com.docker.compose.project" 2>/dev/null)
+  [ "${#ids[@]}" -gt 0 ] || return 0
+  docker inspect -f "{{index .Config.Labels \"com.docker.compose.project\"}}|{{.Id}}|{{.Created}}|{{.State.StartedAt}}|{{index .Config.Labels \"$COMPOSE_REAP_KEEP_LABEL\"}}|{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}" "${ids[@]}" 2>/dev/null
+}
+
+# PROJECT|ID|CREATED, one line per compose network, and per compose volume.
+compose_networks() {
+  local ids
+  mapfile -t ids < <(docker network ls -q --filter "label=com.docker.compose.project" 2>/dev/null)
+  [ "${#ids[@]}" -gt 0 ] || return 0
+  docker network inspect -f '{{index .Labels "com.docker.compose.project"}}|{{.Id}}|{{.Created}}' "${ids[@]}" 2>/dev/null
+}
+compose_volumes() {
+  local ids
+  mapfile -t ids < <(docker volume ls -q --filter "label=com.docker.compose.project" 2>/dev/null)
+  [ "${#ids[@]}" -gt 0 ] || return 0
+  docker volume inspect -f '{{index .Labels "com.docker.compose.project"}}|{{.Name}}|{{.CreatedAt}}' "${ids[@]}" 2>/dev/null
+}
+
+# "RUNNING COMPOSE-RUNNING": all running containers, and those with the label.
+compose_running_counts() {
+  local all composed
+  all="$(docker ps -q 2>/dev/null | wc -l)" || all=0
+  composed="$(docker ps -q --filter "label=com.docker.compose.project" 2>/dev/null | wc -l)" || composed=0
+  echo "$((all)) $((composed))"
+}
+
+docker_available() { command -v docker >/dev/null 2>&1; }
+
+compose_rm() { # container|network|volume ID
+  case "$1" in
+    container) docker rm -f -v "$2" >/dev/null 2>&1 ;;
+    network)   docker network rm "$2" >/dev/null 2>&1 ;;
+    volume)    docker volume rm "$2" >/dev/null 2>&1 ;;
+  esac
+}
+
+# A slot's work folder: `workFolder` from the runner's .runner file (made
+# absolute against the runner directory), else the runner default `_work`.
+runner_work_folder() { # RUNNER-DIR
+  local wf
+  wf="$(sed -n 's/.*"workFolder"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$1/.runner" 2>/dev/null | head -n1 || true)"
+  wf="${wf:-_work}"
+  case "$wf" in /*) ;; *) wf="$1/$wf" ;; esac
+  echo "${wf%/}"
+}
+
+# When PID started, as epoch seconds; nothing if it is gone or unreadable.
+proc_start_epoch() { # PID
+  local age
+  age="$(proc_age "$1")"
+  [ -n "$age" ] || return 0
+  age_to_epoch "$age"
+}
+
+cmd_compose_reap() { # [--apply] [--project NAME] [--max-age-hours N] [--grace-minutes N]
+  local apply=false only="" max_age="$COMPOSE_REAP_MAX_AGE_HOURS" grace="$COMPOSE_REAP_GRACE_MIN"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --apply)         apply=true; shift ;;
+      --dry-run)       apply=false; shift ;;
+      --project)       need_val "$@"; only="$2"; shift 2 ;;
+      --max-age-hours) need_val "$@"; max_age="$2"; shift 2 ;;
+      --grace-minutes) need_val "$@"; grace="$2"; shift 2 ;;
+      *)               die "unknown option for compose-reap: $1" ;;
+    esac
+  done
+  [[ "$max_age" =~ ^[0-9]+$ ]] || die "--max-age-hours must be a whole number of hours, got '$max_age'"
+  [[ "$grace" =~ ^[0-9]+$ ]] || die "--grace-minutes must be a whole number of minutes, got '$grace'"
+  docker_available || die "docker not found on PATH — compose-reap has nothing to inspect"
+
+  local now u wd wf cg pid start
+  now="$(now_epoch)"
+  # Runner slots: work folder -> epoch start of the job running there (empty
+  # when idle or unreadable — an unreadable slot can only say "gone", so run
+  # as root or the runner user to give it a voice).
+  local -A slot_start=()
+  while read -r u; do
+    [ -n "$u" ] || continue
+    wd="$(prop "$u" WorkingDirectory)"
+    [ -n "$wd" ] || continue
+    wf="$(runner_work_folder "$wd")"
+    cg="$(prop "$u" ControlGroup)"
+    start=""
+    pid="$(proc_worker_pid "$cg")"
+    [ -z "$pid" ] || start="$(proc_start_epoch "$pid")"
+    slot_start["$wf"]="$start"
+  done < <(discover)
+  if $apply && [ "${#slot_start[@]}" -eq 0 ]; then
+    die "no '$UNIT_GLOB' units on this host — refusing compose-reap --apply (this is not a runner host, and the age guard would take its own stacks)"
+  fi
+
+  # Inventory, grouped by project.
+  local -A containers=() networks=() volumes=() last=() net_last=() vol_last=() workdir=() keep=()
+  local projects=() project id created started k t
+  compose_add_project() {
+    [ -n "$1" ] || return 1
+    [ -z "$only" ] || [ "$1" = "$only" ] || return 1
+    [ -n "${last[$1]+x}" ] || { projects+=("$1"); last[$1]=0; net_last[$1]=0; vol_last[$1]=0; }
+  }
+  while IFS='|' read -r project id created started k wd; do
+    compose_add_project "$project" || continue
+    containers[$project]+="$id "
+    t="$(compose_epoch "$created")"; start="$(compose_epoch "$started")"
+    [ "$start" -le "$t" ] || t="$start"
+    [ "$t" -le "${last[$project]}" ] || last[$project]="$t"
+    [ "$k" != "true" ] || keep[$project]=1
+    [ -z "$wd" ] || workdir[$project]="$wd"
+  done < <(compose_containers)
+  while IFS='|' read -r project id created; do
+    compose_add_project "$project" || continue
+    networks[$project]+="$id "
+    t="$(compose_epoch "$created")"
+    [ "$t" -le "${net_last[$project]}" ] || net_last[$project]="$t"
+  done < <(compose_networks)
+  while IFS='|' read -r project id created; do
+    compose_add_project "$project" || continue
+    volumes[$project]+="$id "
+    t="$(compose_epoch "$created")"
+    [ "$t" -le "${vol_last[$project]}" ] || vol_last[$project]="$t"
+  done < <(compose_volumes)
+
+  local mode=dry-run reaped=0 kept=0 n_removed=0 n_failed=0 p seen action reason alive dead ok bad kind n
+  $apply && mode=apply
+  for p in ${projects[@]+"${projects[@]}"}; do
+    seen="${last[$p]}"
+    [ "$seen" -gt 0 ] || seen="${net_last[$p]}"
+    alive="" dead=""
+    if [ -n "${keep[$p]+x}" ]; then action=keep reason=label
+    elif [ -z "${containers[$p]:-}${networks[$p]:-}" ]; then action=keep reason=volume-only
+    elif [ $((now - seen)) -lt $((grace * 60)) ]; then action=keep reason=grace
+    else
+      if [[ "$p" =~ -([0-9]+)$ ]] && [ "${BASH_REMATCH[1]}" -ge "$COMPOSE_REAP_MIN_PID" ]; then
+        pid="${BASH_REMATCH[1]}"
+        start="$(proc_start_epoch "$pid")"
+        if [ -n "$start" ] && [ "$start" -le "$seen" ]; then alive+="pid:$pid "; else dead+="pid:$pid "; fi
+      fi
+      if [ -n "${workdir[$p]:-}" ]; then
+        for wf in "${!slot_start[@]}"; do
+          case "${workdir[$p]%/}/" in
+            "$wf"/*)
+              start="${slot_start[$wf]}"
+              if [ -n "$start" ] && [ "$start" -le "$seen" ]; then alive+="slot "; else dead+="slot "; fi
+              ;;
+          esac
+        done
+      fi
+      if [ -n "$alive" ]; then action=keep reason="live:${alive% }"
+      elif [ -n "$dead" ]; then action=reap reason="gone:${dead% }"
+      elif [ $((now - seen)) -ge $((max_age * 3600)) ]; then action=reap reason=age
+      else action=keep reason=young
+      fi
+    fi
+    [ "$seen" -gt 0 ] || seen="${vol_last[$p]}"
+    printf '%s %s reason=%s idle=%sm containers=%s networks=%s volumes=%s\n' \
+      "$action" "$p" "$reason" "$(( (now - seen) / 60 ))" \
+      "$(wc -w <<<"${containers[$p]:-}")" "$(wc -w <<<"${networks[$p]:-}")" "$(wc -w <<<"${volumes[$p]:-}")"
+    if [ "$action" != reap ]; then kept=$((kept + 1)); continue; fi
+    reaped=$((reaped + 1))
+    $apply || continue
+    ok=0 bad=0
+    for kind in container network volume; do
+      case "$kind" in
+        container) n="${containers[$p]:-}" ;;
+        network)   n="${networks[$p]:-}" ;;
+        volume)    n="${volumes[$p]:-}" ;;
+      esac
+      # shellcheck disable=SC2086  # the id list is space-separated by construction
+      for id in $n; do
+        if compose_rm "$kind" "$id"; then ok=$((ok + 1)); else bad=$((bad + 1)); fi
+      done
+    done
+    n_removed=$((n_removed + ok)); n_failed=$((n_failed + bad))
+  done
+
+  local running composed
+  read -r running composed <<<"$(compose_running_counts)"
+  echo "compose-reap: mode=$mode projects=${#projects[@]} reap=$reaped keep=$kept removed=$n_removed failed=$n_failed slots=${#slot_start[@]} non-compose-running=$(( ${running:-0} - ${composed:-0} ))"
+  [ "$n_failed" -eq 0 ]
+}
+
+# compose-reap-timer: run `compose-reap --apply` hourly from a systemd timer,
+# which is the only way it covers a job that died — nothing inside the job
+# survives to clean up after it. The unit runs as root and executes THIS
+# runnerctl, so install refuses unless that file is root-owned and writable by
+# nobody else: a root timer must never run a script its user can rewrite.
+# `runnerctl install` puts it at /usr/local/bin with exactly those modes.
+COMPOSE_REAP_UNIT="runnerctl-compose-reap"
+
+render_compose_reap_service() { # RUNNERCTL-PATH
+  cat <<UNIT
+# Managed by runnerctl compose-reap-timer — DO NOT EDIT BY HAND.
+[Unit]
+Description=runnerctl: remove Docker Compose projects whose CI job is gone
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=$1 compose-reap --apply
+Nice=10
+UNIT
+}
+
+render_compose_reap_timer() {
+  cat <<UNIT
+# Managed by runnerctl compose-reap-timer — DO NOT EDIT BY HAND.
+[Unit]
+Description=runnerctl: hourly compose-reap
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+}
+
+# Prints why PATH may not run as root, or nothing when it may.
+root_exec_problem() { # PATH
+  local owner mode
+  owner="$(stat -c %u "$1" 2>/dev/null)" || { echo "cannot stat $1"; return 0; }
+  mode="$(stat -c %a "$1" 2>/dev/null)"
+  [ "$owner" = 0 ] || { echo "$1 is owned by uid $owner, not root"; return 0; }
+  case "${mode: -2:1}${mode: -1}" in
+    *[2367]*) echo "$1 is group- or world-writable (mode $mode)" ;;
+  esac
+}
+
+cmd_compose_reap_timer() { # install|status|remove
+  local sub="${1:-status}" self problem
+  shift || true
+  [ $# -eq 0 ] || die "compose-reap-timer $sub takes no arguments"
+  case "$sub" in
+    install)
+      require_runners
+      self="$(readlink -f "$0")"
+      problem="$(root_exec_problem "$self")"
+      [ -z "$problem" ] || die "refusing to install a root timer that runs $self: $problem. Install runnerctl system-wide first ('runnerctl install'), then run compose-reap-timer install from that copy."
+      render_compose_reap_service "$self" | run_priv tee "$SYSTEMD_DIR/$COMPOSE_REAP_UNIT.service" >/dev/null
+      render_compose_reap_timer | run_priv tee "$SYSTEMD_DIR/$COMPOSE_REAP_UNIT.timer" >/dev/null
+      run_priv systemctl daemon-reload
+      echo "Installed $COMPOSE_REAP_UNIT.{service,timer}. What the first run would do:"
+      cmd_compose_reap || true
+      run_priv systemctl enable --now "$COMPOSE_REAP_UNIT.timer"
+      echo "Timer enabled (hourly, compose-reap --apply). Check it with: runnerctl compose-reap-timer status"
+      ;;
+    status)
+      systemctl list-timers --all --no-pager "$COMPOSE_REAP_UNIT.timer" 2>/dev/null || true
+      run_priv journalctl -u "$COMPOSE_REAP_UNIT.service" -n 40 --no-pager
+      ;;
+    remove)
+      run_priv systemctl disable --now "$COMPOSE_REAP_UNIT.timer" || true
+      run_priv rm -f "$SYSTEMD_DIR/$COMPOSE_REAP_UNIT.service" "$SYSTEMD_DIR/$COMPOSE_REAP_UNIT.timer"
+      run_priv systemctl daemon-reload
+      echo "Removed $COMPOSE_REAP_UNIT.{service,timer}."
+      ;;
+    *) die "unknown compose-reap-timer command '$sub' (install status remove)" ;;
+  esac
+}
+
 # May `kill` act on the slot slot_job_facts just described? A deactivating
 # unit is the wedged-stop case and always may — that is the state a hung
 # `restart` leaves behind, and the one only a SIGKILL gets out of.
@@ -4982,6 +5328,16 @@ cmd_config_example() {
 # instead. Counted in POLL_SEC steps.
 #KILL_GRACE_SEC="10"
 
+# `compose-reap`: a Docker Compose project whose job is gone (its `-<pid>`
+# name suffix or its runner slot says so) is reaped at once; one with no
+# owner signal once idle MAX_AGE_HOURS. Younger than GRACE_MIN minutes is
+# always kept; a `-<n>` suffix below MIN_PID is compose numbering, not a pid;
+# a container labelled KEEP_LABEL=true keeps its whole project.
+#COMPOSE_REAP_MAX_AGE_HOURS="3"
+#COMPOSE_REAP_GRACE_MIN="10"
+#COMPOSE_REAP_MIN_PID="300"
+#COMPOSE_REAP_KEEP_LABEL="runnerctl.keep"
+
 # PRESS column (memory pressure, PSI full avg10 in percent): yellow from
 # WARN, red and a `health` problem from CRIT.
 #PRESSURE_WARN_PCT="10"
@@ -5852,6 +6208,8 @@ main() {
     remove-limits)      cmd_remove_limits "$@" ;;
     reap)               cmd_reap "$@" ;;
     kill)               cmd_kill "$@" ;;
+    compose-reap)       cmd_compose_reap "$@" ;;
+    compose-reap-timer) cmd_compose_reap_timer "$@" ;;
     health)             cmd_health "$@" ;;
     fleet)              cmd_fleet "$@" ;;
     profiles)           cmd_profiles "$@" ;;
@@ -5860,7 +6218,7 @@ main() {
     upgrade)            cmd_upgrade "$@" ;;
     version|--version)  echo "runnerctl $RUNNERCTL_VERSION" ;;
     -h|--help|help)     usage ;;
-    *) die "unknown command '$cmd' (status watch health fleet provision deprovision apply scale env-init start stop restart drain enable disable logs remove-limits reap kill profiles config-example migrate install upgrade version)" ;;
+    *) die "unknown command '$cmd' (status watch health fleet provision deprovision apply scale env-init start stop restart drain enable disable logs remove-limits reap kill compose-reap compose-reap-timer profiles config-example migrate install upgrade version)" ;;
   esac
 }
 
