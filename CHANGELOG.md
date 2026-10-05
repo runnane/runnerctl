@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.15.0](https://github.com/runnane/runnerctl/compare/v0.14.0...v0.15.0) (2026-10-05)
+
+
+### Features
+
+* compose-reap --standalone — reap unlabelled containers a dead job left running, and the images they pinned ([#71](https://github.com/runnane/runnerctl/issues/71)) ([3e33bd0](https://github.com/runnane/runnerctl/commit/3e33bd09915dc2ff247ea77a1a87e1616fd4183a))
+* compose-reap — remove Docker Compose stacks whose CI job is gone, hourly from a root timer ([#69](https://github.com/runnane/runnerctl/issues/69)) ([9667838](https://github.com/runnane/runnerctl/commit/96678389bf6f58d787762d2bdef1511a471034f1))
+
 ## [0.14.0](https://github.com/runnane/runnerctl/compare/v0.13.0...v0.14.0) (2026-09-24)
 
 
