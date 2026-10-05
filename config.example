@@ -33,6 +33,16 @@
 # instead. Counted in POLL_SEC steps.
 #KILL_GRACE_SEC="10"
 
+# `compose-reap`: a Docker Compose project whose job is gone (its `-<pid>`
+# name suffix or its runner slot says so) is reaped at once; one with no
+# owner signal once idle MAX_AGE_HOURS. Younger than GRACE_MIN minutes is
+# always kept; a `-<n>` suffix below MIN_PID is compose numbering, not a pid;
+# a container labelled KEEP_LABEL=true keeps its whole project.
+#COMPOSE_REAP_MAX_AGE_HOURS="3"
+#COMPOSE_REAP_GRACE_MIN="10"
+#COMPOSE_REAP_MIN_PID="300"
+#COMPOSE_REAP_KEEP_LABEL="runnerctl.keep"
+
 # PRESS column (memory pressure, PSI full avg10 in percent): yellow from
 # WARN, red and a `health` problem from CRIT.
 #PRESSURE_WARN_PCT="10"

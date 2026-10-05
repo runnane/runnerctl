@@ -4685,6 +4685,186 @@ case_scale_save_writes_the_profile_it_scaled_with() {
   expect_cfg "$cfg" "^  # Saved by \`runnerctl scale --save\` on [0-9]{4}-[0-9]{2}-[0-9]{2}\."
 }
 
+# --- compose-reap: compose stacks whose job is gone -----------------------------
+# The fixture in tests/stub.config holds one project per verdict path; these
+# pin each verdict, the removal order and scope, and the two refusals.
+CR_DRY='^compose-reap: mode=dry-run projects=12 reap=5 keep=7 removed=0 failed=0 slots=3 non-compose-running=4$'
+
+case_compose_reap_dry_run_judges_every_project() {
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_WORKER=1 run compose-reap
+  expect_rc 0
+  expect_out '^reap harness-123456 reason=gone:pid:123456 idle=120m containers=1 networks=1 volumes=0$'
+  expect_out '^keep harness-4242 reason=live:pid:4242 '
+  expect_out '^reap harness-777 reason=gone:pid:777 '
+  expect_out '^keep slotone reason=live:slot '
+  expect_out '^reap slottwo reason=gone:slot '
+  expect_out '^reap stale reason=age idle=240m containers=1 networks=1 volumes=1$'
+  expect_out '^keep young reason=young idle=60m '
+  expect_out '^keep app-2 reason=young '
+  expect_out '^keep fresh-1234 reason=grace idle=2m '
+  expect_out '^keep pinned reason=label '
+  expect_out '^reap netonly reason=age idle=300m containers=0 networks=1 volumes=0$'
+  expect_out '^keep leftover reason=volume-only '
+  expect_out "$CR_DRY"
+  expect_no_log '^docker rm'
+}
+
+case_compose_reap_without_a_worker_the_slot_stack_is_gone() {
+  # No Runner.Worker on slot-1 any more: the job that owned the stack ended.
+  RUNNERCTL_STUB_COMPOSE=1 run compose-reap
+  expect_rc 0
+  expect_out '^reap slotone reason=gone:slot '
+}
+
+case_compose_reap_apply_removes_only_reaped_projects_in_order() {
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_WORKER=1 run compose-reap --apply
+  expect_rc 0
+  expect_log_order '^docker rm container c-stale$' '^docker rm network n-stale$' '^docker rm volume v-stale$'
+  expect_log_order '^docker rm container c-pidgone$' '^docker rm network n-pidgone$'
+  expect_log_count '^docker rm ' 8
+  expect_log '^docker rm network n-netonly$'
+  expect_no_log '^docker rm .*(c-pidlive|c-slot1|c-young|c-app2|c-fresh|c-pinned|v-leftover)$'
+  expect_no_log 'prune'
+  expect_out '^compose-reap: mode=apply projects=12 reap=5 keep=7 removed=8 failed=0 '
+}
+
+case_compose_reap_apply_refuses_without_runner_units() {
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_NO_UNITS=1 run compose-reap --apply
+  expect_rc 1
+  expect_err 'refusing compose-reap --apply'
+  expect_no_log '^docker rm'
+  # A dry run still reports: it is how a dev box sees what --apply would do.
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_NO_UNITS=1 run compose-reap
+  expect_rc 0
+  expect_out 'mode=dry-run projects=12 .* slots=0 '
+}
+
+case_compose_reap_project_filter() {
+  RUNNERCTL_STUB_COMPOSE=1 run compose-reap --apply --project stale
+  expect_rc 0
+  expect_out_count '^(reap|keep) ' 1
+  expect_out '^reap stale reason=age '
+  expect_log_count '^docker rm ' 3
+}
+
+case_compose_reap_age_and_grace_flags() {
+  # --max-age-hours 1 makes the 2 h `app-2` old enough; --grace-minutes 1
+  # stops sparing the 2-minute-old `fresh-1234`, whose pid is gone.
+  RUNNERCTL_STUB_COMPOSE=1 run compose-reap --max-age-hours 1 --grace-minutes 1
+  expect_rc 0
+  expect_out '^reap app-2 reason=age '
+  expect_out '^reap fresh-1234 reason=gone:pid:1234 '
+}
+
+case_compose_reap_a_failed_removal_fails_the_run() {
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_WORKER=1 RUNNERCTL_STUB_COMPOSE_RM_FAIL=n-stale run compose-reap --apply
+  expect_rc 1
+  expect_log '^docker rm volume v-stale$'
+  expect_out ' removed=7 failed=1 '
+}
+
+case_compose_reap_refuses_bad_input() {
+  run compose-reap --max-age-hours 3h
+  expect_rc 1
+  expect_err 'max-age-hours must be a whole number'
+  run compose-reap --grace-minutes
+  expect_rc 1
+  run compose-reap --bogus
+  expect_rc 1
+  expect_err 'unknown option for compose-reap: --bogus'
+  RUNNERCTL_STUB_NO_DOCKER=1 run compose-reap
+  expect_rc 1
+  expect_err 'docker not found'
+  expect_no_log '^docker rm'
+}
+
+case_compose_reap_empty_daemon() {
+  run compose-reap --apply
+  expect_rc 0
+  expect_out '^compose-reap: mode=apply projects=0 reap=0 keep=0 removed=0 failed=0 slots=3 non-compose-running=0$'
+}
+
+case_compose_reap_timer_refuses_a_user_writable_runnerctl() {
+  run compose-reap-timer install
+  expect_rc 1
+  expect_err 'refusing to install a root timer .* not root'
+  expect_no_log '^tee '
+  expect_no_log '^systemctl'
+}
+
+case_compose_reap_timer_install_status_remove() {
+  RUNNERCTL_STUB_ROOT_EXEC_OK=1 run compose-reap-timer install
+  expect_rc 0
+  expect_file /etc/systemd/system/runnerctl-compose-reap.service '^ExecStart=/.*/runnerctl compose-reap --apply$'
+  expect_file /etc/systemd/system/runnerctl-compose-reap.service '^Requires=docker\.service$'
+  expect_file /etc/systemd/system/runnerctl-compose-reap.timer '^OnCalendar=hourly$'
+  expect_log_order '^tee .*runnerctl-compose-reap\.service$' '^tee .*runnerctl-compose-reap\.timer$' \
+    '^systemctl daemon-reload$' '^systemctl enable --now runnerctl-compose-reap\.timer$'
+  expect_out 'mode=dry-run'
+  run compose-reap-timer remove
+  expect_rc 0
+  expect_log_order '^systemctl disable --now runnerctl-compose-reap\.timer$' \
+    '^rm -f .*runnerctl-compose-reap\.service .*runnerctl-compose-reap\.timer$' '^systemctl daemon-reload$'
+  run compose-reap-timer status
+  expect_log '^journalctl -u runnerctl-compose-reap\.service -n 40 --no-pager$'
+  run compose-reap-timer install extra
+  expect_rc 1
+  run compose-reap-timer frobnicate
+  expect_rc 1
+  expect_err "unknown compose-reap-timer command 'frobnicate'"
+}
+
+case_compose_reap_real_helpers() {
+  # The stub shadows the docker hooks, so their real bodies are covered here.
+  run_fn compose_epoch 2001-09-09T01:46:40.000000000Z
+  expect_out '^1000000000$'
+  run_fn compose_epoch '2001-09-09 01:46:40.64 +0000 UTC'
+  expect_out '^1000000000$'
+  run_fn compose_epoch 'not a date'
+  expect_out '^0$'
+
+  local d; d="$(mktemp -d)"
+  run_fn runner_work_folder "$d"
+  expect_out "^$d/_work\$"
+  printf '{\n  "agentName": "x",\n  "workFolder": "/srv/work/"\n}\n' >"$d/.runner"
+  run_fn runner_work_folder "$d"
+  expect_out '^/srv/work$'
+
+  : >"$d/self"; chmod 755 "$d/self"
+  run_fn root_exec_problem "$d/self"
+  expect_out "^$d/self is owned by uid $(id -u), not root\$"
+
+  # compose_containers against a fake docker: ids from `ps`, then one inspect
+  # with the project, keep-label and working-dir template fields in order.
+  mkdir -p "$d/bin"
+  cat >"$d/bin/docker" <<'FAKE'
+#!/usr/bin/env bash
+case "$1" in
+  ps)      echo c1 ;;
+  inspect) printf '%s\n' "$*" >"${0%/*}/../inspect.args"; echo 'proj-9000|c1|2001-09-09T01:46:40Z|2001-09-09T01:46:41Z|true|/w' ;;
+esac
+FAKE
+  chmod 755 "$d/bin/docker"
+  local saved="$PATH"
+  PATH="$d/bin:$PATH"
+  run_fn compose_containers
+  PATH="$saved"
+  expect_out '^proj-9000\|c1\|2001-09-09T01:46:40Z\|2001-09-09T01:46:41Z\|true\|/w$'
+  _expect
+  grep -q 'runnerctl.keep' "$d/inspect.args" || FAILS+=("inspect template does not ask for the keep label")
+  grep -q 'com.docker.compose.project.working_dir' "$d/inspect.args" || FAILS+=("inspect template does not ask for the working dir")
+  rm -rf "$d"
+}
+
+case_compose_reap_in_usage() {
+  run help
+  expect_rc 0
+  expect_out 'runnerctl compose-reap \[--apply\]'
+  expect_out 'runnerctl compose-reap-timer install\|status\|remove'
+  run bogus
+  expect_err 'compose-reap compose-reap-timer'
+}
+
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
 t "status: EnvironmentFiles value with embedded '=' survives"       case_status_envfile_value_with_embedded_equals
@@ -5019,6 +5199,21 @@ t "deprovision: the real dir check and token hand-off"                 case_depr
 # --- GHR-48: the real discover(), not the stub's stand-in -------------------
 t "discover: no matching units is empty and exit 0, not a failure"     case_discover_no_matching_units_is_empty_not_a_failure
 t "discover: units still come back, first column only"                 case_discover_still_returns_the_units_when_systemctl_succeeds
+
+# --- compose-reap ---------------------------------------------------------------
+t "compose-reap: one verdict per project, dry run removes nothing"     case_compose_reap_dry_run_judges_every_project
+t "compose-reap: a slot whose worker is gone no longer owns its stack" case_compose_reap_without_a_worker_the_slot_stack_is_gone
+t "compose-reap --apply: reaped projects only, containers->nets->vols" case_compose_reap_apply_removes_only_reaped_projects_in_order
+t "compose-reap --apply: refused on a host with no runner units"       case_compose_reap_apply_refuses_without_runner_units
+t "compose-reap --project: one project judged and removed"             case_compose_reap_project_filter
+t "compose-reap: --max-age-hours and --grace-minutes move the line"    case_compose_reap_age_and_grace_flags
+t "compose-reap: a failed removal is counted and fails the run"        case_compose_reap_a_failed_removal_fails_the_run
+t "compose-reap: bad input and no docker refuse before any removal"    case_compose_reap_refuses_bad_input
+t "compose-reap: an empty daemon is a clean summary"                   case_compose_reap_empty_daemon
+t "compose-reap-timer: refuses to run a user-writable runnerctl"       case_compose_reap_timer_refuses_a_user_writable_runnerctl
+t "compose-reap-timer: install, status and remove"                     case_compose_reap_timer_install_status_remove
+t "compose-reap: the real epoch, work-folder, owner and docker hooks"  case_compose_reap_real_helpers
+t "compose-reap: listed in the usage and the unknown-command list"     case_compose_reap_in_usage
 
 # --- Summary ------------------------------------------------------------------
 echo

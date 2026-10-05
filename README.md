@@ -209,6 +209,9 @@ runnerctl remove-limits [<unit|slot-index|name> ...]
 runnerctl reap [--dry-run] [<unit|slot-index|name> ...]
 runnerctl kill [--dry-run] [--if-stalled] [--stall-after N] \
                [<unit|slot-index|name> ...]
+runnerctl compose-reap [--apply] [--project NAME] [--max-age-hours N] \
+                       [--grace-minutes N]
+runnerctl compose-reap-timer install|status|remove
 runnerctl health [--quiet] [--max-restarts N] [--stall-after N] [--restart-stalled]
 runnerctl profiles
 runnerctl config-example
@@ -329,6 +332,50 @@ A busy slot is skipped, never signalled; `--dry-run` lists what would go.
 It needs to see the cgroup (root or the runner user) and the journal to
 know the slot is idle, and dies with a hint otherwise. For leaks that come
 back every job, fix the workflow step; `reap` from cron is the stopgap.
+
+### Removing compose stacks a dead job left behind: `compose-reap`
+
+The slots on a host share one Docker daemon, and a job that dies before its
+own teardown runs (a cancelled workflow, `MemoryMax`, a runner restart)
+leaves its compose stack **running**. Its images and volumes then count as in
+use, so an age-filtered `docker * prune` skips them forever while reporting
+success, and the disk fills a few GB a day. `compose-reap` judges every
+compose project on the daemon by whether the job that made it is still alive:
+
+| signal | the project is alive while… |
+| --- | --- |
+| `label` | any of its containers carries `runnerctl.keep=true` (`COMPOSE_REAP_KEEP_LABEL`) — the only opt-out |
+| `grace` | its last activity is under `--grace-minutes` (default 10) old: a stack mid-`up` |
+| `pid` | its name ends in `-<pid>` (pid ≥ `COMPOSE_REAP_MIN_PID`, 300) and that process exists and is older than the stack, so a recycled pid does not count |
+| `slot` | its working dir is under a runner slot's work folder and that slot's `Runner.Worker` exists and is older than the stack |
+| `age` | none of the above applies, and it is under `--max-age-hours` (default 3) idle |
+
+```
+$ sudo runnerctl compose-reap
+reap ci-harness-48211 reason=gone:pid:48211 idle=849m containers=2 networks=2 volumes=2
+keep ci-harness-51007 reason=live:pid:51007 idle=4m containers=3 networks=2 volumes=2
+keep pg-scratch reason=volume-only idle=781m containers=0 networks=0 volumes=1
+compose-reap: mode=dry-run projects=3 reap=1 keep=2 removed=0 failed=0 slots=4 non-compose-running=0
+```
+
+It is a dry run unless `--apply`, and `--apply` refuses on a host with no
+runner units, where the age guard would take a developer's own stacks. A
+reaped project loses its containers (with their anonymous volumes), then its
+networks, then its named volumes — by id, never a prune, because on a shared
+daemon a prune reaches other jobs. A project that is only volumes is never
+reaped. Running containers without a compose label are outside its reach:
+they are counted in the summary (`non-compose-running`) so a leak of that
+kind is visible, and never touched. Run it as root (the timer does) so it
+can read every slot's processes; a slot it cannot read can only look idle.
+
+Nothing inside a job survives its death to clean up after it, so the useful
+form is the timer: `runnerctl compose-reap-timer install` writes
+`runnerctl-compose-reap.{service,timer}` (hourly, `compose-reap --apply`),
+enables it and prints a dry run of the first pass. The unit runs as root and
+executes this runnerctl, so `install` refuses unless the file is root-owned
+and writable by nobody else — which is what `runnerctl install` leaves at
+`/usr/local/bin`. `compose-reap-timer status` shows the timer and the last
+runs' journal; `remove` takes both units away.
 
 ### Colour
 
@@ -1025,6 +1072,8 @@ exact sudoers line
 - **`provision` and `deprovision`** take a GitHub token, so fanning them out
   copies a credential to every host — and a runner name or slot index means a
   different runner on each host. Run them on the host.
+- **`compose-reap` and `compose-reap-timer`** are per host for now: run them
+  on each host, or install the timer there once.
 - **`watch`** is interactive and **`logs -f`** is streaming; both only make
   sense against one host. Each says so rather than reporting "unknown
   command".
