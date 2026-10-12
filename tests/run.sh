@@ -392,7 +392,9 @@ case_status_table() {
   expect_out_count '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: [0-9]+ cores, ' 1
   # GHR-34: host_line() is stubbed, so the fragment after "Host: " is exact,
   # not just shaped — this is what made the --color always diff case flake.
-  expect_out '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: 16 cores, 64Gi RAM, 48Gi available$'
+  # GHR-64: the stubbed root drive rides on the same line, and an empty
+  # event window adds nothing to it.
+  expect_out '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: 16 cores, 64Gi RAM, 48Gi available — Disk: / 24% \(353\.9G free\)$'
   expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$'
   # slot-1 also carries MemoryPeak (GHR-8), so USED is current/peak; PRESS
   # is — until the stub answers cgroup_memory_facts (GHR-31).
@@ -1340,7 +1342,10 @@ case_watch_three_iterations_redraw_frames() {
   # every frame carries the version header too (GHR-32), with the same
   # pinned host_line() fragment as `status` on every redraw (GHR-34)
   expect_out_count '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: ' 3
-  expect_out_count '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: 16 cores, 64Gi RAM, 48Gi available$' 3
+  expect_out_count '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: 16 cores, 64Gi RAM, 48Gi available — Disk: / 24% \(353\.9G free\)$' 3
+  # GHR-64: the host journal search is memoised like the per-slot one —
+  # one scan for three frames inside JOURNAL_CACHE_TTL.
+  expect_log_count '^probe:journal_host_events ' 1
   expect_out_count '^0 +example\.slot-1 .* my-app:test \(12m\)$' 3
   expect_log_count '^probe:pause 1$' 3
   expect_log_count '^probe:unit_props ' 9
@@ -1474,7 +1479,7 @@ case_journal_restart_reason_line_no_match() {
 case_status_json_parses_and_carries_the_slot_facts() {
   run status --json
   expect_rc 0
-  expect_out '^\{"runnerctl":"[0-9]+\.[0-9]+\.[0-9]+","host":\{"name":"stub-host-1","cores":16,"mem_total":68719476736,"mem_available":51539607552\},$'
+  expect_out '^\{"runnerctl":"[0-9]+\.[0-9]+\.[0-9]+","host":\{"name":"stub-host-1","cores":16,"mem_total":68719476736,"mem_available":51539607552,"disks":\[.*\],"events":\{.*\}\},$'
   expect_out '^ "slots":\[$'
   expect_out '^\]\}$'
   # read-only, like the table: no privileged call at all.
@@ -1483,7 +1488,7 @@ case_status_json_parses_and_carries_the_slot_facts() {
   expect_no_out '^note:'
   if ! $HAVE_PYTHON3; then skip "python3 not on PATH: status --json parse assertions not run"; return 0; fi
   expect_json 'len(d["slots"]) == 3'
-  expect_json 'd["host"] == {"name": "stub-host-1", "cores": 16, "mem_total": 68719476736, "mem_available": 51539607552}'
+  expect_json '{k: v for k, v in d["host"].items() if k not in ("disks", "events")} == {"name": "stub-host-1", "cores": 16, "mem_total": 68719476736, "mem_available": 51539607552}'
   # GHR-32: the version the script carries, so a fleet can be inventoried
   expect_json 'isinstance(d["runnerctl"], str) and len(d["runnerctl"].split(".")) == 3 and all(x.isdigit() for x in d["runnerctl"].split("."))'
   expect_json '[s["idx"] for s in d["slots"]] == [0, 1, 2]'
@@ -4958,6 +4963,99 @@ case_compose_reap_in_usage() {
   expect_err 'compose-reap compose-reap-timer'
 }
 
+
+# --- Host disks and journal events (GHR-64) ----------------------------------
+case_status_host_disks_and_events() {
+  RUNNERCTL_STUB_DISKS=full RUNNERCTL_STUB_HOST_EVENTS=events run status
+  expect_rc 0
+  # every fixed drive on the header line, a mount point with a space intact,
+  # then the window's host-wide OOM kills (the cgroup one is not counted)
+  expect_out '^runnerctl [0-9.]+ — Host: 16 cores, 64Gi RAM, 48Gi available — Disk: / 24% \(353\.9G free\), /var/lib/docker 96% \(37\.3G free\), /srv/build cache 88% \(223\.5G free\) — last 1h: 2 OOM kills, 1 disk-full$'
+  # the column header stays the third line — fleet status/watch index it
+  [ "$(sed -n 3p <<<"$OUT")" = "$(grep -E '^IDX ' <<<"$OUT")" ] || FAILS+=("column header is not line 3")
+  NEXPECT=$((NEXPECT + 1))
+  # searched from now_epoch (1000000720) minus EVENTS_SEC (3600)
+  expect_log_count '^probe:journal_host_events 999997120$' 1
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test) '
+}
+
+case_status_host_disks_color() {
+  RUNNERCTL_STUB_DISKS=full RUNNERCTL_STUB_HOST_EVENTS=events run status --color always
+  expect_rc 0
+  expect_out $'/ 24% \\(353\\.9G free\\), \e\\[31m/var/lib/docker 96% \\(37\\.3G free\\)\e\\[0m, \e\\[33m/srv/build cache 88% \\(223\\.5G free\\)\e\\[0m — \e\\[31mlast 1h: 2 OOM kills, 1 disk-full\e\\[0m$'
+}
+
+case_status_host_events_no_access() {
+  RUNNERCTL_STUB_HOST_EVENTS=no-access run status
+  expect_rc 0
+  # an unreadable journal says nothing on the header rather than "0 events"
+  expect_out '^runnerctl [0-9.]+ — Host: 16 cores, 64Gi RAM, 48Gi available — Disk: / 24% \(353\.9G free\)$'
+}
+
+case_status_host_events_off() {
+  local cfg="$TMP/events-off.config"
+  save_config "$cfg" <<<'EVENTS_SEC=0'
+  RUNNERCTL_STUB_HOST_EVENTS=events run_cfg "$cfg" status
+  expect_rc 0
+  expect_out '— Disk: / 24% \(353\.9G free\)$'
+  expect_no_log '^probe:journal_host_events '
+}
+
+case_status_disk_ignore() {
+  local cfg="$TMP/disk-ignore.config"
+  save_config "$cfg" <<<"DISK_IGNORE='^/var/lib/docker\$'"
+  RUNNERCTL_STUB_DISKS=full run_cfg "$cfg" status
+  expect_rc 0
+  expect_out '— Disk: / 24% \(353\.9G free\), /srv/build cache 88% \(223\.5G free\)$'
+  expect_no_out '/var/lib/docker'
+}
+
+case_status_json_host_disks_events() {
+  if ! $HAVE_PYTHON3; then skip "python3 not installed — host.disks/events not checked"; expect_rc 0; return; fi
+  RUNNERCTL_STUB_DISKS=full RUNNERCTL_STUB_HOST_EVENTS=events run status --json
+  expect_rc 0
+  expect_json 'd["host"]["disks"][0] == {"mount": "/", "device": "/dev/nvme0n1p2", "fstype": "ext4", "size": 500000000000, "used": 120000000000, "avail": 380000000000, "use_pct": 24}'
+  expect_json '[x["mount"] for x in d["host"]["disks"]] == ["/", "/var/lib/docker", "/srv/build cache"]'
+  expect_json 'd["host"]["events"] == {"window": 3600, "oom_kills": 2, "cgroup_oom_kills": 1, "disk_full": 1, "last_oom": 1000000100, "last_oom_process": "cc1plus", "last_disk_full": 999999500, "last_disk_full_source": "dockerd"}'
+}
+
+case_status_json_host_events_null() {
+  if ! $HAVE_PYTHON3; then skip "python3 not installed — host.events null not checked"; expect_rc 0; return; fi
+  RUNNERCTL_STUB_HOST_EVENTS=no-access run status --json
+  expect_rc 0
+  expect_json 'd["host"]["events"] is None'
+  expect_json 'len(d["host"]["disks"]) == 1'
+}
+
+case_health_host_problems() {
+  RUNNERCTL_STUB_DISKS=full RUNNERCTL_STUB_HOST_EVENTS=events run health --max-restarts 99
+  expect_rc 1
+  expect_out '^host: /var/lib/docker is 96% full \(37\.3G free, DISK_CRIT_PCT=95\)$'
+  # 88 % is a warning on the header, not a health problem
+  expect_no_out 'build cache'
+  expect_out "^host: the kernel OOM-killed 2 process\(es\) host-wide in the last 1h \(last: cc1plus\) — "
+  expect_out "^host: 1 'No space left on device' line\(s\) in the journal in the last 1h \(last from dockerd\)$"
+  expect_out_count '^host: ' 3
+  expect_no_out '^ok: '
+}
+
+case_health_host_ok() {
+  # a quiet journal and a 24 % disk add nothing; an unreadable journal is
+  # not a problem either (the slot-level journal note already covers access)
+  RUNNERCTL_STUB_HOST_EVENTS=no-access run health --max-restarts 99
+  expect_no_out '^host: '
+  run health --max-restarts 99
+  expect_no_out '^host: '
+}
+
+case_host_events_parse() {
+  run_fn host_events_parse $'1.5 h kernel: Out of memory: Killed process 1 (a b) x\n2.0 h kernel: Memory cgroup out of memory: Killed process 2 (c)\n3.9 h runsvc.sh[7]: write: No space left on device\n4.0 h kernel: Out of memory: Kill process 3 (old) score 1'
+  expect_rc 0
+  expect_out $'^2\t1\t1\t4\told\t3\trunsvc\\.sh$'
+  run_fn host_events_parse ''
+  expect_out $'^0\t0\t0\t\t\t\t$'
+}
+
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
 t "status: EnvironmentFiles value with embedded '=' survives"       case_status_envfile_value_with_embedded_equals
@@ -5084,6 +5182,16 @@ t "journal_restart_reason_line: unrelated line -> nothing"            case_journ
 # --- GHR-16: status --json ---------------------------------------------------
 t "status --json: parses, host + 3 slots with the raw facts"           case_status_json_parses_and_carries_the_slot_facts
 t "status --json: host.name null when the host cannot be named"        case_status_json_host_name_null_when_unreadable
+t "status: fixed drives and journal events on the header line"         case_status_host_disks_and_events
+t "status --color always: a drive past WARN/CRIT and the events painted" case_status_host_disks_color
+t "status: an unreadable journal adds no event count"                    case_status_host_events_no_access
+t "status: EVENTS_SEC=0 turns the journal search off"                    case_status_host_events_off
+t "status: DISK_IGNORE leaves a mount out"                               case_status_disk_ignore
+t "status --json: host.disks and host.events"                            case_status_json_host_disks_events
+t "status --json: host.events null when the journal is unreadable"       case_status_json_host_events_null
+t "health: a full drive, a host OOM kill and a disk-full line"           case_health_host_problems
+t "health: a quiet host adds no problem"                                 case_health_host_ok
+t "host_events_parse: global vs cgroup OOM, last process and source"     case_host_events_parse
 t "status --json: no runner units is slots:[] and exit 0, not a die"   case_status_json_no_units_is_empty_slots_not_a_die
 t "status: the table still dies on a host with no runner units"        case_status_table_no_units_still_dies
 t "status --json: same unit_props / journal fetches as the table"      case_status_json_same_fetches_as_the_table

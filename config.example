@@ -54,6 +54,20 @@
 #PRESSURE_WARN_PCT="10"
 #PRESSURE_CRIT_PCT="50"
 
+# Disk usage of every fixed drive (a /dev block device, one row per device)
+# on the status header, in percent: yellow from WARN, red and a `health`
+# problem from CRIT. DISK_IGNORE is an ERE over mount points to leave out,
+# e.g. '^/boot/efi$'.
+#DISK_WARN_PCT="85"
+#DISK_CRIT_PCT="95"
+#DISK_IGNORE=""
+
+# Seconds of journal status/health search for host-wide kernel OOM kills and
+# "No space left on device" lines. Either one in the window is a `health`
+# problem (a slot's own cgroup OOM is not — that fails the step by design).
+# 0 turns the search off.
+#EVENTS_SEC="3600"
+
 # Processes matching this ERE are the runner's own and never counted as
 # leaked or reaped. Extend it for an image that wraps the runner differently.
 #RUNNER_OWN_PATTERN='runsvc\.sh|RunnerService\.js|Runner\.(Listener|Worker|PluginHost)'

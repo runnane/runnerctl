@@ -229,7 +229,7 @@ an idle slot, how long it has been idle and how many jobs it has finished
 since it started:
 
 ```
-runnerctl 0.7.0 — Host: 16 cores, 62Gi RAM, 48Gi available
+runnerctl 0.7.0 — Host: 16 cores, 62Gi RAM, 48Gi available — Disk: / 24% (353.9G free), /var/lib/docker 96% (37.3G free) — last 1h: 1 OOM kill
 
 IDX RUNNER                 PROFILE  ACTIVE                              SINCE    ENABLED   MAX    HIGH   USED        PRESS  RESTART  ENVFILE WORKING-ON
 0   org.host-1             ci       active/running                     3d 4h    enabled   26.0G  25.0G  3.1G/24.9G  0.4%   always   —       my-app:test (12m)
@@ -241,6 +241,24 @@ The header leads with the version of the `runnerctl` that is running — each
 host only picks up a new one when `upgrade` runs, so on a fleet that is
 otherwise only visible through a second command — then the host's cores and
 memory.
+
+`Disk:` lists every fixed drive — each mounted `/dev` block device, once per
+device (bind mounts and btrfs subvolumes are not repeated; loop devices,
+network mounts and tmpfs are left out) — with its use and free space, yellow
+from `DISK_WARN_PCT` (config, default 85) and red from `DISK_CRIT_PCT`
+(default 95). `DISK_IGNORE` (an ERE over mount points, e.g. `'^/boot/efi$'`)
+leaves a mount out of the header, `--json` and `health`.
+
+`last 1h:` appears only when the journal holds host trouble in the last
+`EVENTS_SEC` seconds (default 3600, `0` turns the search off): kernel OOM
+kills that were host-wide (`Out of memory: Killed process`) and `No space
+left on device` lines from any unit. A slot's own cgroup-limit OOM (`Memory
+cgroup out of memory`) is not counted here — that is the slot's `MemoryMax`
+doing its job, and it shows on the slot's row. Needs the same journal access
+as `WORKING-ON`; without it nothing is shown, never a zero. Both ride on the
+header line rather than a new one, so `fleet status` and `fleet watch` read a
+host's table unchanged; on a fleet they are in `fleet status --json` and
+`fleet health`.
 
 `ACTIVE` folds in a restart count (`↻3`) when systemd has restarted the unit
 since it was last started by hand (`NRestarts`, which `systemctl
@@ -482,7 +500,7 @@ memory values); no `jq` needed to produce it, and the table and the JSON are
 rendered from one collector, so they cannot disagree on a value:
 
 ```json
-{"runnerctl":"0.7.0","host":{"name":"build-1","cores":16,"mem_total":64424509440,"mem_available":51539607552},
+{"runnerctl":"0.7.0","host":{"name":"build-1","cores":16,"mem_total":64424509440,"mem_available":51539607552,"disks":[{"mount":"/","device":"/dev/nvme0n1p2","fstype":"ext4","size":500000000000,"used":120000000000,"avail":380000000000,"use_pct":24}],"events":{"window":3600,"oom_kills":0,"cgroup_oom_kills":1,"disk_full":0,"last_oom":null,"last_oom_process":null,"last_disk_full":null,"last_disk_full_source":null}},
  "slots":[
   {"idx":0,"unit":"actions.runner.org.host-1.service","name":"org.host-1",
    "active":"active","sub":"running","enabled":"enabled",
@@ -523,7 +541,13 @@ percentages and total stall microseconds; the `PRESS` column is
 `full_avg10`), each object null when the file could not be read. `host`
 carries `name` (the host's own `hostname`, null when it cannot be read),
 `cores`
-(`nproc`) and `mem_total` / `mem_available` (bytes, from `/proc/meminfo`);
+(`nproc`), `mem_total` / `mem_available` (bytes, from `/proc/meminfo`),
+`disks` (one object per fixed drive — `mount`, `device`, `fstype`, `size`,
+`used`, `avail` in bytes and `use_pct` — the drives the header's `Disk:`
+lists) and `events` (the last `EVENTS_SEC` of journal: `window` in seconds,
+`oom_kills` host-wide and `cgroup_oom_kills` per-cgroup, `disk_full` lines,
+and the epoch second, process and syslog identifier of the last of each;
+null when the journal cannot be read or `EVENTS_SEC=0`);
 `runnerctl` is the version of the script that produced the object, for
 inventorying a fleet.
 `--json` is one-shot and refuses `--watch`; poll it instead.
@@ -548,9 +572,11 @@ closes that: exit 0 with `ok: N slot(s) healthy` when every enabled slot is
 `active`/`activating`/`reloading`, no slot has restarted `--max-restarts`
 times (default 5) or more since its last manual start, no job has been
 running for `--stall-after` seconds (default `STALL_SEC`, 1 h) or more, no
-idle slot has leaked processes, and no slot is under full memory pressure
-of `PRESSURE_CRIT_PCT` (50 %) or more; otherwise one line per problem on
-stdout and exit 1:
+idle slot has leaked processes, no slot is under full memory pressure
+of `PRESSURE_CRIT_PCT` (50 %) or more, no fixed drive is at `DISK_CRIT_PCT`
+(95 %) or more, and the journal holds no host-wide OOM kill and no `No space
+left on device` line in the last `EVENTS_SEC` (1 h); otherwise one line per
+problem on stdout and exit 1:
 
 ```
 example.slot-2: enabled but inactive/dead since 3d
@@ -558,6 +584,9 @@ example.slot-1: 7 restarts since last start (oom-kill)
 example.slot-3: stalled — job my-app:build running 1h33m, longer than 1h (--stall-after 3600)
 example.slot-4: 2 leaked process(es) left by finished jobs (node, esbuild) — runnerctl reap 3
 example.slot-5: under full memory pressure 63.2% (avg10, PRESSURE_CRIT_PCT=50) — throttled at MemoryHigh (4 times so far), see USED vs HIGH
+host: /var/lib/docker is 96% full (37.3G free, DISK_CRIT_PCT=95)
+host: the kernel OOM-killed 2 process(es) host-wide in the last 1h (last: cc1plus) — 'journalctl -k -g "Out of memory"' shows them
+host: 1 'No space left on device' line(s) in the journal in the last 1h (last from dockerd)
 ```
 
 `--quiet` drops the output either way and keeps just the exit code, for a

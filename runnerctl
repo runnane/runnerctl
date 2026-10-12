@@ -357,6 +357,15 @@ COMPOSE_REAP_STANDALONE="0"
 # and a `health` problem from CRIT (GHR-31).
 PRESSURE_WARN_PCT="10"
 PRESSURE_CRIT_PCT="50"
+# Disk usage of the host's fixed drives in percent (GHR-64): yellow on the
+# status header from WARN, red and a `health` problem from CRIT. DISK_IGNORE
+# is an ERE over mount points left out of all three surfaces (empty = none).
+DISK_WARN_PCT="85"
+DISK_CRIT_PCT="95"
+DISK_IGNORE=""
+# How far back status/health look in the journal for host-wide OOM kills and
+# "No space left on device" lines, in seconds (GHR-64). 0 turns it off.
+EVENTS_SEC="3600"
 # Fleet mode (GHR-39): one central node driving several runner hosts over ssh.
 # FLEET_HOSTS is the inventory — ssh aliases or user@host — and lives in the
 # config file, never here: it is site data, and this repo is public. Empty
@@ -456,6 +465,8 @@ load_config() {
   [[ "$COMPOSE_REAP_STANDALONE" =~ ^[01]$ ]] || die "COMPOSE_REAP_STANDALONE '$COMPOSE_REAP_STANDALONE' set in $CONFIG_FILE is invalid — want 0 or 1"
   [[ "$COMPOSE_REAP_KEEP_LABEL" =~ ^[A-Za-z0-9._/-]+$ ]] || die "COMPOSE_REAP_KEEP_LABEL '$COMPOSE_REAP_KEEP_LABEL' set in $CONFIG_FILE is invalid — want a Docker label key"
   [[ "$PRESSURE_WARN_PCT" =~ ^[0-9]+$ && "$PRESSURE_CRIT_PCT" =~ ^[0-9]+$ ]] || die "PRESSURE_WARN_PCT/PRESSURE_CRIT_PCT set in $CONFIG_FILE are invalid — want whole percentages"
+  [[ "$DISK_WARN_PCT" =~ ^[0-9]+$ && "$DISK_CRIT_PCT" =~ ^[0-9]+$ ]] || die "DISK_WARN_PCT/DISK_CRIT_PCT set in $CONFIG_FILE are invalid — want whole percentages"
+  [[ "$EVENTS_SEC" =~ ^[0-9]+$ ]] || die "EVENTS_SEC '$EVENTS_SEC' set in $CONFIG_FILE is invalid — want a whole number of seconds (0 turns the journal search off)"
   # Fleet settings (GHR-39). Validated here, once, rather than per host: a
   # typo in a fleet-wide config should fail before anything is dialled, not
   # produce N identical errors after N connections have been made.
@@ -1795,7 +1806,11 @@ render_status() {
   require_runners
   # The version leads the header (GHR-32): `upgrade` fetches main, so what a
   # host actually runs is otherwise only visible through a second command.
-  echo "runnerctl $RUNNERCTL_VERSION — Host: $(host_line)"
+  # Disks and journal events (GHR-64) ride on this same line rather than a
+  # new one: `fleet status` and `fleet watch` read the column header as the
+  # third line of a host's output, and a host's table must not move it.
+  collect_host
+  echo "runnerctl $RUNNERCTL_VERSION — Host: $(host_line)$(host_header_suffix)"
   echo
   paint "$C_BOLD" "$(status_row IDX RUNNER PROFILE ACTIVE SINCE ENABLED MAX HIGH USED PRESS RESTART ENVFILE WORKING-ON)"
   local i=0 u no_access=false stalled=false leaked=false
@@ -1922,6 +1937,194 @@ host_name() {
   hostname 2>/dev/null || uname -n 2>/dev/null || true
 }
 
+# --- Host disks and journal events (GHR-64) ----------------------------------
+# A runner host that fills its disk (docker layers, workspaces, caches) or
+# takes a host-wide OOM kill says nothing about it in the slot rows: the
+# per-slot memory_events.oom_kill (GHR-31) only sees a slot's own cgroup
+# limit. These two hooks are the host's half, read once per status/health.
+
+# One line per fixed drive: "DEVICE FSTYPE SIZE USED AVAIL PCT MOUNT", sizes
+# in bytes, PCT without the %. Fixed = a /dev block device that is not a loop
+# device (snaps, images) or read-only media; one row per device, the first
+# mount df lists, so bind mounts and btrfs subvolumes are not counted twice.
+# MOUNT is last so a mount point with a space in it survives `read`. Behind
+# a function so a test config can pin it.
+host_disks() {
+  df -B1 --output=source,fstype,size,used,avail,pcent,target 2>/dev/null \
+    | awk 'NR > 1 && $1 ~ /^\/dev\// && $1 !~ /^\/dev\/loop/ \
+             && $2 !~ /^(squashfs|iso9660|udf)$/ && !seen[$1]++ { sub(/%/, "", $6); print }' || true
+}
+
+# Each fixed drive as "PCT<TAB>AVAIL<TAB>MOUNT<TAB>DEVICE<TAB>FSTYPE<TAB>SIZE<TAB>USED",
+# DISK_IGNORE applied — the one reader the header, --json and health share.
+host_disk_rows() {
+  local dev fs size used avail pct mnt
+  while read -r dev fs size used avail pct mnt; do
+    [ -n "$mnt" ] || continue
+    [ -z "$DISK_IGNORE" ] || ! [[ "$mnt" =~ $DISK_IGNORE ]] || continue
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$pct" "$avail" "$mnt" "$dev" "$fs" "$size" "$used"
+  done < <(host_disks)
+}
+
+# The journal lines that are host trouble, since epoch SINCE, as
+# `journalctl -o short-unix` prints them: kernel OOM kills (global and
+# cgroup-limit, told apart by host_events_parse) and "No space left on
+# device" from any unit. Fails when the journal cannot be read, because "no
+# events" must not be what an unreadable journal looks like.
+#
+# Two calls, because one cannot tell those apart. `journalctl -g` exits 1
+# when NOTHING MATCHES — measured, as root, on a readable journal — which is
+# the same status it gives a user outside systemd-journal. So access is asked
+# first with `-n 1` (--system: a plain journalctl answers an unreadable
+# journal with exit 0), which exits 0 on an empty window too, and the search
+# itself is then allowed to "fail". Behind a function so a test config can
+# pin it.
+HOST_EVENTS_PATTERN='Out of memory: Kill(ed)? process|Memory cgroup out of memory|No space left on device'
+journal_host_events() { # SINCE-EPOCH
+  journalctl --system -q --no-pager -n 1 >/dev/null 2>&1 || return 1
+  journalctl --system -q --no-pager -o short-unix --since "@$1" -g "$HOST_EVENTS_PATTERN" 2>/dev/null || true
+}
+
+# journal_host_events, memoised under `watch` like journal_job_lines_cached:
+# a redraw every 2 s is not worth a journal scan every 2 s.
+journal_host_events_cached() { # SINCE-EPOCH
+  [ -n "$JOURNAL_MEMO_DIR" ] || { journal_host_events "$@"; return; }
+  local f="$JOURNAL_MEMO_DIR/host-events" out rc=0
+  if [ ! -f "$f.rc" ]; then
+    out="$(journal_host_events "$@")" || rc=$?
+    printf '%s\n' "$out" >"$f"
+    echo "$rc" >"$f.rc"
+  fi
+  cat "$f"
+  return "$(cat "$f.rc")"
+}
+
+# Parse those lines into one tab-separated record:
+#   OOM CGROUP-OOM DISK-FULL LAST-OOM-TS LAST-OOM-PROC LAST-DF-TS LAST-DF-SOURCE
+# OOM is the kernel's host-wide kill ("Out of memory: Killed process N
+# (comm)"); a "Memory cgroup out of memory" line is a cgroup limit — a slot's
+# MemoryMax, which GHR-28 makes a step failure by design — and counted apart.
+# LAST-DF-SOURCE is the syslog identifier of the last disk-full line. Pure,
+# so it is unit-testable (`run_fn`).
+host_events_parse() { # LINES
+  local line oom=0 cg=0 df=0 oom_ts="" oom_proc="" df_ts="" df_src="" rest
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    case "$line" in
+      *"Memory cgroup out of memory"*)
+        cg=$((cg + 1)) ;;
+      *"Out of memory: Kill"*" process "*)
+        oom=$((oom + 1)); oom_ts="${line%% *}"; oom_ts="${oom_ts%%.*}"
+        rest="${line#*process }"; oom_proc=""
+        if [[ "$rest" == *"("*")"* ]]; then rest="${rest#*\(}"; oom_proc="${rest%%\)*}"; fi ;;
+      *"No space left on device"*)
+        df=$((df + 1)); df_ts="${line%% *}"; df_ts="${df_ts%%.*}"
+        rest="${line#* }"; rest="${rest#* }"; df_src="${rest%%:*}"; df_src="${df_src%%\[*}" ;;
+    esac
+  done <<<"$1"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$oom" "$cg" "$df" "$oom_ts" "$oom_proc" "$df_ts" "$df_src"
+}
+
+# The host facts every surface reads, into HOST (an associative array) —
+# like collect_slot fills SLOT, so the header, --json and health cannot
+# disagree. HOST[disks] is host_disk_rows' output; HOST[events] is "ok",
+# "off" (EVENTS_SEC=0) or "no-access", and with "ok" the parsed counts.
+declare -A HOST=()
+collect_host() {
+  local lines rc=0
+  HOST=()
+  HOST[disks]="$(host_disk_rows)"
+  if [ "$EVENTS_SEC" -eq 0 ]; then
+    HOST[events]=off; return 0
+  fi
+  lines="$(journal_host_events_cached "$(( $(now_epoch) - EVENTS_SEC ))")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    HOST[events]=no-access; return 0
+  fi
+  HOST[events]=ok
+  IFS=$'\t' read -r 'HOST[oom]' 'HOST[cgroup_oom]' 'HOST[disk_full]' 'HOST[last_oom]' 'HOST[last_oom_proc]' \
+    'HOST[last_disk_full]' 'HOST[last_disk_full_src]' < <(host_events_parse "$lines")
+}
+
+# How full is full: "crit", "warn" or nothing, for a percentage.
+disk_level() { # PCT
+  [[ "${1:-}" =~ ^[0-9]+$ ]] || return 0
+  if [ "$1" -ge "$DISK_CRIT_PCT" ]; then echo crit
+  elif [ "$1" -ge "$DISK_WARN_PCT" ]; then echo warn
+  fi
+}
+
+# ARGS joined by SEP.
+join_by() { # SEP ARGS...
+  local sep="$1" out="" a; shift
+  for a in "$@"; do out+="${out:+$sep}$a"; done
+  printf '%s\n' "$out"
+}
+
+# The header's " — Disk: / 24% (354.0G free), /data 91% (45.0G free)" and,
+# when the window holds any, " — last 1h: 2 OOM kills, 1 disk-full", painted
+# per mount. Empty when there is nothing to say. Reads HOST.
+host_header_suffix() {
+  local out="" pct avail mnt cells=() color
+  while IFS=$'\t' read -r pct avail mnt _; do
+    [ -n "$mnt" ] || continue
+    case "$(disk_level "$pct")" in
+      crit) color="$C_RED" ;; warn) color="$C_YELLOW" ;; *) color="" ;;
+    esac
+    cells+=("$(paint "$color" "$mnt $pct% ($(hbytes "$avail") free)")")
+  done <<<"${HOST[disks]}"
+  if [ "${#cells[@]}" -gt 0 ]; then
+    out+=" — Disk: $(join_by ", " "${cells[@]}")"
+  fi
+  if [ "${HOST[events]}" = ok ]; then
+    cells=()
+    [ "${HOST[oom]}" -eq 0 ] || cells+=("${HOST[oom]} OOM kill$([ "${HOST[oom]}" -eq 1 ] || echo s)")
+    [ "${HOST[disk_full]}" -eq 0 ] || cells+=("${HOST[disk_full]} disk-full")
+    if [ "${#cells[@]}" -gt 0 ]; then
+      out+=" — $(paint "$C_RED" "last $(fmt_dur "$EVENTS_SEC"): $(join_by ", " "${cells[@]}")")"
+    fi
+  fi
+  printf '%s\n' "$out"
+}
+
+# The `health` problems the host facts carry, one per line. Reads HOST.
+host_problems() {
+  local pct avail mnt
+  while IFS=$'\t' read -r pct avail mnt _; do
+    [ -n "$mnt" ] || continue
+    [ "$(disk_level "$pct")" = crit ] || continue
+    echo "host: $mnt is $pct% full ($(hbytes "$avail") free, DISK_CRIT_PCT=$DISK_CRIT_PCT)"
+  done <<<"${HOST[disks]}"
+  [ "${HOST[events]}" = ok ] || return 0
+  if [ "${HOST[oom]}" -gt 0 ]; then
+    echo "host: the kernel OOM-killed ${HOST[oom]} process(es) host-wide in the last $(fmt_dur "$EVENTS_SEC")${HOST[last_oom_proc]:+ (last: ${HOST[last_oom_proc]})} — 'journalctl -k -g \"Out of memory\"' shows them"
+  fi
+  if [ "${HOST[disk_full]}" -gt 0 ]; then
+    echo "host: ${HOST[disk_full]} 'No space left on device' line(s) in the journal in the last $(fmt_dur "$EVENTS_SEC")${HOST[last_disk_full_src]:+ (last from ${HOST[last_disk_full_src]})}"
+  fi
+}
+
+# --json's "disks":[...] array. Reads HOST.
+host_disks_json() {
+  local pct avail mnt dev fs size used sep="" out="["
+  while IFS=$'\t' read -r pct avail mnt dev fs size used; do
+    [ -n "$mnt" ] || continue
+    out+="$sep{\"mount\":$(json_str "$mnt"),\"device\":$(json_str "$dev"),\"fstype\":$(json_strn "$fs"),\"size\":$(json_num "$size"),\"used\":$(json_num "$used"),\"avail\":$(json_num "$avail"),\"use_pct\":$(json_num "$pct")}"
+    sep=","
+  done <<<"${HOST[disks]}"
+  printf '%s]\n' "$out"
+}
+
+# --json's "events":{...}, null when the journal could not be read or the
+# search is off. Reads HOST.
+host_events_json() {
+  [ "${HOST[events]}" = ok ] || { echo null; return; }
+  printf '{"window":%s,"oom_kills":%s,"cgroup_oom_kills":%s,"disk_full":%s,"last_oom":%s,"last_oom_process":%s,"last_disk_full":%s,"last_disk_full_source":%s}\n' \
+    "$(json_num "$EVENTS_SEC")" "$(json_num "${HOST[oom]}")" "$(json_num "${HOST[cgroup_oom]}")" \
+    "$(json_num "${HOST[disk_full]}")" "$(json_num "${HOST[last_oom]}")" "$(json_strn "${HOST[last_oom_proc]}")" \
+    "$(json_num "${HOST[last_disk_full]}")" "$(json_strn "${HOST[last_disk_full_src]}")"
+}
+
 # `status --json`: the same SLOT facts as raw bytes, epoch seconds and null
 # — formatting is the consumer's job. The top-level object carries
 # `runnerctl` (the version of the script that produced it, GHR-32) and
@@ -1956,9 +2159,11 @@ render_status_json() {
   # wrong box should be told so.
   local cores mem_total mem_avail i=0 u sep="" job idle_since completed
   read -r cores mem_total mem_avail < <(host_facts) || true
-  printf '{"runnerctl":%s,"host":{"name":%s,"cores":%s,"mem_total":%s,"mem_available":%s},\n "slots":[' \
+  collect_host
+  printf '{"runnerctl":%s,"host":{"name":%s,"cores":%s,"mem_total":%s,"mem_available":%s,"disks":%s,"events":%s},\n "slots":[' \
     "$(json_str "$RUNNERCTL_VERSION")" "$(json_strn "$(host_name)")" \
-    "$(json_num "$cores")" "$(json_num "$mem_total")" "$(json_num "$mem_avail")"
+    "$(json_num "$cores")" "$(json_num "$mem_total")" "$(json_num "$mem_avail")" \
+    "$(host_disks_json)" "$(host_events_json)"
   while read -r u; do
     [ -n "$u" ] || continue
     collect_slot "$u" "$i"
@@ -3286,6 +3491,13 @@ cmd_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart-stall
       problems+=("$short: under full memory pressure $(status_press_cell "${SLOT[mem_pressure_full_avg10]}") (avg10, PRESSURE_CRIT_PCT=$PRESSURE_CRIT_PCT) — throttled at MemoryHigh (${SLOT[mem_events_high]:-?} times so far), see USED vs HIGH")
     fi
   done < <(discover)
+  # Host-wide trouble (GHR-64): a full fixed drive, a kernel OOM kill or a
+  # disk-full line in the last EVENTS_SEC. After the slot lines, so a probe
+  # that greps for a slot still finds it first.
+  collect_host
+  while IFS= read -r line; do
+    [ -z "$line" ] || problems+=("$line")
+  done < <(host_problems)
   if [ "${#problems[@]}" -eq 0 ]; then
     $quiet || echo "ok: $n slot(s) healthy"
     return 0
@@ -5420,6 +5632,20 @@ cmd_config_example() {
 # WARN, red and a `health` problem from CRIT.
 #PRESSURE_WARN_PCT="10"
 #PRESSURE_CRIT_PCT="50"
+
+# Disk usage of every fixed drive (a /dev block device, one row per device)
+# on the status header, in percent: yellow from WARN, red and a `health`
+# problem from CRIT. DISK_IGNORE is an ERE over mount points to leave out,
+# e.g. '^/boot/efi$'.
+#DISK_WARN_PCT="85"
+#DISK_CRIT_PCT="95"
+#DISK_IGNORE=""
+
+# Seconds of journal status/health search for host-wide kernel OOM kills and
+# "No space left on device" lines. Either one in the window is a `health`
+# problem (a slot's own cgroup OOM is not — that fails the step by design).
+# 0 turns the search off.
+#EVENTS_SEC="3600"
 
 # Processes matching this ERE are the runner's own and never counted as
 # leaked or reaped. Extend it for an image that wraps the runner differently.
