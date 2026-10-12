@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.0](https://github.com/runnane/runnerctl/compare/v0.15.0...v0.16.0) (2026-10-12)
+
+
+### Features
+
+* status/health show fixed-disk usage and recent host OOM-kill / disk-full journal events (GHR-64) ([#72](https://github.com/runnane/runnerctl/issues/72)) ([e6f84ca](https://github.com/runnane/runnerctl/commit/e6f84ca5f366d2c904355c02633570ed7e07d858))
+
 ## [0.15.0](https://github.com/runnane/runnerctl/compare/v0.14.0...v0.15.0) (2026-10-05)
 
 
