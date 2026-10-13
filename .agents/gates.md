@@ -134,6 +134,18 @@ Traps:
   stub pins (GHR-34: `free -h`'s real rounding differed between the two runs
   the `--color always` case diffs, and flaked it). `status --json`'s `host`
   object comes from the separate `host_facts`, pinned the same way.
+- **A watch frame fitted to a pinned height has no final newline** (GHR-73:
+  `RUNNERCTL_STUB_LINES=N`, with `RUNNERCTL_STUB_SLOTS=4..9` to make the
+  frame taller than it). So the next frame's home+clear prefix follows the
+  status line on the SAME line, and `expect_out_count "$FRAME_PREFIX" N` —
+  anchored to a line start — undercounts as soon as a status line is not
+  empty. Split with `frames` and use `expect_frame_count` /
+  `expect_frame_lines` / `expect_frame_line` instead, and never count the
+  lines of a run's LAST frame: `"$(...)"` strips the newlines it ends in, an
+  empty status line among them, so end the key string `-q` and assert on the
+  frames before the tick's. A `%` in `RUNNERCTL_STUB_KEYS` is a real SIGWINCH
+  sent from inside the key read. With the height unknown (the default, 0)
+  nothing is fitted and every older case draws what it always drew.
 - The `status --json` case (GHR-16) asserts the parsed JSON through
   `python3` (`expect_json`): where python3 is absent the case keeps its
   exit-code, shape and read-only assertions, prints a `skip` notice for the

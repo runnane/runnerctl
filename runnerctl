@@ -114,7 +114,11 @@
 # `logs <slot> -n 50` in $PAGER. Privileged keys go through sudo like the
 # commands do. Too narrow a terminal drops MAX, HIGH and ENVFILE from the
 # table, never WORKING-ON; --narrow (GHR-56, on `status` too) asks for that
-# narrow table outright.
+# narrow table outright. Too short a terminal (GHR-73) shows a window of the
+# rows that follows the cursor, the header, legend and status line staying
+# put and `↑ N more` / `↓ N more` counting the hidden lines; PgUp/PgDn move
+# the cursor a page, g/G (Home/End) to the first and last slot, and a resize
+# redraws at once. `fleet watch` does the same.
 #
 # The table is coloured by meaning when stdout is a terminal (--color auto;
 # NO_COLOR in the environment turns it off, --color always/never override):
@@ -2569,6 +2573,13 @@ term_cols() {
   if command -v tput >/dev/null 2>&1; then c="$(tput cols 2>/dev/null || true)"; fi
   if [[ "$c" =~ ^[0-9]+$ ]]; then echo "$c"; else echo 0; fi
 }
+# The terminal's height in rows, 0 when unknown — term_cols' twin, with the
+# same tput fallback, and behind a function for the same reason (GHR-73).
+term_lines() {
+  local l=""
+  if command -v tput >/dev/null 2>&1; then l="$(tput lines 2>/dev/null || true)"; fi
+  if [[ "$l" =~ ^[0-9]+$ ]]; then echo "$l"; else echo 0; fi
+}
 
 # --- Interactive watch (GHR-33) -----------------------------------------------
 # One keystroke from the terminal into KEY_CHAR (empty for Enter): 0 with a
@@ -2590,17 +2601,33 @@ tty_read_char() { # TIMEOUT
   pause "$1"
   return 1
 }
-# One key into KEY: `up` / `down` for the arrows (ESC [ A, ESC O A, …), `esc`
-# for a lone Escape, `enter`, otherwise the character itself. 1 on timeout.
+# One key into KEY: `up` / `down` for the arrows (ESC [ A, ESC O A, …), `pgup`
+# / `pgdn` / `home` / `end` for the paging keys (GHR-73: ESC [ 5 ~, ESC [ 6 ~,
+# ESC [ H or 1 ~ or 7 ~, ESC [ F or 4 ~ or 8 ~), `esc` for a lone Escape,
+# `enter`, otherwise the character itself. 1 on timeout.
 # The rest of an arrow's sequence is already buffered when the ESC arrives,
-# so a short second read tells the two apart.
+# so a short second read tells the two apart. A numbered sequence ends in a
+# `~`, which is read here too — left in the buffer it would arrive as a key
+# of its own on the next read.
 read_key() { # TIMEOUT
+  local code
   KEY=""
   tty_read_char "$1" || return 1
   case "$KEY_CHAR" in
     $'\e')
       if tty_read_char 0.05 && [[ "$KEY_CHAR" == [\[O] ]] && tty_read_char 0.05; then
-        case "$KEY_CHAR" in A) KEY=up ;; B) KEY=down ;; *) KEY=other ;; esac
+        case "$KEY_CHAR" in
+          A) KEY=up ;;
+          B) KEY=down ;;
+          H) KEY=home ;;
+          F) KEY=end ;;
+          [0-9])
+            code="$KEY_CHAR" KEY=other
+            if tty_read_char 0.05 && [ "$KEY_CHAR" = "~" ]; then
+              case "$code" in 5) KEY=pgup ;; 6) KEY=pgdn ;; 1|7) KEY=home ;; 4|8) KEY=end ;; esac
+            fi ;;
+          *) KEY=other ;;
+        esac
       else
         KEY=esc
       fi ;;
@@ -2676,6 +2703,218 @@ watch_table() {
   [ "$now" != "$want" ] || return 0
   status_narrow "$want"
   WATCH_TABLE="$(render_status)"
+}
+
+# --- Viewport (GHR-73) ----------------------------------------------------------
+# A frame taller than the terminal used to scroll its own top off: the header
+# and the first rows left the screen, and the cursor row could be one of them,
+# so K/R/S/T acted on a slot nobody could see. Both watches now draw through
+# viewport_draw, which fits the frame to term_lines:
+#
+#   * HEAD (the header; in `fleet watch` the summary line too) and FOOT (the
+#     blank line, the legend, the status line) are fixed chrome and always
+#     drawn. So are the BODY's lines down to its column header (`IDX …` /
+#     `HOST IDX …`): a table without its header is a grid of unlabelled cells.
+#   * What is left of the height is a WINDOW over the rest of the body's
+#     lines. It moves only when it has to: the cursor line crossing an edge
+#     scrolls it by as little as puts the line back in. Two lines travel with
+#     the cursor where they fit — LEAD, the first line of its group (in `fleet
+#     watch` the host's Disk/OOM line above a host's first slot, which the
+#     cursor itself never stops on), and TAIL, the last (the notes under the
+#     last row, which no cursor movement could otherwise bring into view).
+#   * Hidden lines are counted on a dim marker line — `↑ 12 more` above,
+#     `↓ 7 more` below — so a clipped frame never reads as the whole table.
+#     The counts are FRAME LINES, host lines and notes included. The markers
+#     name the paging keys; the legend does not, because it is on every frame
+#     and a frame of unknown height has to stay what it was, byte for byte.
+#   * Heights are in terminal ROWS, not lines: with the width known a line
+#     longer than the terminal counts as the rows it wraps to — a confirm line
+#     naming a command is routinely two — so the chrome is measured per frame
+#     and the windowed frame is padded to exactly the terminal's height, the
+#     legend and status line staying on its last rows.
+#   * A fitted frame is written WITHOUT a final newline: on the last row a
+#     newline scrolls the screen by one and takes the header with it.
+#     viewport_close supplies it on the way out.
+#
+# Nothing is fitted — the frame is drawn whole and newline-terminated, exactly
+# as before — when the height is unknown (0), when the chrome leaves fewer
+# than VIEW_MIN_ROWS rows for the window (one line and two markers), or when
+# the cursor line alone is taller than the window: a terminal that small
+# cannot show a usable view, and a truncated one would hide the confirm line.
+# `--iterations` (the headless test path) never comes through here at all.
+VIEW_TOP=0 VIEW_PAGE=0 VIEW_STEP=1 VIEW_BOT=0 VIEW_ROWS=1 VIEW_OUT="" VIEW_FITTED=false
+VIEW_MIN_ROWS=3
+VIEW_END=1000000 # a TAIL past any frame: "down to the last line"
+VIEW_LINE_ROWS=() VIEW_ARGS=()
+
+# The rows LINE takes on a terminal COLS wide, into VIEW_ROWS (1 when the
+# width is unknown). Leaves the line's visible text in SGR_STRIPPED.
+viewport_rows() { # LINE COLS
+  strip_sgr "$1"
+  VIEW_ROWS=1
+  [ "$2" -gt 0 ] || return 0
+  [ "${#SGR_STRIPPED}" -le "$2" ] || VIEW_ROWS=$(((${#SGR_STRIPPED} + $2 - 1) / $2))
+}
+# The last body line (0-based, into VIEW_BOT) a window starting at TOP reaches
+# in AVAIL rows, of N lines whose scrolling part starts at FIRST. A marker row
+# is paid for wherever lines stay hidden: above when TOP is past FIRST, below
+# for as long as the line being added is not the last.
+viewport_fill() { # TOP FIRST N AVAIL
+  local used=0 next reserve
+  [ "$1" -le "$2" ] || used=1
+  VIEW_BOT=$(($1 - 1))
+  while [ "$VIEW_BOT" -lt $(($3 - 1)) ]; do
+    next=$((VIEW_BOT + 1)) reserve=1
+    [ "$next" -lt $(($3 - 1)) ] || reserve=0
+    [ $((used + VIEW_LINE_ROWS[next] + reserve)) -le "$4" ] || break
+    used=$((used + VIEW_LINE_ROWS[next])) VIEW_BOT="$next"
+  done
+}
+# The frame for a terminal HEIGHT rows by COLS columns, into VIEW_OUT (no
+# final newline). CURSOR, LEAD and TAIL are 1-based BODY line numbers, CURSOR
+# 0 when nothing is selected. VIEW_FITTED says whether the frame was fitted
+# to the height; VIEW_PAGE is the window's size in lines, 0 when nothing is
+# hidden; VIEW_TOP carries the window's position to the next frame.
+viewport_frame() { # HEIGHT COLS HEAD BODY FOOT CURSOR LEAD TAIL
+  local height="$1" cols="$2" cur=$(($6 - 1)) lead=$(($7 - 1)) tail=$(($8 - 1))
+  local -a body=()
+  local line i n pin=0 chrome=0 total=0 avail top bot used
+  VIEW_OUT="$3"$'\n'"$4"$'\n'"$5" VIEW_PAGE=0 VIEW_FITTED=false
+  # Unknown: the frame whole. The VIEW_MIN_ROWS test below would send a
+  # height of 0 the same way — this is the exit that does not measure every
+  # line of the frame first, on every redraw, to get there.
+  [ "$height" -gt 0 ] || return 0
+  while IFS= read -r line; do
+    viewport_rows "$line" "$cols"
+    chrome=$((chrome + VIEW_ROWS))
+  done <<<"$3"$'\n'"$5"
+  mapfile -t body <<<"$4"
+  n="${#body[@]}"
+  VIEW_LINE_ROWS=()
+  for i in "${!body[@]}"; do
+    viewport_rows "${body[$i]}" "$cols"
+    VIEW_LINE_ROWS[i]="$VIEW_ROWS"
+    total=$((total + VIEW_ROWS))
+    # The column header, where it is among the body's first lines, ends the
+    # pinned part: the local table has a version/host line and a blank above it.
+    if [ "$pin" -eq 0 ] && [ "$i" -lt 4 ] && [[ "$SGR_STRIPPED" =~ ^(HOST\ +)?IDX\ + ]]; then pin=$((i + 1)); fi
+  done
+  if [ $((chrome + total)) -le "$height" ]; then
+    VIEW_FITTED=true VIEW_TOP=0
+    return 0
+  fi
+  for ((i = 0; i < pin; i++)); do chrome=$((chrome + VIEW_LINE_ROWS[i])); done
+  avail=$((height - chrome))
+  [ "$avail" -ge "$VIEW_MIN_ROWS" ] || return 0
+  top="$VIEW_TOP"
+  [ "$top" -ge "$pin" ] || top="$pin"
+  [ "$top" -lt "$n" ] || top=$((n - 1))
+  if [ "$cur" -ge "$pin" ] && [ "$cur" -lt "$n" ]; then
+    [ "$lead" -ge "$pin" ] || lead="$pin"
+    [ "$lead" -le "$cur" ] || lead="$cur"
+    [ "$tail" -ge "$cur" ] || tail="$cur"
+    [ "$tail" -lt "$n" ] || tail=$((n - 1))
+    # Up: the cursor line becomes the top one. Down: the window moves a line
+    # at a time until the cursor's TAIL is in — or the cursor line is the top
+    # one, with as much of what is under it as fits.
+    [ "$cur" -ge "$top" ] || top="$cur"
+    viewport_fill "$top" "$pin" "$n" "$avail"
+    while [ "$VIEW_BOT" -lt "$tail" ] && [ "$top" -lt "$cur" ]; do
+      top=$((top + 1))
+      viewport_fill "$top" "$pin" "$n" "$avail"
+    done
+    [ "$VIEW_BOT" -ge "$cur" ] || return 0
+    bot="$VIEW_BOT"
+    # LEAD comes along when starting there loses nothing the window has.
+    if [ "$lead" -lt "$top" ]; then
+      viewport_fill "$lead" "$pin" "$n" "$avail"
+      if [ "$VIEW_BOT" -ge "$bot" ] || [ "$VIEW_BOT" -ge "$tail" ]; then top="$lead"; fi
+    fi
+  fi
+  # Rows left over go to the lines above: a table that got shorter, or a
+  # terminal that got taller, does not leave the window half empty; and a
+  # lone hidden line is drawn in the row its marker would have taken.
+  viewport_fill "$top" "$pin" "$n" "$avail"
+  bot="$VIEW_BOT"
+  while [ "$top" -gt "$pin" ]; do
+    viewport_fill $((top - 1)) "$pin" "$n" "$avail"
+    [ "$VIEW_BOT" -ge "$bot" ] || break
+    top=$((top - 1)) bot="$VIEW_BOT"
+  done
+  VIEW_OUT="$3" used=0
+  for ((i = 0; i < pin; i++)); do VIEW_OUT+=$'\n'"${body[$i]}"; done
+  if [ "$top" -gt "$pin" ]; then
+    VIEW_OUT+=$'\n'"$(paint "$C_DIM" "↑ $((top - pin)) more  PgUp/g")"
+    used=1
+  fi
+  for ((i = top; i <= bot; i++)); do
+    VIEW_OUT+=$'\n'"${body[$i]}"
+    used=$((used + VIEW_LINE_ROWS[i]))
+  done
+  if [ "$bot" -lt $((n - 1)) ]; then
+    VIEW_OUT+=$'\n'"$(paint "$C_DIM" "↓ $((n - 1 - bot)) more  PgDn/G")"
+    used=$((used + 1))
+  fi
+  for ((i = used; i < avail; i++)); do VIEW_OUT+=$'\n'; done
+  VIEW_OUT+=$'\n'"$5"
+  VIEW_TOP="$top" VIEW_PAGE=$((bot - top + 1)) VIEW_FITTED=true
+}
+# How far PgUp/PgDn move, into VIEW_STEP: a window less one line, so the line
+# the cursor leaves is still on screen after the jump; the whole LENGTH when
+# nothing is hidden, which makes them top and bottom.
+viewport_step() { # LENGTH
+  if [ "$VIEW_PAGE" -le 0 ]; then VIEW_STEP="$1"
+  elif [ "$VIEW_PAGE" -le 1 ]; then VIEW_STEP=1
+  else VIEW_STEP=$((VIEW_PAGE - 1))
+  fi
+}
+# One frame onto the terminal: home, clear, and the frame fitted to the
+# height the terminal has NOW — both sizes are read per frame, the width only
+# where the height is known. The arguments are kept, so a resize can redraw
+# the frame in hand.
+viewport_draw() { # HEAD BODY FOOT CURSOR LEAD TAIL
+  local lines cols=0
+  VIEW_ARGS=("$@")
+  lines="$(term_lines)"
+  [ "$lines" -le 0 ] || cols="$(term_cols)"
+  viewport_frame "$lines" "$cols" "$@"
+  if $VIEW_FITTED; then
+    printf '\033[H\033[2J%s' "$VIEW_OUT"
+  else
+    printf '\033[H\033[2J%s\n' "$VIEW_OUT"
+  fi
+}
+# read_key, redrawing on SIGWINCH while it waits instead of sitting out the
+# interval on a frame cut for the old size. The trap is armed for the wait
+# ONLY: bash runs a trap in the middle of a `read` and the read then carries
+# on (measured on 5.3 — the handler is what redraws, the read still times out
+# when the interval is up), but the same signal makes a `wait` return early,
+# and the fan-out waits on its ssh children. Outside the wait a resize needs
+# nothing anyway: the next frame reads the size again.
+viewport_winch() {
+  [ "${#VIEW_ARGS[@]}" -eq 0 ] || viewport_draw "${VIEW_ARGS[@]}"
+}
+viewport_read_key() { # TIMEOUT
+  local rc=0
+  trap viewport_winch WINCH
+  read_key "$1" || rc=$?
+  trap - WINCH
+  return "$rc"
+}
+# The newline a fitted frame was drawn without, so the shell prompt starts on
+# a line of its own. For the EXIT traps; nothing when no frame was fitted.
+viewport_close() {
+  ! $VIEW_FITTED || printf '\n'
+  VIEW_FITTED=false
+}
+# The line of TABLE the cursor row is on — watch_highlight's own match — or 0.
+watch_cursor_line() { # TABLE NAME
+  local line n=0
+  while IFS= read -r line; do
+    n=$((n + 1))
+    if [[ "$line" =~ ^[0-9]+\ +"$2"\ + ]]; then echo "$n"; return 0; fi
+  done <<<"$1"
+  echo 0
 }
 
 # The facts an action decides on, fresh: the memoised journal for UNIT is
@@ -2812,6 +3051,20 @@ watch_handle_key() { # KEY UNITS...
     q|Q)      return 1 ;;
     down|j)   [ "$i" -ge $((n - 1)) ] || WATCH_CURSOR="${units[$((i + 1))]}" ;;
     up|k)     [ "$i" -le 0 ] || WATCH_CURSOR="${units[$((i - 1))]}" ;;
+    # GHR-73: a page at a time, and the two ends. The slot rows are one line
+    # each, so a step in lines is a step in units.
+    pgdn|pgup|g|G|home|end)
+      [ "$n" -gt 0 ] || return 0
+      viewport_step "$n"
+      case "$key" in
+        pgdn)   i=$((i + VIEW_STEP)) ;;
+        pgup)   i=$((i - VIEW_STEP)) ;;
+        g|home) i=0 ;;
+        *)      i=$((n - 1)) ;;
+      esac
+      [ "$i" -lt "$n" ] || i=$((n - 1))
+      [ "$i" -ge 0 ] || i=0
+      WATCH_CURSOR="${units[$i]}" ;;
     K|R|S|T|P|L) watch_key_action "$key" "$WATCH_CURSOR" ;;
   esac
   return 0
@@ -2830,7 +3083,7 @@ watch_handle_key() { # KEY UNITS...
 # a key read with the interval as its timeout: a key redraws at once, a
 # timeout is a tick. The journal memo counts ticks, not keys.
 cmd_watch() { # [--interval N] [--iterations N] [--color WHEN] [--stall-after N] [--narrow]
-  local interval=2 iterations="" tick=0 refreshed=-1 out header units=() status
+  local interval=2 iterations="" tick=0 refreshed=-1 out header units=() status short cur tail
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     view_opt "$@"
@@ -2854,7 +3107,7 @@ cmd_watch() { # [--interval N] [--iterations N] [--color WHEN] [--stall-after N]
   color_setup "$COLOR_MODE"
   JOURNAL_MEMO_DIR="$(mktemp -d)"
   # Ctrl-C exits 0 through the EXIT trap, which restores the cursor either way.
-  trap 'term_cursor show; rm -rf "$JOURNAL_MEMO_DIR"' EXIT
+  trap 'term_cursor show; viewport_close; rm -rf "$JOURNAL_MEMO_DIR"' EXIT
   trap 'exit 0' INT TERM
   term_cursor hide
   while :; do
@@ -2876,10 +3129,17 @@ cmd_watch() { # [--interval N] [--iterations N] [--color WHEN] [--stall-after N]
     mapfile -t units < <(discover)
     # The cursor follows its unit; a slot that went away drops it to the top.
     [[ " ${units[*]} " == *" $WATCH_CURSOR "* ]] || WATCH_CURSOR="${units[0]:-}"
-    out="$(watch_highlight "$WATCH_TABLE" "$(short_name "$WATCH_CURSOR")")"
+    short="$(short_name "$WATCH_CURSOR")"
+    out="$(watch_highlight "$WATCH_TABLE" "$short")"
     status="${WATCH_PROMPT:-$WATCH_NOTICE}"
-    printf '\033[H\033[2J%s\n%s\n\n%s\n%s\n' "$header" "$out" "$(paint "$C_DIM" "$WATCH_LEGEND")" "$status"
-    if read_key "$interval"; then
+    # GHR-73: fitted to the terminal's height where it is known. The notes
+    # under the table belong to the last slot's view (TAIL), or nothing would
+    # ever scroll them in.
+    cur="$(watch_cursor_line "$WATCH_TABLE" "$short")"
+    tail="$cur"
+    if [ "${#units[@]}" -gt 0 ] && [ "$WATCH_CURSOR" = "${units[$((${#units[@]} - 1))]}" ]; then tail="$VIEW_END"; fi
+    viewport_draw "$header" "$out" $'\n'"$(paint "$C_DIM" "$WATCH_LEGEND")"$'\n'"$status" "$cur" "$cur" "$tail"
+    if viewport_read_key "$interval"; then
       watch_handle_key "$KEY" "${units[@]}" || break
     else
       tick=$((tick + 1))
@@ -4914,6 +5174,7 @@ cmd_fleet_status() { # [--json] [--color WHEN] [--stall-after N] [--narrow]
 # or hanging close cannot leave an invisible cursor behind.
 fleet_watch_cleanup() {
   term_cursor show
+  viewport_close
   fleet_cleanup
   [ -z "$FW_TMP" ] || rm -rf "$FW_TMP"
   fleet_ssh_control_close
@@ -5212,6 +5473,30 @@ fleet_watch_run_action() {
   FW_ACTION="" FW_PROMPT="" FW_REFRESH=true
 }
 
+# PgUp/PgDn and g/G (GHR-73). A page is measured in FRAME LINES, not rows: a
+# host's Disk/OOM line and the notes take window rows too, so a step counted
+# in rows would jump further than a screenful and skip slots nobody saw. The
+# cursor lands on the furthest row within a page of where it was, and always
+# moves at least one row while there is one to move to.
+fleet_watch_page() { # KEY
+  local n="${#FW_ROWS[@]}" i="$FW_POS" want
+  if [ "$n" -eq 0 ] || [ "$i" -lt 0 ]; then return 0; fi
+  viewport_step "${FW_LINES[$((n - 1))]}"
+  case "$1" in
+    pgdn)
+      want=$((FW_LINES[i] + VIEW_STEP))
+      while [ "$i" -lt $((n - 1)) ] && [ "${FW_LINES[$((i + 1))]}" -le "$want" ]; do i=$((i + 1)); done
+      [ "$i" -gt "$FW_POS" ] || [ "$i" -ge $((n - 1)) ] || i=$((i + 1)) ;;
+    pgup)
+      want=$((FW_LINES[i] - VIEW_STEP))
+      while [ "$i" -gt 0 ] && [ "${FW_LINES[$((i - 1))]}" -ge "$want" ]; do i=$((i - 1)); done
+      [ "$i" -lt "$FW_POS" ] || [ "$i" -le 0 ] || i=$((i - 1)) ;;
+    g|home) i=0 ;;
+    *)      i=$((n - 1)) ;;
+  esac
+  fleet_watch_select "$i"
+}
+
 # One key against the watch. Returns 1 on `q`. At a confirm only `y` runs it
 # and anything else — `q` included — cancels, as in the local watch.
 fleet_watch_handle_key() { # KEY
@@ -5228,6 +5513,7 @@ fleet_watch_handle_key() { # KEY
     q|Q)    return 1 ;;
     down|j) [ "$FW_POS" -lt 0 ] || [ "$FW_POS" -ge $((n - 1)) ] || fleet_watch_select $((FW_POS + 1)) ;;
     up|k)   [ "$FW_POS" -le 0 ] || fleet_watch_select $((FW_POS - 1)) ;;
+    pgdn|pgup|g|G|home|end) fleet_watch_page "$1" ;;
     K|R|S|T|P|L) fleet_watch_key_action "$1" ;;
   esac
   return 0
@@ -5235,7 +5521,7 @@ fleet_watch_handle_key() { # KEY
 
 cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] [--stall-after N] [--narrow] [--min-available K]
   local interval=5 iterations="" tick=0 header="" frame="" summary="" remote_color=never
-  local narrow=false forced=false wide fetch=true hl
+  local narrow=false forced=false wide fetch=true hl lead tail
   local -a hosts=() fwd=() narrow_arg=()
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
@@ -5338,12 +5624,20 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
     fi
     fleet_watch_rows "$frame"
     fleet_watch_place
-    hl=0
-    [ "$FW_POS" -lt 0 ] || hl="${FW_LINES[$FW_POS]}"
-    printf '\033[H\033[2J%s\n%s\n%s\n\n%s\n%s\n' "$header" "$summary" \
-      "$(fleet_watch_highlight "$frame" "$hl")" \
-      "$(paint "$C_DIM" "$WATCH_LEGEND")" "${FW_PROMPT:-$FW_NOTICE}"
-    if read_key "$interval"; then
+    # GHR-73: fitted to the terminal's height where it is known, with the
+    # summary line as fixed chrome beside the header. The cursor's group runs
+    # from the line after the previous row — the host's Disk/OOM line, where
+    # this is that host's first slot — and, on the last row, down through the
+    # notes to the end of the frame.
+    hl=0 lead=0 tail=0
+    if [ "$FW_POS" -ge 0 ]; then
+      hl="${FW_LINES[$FW_POS]}" lead=1 tail="${FW_LINES[$FW_POS]}"
+      [ "$FW_POS" -eq 0 ] || lead=$((FW_LINES[FW_POS - 1] + 1))
+      [ "$FW_POS" -lt $((${#FW_ROWS[@]} - 1)) ] || tail="$VIEW_END"
+    fi
+    viewport_draw "$header"$'\n'"$summary" "$(fleet_watch_highlight "$frame" "$hl")" \
+      $'\n'"$(paint "$C_DIM" "$WATCH_LEGEND")"$'\n'"${FW_PROMPT:-$FW_NOTICE}" "$hl" "$lead" "$tail"
+    if viewport_read_key "$interval"; then
       FW_REFRESH=false
       fleet_watch_handle_key "$KEY" || break
       fetch="$FW_REFRESH"

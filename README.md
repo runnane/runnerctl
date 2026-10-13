@@ -485,7 +485,30 @@ and the result becomes the status line under the legend:
 | `S` / `T` | stop / start the slot (stop carries the same warning while a job runs) | `systemctl stop\|start <unit>` |
 | `P` | reap the `+N leaked` processes on an idle slot, exactly as `reap <IDX>` does | `kill -TERM …`, then `kill -KILL` for what survives |
 | `L` | show `logs <slot> -n 50` in `$PAGER` (`less`; `q` returns to the table). No confirm — it changes nothing | `journalctl -u <unit> -n 50` |
+| `PgUp` / `PgDn` | move the cursor a page (a window less one row, so the row you left is still on screen) | |
+| `g` / `G`, `Home` / `End` | the first / last slot | |
 | `q` | quit | |
+
+**A table taller than the terminal.** The frame is cut to the terminal's
+height instead of scrolling its own top away. The header, the column header,
+the legend and the status line stay where they are; between them a window of
+the rows follows the cursor, moving only when the cursor crosses its edge,
+and a dim line counts what is out of sight and names the keys that page:
+
+```
+IDX RUNNER          PROFILE  ACTIVE           SINCE  ENABLED  ...  WORKING-ON
+↑ 12 more  PgUp/g
+12  org.build-1-m   ci       active/running   3d 4h  enabled  ...  my-app:test (12m)
+13  org.build-1-n   ci       active/running   2d 7h  enabled  ...  idle 2h31m (7 jobs)
+↓ 7 more  PgDn/G
+```
+
+So the slot a key acts on is always one you can see. A line longer than the
+terminal is counted as the rows it wraps to — a confirm line usually is two —
+and resizing the terminal redraws at once rather than at the next interval.
+A terminal too small for the header, the legend and a three-row window, or
+one whose height cannot be read (no `tput`, no `TERM`), gets the whole frame
+as before.
 
 The redraws keep coming at `--interval` while a confirm line is up, so the
 table under it is current when you answer. On a terminal narrower than the
@@ -936,6 +959,17 @@ The [fleet summary](#several-hosts-from-one-place-fleet-status) sits directly
 under the header rather than at the bottom, so it stays on screen however long
 the table is. It is refreshed with the table, once per tick.
 
+**A fleet taller than the terminal** — six hosts of four slots is past thirty
+lines — is cut to the terminal's height [the way the local `watch`
+is](#live-view-watch): the header, the summary, the column header, the legend
+and the status line stay put, and a window of the table follows the cursor,
+with `↑ N more` / `↓ N more` counting the lines out of sight (a host's `Disk:`
+line and the notes are lines too). A host's `Disk:` line comes into view with
+that host's first slot, and the notes under the table with the last row, since
+the cursor stops on neither. `PgUp`/`PgDn` and `g`/`G` move by a page and to
+the ends, and none of it costs a round trip: scrolling redraws the frame in
+hand.
+
 `--stall-after` is forwarded by both — the `STALLED` marker (and, for
 `--json`, the `stalled` field) is computed wherever it is drawn, which is
 always the remote.
@@ -968,6 +1002,8 @@ has its own `slot-1`:
 | key | does, on the selected slot's host |
 | --- | --- |
 | `↑` `↓` / `j` `k` | move the cursor, across host boundaries; no round trip |
+| `PgUp` / `PgDn` | move the cursor a page; no round trip |
+| `g` / `G`, `Home` / `End` | the first / last row of the fleet |
 | `K` | kill the running job (`runnerctl kill <slot>` there) |
 | `R` / `S` / `T` | restart / stop / start the slot |
 | `P` | reap processes a finished job leaked |
