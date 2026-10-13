@@ -200,7 +200,10 @@
 # outcomes are kept apart on purpose: unreachable, timed out, and the remote
 # runnerctl exiting non-zero (on a runner-less host that is its own message,
 # not a fleet fault). When the hosts are not all on one version, a note says
-# so under the table.
+# so under the table. A summary line (GHR-72) totals it: hosts answering,
+# slots by state, leaks, disk and event hosts, free capacity, versions — the
+# last line of `fleet status`, under the header in `fleet watch`, counted
+# from a second `status --json` call to each host that answered.
 # `fleet watch` (GHR-54) is that same table in a redraw loop, and the reason
 # it is a command of its own rather than `watch runnerctl fleet status` is the
 # ssh cost. A fan-out pays a TCP connect, a key exchange and an auth PER HOST
@@ -4031,6 +4034,164 @@ fleet_status_table() {
   [ "$bad" -eq 0 ]
 }
 
+# --- Fleet summary line (GHR-72) ----------------------------------------------
+# One line of totals for the two questions a central operator asks first — is
+# anything wrong, and how much capacity is left:
+#
+#   6/7 hosts answering · 22 slots: 14 busy, 6 idle, 1 STALLED, 1 down · 2 leaking · capacity 6 free of 21 · 3 versions
+#
+# Under the header in `fleet watch`, the last line of `fleet status`.
+#
+# The counts come from each host's `status --json`, NEVER from the table the
+# line sits next to: that table is not parsed by column position (see
+# fleet_status_table), and a count read off a painted cell would be exactly
+# that. So the summary costs a second remote call per host, and the choice was
+# between that and one call returning both. The second call it is:
+#
+#   * one call needs a new remote flag, which no host has until it is
+#     released and upgraded — and a host without it would be asked a second
+#     time anyway, so the second pass has to exist either way (and
+#     FLEET_OPTIONAL_ARG, the skew mechanism, carries one flag: --narrow);
+#   * the other one-call form, two commands on one remote command line,
+#     depends on what the remote login shell makes of the line;
+#   * the pass is TARGETED: only a host whose table call exited 0 is asked, so
+#     a host that is down is waited on once per tick, not twice. Under `fleet
+#     watch` it is one more channel on the connection already held, per tick
+#     and never per key. A one-shot `fleet status` holds no connection, so
+#     there it is a second ssh login per answering host.
+#
+# `status --json` has been there since long before `fleet`, so every host
+# that can draw the table can answer it.
+fleet_summary_fetch() { # STATUS-ARGS...
+  local i running=0
+  for i in "${!FLEET_HOSTS[@]}"; do
+    [ "$(fleet_rc "$i")" = 0 ] || continue
+    fleet_summary_fetch_one "$i" "$@" &
+    running=$((running + 1))
+    if [ "$running" -ge "$FLEET_PARALLEL" ]; then
+      wait -n 2>/dev/null || true
+      running=$((running - 1))
+    fi
+  done
+  wait
+}
+# One host's payload and exit status, beside its table in FLEET_DIR. In the
+# background, like fleet_fanout_one, and `|| hrc=$?` for the same reason.
+fleet_summary_fetch_one() { # INDEX STATUS-ARGS...
+  local i="$1" hrc=0
+  shift
+  ssh_run "${FLEET_HOSTS[$i]}" "$FLEET_RUNNERCTL" status --json "$@" >"$FLEET_DIR/$i.json" 2>/dev/null || hrc=$?
+  echo "$hrc" >"$FLEET_DIR/$i.jrc"
+}
+
+# COUNT and its noun, the noun plural unless COUNT is 1.
+fleet_plural() { # COUNT NOUN
+  if [ "$1" -eq 1 ]; then echo "$1 $2"; else echo "$1 $2s"; fi
+}
+
+# The line itself, from what fleet_fanout and fleet_summary_fetch left in
+# FLEET_DIR. What each number means:
+#
+#   hosts     answering / configured, by fleet_reachable — on the table call,
+#             and on the --json call when one was made, so a host that dropped
+#             out between the two is not answering. A host that did not answer
+#             is in this count AND NOTHING ELSE: its slots are unknown, not
+#             down (the rule fleet_slots follows).
+#   slots     every slot is exactly one of: STALLED, busy or idle when its
+#             unit is active (a job past the stall threshold, a job, none);
+#             disabled or down when it is not (UnitFileState disabled, or
+#             anything else — failed, activating, stopped by hand).
+#   leaking   slots whose finished job left processes behind.
+#   disk      hosts with a partition at DISK_CRIT_PCT / DISK_WARN_PCT — THIS
+#             node's thresholds, as `fleet status` paints the host line —
+#             each host counted once, at its worst partition.
+#   events    hosts with an OOM kill or a disk-full line in their window.
+#   capacity  idle slots, of the active ones: what can take a job right now.
+#   versions  distinct runnerctl versions, when there is more than one.
+#
+# A segment whose count is zero is left out, so a healthy fleet is a short
+# line — except capacity, which is printed whenever there are slots: `0 free`
+# is the one zero an operator most needs to see.
+#
+# Slots are read one per line with json_line_field, on the footing fleet_slots
+# and fleet_watch_facts read them: render_status_json writes each slot on a
+# line of its own and this script owns that emitter.
+fleet_summary_line() {
+  local i rc jrc line job pct lvl worst ver n
+  local hosts="${#FLEET_HOSTS[@]}" answering=0 slots=0 busy=0 idle=0 stalled=0 down=0 disabled=0
+  local leaking=0 dcrit=0 dwarn=0 events=0 active
+  local -A vers=()
+  local -a seg=() states=()
+  for i in "${!FLEET_HOSTS[@]}"; do
+    rc="$(fleet_rc "$i")"
+    [ "$(fleet_reachable "$rc")" = true ] || continue
+    # Reached, but its runnerctl exited non-zero (a runner-less host): it
+    # answered, and was not asked for a payload.
+    if [ "$rc" != 0 ]; then answering=$((answering + 1)); continue; fi
+    jrc="$(cat "$FLEET_DIR/$i.jrc" 2>/dev/null || echo 255)"
+    [ "$(fleet_reachable "$jrc")" = true ] || continue
+    answering=$((answering + 1))
+    [ "$jrc" = 0 ] || continue
+    while IFS= read -r line; do
+      case "$line" in
+        '{"runnerctl":'*)
+          ver="$(json_line_field "$line" runnerctl)"
+          [ -z "$ver" ] || vers[$ver]=1
+          worst=""
+          while [[ "$line" =~ \"use_pct\":([0-9]+) ]]; do
+            lvl="$(disk_level "${BASH_REMATCH[1]}")"
+            line="${line#*"${BASH_REMATCH[0]}"}"
+            case "$lvl" in crit) worst=crit ;; warn) [ -n "$worst" ] || worst=warn ;; esac
+          done
+          case "$worst" in crit) dcrit=$((dcrit + 1)) ;; warn) dwarn=$((dwarn + 1)) ;; esac
+          # What is left of the line is past the disks: the events object.
+          n="$(json_line_field "$line" oom_kills)"; pct="$(json_line_field "$line" disk_full)"
+          if { [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt 0 ]; } || { [[ "$pct" =~ ^[0-9]+$ ]] && [ "$pct" -gt 0 ]; }; then
+            events=$((events + 1))
+          fi ;;
+        '  {"idx":'*)
+          slots=$((slots + 1))
+          job=null
+          [[ ! "$line" =~ \"job\":(.*),\"idle_since\": ]] || job="${BASH_REMATCH[1]}"
+          if [ "$(json_line_field "$line" active)" != active ]; then
+            if [ "$(json_line_field "$line" enabled)" = disabled ]; then disabled=$((disabled + 1)); else down=$((down + 1)); fi
+          elif [ "$job" = null ]; then idle=$((idle + 1))
+          elif [ "$(json_line_field "$job" stalled)" = true ]; then stalled=$((stalled + 1))
+          else busy=$((busy + 1))
+          fi
+          n="$(json_line_field "$line" leaked_procs)"
+          if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt 0 ]; then leaking=$((leaking + 1)); fi ;;
+      esac
+    done <"$FLEET_DIR/$i.json"
+  done
+  line="$answering/$hosts host$([ "$hosts" -eq 1 ] || echo s) answering"
+  if [ "$answering" -lt "$hosts" ]; then seg+=("$(paint "$C_RED" "$line")"); else seg+=("$line"); fi
+  if [ "$answering" -gt 0 ]; then
+    # The table's own colours: status_job_color for a job, a leak and an idle
+    # slot, status_active_color for a unit that is not active, the ENABLED
+    # cell's dim for a disabled one.
+    [ "$busy" -eq 0 ] || states+=("$(paint "$C_GREEN" "$busy busy")")
+    [ "$idle" -eq 0 ] || states+=("$(paint "$C_DIM" "$idle idle")")
+    [ "$stalled" -eq 0 ] || states+=("$(paint "$C_BOLD$C_RED" "$stalled STALLED")")
+    [ "$down" -eq 0 ] || states+=("$(paint "$C_RED" "$down down")")
+    [ "$disabled" -eq 0 ] || states+=("$(paint "$C_DIM" "$disabled disabled")")
+    line="$(fleet_plural "$slots" slot)"
+    [ "${#states[@]}" -eq 0 ] || line+=": $(join_by ", " "${states[@]}")"
+    seg+=("$line")
+  fi
+  [ "$leaking" -eq 0 ] || seg+=("$(paint "$C_YELLOW" "$leaking leaking")")
+  [ "$dcrit" -eq 0 ] || seg+=("$(paint "$C_RED" "$(fleet_plural "$dcrit" host) disk crit")")
+  [ "$dwarn" -eq 0 ] || seg+=("$(paint "$C_YELLOW" "$(fleet_plural "$dwarn" host) disk warn")")
+  [ "$events" -eq 0 ] || seg+=("$(paint "$C_RED" "$(fleet_plural "$events" host) OOM/disk-full")")
+  if [ "$slots" -gt 0 ]; then
+    active=$((busy + idle + stalled))
+    line="capacity $idle free of $active"
+    if [ "$idle" -eq 0 ]; then seg+=("$(paint "$C_YELLOW" "$line")"); else seg+=("$line"); fi
+  fi
+  [ "${#vers[@]}" -le 1 ] || seg+=("$(paint "$C_YELLOW" "${#vers[@]} versions")")
+  join_by " · " "${seg[@]}"
+}
+
 cmd_fleet() {
   local sub="${1:-status}"
   shift || true
@@ -4559,7 +4720,7 @@ fleet_health_report() { # QUIET
 
 cmd_fleet_status() { # [--json] [--color WHEN] [--stall-after N] [--narrow]
   local json=false narrow=false rc=0
-  local -a fwd=()
+  local -a fwd=() stall=()
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     view_opt "$@"
@@ -4569,8 +4730,9 @@ cmd_fleet_status() { # [--json] [--color WHEN] [--stall-after N] [--narrow]
       # it is forwarded on both fan-outs, or it would be an accepted flag
       # that silently does nothing (the bug this fixes). --color is NOT
       # forwarded: `fleet status` asks the remote for --color never and
-      # paints locally, unlike `fleet watch`.
-      [ "$1" != --stall-after ] || fwd+=(--stall-after "$2")
+      # paints locally, unlike `fleet watch`. `stall` is the same flag for
+      # the summary's --json pass (GHR-72), which must not be handed --narrow.
+      [ "$1" != --stall-after ] || { fwd+=(--stall-after "$2"); stall=(--stall-after "$2"); }
       shift "$VIEW_SHIFT"; continue
     fi
     case "$1" in
@@ -4594,7 +4756,9 @@ cmd_fleet_status() { # [--json] [--color WHEN] [--stall-after N] [--narrow]
     # --color never on the remote: the fleet renderer paints locally, and a
     # remote SGR sequence would be measured as visible width by the prefix.
     fleet_fanout "$FLEET_RUNNERCTL" status --color never ${fwd[@]+"${fwd[@]}"}
+    fleet_summary_fetch ${stall[@]+"${stall[@]}"}
     fleet_status_table || rc=$?
+    fleet_summary_line
   fi
   fleet_cleanup
   return "$rc"
@@ -4942,7 +5106,7 @@ fleet_watch_handle_key() { # KEY
 }
 
 cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] [--stall-after N] [--narrow] [--min-available K]
-  local interval=5 iterations="" tick=0 header="" frame="" remote_color=never
+  local interval=5 iterations="" tick=0 header="" frame="" summary="" remote_color=never
   local narrow=false forced=false wide fetch=true hl
   local -a hosts=() fwd=() narrow_arg=()
   while [ $# -gt 0 ]; do
@@ -5015,10 +5179,15 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
       # tmpdir removal alone — cursor still hidden, and every ssh master left
       # alive until ControlPersist expires.
       trap fleet_watch_cleanup EXIT
+      # GHR-72: the summary's --json pass, to the hosts that just answered.
+      # The one deliberate exception to "no second round trip per tick" — see
+      # fleet_summary_fetch for why it is a second call and not a wider first.
+      fleet_summary_fetch ${fwd[@]+"${fwd[@]}"}
       # A frame is rendered whatever the hosts said: an unreachable host is a
       # row (fleet_status_table's own contract), and its non-zero return is not
       # a reason to stop watching the ones that answered.
       frame="$(fleet_status_table || true)"
+      summary="$(fleet_summary_line)"
       fleet_cleanup
       # GHR-56: the local watch's narrowing, measured on the ASSEMBLED frame —
       # HOST column included, SGR stripped, error rows and notes not counted —
@@ -5033,7 +5202,7 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
       fi
     fi
     if [ -n "$iterations" ]; then
-      printf '\033[H\033[2J%s\n%s\n' "$header" "$frame"
+      printf '\033[H\033[2J%s\n%s\n%s\n' "$header" "$summary" "$frame"
       pause "$interval"
       tick=$((tick + 1))
       [ "$tick" -lt "$iterations" ] || break
@@ -5043,7 +5212,7 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
     fleet_watch_place
     hl=0
     [ "$FW_POS" -lt 0 ] || hl="${FW_LINES[$FW_POS]}"
-    printf '\033[H\033[2J%s\n%s\n\n%s\n%s\n' "$header" \
+    printf '\033[H\033[2J%s\n%s\n%s\n\n%s\n%s\n' "$header" "$summary" \
       "$(fleet_watch_highlight "$frame" "$hl")" \
       "$(paint "$C_DIM" "$WATCH_LEGEND")" "${FW_PROMPT:-$FW_NOTICE}"
     if read_key "$interval"; then

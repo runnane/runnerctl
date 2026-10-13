@@ -762,7 +762,33 @@ build-1  1   org.build-1-b   ci       active/running   2d 7h  enabled  ...  idle
 build-2  Disk: /var/lib/docker [docker] 96% (37.3G free), /srv/runners [work] 41% (602.4G free) — last 1h: 1 OOM kill
 build-2  0   org.build-2-a   ci       active/running   6d     enabled  ...  my-app:lint (2m)
 build-3  unreachable — ssh: connect to host build-3 port 22: No route to host
+2/3 hosts answering · 3 slots: 2 busy, 1 idle · 1 host disk crit · 1 host OOM/disk-full · capacity 1 free of 3
 ```
+
+The last line is the **fleet summary**: is anything wrong, and how much
+capacity is left, without counting rows. A segment whose count is zero is left
+out, so a healthy fleet is a short line:
+
+| segment | counts |
+| --- | --- |
+| `2/3 hosts answering` | hosts that answered, of those configured. Unreachable and timed-out hosts are not answering; a host whose `runnerctl` exited non-zero answered. |
+| `3 slots: 2 busy, 1 idle, …` | every slot, as exactly one of `busy`, `idle`, `STALLED` (a job past `--stall-after`) while its unit is active, and `down` or `disabled` when it is not. |
+| `N leaking` | slots whose finished job left processes behind. |
+| `N host(s) disk crit` / `disk warn` | hosts with a partition past this node's `DISK_CRIT_PCT` / `DISK_WARN_PCT`, each host once, at its worst partition. |
+| `N host(s) OOM/disk-full` | hosts with an OOM kill or a disk-full line in their event window. |
+| `capacity 1 free of 3` | idle slots, of the active ones — what can take a job now. Printed whenever there are slots, `0 free` included. |
+| `N versions` | distinct `runnerctl` versions, when there is more than one. |
+
+A host that did not answer is in the host count and in nothing else: its
+slots are unknown, not down. Each segment takes the colour the table uses for
+that state.
+
+The numbers come from each host's `status --json` — never from the table
+beside them — so the summary costs one more call to every host that answered
+the first. Under `fleet watch` that is another channel on the connection
+already held. For a one-shot `fleet status` it is a second ssh login per
+answering host; a host that did not answer is not dialled again.
+`fleet status --json` carries no summary.
 
 Each host that answered gets a **host line** above its slots: the `Disk:` and
 `last 1h:` part of its own `status` header. Each partition on it is green,
@@ -867,6 +893,7 @@ place, with colour, over ssh connections that **stay open**:
 ```
 $ runnerctl fleet watch --interval 5
 runnerctl fleet watch — 3 host(s) — 14:02:11 — every 5s (q to quit)
+2/3 hosts answering · 3 slots: 2 busy, 1 idle · 1 host disk crit · 1 host OOM/disk-full · capacity 1 free of 3
 HOST     IDX RUNNER          PROFILE  ACTIVE           SINCE  ENABLED  ...  WORKING-ON
 build-1  Disk: / [docker,work] 24% (353.9G free)
 build-1  0   org.build-1-a   ci       active/running   3d 4h  enabled  ...  my-app:test (12m)
@@ -900,6 +927,10 @@ Two differences from `fleet status`, each worth knowing:
 - **The default interval is 5 s**, not the local watch's 2 s. Every tick is a
   round trip to every host, and a tick that has not finished before the next one
   starts is not a faster view, it is a queue.
+
+The [fleet summary](#several-hosts-from-one-place-fleet-status) sits directly
+under the header rather than at the bottom, so it stays on screen however long
+the table is. It is refreshed with the table, once per tick.
 
 `--stall-after` is forwarded by both — the `STALLED` marker (and, for
 `--json`, the `stalled` field) is computed wherever it is drawn, which is
