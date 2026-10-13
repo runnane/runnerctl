@@ -143,10 +143,17 @@
 #FLEET_SSH_OPTS=(-o ControlMaster=auto -o ControlPath=~/.ssh/cm-%C -o ControlPersist=60)
 
 # Most hosts contacted at once, and the per-host seconds budget of a read-only
-# call (status, health, a watch tick). The timeout is what stops one wedged
-# host holding up the whole fan-out.
+# call (status, health). The timeout is what stops one wedged host holding up
+# the whole fan-out.
 #FLEET_PARALLEL="8"
 #FLEET_TIMEOUT="30"
+
+# The per-host seconds budget of a read made by `fleet watch`: each tick's
+# calls, and the reads an action key makes before it decides. A host that
+# does not answer inside it keeps its last rows on screen, marked with how
+# long ago they were seen, and is asked again; it never holds up the other
+# hosts or the keyboard. A one-shot `fleet status` stays on FLEET_TIMEOUT.
+#FLEET_WATCH_TIMEOUT="10"
 
 # The per-host seconds budget of a call that CHANGES things (restart, stop,
 # apply, upgrade, a watch action key, ...). Those are slow by design — a slot

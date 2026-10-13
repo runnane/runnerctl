@@ -102,7 +102,7 @@ XFAIL_KEYS=""  # issue keys of the xfail cases that failed as expected
 RUN_TIMEOUT="${RUN_TIMEOUT:-30}"
 
 run() {
-  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines"
+  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
   rm -rf "$WRITES"; mkdir -p "$WRITES"
   RC=0
   OUT="$(RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
@@ -114,7 +114,7 @@ run() {
 # that seeds the writes-mirror tree with seed_dropin before running a
 # read-only command that reads it back (status's PROFILE column).
 run_keep() {
-  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines"
+  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
   RC=0
   OUT="$(RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
          timeout "$RUN_TIMEOUT" "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
@@ -138,7 +138,7 @@ seed_dropin() {
 # define its functions and return instead of running main, so nothing is
 # sourced from a config and nothing touches the host.
 run_fn() {
-  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines"
+  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
   RC=0
   OUT="$(RUNNERCTL_NO_MAIN=1 bash -c '. "$0" && "$@"' "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
   ERR="$(cat "$TMP/err")"
@@ -157,7 +157,7 @@ save_config() { # PATH   (further config body on stdin)
 
 run_cfg() { # CONFIG-PATH ARGS...
   local cfg="$1"; shift
-  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines"
+  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
   rm -rf "$WRITES"; mkdir -p "$WRITES"
   RC=0
   OUT="$(RUNNERCTL_CONFIG="$cfg" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
@@ -171,7 +171,7 @@ run_cfg() { # CONFIG-PATH ARGS...
 # config file IS the stub and therefore always exists, and a run with no
 # config at all dies at require_runners long before the save.
 run_snippet() { # CONFIG-PATH SNIPPET
-  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines"
+  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
   RC=0
   # shellcheck disable=SC2016  # the child expands $1/$2/$3, not this shell
   OUT="$(RUNNERCTL_NO_MAIN=1 RUNNERCTL_CONFIG="$1" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
@@ -3609,31 +3609,58 @@ case_fleet_watch_cursor_walks_host_slot_pairs() {
   expect_no_log '^direct:'
 }
 
-# A host that stops answering keeps the cursor on its error row and REMEMBERS
-# the slot: the frame it answers in again has the cursor back on build-2's
-# slot-2, not on its first slot and not back at the top of the fleet. A key
-# on the error row acts on nothing and dials nothing.
+# A host that stops answering keeps its ROWS (GHR-74), so the cursor simply
+# stays where it was: on build-2's slot-2, through the tick build-2 drops out
+# of. The kept rows are walkable — j moves on to its slot-3 — and the age
+# line above them is never a stop. The frame build-2 answers in again has the
+# cursor still on that slot, not on its first and not back at the top.
+#
+# Before GHR-74 the host's rows were replaced by one error row and the cursor
+# waited on that; a host with no rows to keep still is one, and a key on it
+# still acts on nothing and dials nothing — which is now pinned by
+# case_fleet_watch_first_frame_before_any_host_has_answered.
 case_fleet_watch_cursor_survives_a_host_dropping_out() {
-  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjj-S-q' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjj-j-q' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
     RUNNERCTL_STUB_FLEET_DOWN="build-2:2" run fleet watch --color never
   expect_rc 0
   expect_out_count "$FRAME_PREFIX" 8
-  expect_out_count "^${REV}build-2 unreachable — ssh: connect to host build-2 port 22: No route to host$ESC\[0m\$" 2
+  # frames 5 and 6 (before and through the tick it dropped out of), then 7
+  # and 8 (the j onto its kept slot-3, and the tick it came back in)
   expect_out_count "$(fw_row build-2 1 2)" 2
+  expect_out_count "$(fw_row build-2 2 3)" 2
   expect_out_count "$(fw_row build-2 0 1)" 1
   expect_out_count "$(fw_row build-1 0 1)" 1
-  # a notice stays up until the next key, so the tick after S shows it too
-  expect_out_count '^build-2: not answering — no slot there to act on$' 2
+  expect_out_count "^${REV}" 8
+  # its rows are in every frame, the two it did not answer in included, under
+  # the age line — which is never the cursor row, and there is no error row
+  expect_out_count "^(${REV})?build-2 +0 +example\.slot-1 " 8
+  expect_out_count '^build-2 +no answer for 0s — last seen [0-9]{2}:[0-9]{2}:[0-9]{2} — unreachable — ssh: connect to host build-2 port 22: No route to host$' 2
+  expect_no_out "^${REV}build-2 +no answer"
+  expect_no_out "^(${REV})?build-2 +unreachable"
   expect_no_out '\[y/n\]'
   expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 3
-  # the S on the error row reads no facts: every --json call here is the
-  # summary's pass (GHR-72), one per tick to a host that ANSWERED that tick —
-  # three for build-1, and two for build-2, which is not asked again on the
-  # tick it was unreachable
+  # every --json call here is the summary's pass (GHR-72), one per tick to a
+  # host that ANSWERED that tick — three for build-1, and two for build-2,
+  # which is not asked again on the tick it was unreachable
   expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 3
   expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 2
   expect_log_count '^probe:ssh_run ' 11
   expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap|logs) '
+  # The age line is not a stop. The run above cannot show that: its cursor is
+  # already on one of build-2's slots, and the cursor's own pair is found
+  # before any other row of that host is considered — so an age line that DID
+  # count as a row changed nothing there (measured: that mutation ran green).
+  # Here the cursor has to CROSS it: on build-2's first kept slot, k goes to
+  # build-1's last slot, not onto the line between them.
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjj-kq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_DOWN="build-2:2" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 6
+  expect_out_count "^${REV}" 6
+  expect_out_count "$(fw_row build-2 0 1)" 2
+  expect_out_count "$(fw_row build-1 2 3)" 2
+  expect_out_count '^build-2 +no answer for ' 2
+  expect_no_out "^${REV}build-2 +no answer"
 }
 
 # A slot that goes away (the host scaled down) drops the cursor to THAT
@@ -6128,6 +6155,440 @@ case_term_lines_real_function_reads_tput() {
   expect_text "no tput on PATH" 0 "$OUT"
 }
 
+# --- GHR-74: fleet watch fetches in the background -----------------------------
+# Each host is fetched by a job of its own and the frame is assembled from what
+# each host last returned. Three stub knobs carry these cases (tests/stub.config
+# has the detail of each):
+#   RUNNERCTL_STUB_FLEET_HANG   a host whose table call never returns — it
+#                               blocks, really, until the process is killed
+#   RUNNERCTL_STUB_CLOCK=1      the pinned clock moves with every `pause`, so
+#                               an age is a number a case can pin
+#   RUNNERCTL_STUB_FLEET_DELAY  its fourth field: slow from frame poll N on
+# and the stub models the watch's poll step: a step waits until every fetch has
+# landed or is hung, a step in which something landed consumes no key, and
+# only a step with nothing but hung hosts out reads RUNNERCTL_STUB_KEYS — so a
+# key logged with the poll step as its timeout (`probe:tty_read_char 0.2 j`)
+# is a key handled WHILE A HOST WAS OUTSTANDING.
+#
+# Frame line numbers, for two hosts of three slots at unknown height: 1 the
+# header, 2 the summary, 3 the column header, 4 build-1's Disk line, 5-7 its
+# slots, 8 build-2's Disk line — or the age line over its kept rows — 9-11
+# its slots.
+SUM_ONE='1/2 hosts answering · 3 slots: 1 busy, 1 idle, 1 disabled · capacity 1 free of 2'
+
+# The pids in PIDS are gone, within two seconds. Whatever is not gets killed
+# here — by pid, the ones the hung call wrote down itself — so a failing run
+# does not leave them spinning.
+_ghr74_expect_dead() { # PIDS
+  _expect
+  local p n alive=""
+  [ -n "$1" ] || FAILS+=("no pid was recorded for the hung call")
+  for p in $1; do
+    n=0
+    while kill -0 "$p" 2>/dev/null && [ "$n" -lt 100 ]; do sleep 0.02; n=$((n + 1)); done
+    if kill -0 "$p" 2>/dev/null; then
+      alive+=" $p"
+      kill "$p" 2>/dev/null || true
+    fi
+  done
+  [ -z "$alive" ] || FAILS+=("still running after the watch exited:$alive")
+}
+_ghr74_expect_empty() { # DIR
+  _expect
+  local left
+  left="$(find "$1" -mindepth 1 -maxdepth 1 2>/dev/null | tr '\n' ' '; true)"
+  [ -z "$left" ] || FAILS+=("left behind in the temp directory: $left")
+}
+
+# The acceptance case. slow-1 accepts its call and never answers. The frame
+# with build-1's rows is drawn all the same — on the first poll step, with
+# slow-1 as a row saying it has not answered yet — and j, pressed while
+# slow-1 is still out, moves the cursor in the next frame. slow-1's call
+# never does return: the watch is quit with it outstanding.
+#
+# RUN_TIMEOUT is short on purpose: a loop that waits for the slowest host
+# again blocks on slow-1 until it is killed, and draws nothing.
+case_fleet_watch_a_hung_host_holds_up_neither_the_frame_nor_a_key() {
+  RUN_TIMEOUT=10 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jq' RUNNERCTL_STUB_FLEET_HOSTS="build-1 slow-1" \
+    RUNNERCTL_STUB_FLEET_HANG="slow-1" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 2
+  # frame 1: build-1 whole, and counted; slow-1 a row, and not
+  expect_frame_line 1 2 "^${SUM_ONE}\$"
+  expect_frame 1 "$(fw_row build-1 0 1)"
+  expect_frame 1 '^build-1 +1 +example\.slot-2 '
+  expect_frame 1 '^build-1 +2 +example\.slot-3 '
+  expect_frame 1 '^slow-1 +waiting for its first answer$'
+  # frame 2: the key, handled with slow-1 still out
+  expect_frame 2 "$(fw_row build-1 1 2)"
+  expect_frame 2 '^slow-1 +waiting for its first answer$'
+  expect_log_count '^probe:tty_read_char 0\.2 j$' 1
+  expect_log_count '^probe:tty_read_char 0\.2 q$' 1
+  # the step build-1 landed in read no key; the two after it did
+  expect_log_order '^probe:fleet_poll landed=1 hung=1$' '^probe:fleet_poll landed=0 hung=1$' \
+                   '^probe:tty_read_char 0\.2 j$' '^probe:fleet_poll landed=0 hung=1$' '^probe:tty_read_char 0\.2 q$'
+  # slow-1 was dialled once, for its table, and that call never came back
+  expect_log_count '^probe:ssh_run slow-1 -- runnerctl status --color never$' 1
+  expect_log_count '^probe:ssh_run slow-1 -- ' 1
+  expect_no_log '^probe:ssh_run_done slow-1$'
+  expect_log_count '^probe:ssh_run build-1 -- ' 2
+}
+
+# Before any host has answered there is still a frame: nobody answering, each
+# host a row that says so in its own words — `waiting`, not `unreachable`,
+# which would be a claim nothing has tested yet. The cursor waits on the first
+# of them, and a key there acts on nothing and dials nothing (the row is a
+# host, not a slot).
+case_fleet_watch_first_frame_before_any_host_has_answered() {
+  RUN_TIMEOUT=10 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='-Sq' RUNNERCTL_STUB_FLEET_HOSTS="slow-1 slow-2" \
+    RUNNERCTL_STUB_FLEET_HANG="slow-1 slow-2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 2
+  expect_frame_line 1 2 '^0/2 hosts answering$'
+  expect_frame_line 1 3 "^${REV}slow-1 +waiting for its first answer$ESC\[0m\$"
+  expect_frame_line 1 4 '^slow-2 +waiting for its first answer$'
+  expect_no_out 'unreachable|timed out|HOST +IDX'
+  expect_frame 2 '^slow-1: not answering — no slot there to act on$'
+  expect_no_out '\[y/n\]'
+  # one call each, the table's; no facts read for the S
+  expect_log_count '^probe:ssh_run ' 2
+  expect_no_log ' --json'
+}
+
+# Nothing outlives the watch: not the fetch job of a host that never answered,
+# not the call under it, not a file. Quit with q, and with Ctrl-C (the stub's
+# `!` is a real SIGINT, so the script's own INT and EXIT traps are what run);
+# the hung call wrote its pid and its job's down, and both are gone. TMPDIR
+# points every mktemp of the run at one directory, which is empty afterwards —
+# the buffer of each host's last answer, the action keys' buffer and the ssh
+# control directory. `--iterations` ending leaves it empty as well.
+case_fleet_watch_exit_ends_its_fetches_and_removes_its_files() {
+  local d="$TMP/ghr74-tmp" how
+  for how in q '!'; do
+    rm -rf "$d"; mkdir -p "$d"
+    TMPDIR="$d" RUN_TIMEOUT=10 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS="$how" RUNNERCTL_STUB_FLEET_HOSTS="build-1 slow-1" \
+      RUNNERCTL_STUB_FLEET_HANG="slow-1" run fleet watch --color never
+    expect_rc 0
+    expect_cfg "$WRITES/remote/slow-1.hung.pids" '^[0-9]+ [0-9]+$'
+    _ghr74_expect_dead "$(cat "$WRITES/remote/slow-1.hung.pids" 2>/dev/null; true)"
+    _ghr74_expect_empty "$d"
+    expect_no_log '^probe:ssh_run_done slow-1$'
+    expect_log_order '^probe:term_cursor show$' '^probe:ssh_control build-1 exit$' '^probe:ssh_control slow-1 exit$'
+  done
+  # SIGINT, or SIGTERM where this run inherited SIGINT ignored (a backgrounded
+  # gate) — the stub says which, and the watch answers both on one trap line
+  expect_log_count '^probe:sig(int|term)$' 1
+  rm -rf "$d"; mkdir -p "$d"
+  TMPDIR="$d" RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-unreachable" \
+    run fleet watch --iterations 2 --color never
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 2
+  _ghr74_expect_empty "$d"
+  rm -rf "$d"
+}
+
+# The other acceptance case: a host that answered and then cannot be reached
+# keeps its rows, under a line that says how old they are, when it was last
+# seen and why — not one bare error row. build-2 is down for ticks 2 and 3 and
+# back for tick 4; the clock moves 5 s a tick, from 01:58:40 UTC, and build-2
+# was last seen at tick 1: 5 s ago at tick 2, 10 s ago at tick 3, the same
+# instant both times. Tick 4 draws it as it was before, Disk line and all.
+case_fleet_watch_a_host_that_stops_answering_keeps_its_rows_with_an_age() {
+  local f
+  TZ=UTC RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='---q' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_DOWN="build-2:2,3" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 4
+  for f in 1 4; do
+    expect_frame_line "$f" 8 '^build-2 +Disk: '
+    expect_no_frame "$f" 'no answer'
+  done
+  expect_frame_line 2 8 '^build-2 +no answer for 5s — last seen 01:58:40 — unreachable — ssh: connect to host build-2 port 22: No route to host$'
+  expect_frame_line 3 8 '^build-2 +no answer for 10s — last seen 01:58:40 — unreachable — ssh: connect to host build-2 port 22: No route to host$'
+  for f in 1 2 3 4; do
+    expect_frame_line "$f" 9 '^build-2 +0 +example\.slot-1 .* my-app:test \(12m\)$'
+    expect_frame_line "$f" 10 '^build-2 +1 +example\.slot-2 .* idle 2h31m \(2 jobs\)$'
+    expect_frame_line "$f" 11 '^build-2 +2 +example\.slot-3 '
+    expect_frame_line "$f" 12 '^$'
+  done
+  expect_no_out '^build-2 +unreachable'
+  expect_no_frame 2 '^build-2 +Disk: '
+  # painted: the age line red, and each kept row dim as a whole with the
+  # remote's own colours taken off — the STALLED it painted bold red at tick 1
+  # is plain text inside the dim at tick 2
+  TZ=UTC RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='-q' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_DOWN="build-2:2" run fleet watch --color always --stall-after 600
+  expect_rc 0
+  frames
+  expect_frame_count 2
+  expect_frame_line 1 9 "^build-2 +0 +example\.slot-1 .*$ESC\[1m$ESC\[31mmy-app:test \(12m\) STALLED$ESC\[0m\$"
+  expect_frame_line 2 8 "^build-2 +$ESC\[31mno answer for 5s — last seen 01:58:40 — unreachable — .*$ESC\[0m\$"
+  expect_frame_line 2 9 "^$ESC\[2mbuild-2 +0 +example\.slot-1 [^$ESC]* my-app:test \(12m\) STALLED$ESC\[0m\$"
+  expect_frame_line 2 10 "^$ESC\[2mbuild-2 +1 +example\.slot-2 [^$ESC]*$ESC\[0m\$"
+}
+
+# A call still out when the next tick comes due makes its host LATE — and not
+# before. build-2 answers tick 1 and hangs from tick 2. In the frame of tick 2
+# its rows are simply the newest there are (a call that has been out for less
+# than an interval is not news), and it still counts. At tick 3 it has missed
+# a whole interval: its rows are kept under their age, it is not asked a
+# second time while the first call is out, and the summary stops counting it.
+case_fleet_watch_a_call_still_out_at_the_next_tick_is_late() {
+  TZ=UTC RUN_TIMEOUT=10 RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='--q' \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" RUNNERCTL_STUB_FLEET_HANG="build-2:2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 3
+  expect_frame_line 2 2 "^${SUM_OK}\$"
+  expect_frame_line 2 8 '^build-2 +Disk: '
+  expect_no_frame 2 'no answer'
+  expect_frame_line 3 2 "^${SUM_ONE}\$"
+  expect_frame_line 3 8 '^build-2 +no answer for 10s — last seen 01:58:40 — its call is still running$'
+  expect_frame_line 3 9 '^build-2 +0 +example\.slot-1 .* my-app:test \(12m\)$'
+  expect_frame_line 3 11 '^build-2 +2 +example\.slot-3 '
+  # build-1 three ticks; build-2 two — the one that answered, the one still out
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 3
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 2
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 1
+}
+
+# PINNED SEPARATELY, because it is the claim the kept rows rest on: rows that
+# are only being kept on screen are worth NOTHING to S's capacity floor. One
+# run, both sides. While build-2 answers, a stop on build-1 leaves 3 of 6.
+# From tick 2 build-2 answers nothing (every call to it runs out of time),
+# its three rows are still in the frame — and the same stop now leaves 1 of 3,
+# with one host not answering and not counted. A floor that read the frame, or
+# the answers the frame was built from, would still say 3 of 6.
+#
+# Also what the floor's fan-out must NOT do to the session: the watch's one
+# EXIT trap is still the one that runs on q, cursor first, then the masters.
+case_fleet_watch_floor_counts_nothing_for_a_host_with_kept_rows() {
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Sn-Snq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_DELAY="build-2:99:status:2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 6
+  expect_frame 2 '^Stop example\.slot-1 on build-1\? runs on build-1: runnerctl stop example\.slot-1 — leaves 3 of 6 slot\(s\) active across the watched hosts  \[y/n\]$'
+  expect_no_frame 2 'no answer'
+  # frame 5: build-2's rows on screen, and not in the arithmetic
+  expect_frame_line 5 8 '^build-2 +no answer for 5s — last seen [0-9]{2}:[0-9]{2}:[0-9]{2} — timed out after 10s$'
+  expect_frame_line 5 9 '^build-2 +0 +example\.slot-1 .* my-app:test \(12m\)$'
+  expect_frame_line 5 10 '^build-2 +1 +example\.slot-2 '
+  expect_frame_line 5 11 '^build-2 +2 +example\.slot-3 '
+  expect_frame 5 '^Stop example\.slot-1 on build-1\? runs on build-1: runnerctl stop example\.slot-1 — leaves 1 of 3 slot\(s\) active across the watched hosts, 1 host\(s\) not answering and not counted  \[y/n\]$'
+  expect_no_frame 5 'leaves [0-9]+ of 6 '
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl stop '
+  expect_log_order '^probe:tty_read_char 5 q$' '^probe:term_cursor show$' '^probe:ssh_control build-1 exit$' '^probe:ssh_control build-2 exit$'
+  expect_log_count '^probe:term_cursor ' 2
+}
+
+# S pressed while a host's fetch is still out. The floor's fan-out waits for
+# ITS OWN calls and nothing else: a bare `wait` there would also sit through
+# slow-1's frame fetch, which never returns, and the key would be dead until
+# the run was killed. (The stub hangs slow-1's table call only, so the floor's
+# own --json read of it answers and its three slots count.)
+case_fleet_watch_floor_does_not_wait_for_a_fetch_still_out() {
+  RUN_TIMEOUT=10 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Snq' RUNNERCTL_STUB_FLEET_HOSTS="build-1 slow-1" \
+    RUNNERCTL_STUB_FLEET_HANG="slow-1" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^Stop example\.slot-1 on build-1\? runs on build-1: runnerctl stop example\.slot-1 — leaves 3 of 6 slot\(s\) active across the watched hosts  \[y/n\]$' 1
+  expect_out_count '^cancelled — nothing run$' 1
+  expect_log_order '^probe:tty_read_char 0\.2 S$' '^probe:ssh_run slow-1 -- runnerctl status --json$' \
+                   '^probe:tty_read_char 0\.2 n$' '^probe:tty_read_char 0\.2 q$'
+  # two calls to slow-1 went out and one came back: the floor's
+  expect_log_count '^probe:ssh_run slow-1 -- ' 2
+  expect_log_count '^probe:ssh_run_done slow-1$' 1
+}
+
+# The summary line, the same rule: a host whose rows are kept is in the host
+# count as NOT answering and in nothing else. Tick 2 has build-2's three rows
+# in the frame and three slots in the summary. Nor is it dialled for the
+# summary's --json on the tick it did not answer: two such calls to build-2
+# over three ticks, three to build-1.
+case_fleet_watch_summary_counts_nothing_for_a_host_with_kept_rows() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='--q' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_DOWN="build-2:2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 3
+  expect_frame_line 1 2 "^${SUM_OK}\$"
+  expect_frame_line 2 2 "^${SUM_ONE}\$"
+  expect_frame_line 2 9 '^build-2 +0 +example\.slot-1 '
+  expect_frame_line 2 10 '^build-2 +1 +example\.slot-2 '
+  expect_frame_line 2 11 '^build-2 +2 +example\.slot-3 '
+  expect_frame_line 3 2 "^${SUM_OK}\$"
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 3
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 2
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 3
+  expect_log_count '^probe:ssh_run ' 11
+}
+
+# FLEET_WATCH_TIMEOUT: the watch's reads have a budget of their own, 10 s by
+# default, and `fleet status` does not. slow-1 takes 15 s to answer anything —
+# inside FLEET_TIMEOUT's 30, outside the watch's 10. So the watch times it out
+# and says after how long, the one-shot gets its rows, and a watch whose
+# budget is raised past 15 gets them too. S's floor reads on the same budget
+# (slow-1 is not counted), and so does the facts read an action key makes: K
+# on a row kept from a host that has since gone slow is told so, in 10 s.
+case_fleet_watch_reads_are_on_their_own_budget() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 slow-1" RUNNERCTL_STUB_FLEET_DELAY="slow-1:15" \
+    run fleet watch --iterations 1 --color never
+  expect_rc 0
+  expect_out_count '^slow-1 +timed out after 10s$' 1
+  expect_out_count '^build-1 +0 +example\.slot-1 ' 1
+  expect_under_header "$SUM_ONE" 1
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 slow-1" RUNNERCTL_STUB_FLEET_DELAY="slow-1:15" run fleet status
+  expect_rc 0
+  expect_out_count '^slow-1 +0 +example\.slot-1 ' 1
+  expect_no_out 'timed out'
+  printf '. %q\nFLEET_WATCH_TIMEOUT=20\n' "$PWD/$STUB" >"$TMP/ghr74.config"
+  chmod 644 "$TMP/ghr74.config"
+  STUB="$TMP/ghr74.config" RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 slow-1" \
+    RUNNERCTL_STUB_FLEET_DELAY="slow-1:15" run fleet watch --iterations 1 --color never
+  expect_rc 0
+  expect_out_count '^slow-1 +0 +example\.slot-1 ' 1
+  expect_no_out 'timed out'
+  printf '. %q\nFLEET_WATCH_TIMEOUT=0\n' "$PWD/$STUB" >"$TMP/ghr74.config"
+  STUB="$TMP/ghr74.config" RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet status
+  expect_rc 1
+  expect_err "^runnerctl: FLEET_WATCH_TIMEOUT '0' set in .* is invalid — want a whole number of seconds, 1 or more\$"
+  expect_no_log '^probe:ssh_run'
+  # the floor
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Snq' RUNNERCTL_STUB_FLEET_HOSTS="build-1 slow-1" \
+    RUNNERCTL_STUB_FLEET_DELAY="slow-1:15" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^Stop example\.slot-1 on build-1\? .* — leaves 1 of 3 slot\(s\) active across the watched hosts, 1 host\(s\) not answering and not counted  \[y/n\]$' 1
+  # the facts read at a key, on a kept row
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='-Kq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    RUNNERCTL_STUB_FLEET_DELAY="build-1:15:status:2" run fleet watch --color never
+  expect_rc 0
+  expect_out "^${REV}build-1 +0 +example\.slot-1 .*$ESC\[0m\$"
+  expect_out_count '^build-1 +no answer for 5s — last seen [0-9]{2}:[0-9]{2}:[0-9]{2} — timed out after 10s$' 2
+  expect_out_count '^example\.slot-1 on build-1: could not read its current state — timed out after 10s$' 1
+  expect_no_out '\[y/n\]'
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl kill '
+}
+
+# FLEET_PARALLEL still caps the calls in flight, now that each host has a job
+# of its own: with it at 1, three hosts are fetched one after another and the
+# stub's overlap detector (a lock held for a window, see ssh_run_body) never
+# trips. The twin run, at the default of 8, trips it — which is what makes the
+# first one evidence rather than a detector that cannot fire.
+case_fleet_watch_fetches_respect_fleet_parallel() {
+  printf '. %q\nFLEET_PARALLEL=1\n' "$PWD/$STUB" >"$TMP/ghr74.config"
+  chmod 644 "$TMP/ghr74.config"
+  STUB="$TMP/ghr74.config" RUNNERCTL_STUB_DETECT_OVERLAP=1 RUNNERCTL_STUB_TTY=1 \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 build-3" run fleet watch --iterations 1 --color never
+  expect_rc 0
+  expect_out_count '^build-[123] +0 +example\.slot-1 ' 3
+  expect_log_count '^probe:ssh_run ' 6
+  expect_no_log '^probe:ssh_run_overlap '
+  RUNNERCTL_STUB_DETECT_OVERLAP=1 RUNNERCTL_STUB_TTY=1 \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 build-3" run fleet watch --iterations 1 --color never
+  expect_rc 0
+  expect_log '^probe:ssh_run_overlap '
+}
+
+# now_ms — the clock the ticks are scheduled on — is shadowed by the stub (the
+# pinned clock), so the real one is pinned here: thirteen digits, the instant
+# date's seconds say it is, from bash's own clock and, with that taken away,
+# from date. And ms_to_secs, which turns what is left of an interval into the
+# timeout of the key read: whole seconds stay whole, which is what keeps that
+# read's logged timeout the `5` it always was.
+case_now_ms_real_function_is_epoch_milliseconds() {
+  local s how
+  for how in 'now_ms' 'unset EPOCHREALTIME; now_ms'; do
+    s="$(date +%s)"
+    run_fn eval "$how"
+    expect_rc 0
+    expect_out '^[0-9]{13}$'
+    _expect
+    if ! [[ "$OUT" =~ ^[0-9]{13}$ ]] || [ $((OUT / 1000 - s)) -lt 0 ] || [ $((OUT / 1000 - s)) -gt 2 ]; then
+      FAILS+=("'$how' answered '$OUT', not the millisecond of epoch second $s")
+    fi
+  done
+  run_fn eval 'ms_to_secs 5000; ms_to_secs 4412; ms_to_secs 200; ms_to_secs 60005'
+  expect_rc 0
+  expect_text "milliseconds as seconds" $'5\n4.412\n0.200\n60.005' "$OUT"
+}
+
+# Everything above runs the stub's ssh_run and the stub's model of the poll
+# step. This one runs the REAL ssh_run — the real `timeout`, which puts itself
+# and its command in a process group of their own — against a fake `ssh`, and
+# drives the fetch functions directly:
+#   * ok-1's answer is taken in whole (table, summary payload, both exit
+#     statuses) while hang-1's call is still out, and nothing of hang-1's is
+#     published;
+#   * a round asked for by an action key while ok-1's call was already out
+#     fetches ok-1 AGAIN once that call lands — what it brought back may
+#     predate the action;
+#   * fleet_watch_reap ends hang-1's job AND the ssh under its `timeout`,
+#     which is not in the job's process group and would otherwise sit there
+#     until the budget ran out.
+case_fleet_watch_real_fetch_job_and_its_ssh_end_at_cleanup() {
+  local d saved="$PATH"
+  d="$(mktemp -d "$TMP/ghr74.XXXXXX")"
+  mkdir "$d/bin"
+  cat >"$d/bin/ssh" <<'EOF'
+#!/bin/sh
+# A fake remote. The host is the word after `--`; hang-* never answers.
+echo "$*" >>"$GHR74_DIR/calls"
+while [ "$1" != "--" ]; do shift; done
+host="$2"
+case "$host" in
+  hang-*) echo "$$" >"$GHR74_DIR/ssh.pid"; exec sleep 30 ;;
+esac
+sleep 0.2
+case "$*" in
+  *--json*) printf '{"runnerctl":"1.0.0"}\n' ;;
+  *)        printf 'runnerctl 1.0.0 — Host: x\n\nIDX RUNNER\n0 example.slot-1\n' ;;
+esac
+EOF
+  chmod +x "$d/bin/ssh"
+  PATH="$d/bin:$PATH"
+  # shellcheck disable=SC2016
+  GHR74_DIR="$d" run_fn eval '
+    FLEET_HOSTS=(ok-1 hang-1) FLEET_BUDGETS=(20 20)
+    FW_STATE="$(mktemp -d)" FW_PID=("" "") FW_AGAIN=("" "") FW_TABLE_ARGS=(status --color never)
+    echo late >"$FW_STATE/0.rc"; echo late >"$FW_STATE/1.rc"
+    fleet_watch_round tick
+    fleet_watch_round refresh
+    n=0
+    while [ "$(grep -c -- "-- ok-1 runnerctl status --color" "$GHR74_DIR/calls"; true)" -lt 2 ] || [ -n "${FW_PID[0]}" ] || [ ! -s "$GHR74_DIR/ssh.pid" ]; do
+      n=$((n + 1)); [ "$n" -lt 300 ] || break
+      sleep 0.02
+      fleet_watch_collect
+    done
+    echo "ok-1 rc=$(cat "$FW_STATE/0.rc") jrc=$(cat "$FW_STATE/0.jrc") rows=$(grep -c slot "$FW_STATE/0.out") json=$(cat "$FW_STATE/0.json") seen=$(grep -c . "$FW_STATE/0.seen")"
+    echo "ok-1 table calls=$(grep -c -- "-- ok-1 runnerctl status --color" "$GHR74_DIR/calls")"
+    echo "hang-1 rc=$(cat "$FW_STATE/1.rc") job=${FW_PID[1]:+out} published=$(ls "$FW_STATE" | grep -c "^1\.done"; true) seen=$(ls "$FW_STATE" | grep -c "^1\.seen"; true)"
+    job="${FW_PID[1]}" ssh_pid="$(cat "$GHR74_DIR/ssh.pid")"
+    if pid_alive "$ssh_pid" && pid_alive "$job"; then echo "both alive before"; fi
+    fleet_watch_reap
+    n=0
+    while { pid_alive "$ssh_pid" || pid_alive "$job"; } && [ "$n" -lt 150 ]; do sleep 0.02; n=$((n + 1)); done
+    if pid_alive "$ssh_pid"; then echo "ssh SURVIVED"; kill "$ssh_pid"; fi
+    if pid_alive "$job"; then echo "job SURVIVED"; kill "$job"; fi
+    echo "reaped job=[${FW_PID[1]}]"
+    rm -rf "$FW_STATE"
+  '
+  PATH="$saved"
+  expect_rc 0
+  expect_out '^ok-1 rc=0 jrc=0 rows=1 json=\{"runnerctl":"1\.0\.0"\} seen=1$'
+  expect_out '^ok-1 table calls=2$'
+  expect_out '^hang-1 rc=late job=out published=0 seen=0$'
+  expect_out '^both alive before$'
+  expect_no_out 'SURVIVED'
+  expect_out '^reaped job=\[\]$'
+  # and what was dialled is the table call, on the real ssh command line
+  expect_cfg "$d/calls" '^-o BatchMode=yes -o ConnectTimeout=10 -- hang-1 runnerctl status --color never$'
+  expect_cfg_count "$d/calls" ' -- hang-1 ' 1
+  rm -rf "$d"
+}
+
 t "status: header and one row per discovered slot"                case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
 t "status: EnvironmentFiles value with embedded '=' survives"       case_status_envfile_value_with_embedded_equals
@@ -6475,6 +6936,20 @@ t "viewport: the last row brings the notes under it into view"            case_v
 t "viewport: no room for a window, or for the cursor line — drawn whole"  case_viewport_frame_too_small_is_drawn_whole
 t "read_key: PgUp/PgDn/Home/End in every spelling, the ~ read with them"  case_read_key_decodes_the_paging_keys
 t "term_lines: the real one reads tput; failing, garbage or absent is 0"  case_term_lines_real_function_reads_tput
+
+# --- GHR-74: fleet watch fetches in the background -----------------------------
+t "fleet watch: a hung host holds up neither the frame nor a key"         case_fleet_watch_a_hung_host_holds_up_neither_the_frame_nor_a_key
+t "fleet watch: the first frame, before any host has answered"            case_fleet_watch_first_frame_before_any_host_has_answered
+t "fleet watch: q, Ctrl-C and --iterations leave no job and no file"      case_fleet_watch_exit_ends_its_fetches_and_removes_its_files
+t "fleet watch: a host that stops answering keeps its rows, with an age"  case_fleet_watch_a_host_that_stops_answering_keeps_its_rows_with_an_age
+t "fleet watch: a call still out at the next tick is late, not before"    case_fleet_watch_a_call_still_out_at_the_next_tick_is_late
+t "fleet watch: S's floor counts nothing for a host with kept rows"       case_fleet_watch_floor_counts_nothing_for_a_host_with_kept_rows
+t "fleet watch: S's floor does not wait for a fetch that is still out"    case_fleet_watch_floor_does_not_wait_for_a_fetch_still_out
+t "fleet watch: the summary counts nothing for a host with kept rows"     case_fleet_watch_summary_counts_nothing_for_a_host_with_kept_rows
+t "fleet watch: its reads are on FLEET_WATCH_TIMEOUT; fleet status is not" case_fleet_watch_reads_are_on_their_own_budget
+t "fleet watch: the background fetches respect FLEET_PARALLEL"            case_fleet_watch_fetches_respect_fleet_parallel
+t "now_ms: the real one is epoch milliseconds; ms_to_secs keeps 5 a 5"    case_now_ms_real_function_is_epoch_milliseconds
+t "fleet watch: the real fetch job and the ssh under it end at cleanup"   case_fleet_watch_real_fetch_job_and_its_ssh_end_at_cleanup
 
 
 # --- GHR-45: provision --------------------------------------------------------

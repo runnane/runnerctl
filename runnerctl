@@ -227,6 +227,12 @@
 # a stop that would leave fewer than --min-available K (default 1) slots
 # active across the watched hosts, so a cursor walked down the fleet pressing
 # S cannot take it to zero. `q` quits.
+# Each host is fetched in the background (GHR-74), so one that stalls holds up
+# neither the others' rows nor the keys. A host that stops answering keeps its
+# last rows, dimmed, under `no answer for 45s — last seen 14:02:10 — <why>`;
+# rows kept that way count for nothing in the summary or in S's floor. The
+# watch's reads have FLEET_WATCH_TIMEOUT seconds per host (default 10), not
+# FLEET_TIMEOUT.
 # A frame wider than the terminal makes the next tick ask the hosts for
 # `status --narrow` (GHR-56), with the local watch's hysteresis; a host too
 # old for the flag is asked again without it and shows its full-width rows.
@@ -392,9 +398,14 @@ FLEET_HOSTS=()
 # any of them (e.g. adding ControlMaster/ControlPersist for a polling loop).
 FLEET_SSH_OPTS=()
 # Most hosts contacted at once, and the per-host seconds budget of a READ-ONLY
-# call (status, health, a watch tick).
+# call (status, health).
 FLEET_PARALLEL="8"
 FLEET_TIMEOUT="30"
+# The per-host seconds budget of a read made by `fleet watch` (GHR-74): a
+# tick's table and summary calls, and the reads an action key makes before it
+# decides. Shorter than FLEET_TIMEOUT because a host that takes half a minute
+# to answer a poll is not being watched, it is being waited for.
+FLEET_WATCH_TIMEOUT="10"
 # The per-host seconds budget of a MUTATING call (GHR-81). Separate because
 # FLEET_TIMEOUT is sized for a status read, and the commands that change
 # things are slow by design: a restart of a slot whose job ignores SIGTERM
@@ -496,6 +507,7 @@ load_config() {
   [[ "$FLEET_PARALLEL" =~ ^[1-9][0-9]*$ ]] || die "FLEET_PARALLEL '$FLEET_PARALLEL' set in $CONFIG_FILE is invalid — want a whole number of hosts, 1 or more"
   [[ "$FLEET_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "FLEET_TIMEOUT '$FLEET_TIMEOUT' set in $CONFIG_FILE is invalid — want a whole number of seconds, 1 or more"
   [[ "$FLEET_MUTATE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "FLEET_MUTATE_TIMEOUT '$FLEET_MUTATE_TIMEOUT' set in $CONFIG_FILE is invalid — want a whole number of seconds, 1 or more"
+  [[ "$FLEET_WATCH_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "FLEET_WATCH_TIMEOUT '$FLEET_WATCH_TIMEOUT' set in $CONFIG_FILE is invalid — want a whole number of seconds, 1 or more"
   [ -n "$FLEET_RUNNERCTL" ] || die "FLEET_RUNNERCTL set in $CONFIG_FILE is empty — want the remote command name or an absolute path"
   # Provisioning settings (GHR-45). Checked here so a typo fails before a
   # download, a useradd or a registration — not half way through slot 3.
@@ -905,8 +917,62 @@ cgroup_memory_facts() { # CGROUP
   fi
 }
 
+# PID's parent, from /proc — nothing when PID is gone. Past the last `)`: the
+# comm field between the parentheses may itself hold spaces and parentheses.
+proc_ppid() { # PID
+  local s
+  s="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
+  s="${s##*) }"
+  read -r _ s _ <<<"$s"
+  echo "$s"
+}
+# PID's direct children, one per line. The kernel's own list where it keeps
+# one (reliable only while PID is stopped, which is how proc_tree_kill reads
+# it), else every process whose parent is PID.
+proc_children() { # PID
+  local f="/proc/$1/task/$1/children" d kid
+  if [ -r "$f" ]; then
+    for kid in $(cat "$f" 2>/dev/null || true); do echo "$kid"; done
+    return 0
+  fi
+  for d in /proc/[0-9]*; do
+    kid="${d#/proc/}"
+    [ "$(proc_ppid "$kid")" != "$1" ] || echo "$kid"
+  done
+}
+# TERM for PID and everything under it (GHR-74). Signalling the group is not
+# enough: `timeout` puts itself and its command in a group of their own, so a
+# background job's ssh is not in the job's group. Each process is STOPPED
+# before its children are listed, so it cannot start another one between the
+# listing and its own TERM — which is delivered when it is continued.
+proc_tree_kill() { # PID
+  local kid
+  kill -STOP "$1" 2>/dev/null || return 0
+  for kid in $(proc_children "$1"); do proc_tree_kill "$kid"; done
+  kill -TERM "$1" 2>/dev/null || true
+  kill -CONT "$1" 2>/dev/null || true
+}
+
 # Epoch seconds; a config can shadow it to pin the journal-derived runtime.
 now_epoch() { date +%s; }
+# Epoch milliseconds, for scheduling `fleet watch`'s ticks (GHR-74): its waits
+# are fractions of a second, and a deadline kept in whole seconds would put
+# every tick up to a second early or late. From bash's own clock where it has
+# one (5.0 on — no fork, and its decimal mark follows the locale), else from
+# date. Behind a function for the same reason as now_epoch.
+now_ms() {
+  local t="${EPOCHREALTIME:-}"
+  if [[ "$t" =~ ^([0-9]+)[.,]([0-9]{3}) ]]; then
+    echo "${BASH_REMATCH[1]}${BASH_REMATCH[2]}"
+  else
+    date +%s%3N
+  fi
+}
+# MILLISECONDS as the seconds `read -t` and `sleep` take: 5000 -> 5, 4412 ->
+# 4.412.
+ms_to_secs() { # MILLISECONDS
+  if [ $(($1 % 1000)) -eq 0 ]; then echo $(($1 / 1000)); else printf '%d.%03d\n' $(($1 / 1000)) $(($1 % 1000)); fi
+}
 
 # The WORKING-ON cell. Takes the cgroup, invocation id and active-enter stamp
 # (µs since boot) from the caller's already-fetched unit_props (GHR-4)
@@ -4014,20 +4080,30 @@ FLEET_OPTIONAL_REJECTED=" "
 # Empty for a read-only fan-out, which leaves every host on FLEET_TIMEOUT; a
 # mutating command fills it from fleet_mutate_budget before it fans out.
 FLEET_BUDGETS=()
+# Whether a longer-lived session already owns the EXIT trap (GHR-74). `fleet
+# watch` does: its one trap tears down the terminal, its background fetches,
+# both buffer directories and the ssh masters, and a fan-out made from inside
+# it — S's capacity floor — must not replace that with the removal of one
+# directory. Its trap removes this fan-out's FLEET_DIR as well.
+FLEET_EXIT_OWNED=false
 fleet_fanout() { # REMOTE-ARGS...
   local i host running=0
-  local -a retry=()
+  local -a retry=() pids=()
   FLEET_DIR="$(mktemp -d)"
-  trap fleet_cleanup EXIT
+  $FLEET_EXIT_OWNED || trap fleet_cleanup EXIT
   for i in "${!FLEET_HOSTS[@]}"; do
     fleet_fanout_one "$i" "$@" &
+    pids+=("$!")
     running=$((running + 1))
     if [ "$running" -ge "$FLEET_PARALLEL" ]; then
       wait -n 2>/dev/null || true
       running=$((running - 1))
     fi
   done
-  wait
+  # This fan-out's own children, by pid, and never a bare `wait` (GHR-74):
+  # under `fleet watch` a host's background fetch may still be out, and a
+  # bare wait would sit through that one's budget as well.
+  wait "${pids[@]}" 2>/dev/null || true
   [ -n "$FLEET_OPTIONAL_ARG" ] || return 0
   for i in "${!FLEET_HOSTS[@]}"; do
     host="${FLEET_HOSTS[$i]}"
@@ -4036,16 +4112,17 @@ fleet_fanout() { # REMOTE-ARGS...
     FLEET_OPTIONAL_REJECTED+="$host "
     retry+=("$i")
   done
-  running=0
+  running=0 pids=()
   for i in ${retry[@]+"${retry[@]}"}; do
     fleet_fanout_one "$i" "$@" &
+    pids+=("$!")
     running=$((running + 1))
     if [ "$running" -ge "$FLEET_PARALLEL" ]; then
       wait -n 2>/dev/null || true
       running=$((running - 1))
     fi
   done
-  wait
+  [ "${#pids[@]}" -eq 0 ] || wait "${pids[@]}" 2>/dev/null || true
 }
 # One host's call into its three files. Runs in the background, so nothing it
 # sets survives; FLEET_OPTIONAL_ARG is left out of the argv of a host already
@@ -4076,8 +4153,12 @@ fleet_rc() { # INDEX
 # (255) or the call ran out of time (124) — nothing is known about it — versus
 # the remote runnerctl running fine and exiting non-zero, which on a
 # runner-less host is its own perfectly good message and not a fleet fault.
+#
+# `late` is `fleet watch`'s own (GHR-74), never an exit status: the host's call
+# has not come back — it has not answered at all yet, or a tick came due with
+# its call from an earlier one still out. Nothing is known about it either.
 fleet_reachable() { # RC
-  case "$1" in 124|255) echo false ;; *) echo true ;; esac
+  case "$1" in 124|255|late) echo false ;; *) echo true ;; esac
 }
 
 # What a timed-out MUTATING call adds to `timed out after Ns` (GHR-81).
@@ -4138,6 +4219,7 @@ fleet_error_text() { # RC ERRFILE [BUDGET [MUTATING]]
   esac
   case "$rc" in
     0)   echo "" ;;
+    late) echo "waiting for its first answer" ;;
     124) echo "timed out after ${budget}s$still${err:+ — $err}" ;;
     255) echo "unreachable${err:+ — $err}" ;;
     *)   echo "remote exit $rc${err:+ — $err}$hint" ;;
@@ -4249,8 +4331,46 @@ fleet_host_info_paint() { # PLAIN-INFO
 # did not answer, so `fleet watch`'s cursor must not stop on it.
 FLEET_INFO_RE='^[^ ]+ +(Disk: |last [^:]*: )'
 
+# --- Rows kept from a host that stopped answering (GHR-74) --------------------
+# `fleet watch` keeps what each host last returned. A host that then cannot be
+# reached, runs out of time, or whose call is still out when the next tick
+# comes due, used to lose its rows to one red error row — at exactly the
+# moment an operator wants to know what that box was running. Its rows now
+# stay, dimmed, under a line saying how old they are and why:
+#
+#   build-3 no answer for 45s — last seen 14:02:10 — unreachable — ssh: …
+#   build-3 0 example.slot-1 …
+#
+# The age is counted from the last time the host returned a table (its
+# `.seen`, written with now_epoch when that answer was taken in), to the
+# moment the frame is assembled; `last seen` is that same instant as a clock
+# time. The rows are DISPLAY ONLY. The summary line and S's capacity floor
+# both read the host's latest exit status, which says it is not answering, and
+# count nothing for it.
+#
+# Only `fleet watch` writes a `.seen`, so a one-shot `fleet status` — which has
+# no earlier answer to show — draws the bare error row it always drew. So does
+# a host that answered and whose runnerctl then exited non-zero: that is the
+# host's own account of itself (its runners are gone, say), not silence, and
+# old rows under it would contradict it.
+#
+# The line as it appears in the assembled frame — the HOST cell, then `no
+# answer for`. Not a slot, and its host's rows follow it, so `fleet watch`'s
+# cursor must not stop on it (as for a host line).
+FLEET_STALE_RE='^[^ ]+ +no answer for '
+fleet_stale_line() { # INDEX RC
+  local seen why
+  seen="$(cat "$FLEET_DIR/$1.seen")"
+  case "$2" in
+    late) why="its call is still running" ;;
+    *)    why="$(fleet_error_text "$2" "$FLEET_DIR/$1.err" "${FLEET_BUDGETS[$1]:-}")" ;;
+  esac
+  printf 'no answer for %s — last seen %s — %s\n' \
+    "$(fmt_dur $(($(now_epoch) - seen)))" "$(date -d "@$seen" +%H:%M:%S)" "$why"
+}
+
 fleet_status_table() {
-  local i host rc hostw=4 ver first_ver="" skew=false bad=0 n=0 hdr=""
+  local i host rc hostw=4 ver first_ver="" skew=false bad=0 n=0 hdr="" stale
   local -a lines notes=()
   for host in "${FLEET_HOSTS[@]}"; do
     [ "${#host}" -le "$hostw" ] || hostw="${#host}"
@@ -4258,11 +4378,20 @@ fleet_status_table() {
   for i in "${!FLEET_HOSTS[@]}"; do
     host="${FLEET_HOSTS[$i]}"
     rc="$(fleet_rc "$i")"
+    stale=false
     if [ "$rc" != 0 ]; then
       bad=$((bad + 1))
-      printf '%-*s %s\n' "$hostw" "$host" \
-        "$(paint "$C_RED" "$(fleet_error_text "$rc" "$FLEET_DIR/$i.err")")"
-      continue
+      if [ "$(fleet_reachable "$rc")" = false ] && [ -s "$FLEET_DIR/$i.seen" ]; then
+        # GHR-74: its last table is still in $i.out — a failed call replaces
+        # the exit status and the error, never the rows.
+        stale=true
+      else
+        # The budget the call was given, where the caller named one per host
+        # (`fleet watch` does): a timed-out row must quote the right number.
+        printf '%-*s %s\n' "$hostw" "$host" \
+          "$(paint "$C_RED" "$(fleet_error_text "$rc" "$FLEET_DIR/$i.err" "${FLEET_BUDGETS[$i]:-}")")"
+        continue
+      fi
     fi
     mapfile -t lines <"$FLEET_DIR/$i.out"
     # A zero-status host that produced no table is still a failed row rather
@@ -4270,15 +4399,18 @@ fleet_status_table() {
     # ${lines[0]} on an empty mapfile fatal, and the header and column-header
     # lines are only there to index if the remote actually printed a table.
     if [ "${#lines[@]}" -lt 3 ]; then
-      bad=$((bad + 1))
+      $stale || bad=$((bad + 1))
       printf '%-*s %s\n' "$hostw" "$host" \
         "$(paint "$C_RED" "no status table returned")"
       continue
     fi
-    strip_sgr "${lines[0]}"
-    ver="${SGR_STRIPPED#runnerctl }"; ver="${ver%% *}"
-    if [ -z "$first_ver" ]; then first_ver="$ver"
-    elif [ "$ver" != "$first_ver" ]; then skew=true
+    # A version read off rows this old says nothing about skew today.
+    if ! $stale; then
+      strip_sgr "${lines[0]}"
+      ver="${SGR_STRIPPED#runnerctl }"; ver="${ver%% *}"
+      if [ -z "$first_ver" ]; then first_ver="$ver"
+      elif [ "$ver" != "$first_ver" ]; then skew=true
+      fi
     fi
     # The column header is printed once, from the first host that answered —
     # and again whenever a host's differs from the one above it (GHR-56): a
@@ -4299,14 +4431,27 @@ fleet_status_table() {
     fi
     n=$((n + 1))
     local l info
-    info="$(fleet_host_info "${lines[0]}")"
-    [ -z "$info" ] || printf '%-*s %s\n' "$hostw" "$host" "$info"
+    if $stale; then
+      # Where the host line would be: the age line, and no Disk/OOM line —
+      # those facts are as old as the rows and would not be dimmed by them.
+      printf '%-*s %s\n' "$hostw" "$host" "$(paint "$C_RED" "$(fleet_stale_line "$i" "$rc")")"
+    else
+      info="$(fleet_host_info "${lines[0]}")"
+      [ -z "$info" ] || printf '%-*s %s\n' "$hostw" "$host" "$info"
+    fi
     for l in "${lines[@]:3}"; do
       strip_sgr "$l"
       case "$SGR_STRIPPED" in
         note:*) notes+=("$l") ;;
         '')     ;;
-        *)      printf '%-*s %s\n' "$hostw" "$host" "$l" ;;
+        *)
+          if $stale; then
+            # The whole row dim, the remote's own colours taken off first: a
+            # red STALLED from half a minute ago is not a current alarm.
+            paint "$C_DIM" "$(printf '%-*s %s' "$hostw" "$host" "$SGR_STRIPPED")"
+          else
+            printf '%-*s %s\n' "$hostw" "$host" "$l"
+          fi ;;
       esac
     done
   done
@@ -5169,14 +5314,202 @@ cmd_fleet_status() { # [--json] [--color WHEN] [--stall-after N] [--narrow]
 # a network round trip to every host, and a tick that has not finished before
 # the next one starts is not a faster view, it is a queue.
 
-# Restores the terminal, drops the fan-out's buffer directory and closes every
-# ssh master. Ordering is deliberate: the cursor comes back first, so a slow
-# or hanging close cannot leave an invisible cursor behind.
+# --- Fleet watch: fetching in the background (GHR-74) -------------------------
+# A tick used to be a fan-out the loop WAITED for, so the slowest host set the
+# pace for all of them: one box that accepted the connection and then stalled
+# made every frame FLEET_TIMEOUT late and left the keyboard dead for as long.
+#
+# Now each host is fetched by a background job of its own and the frame is
+# assembled from whatever each host LAST returned:
+#
+#   * One job per host, and never two for the same host at once. A job makes
+#     the tick's two calls — the table, then (to a host that answered) the
+#     summary's `status --json` — each on FLEET_WATCH_TIMEOUT rather than
+#     FLEET_TIMEOUT, and publishes them TOGETHER: it writes into `<i>.new/`
+#     and renames that to `<i>.done/`, so the loop only ever sees a whole
+#     answer and a redraw can never read half of one.
+#   * The loop is the only reader. fleet_watch_collect takes a `.done` into
+#     the flat `<i>.out/.err/.rc/.json/.jrc` files the renderers already read
+#     (FW_STATE stands in for FLEET_DIR while a frame is assembled). A good
+#     answer replaces all of them and stamps `<i>.seen`; a failed one replaces
+#     the exit status and the error ONLY — the rows it had stay, which is what
+#     fleet_status_table draws dimmed under the age line.
+#   * The wait between two frames is always the key read. While a job is out
+#     it is FW_POLL long, so an answer is on screen within that of landing and
+#     a key is handled at once; otherwise it is what is left of the interval.
+#     Nothing on this path calls `wait`: viewport_read_key arms its WINCH trap
+#     around the read, and a trapped signal makes a `wait` return early.
+#   * A host still out when the next tick comes due is `late`: not asked a
+#     second time (it has a call in flight), not answering as far as the
+#     summary is concerned, and — if it answered before — shown as its old
+#     rows with their age. Until that tick its rows are simply the newest
+#     there are, exactly as old as every row is between two ticks, so a call
+#     that takes its ordinary few hundred milliseconds never dims anything.
+#   * `--iterations` (the headless test path) has no keys to keep alive, so it
+#     waits for the round and prints once — by pid, with no trap armed.
+#
+# FW_PID is each host's state, indexed like FLEET_HOSTS: empty when idle, `-`
+# when queued behind FLEET_PARALLEL, else the pid of its job. FW_AGAIN marks a
+# host whose job was already out when an action key asked for a fresh frame:
+# what that job brings back may predate the action, so it is fetched once
+# more as soon as it lands.
+#
+# FW_NEXT is when the next tick is due, in now_ms's milliseconds.
+FW_STATE="" FW_POLL="0.2" FW_NEXT=0 FW_INTERVAL=5 FW_DIRTY=false
+FW_PID=() FW_AGAIN=() FW_TABLE_ARGS=() FW_JSON_ARGS=()
+
+# One host's tick, in the background: nothing it sets survives, which is why a
+# host found too old for --narrow is remembered as a file. See fleet_fanout
+# for that skew rule — the same one, with the second call in the same job.
+fleet_watch_fetch_one() { # INDEX
+  local i="$1" host d a hrc=0
+  local -a args=()
+  host="${FLEET_HOSTS[$i]}" d="$FW_STATE/$i.new"
+  rm -rf "$d"
+  mkdir "$d"
+  for a in "${FW_TABLE_ARGS[@]}"; do
+    if [ "$a" != "$FLEET_OPTIONAL_ARG" ] || [ ! -e "$FW_STATE/$i.plain" ]; then args+=("$a"); fi
+  done
+  FLEET_CALL_TIMEOUT="${FLEET_BUDGETS[$i]:-}" ssh_run "$host" "$FLEET_RUNNERCTL" "${args[@]}" >"$d/out" 2>"$d/err" || hrc=$?
+  if [ "$hrc" = 1 ] && [ ! -e "$FW_STATE/$i.plain" ] && grep -qF -- "unknown option: $FLEET_OPTIONAL_ARG" "$d/err"; then
+    : >"$FW_STATE/$i.plain"
+    args=() hrc=0
+    for a in "${FW_TABLE_ARGS[@]}"; do [ "$a" = "$FLEET_OPTIONAL_ARG" ] || args+=("$a"); done
+    FLEET_CALL_TIMEOUT="${FLEET_BUDGETS[$i]:-}" ssh_run "$host" "$FLEET_RUNNERCTL" "${args[@]}" >"$d/out" 2>"$d/err" || hrc=$?
+  fi
+  echo "$hrc" >"$d/rc"
+  # GHR-72's summary pass, to a host whose table call exited 0 and no other:
+  # one that is down is dialled once per tick, not twice.
+  if [ "$hrc" = 0 ]; then
+    FLEET_CALL_TIMEOUT="${FLEET_BUDGETS[$i]:-}" ssh_run "$host" "$FLEET_RUNNERCTL" status --json ${FW_JSON_ARGS[@]+"${FW_JSON_ARGS[@]}"} >"$d/json" 2>/dev/null || hrc=$?
+    echo "$hrc" >"$d/jrc"
+  fi
+  mv "$d" "$FW_STATE/$i.done"
+}
+
+# Whether any host is queued or has a job out.
+fleet_watch_busy() {
+  local i
+  for i in "${!FW_PID[@]}"; do [ -z "${FW_PID[$i]}" ] || return 0; done
+  return 1
+}
+
+# Start the queued hosts, as many as FLEET_PARALLEL leaves room for. A job's
+# stdout and stderr go nowhere: every byte it has to say is in its files, and
+# it may outlive the directory they are in by a moment on the way out.
+fleet_watch_pump() {
+  local i running=0
+  for i in "${!FW_PID[@]}"; do
+    [[ "${FW_PID[$i]}" != [0-9]* ]] || running=$((running + 1))
+  done
+  for i in "${!FW_PID[@]}"; do
+    [ "${FW_PID[$i]}" = "-" ] || continue
+    [ "$running" -lt "$FLEET_PARALLEL" ] || break
+    fleet_watch_fetch_one "$i" >/dev/null 2>&1 &
+    FW_PID[i]="$!"
+    running=$((running + 1))
+  done
+}
+
+# Take in what has landed since the last look; FW_DIRTY when anything did.
+# A job that is gone without having published — killed from outside — is an
+# answer too, or its host would read as "still running" for ever: that one
+# gets a failed result made here.
+fleet_watch_collect() {
+  local i d rc
+  for i in "${!FW_PID[@]}"; do
+    [[ "${FW_PID[$i]}" == [0-9]* ]] || continue
+    d="$FW_STATE/$i.done"
+    if [ ! -d "$d" ]; then
+      ! kill -0 "${FW_PID[$i]}" 2>/dev/null || continue
+      # Gone — and it may have published between the two looks.
+      if [ ! -d "$d" ]; then
+        mkdir -p "$d"
+        echo 255 >"$d/rc"
+        echo "the call ended without an answer" >"$d/err"
+      fi
+    fi
+    rc="$(cat "$d/rc" 2>/dev/null || echo 255)"
+    if [ "$rc" = 0 ]; then
+      mv -f "$d/out" "$FW_STATE/$i.out"
+      rm -f "$FW_STATE/$i.json" "$FW_STATE/$i.jrc"
+      [ ! -e "$d/json" ] || mv -f "$d/json" "$FW_STATE/$i.json"
+      [ ! -e "$d/jrc" ] || mv -f "$d/jrc" "$FW_STATE/$i.jrc"
+      # Seen: only an answer that IS a table (fleet_status_table's own test)
+      # is something to show again later.
+      if [ "$(wc -l <"$FW_STATE/$i.out")" -ge 3 ]; then now_epoch >"$FW_STATE/$i.seen"; fi
+    fi
+    [ ! -e "$d/err" ] || mv -f "$d/err" "$FW_STATE/$i.err"
+    echo "$rc" >"$FW_STATE/$i.rc"
+    rm -rf "$d"
+    FW_PID[i]=""
+    if [ -n "${FW_AGAIN[$i]:-}" ]; then FW_AGAIN[i]="" FW_PID[i]="-"; fi
+    FW_DIRTY=true
+  done
+  fleet_watch_pump
+}
+
+# A round: every host that has no call out is asked. WHY is `tick` when the
+# interval came due and `refresh` when an action key just ran — the two differ
+# only in what happens to a host that is still out (see the block above).
+# The next tick is counted from here, not from when the answers arrive.
+fleet_watch_round() { # tick|refresh
+  local i
+  fleet_watch_collect
+  FW_NEXT=$(($(now_ms) + FW_INTERVAL * 1000))
+  for i in "${!FW_PID[@]}"; do
+    if [ -z "${FW_PID[$i]}" ]; then
+      FW_PID[i]="-"
+    elif [ "$1" = refresh ]; then
+      FW_AGAIN[i]=1
+    elif [ "$(cat "$FW_STATE/$i.rc" 2>/dev/null || echo late)" = 0 ]; then
+      # Late. A host whose last call FAILED keeps that failure's own words.
+      echo late >"$FW_STATE/$i.rc"
+    fi
+  done
+  # Dirty whatever landed: a frame showing an age has to count it up.
+  FW_DIRTY=true
+  fleet_watch_pump
+}
+
+# `--iterations`: block until the round is in. The only `wait` in the watch,
+# and no trap is armed here for a signal to cut it short.
+fleet_watch_settle() {
+  while fleet_watch_busy; do
+    wait -n 2>/dev/null || true
+    fleet_watch_collect
+  done
+}
+
+# End every fetch still out, with whatever it started (its `timeout`, and the
+# ssh under that). Only a pid this process started and has not yet taken the
+# answer of, and only while it is still this process's child — a pid that has
+# been reaped can belong to anything by now.
+fleet_watch_reap() {
+  local i pid
+  for i in "${!FW_PID[@]}"; do
+    pid="${FW_PID[$i]}"
+    FW_PID[i]=""
+    [[ "$pid" == [0-9]* ]] || continue
+    [ "$(proc_ppid "$pid")" = "$$" ] || continue
+    proc_tree_kill "$pid"
+  done
+}
+
+# Restores the terminal, ends the background fetches, drops the buffer
+# directories and closes every ssh master. The ONE exit trap of a watch
+# (FLEET_EXIT_OWNED keeps a fan-out made from inside it from taking it over).
+# Ordering is deliberate: the cursor comes back first, so a slow or hanging
+# close cannot leave an invisible cursor behind; the fetches end before their
+# directory goes; and the masters close last, with no client left on them.
 fleet_watch_cleanup() {
   term_cursor show
   viewport_close
+  fleet_watch_reap
   fleet_cleanup
   [ -z "$FW_TMP" ] || rm -rf "$FW_TMP"
+  [ -z "$FW_STATE" ] || rm -rf "$FW_STATE"
+  FW_STATE=""
   fleet_ssh_control_close
 }
 
@@ -5190,9 +5523,13 @@ fleet_watch_cleanup() {
 #     (HOST, then IDX and RUNNER), which is safe where parsing by column
 #     position is not: an over-wide cell only shifts what is to its right.
 #     It survives both ways a row can leave a frame. A host that stops
-#     answering keeps the cursor on its error row and REMEMBERS the slot, so
-#     the next frame it answers in puts the cursor back where it was; a slot
-#     that goes away (scaled down) drops it to that host's first slot.
+#     answering keeps its rows (GHR-74), dimmed under their age, and the
+#     cursor stays on the slot it was on — those rows are selectable, because
+#     a key on one decides on facts read from the host at that moment and
+#     never on the row. A host with no rows to keep is one error row: the
+#     cursor waits there and REMEMBERS the slot, so the frame the host
+#     answers in puts it back. A slot that goes away (scaled down) drops it
+#     to that host's first slot.
 #   * THE FACTS ARE REMOTE. An action is decided on the host's own `status
 #     --json`, fetched when the key is pressed — one round trip to that host
 #     over the held connection — never on the frame, which is up to an
@@ -5229,7 +5566,9 @@ declare -A FF=()
 # Only a first word that IS a watched host counts, so the column header, a
 # note and the skew line are never rows; nor is a host line (GHR-66), which
 # starts with a watched host but would otherwise read as that host's
-# did-not-answer row — and fleet_watch_place prefers that row.
+# did-not-answer row — and fleet_watch_place prefers that row. The age line
+# over a host's kept rows (GHR-74) is skipped for the same reason: the rows
+# under it are that host's rows.
 fleet_watch_rows() { # FRAME
   local line n=0 h re_slot='^([^ ]+) +[0-9]+ +([^ ]+)( |$)' re_host='^([^ ]+) '
   local -A known=()
@@ -5239,6 +5578,7 @@ fleet_watch_rows() { # FRAME
     n=$((n + 1))
     strip_sgr "$line"
     [[ ! "$SGR_STRIPPED" =~ $FLEET_INFO_RE ]] || continue
+    [[ ! "$SGR_STRIPPED" =~ $FLEET_STALE_RE ]] || continue
     if [[ "$SGR_STRIPPED" =~ $re_slot ]] && [ -n "${known[${BASH_REMATCH[1]}]:-}" ]; then
       FW_ROWS+=("${BASH_REMATCH[1]}"$'\t'"${BASH_REMATCH[2]}"); FW_LINES+=("$n")
     elif [[ "$SGR_STRIPPED" =~ $re_host ]] && [ -n "${known[${BASH_REMATCH[1]}]:-}" ]; then
@@ -5304,12 +5644,16 @@ json_line_field() { # LINE KEY
 # set when there is nothing to decide on: the host did not answer, or the slot
 # is no longer there. A remote runs in a subshell of its own here, as it would
 # in reality, so nothing it sets can reach this process.
+#
+# On the watch's budget (GHR-74), like every read the watch makes: the key is
+# held for as long as this takes, and a row kept from a host that has stopped
+# answering is exactly where it will be pressed.
 fleet_watch_facts() { # HOST NAME
   local rc=0 line job
   FF=()
-  (ssh_run "$1" "$FLEET_RUNNERCTL" status --json) >"$FW_TMP/facts" 2>"$FW_TMP/err" || rc=$?
+  (FLEET_CALL_TIMEOUT="$FLEET_WATCH_TIMEOUT" ssh_run "$1" "$FLEET_RUNNERCTL" status --json) >"$FW_TMP/facts" 2>"$FW_TMP/err" || rc=$?
   if [ "$rc" != 0 ]; then
-    FW_NOTICE="$2 on $1: could not read its current state — $(fleet_error_text "$rc" "$FW_TMP/err")"
+    FW_NOTICE="$2 on $1: could not read its current state — $(fleet_error_text "$rc" "$FW_TMP/err" "$FLEET_WATCH_TIMEOUT")"
     return 1
   fi
   # `,"name":"X","active":` is the slot's own name: a job's name is followed
@@ -5349,12 +5693,17 @@ fleet_watch_job_warning() { # VERB
 
 # S's capacity floor (see the block above). 0 with FW_CAPACITY describing what
 # the stop leaves; 1 with FW_NOTICE when it would cross --min-available.
+#
+# GHR-74: the count is this fan-out's own — every watched host re-read at the
+# key, on the watch's budget (FLEET_BUDGETS, set for the session) — and never
+# the frame's. A host whose rows are only being KEPT on screen does not answer
+# here either, so it counts as nothing available however many slots the frame
+# still shows for it. The fan-out leaves the session's EXIT trap alone
+# (FLEET_EXIT_OWNED) and waits for its own children only.
 FW_CAPACITY=""
 fleet_watch_floor() { # HOST NAME ACTIVE-STATE
   local slots total avail after note=""
   fleet_slots >"$FW_TMP/slots"
-  # fleet_fanout arms its own EXIT trap; the session's goes back on.
-  trap fleet_watch_cleanup EXIT
   slots="$(cat "$FW_TMP/slots")"
   total="$(printf '%s\n' "$slots" | grep -c . || true)"
   avail="$(fleet_count_available "$slots")"
@@ -5521,7 +5870,7 @@ fleet_watch_handle_key() { # KEY
 
 cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] [--stall-after N] [--narrow] [--min-available K]
   local interval=5 iterations="" tick=0 header="" frame="" summary="" remote_color=never
-  local narrow=false forced=false wide fetch=true hl lead tail
+  local narrow=false forced=false wide fetch=tick launched draw=false hl lead tail step left polling i
   local -a hosts=() fwd=() narrow_arg=()
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
@@ -5568,51 +5917,71 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
   # under --color never a remote SGR sequence would be the one thing in the
   # frame that ignored the flag. C_RESET is set exactly when colour is on.
   if [ -n "$C_RESET" ]; then remote_color=always; FLEET_REMOTE_COLOR=true; fi
-  # One tick is the interval plus however long the slowest host takes, and
-  # FLEET_TIMEOUT caps that second part; the margin on top means a master is
-  # never expiring at the moment the next tick wants it.
+  # Comfortably more than the longest a master sits unused — the interval
+  # between two ticks, and a call that runs to its budget in between — so one
+  # is never expiring at the moment the next tick wants it.
   fleet_ssh_control_open "$((interval + FLEET_TIMEOUT + 30))"
-  # Where the action keys buffer a remote's answer (facts, logs, output).
+  # Where the action keys buffer a remote's answer (facts, logs, output), and
+  # where each host's last answer lives between ticks (GHR-74).
   FW_TMP="$(mktemp -d)"
-  # Ctrl-C exits 0 through the EXIT trap, which tears the session down either way.
+  FW_STATE="$(mktemp -d)"
+  # Ctrl-C exits 0 through the EXIT trap, which tears the session down either
+  # way — the one trap of the session, armed once.
+  FLEET_EXIT_OWNED=true
   trap fleet_watch_cleanup EXIT
   trap 'exit 0' INT TERM
+  FW_INTERVAL="$interval" FW_DIRTY=true FW_PID=() FW_AGAIN=()
+  FW_JSON_ARGS=(${fwd[@]+"${fwd[@]}"})
+  for i in "${!FLEET_HOSTS[@]}"; do
+    FW_PID[i]="" FW_AGAIN[i]=""
+    # Every read the watch makes of this host is on the watch's budget: the
+    # tick's calls and the floor's fan-out both take it from here.
+    FLEET_BUDGETS[i]="$FLEET_WATCH_TIMEOUT"
+    # Nobody has answered yet, which is not the same as being unreachable.
+    echo late >"$FW_STATE/$i.rc"
+  done
   term_cursor hide
   while :; do
-    # A fan-out per TICK, and after an action ran — not per key. Moving the
+    # A round per TICK, and after an action ran — not per key. Moving the
     # cursor, a confirm line or a refusal redraws the frame in hand: a round
     # trip to every host to move a highlight one row is the cost this command
     # exists to avoid.
-    if $fetch; then
-      header="$(paint "$C_BOLD" "runnerctl fleet watch — ${#FLEET_HOSTS[@]} host(s) — $(date +%H:%M:%S) — every ${interval}s (q to quit)")"
+    launched=false
+    if [ -n "$fetch" ]; then
       narrow_arg=()
       ! $narrow || narrow_arg=(--narrow)
-      fleet_fanout "$FLEET_RUNNERCTL" status --color "$remote_color" ${fwd[@]+"${fwd[@]}"} ${narrow_arg[@]+"${narrow_arg[@]}"}
-      # fleet_fanout arms its OWN EXIT trap on every call, so ours has to go
-      # back afterwards. Without this the last thing to run on exit is the
-      # tmpdir removal alone — cursor still hidden, and every ssh master left
-      # alive until ControlPersist expires.
-      trap fleet_watch_cleanup EXIT
-      # GHR-72: the summary's --json pass, to the hosts that just answered.
-      # The one deliberate exception to "no second round trip per tick" — see
-      # fleet_summary_fetch for why it is a second call and not a wider first.
-      fleet_summary_fetch ${fwd[@]+"${fwd[@]}"}
-      # A frame is rendered whatever the hosts said: an unreachable host is a
-      # row (fleet_status_table's own contract), and its non-zero return is not
-      # a reason to stop watching the ones that answered.
-      frame="$(fleet_status_table || true)"
-      summary="$(fleet_summary_line)"
-      fleet_cleanup
-      # GHR-56: the local watch's narrowing, measured on the ASSEMBLED frame —
-      # HOST column included, SGR stripped, error rows and notes not counted —
-      # and acted on by asking the remotes for the narrow table on the NEXT
-      # tick rather than re-fanning out now: a second round trip to every host
-      # to redraw one frame is the cost this command exists to avoid. The same
-      # hysteresis as the local watch, so a terminal near the threshold does
-      # not flip the table on every tick. --narrow pins it.
-      if ! $forced; then
-        wide="$(watch_table_width "$frame" '[^ ]+ +')"
-        if narrow_wanted "$narrow" "$wide" "$(term_cols)"; then narrow=true; else narrow=false; fi
+      FW_TABLE_ARGS=(status --color "$remote_color" ${fwd[@]+"${fwd[@]}"} ${narrow_arg[@]+"${narrow_arg[@]}"})
+      fleet_watch_round "$fetch"
+      fetch="" launched=true
+      [ -z "$iterations" ] || fleet_watch_settle
+    fi
+    # Straight after a round is launched there is nothing new to take in or
+    # draw: the first look is one FW_POLL later, when a host that answers
+    # promptly already has — one frame per tick, not one per host.
+    if ! $launched || [ -n "$iterations" ]; then
+      fleet_watch_collect
+      if $FW_DIRTY; then
+        FW_DIRTY=false draw=true
+        header="$(paint "$C_BOLD" "runnerctl fleet watch — ${#FLEET_HOSTS[@]} host(s) — $(date +%H:%M:%S) — every ${interval}s (q to quit)")"
+        # A frame is rendered whatever the hosts said: a host that is not
+        # answering is a row or its kept rows (fleet_status_table's own
+        # contract), and the non-zero return is not a reason to stop watching
+        # the ones that answered. FLEET_DIR is only lent to the renderers.
+        FLEET_DIR="$FW_STATE"
+        frame="$(fleet_status_table || true)"
+        summary="$(fleet_summary_line)"
+        FLEET_DIR=""
+        # GHR-56: the local watch's narrowing, measured on the ASSEMBLED frame
+        # — HOST column included, SGR stripped, error rows and notes not
+        # counted — and acted on by asking the remotes for the narrow table on
+        # the NEXT tick rather than fetching again now: a second round trip to
+        # every host to redraw one frame is the cost this command exists to
+        # avoid. The same hysteresis as the local watch, so a terminal near
+        # the threshold does not flip the table on every tick. --narrow pins it.
+        if ! $forced; then
+          wide="$(watch_table_width "$frame" '[^ ]+ +')"
+          if narrow_wanted "$narrow" "$wide" "$(term_cols)"; then narrow=true; else narrow=false; fi
+        fi
       fi
     fi
     if [ -n "$iterations" ]; then
@@ -5620,29 +5989,46 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
       pause "$interval"
       tick=$((tick + 1))
       [ "$tick" -lt "$iterations" ] || break
+      fetch=tick
       continue
     fi
-    fleet_watch_rows "$frame"
-    fleet_watch_place
-    # GHR-73: fitted to the terminal's height where it is known, with the
-    # summary line as fixed chrome beside the header. The cursor's group runs
-    # from the line after the previous row — the host's Disk/OOM line, where
-    # this is that host's first slot — and, on the last row, down through the
-    # notes to the end of the frame.
-    hl=0 lead=0 tail=0
-    if [ "$FW_POS" -ge 0 ]; then
-      hl="${FW_LINES[$FW_POS]}" lead=1 tail="${FW_LINES[$FW_POS]}"
-      [ "$FW_POS" -eq 0 ] || lead=$((FW_LINES[FW_POS - 1] + 1))
-      [ "$FW_POS" -lt $((${#FW_ROWS[@]} - 1)) ] || tail="$VIEW_END"
+    if $draw && ! $launched; then
+      draw=false
+      fleet_watch_rows "$frame"
+      fleet_watch_place
+      # GHR-73: fitted to the terminal's height where it is known, with the
+      # summary line as fixed chrome beside the header. The cursor's group runs
+      # from the line after the previous row — the host's Disk/OOM line (or the
+      # age line over kept rows), where this is that host's first slot — and,
+      # on the last row, down through the notes to the end of the frame.
+      hl=0 lead=0 tail=0
+      if [ "$FW_POS" -ge 0 ]; then
+        hl="${FW_LINES[$FW_POS]}" lead=1 tail="${FW_LINES[$FW_POS]}"
+        [ "$FW_POS" -eq 0 ] || lead=$((FW_LINES[FW_POS - 1] + 1))
+        [ "$FW_POS" -lt $((${#FW_ROWS[@]} - 1)) ] || tail="$VIEW_END"
+      fi
+      viewport_draw "$header"$'\n'"$summary" "$(fleet_watch_highlight "$frame" "$hl")" \
+        $'\n'"$(paint "$C_DIM" "$WATCH_LEGEND")"$'\n'"${FW_PROMPT:-$FW_NOTICE}" "$hl" "$lead" "$tail"
     fi
-    viewport_draw "$header"$'\n'"$summary" "$(fleet_watch_highlight "$frame" "$hl")" \
-      $'\n'"$(paint "$C_DIM" "$WATCH_LEGEND")"$'\n'"${FW_PROMPT:-$FW_NOTICE}" "$hl" "$lead" "$tail"
-    if viewport_read_key "$interval"; then
+    # GHR-74: the wait is the key read, always. A step while a call is out,
+    # so an answer is drawn soon after it lands; what is left of the interval
+    # otherwise. The interval running out is a tick; a step running out is one
+    # only when the clock says the interval has gone by as well.
+    polling=false
+    if fleet_watch_busy; then
+      polling=true step="$FW_POLL"
+    else
+      left=$((FW_NEXT - $(now_ms)))
+      if [ "$left" -le 0 ]; then fetch=tick; continue; fi
+      step="$(ms_to_secs "$left")"
+    fi
+    if viewport_read_key "$step"; then
       FW_REFRESH=false
       fleet_watch_handle_key "$KEY" || break
-      fetch="$FW_REFRESH"
-    else
-      fetch=true
+      draw=true
+      ! $FW_REFRESH || fetch=refresh
+    elif ! $polling || [ "$(now_ms)" -ge "$FW_NEXT" ]; then
+      fetch=tick
     fi
   done
 }
@@ -6455,10 +6841,17 @@ cmd_config_example() {
 #FLEET_SSH_OPTS=(-o ControlMaster=auto -o ControlPath=~/.ssh/cm-%C -o ControlPersist=60)
 
 # Most hosts contacted at once, and the per-host seconds budget of a read-only
-# call (status, health, a watch tick). The timeout is what stops one wedged
-# host holding up the whole fan-out.
+# call (status, health). The timeout is what stops one wedged host holding up
+# the whole fan-out.
 #FLEET_PARALLEL="8"
 #FLEET_TIMEOUT="30"
+
+# The per-host seconds budget of a read made by `fleet watch`: each tick's
+# calls, and the reads an action key makes before it decides. A host that
+# does not answer inside it keeps its last rows on screen, marked with how
+# long ago they were seen, and is asked again; it never holds up the other
+# hosts or the keyboard. A one-shot `fleet status` stays on FLEET_TIMEOUT.
+#FLEET_WATCH_TIMEOUT="10"
 
 # The per-host seconds budget of a call that CHANGES things (restart, stop,
 # apply, upgrade, a watch action key, ...). Those are slow by design — a slot
