@@ -1043,6 +1043,18 @@ Because each payload is nested rather than re-serialised, fleet mode needs no
 JSON parser and `runnerctl` still depends on nothing beyond coreutils, awk,
 systemd and curl.
 
+**What the central node relays from a host.** Everything a host sends to be
+printed — its table rows, column header, host line and notes, what it wrote on
+stderr, the output of an action, the journal `L` pages — is filtered once, as
+it arrives, before any table, notice or pager sees it. The colours a host
+paints (SGR, in the shape and with the attributes `runnerctl` itself uses) are
+kept; every other escape sequence — a screen clear, a window title, cursor
+movement, a colour that hides text — is removed whole, and every other control
+character, bidi control and malformed byte as for a job's own text. So a host
+on an older `runnerctl`, or a login banner or wrapper script on one, cannot
+act on the operator's terminal. A `--json` payload carrying a raw control byte
+is not nested at all: that host gets an `error` and `"status":null`.
+
 **Fleet mode needs `runnerctl` installed on each host.** Piping the script over
 ssh on every call would avoid that and remove version skew, but it pays a
 transfer on every command to solve a problem a fleet-wide upgrade solves once,

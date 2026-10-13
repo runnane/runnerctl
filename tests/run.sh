@@ -9060,6 +9060,215 @@ t "fleet watch: the pane unescapes a job's text, then makes it safe to draw" cas
 t "json_unescape: what each escape stands for"                               case_json_unescape_pins_the_text
 t "fleet watch: an older host's payload is — per row, a hostile one harmless" case_fleet_watch_pane_reads_an_old_or_hostile_payload
 
+# --- GHR-101: what the central node relays from a host ---------------------------
+# A host named *hostile* (tests/stub.config) appends a screen clear, a window
+# title and one painted word to every line it writes, stdout and stderr alike.
+# What survives the relay is the painted word, SGR and all: HOSTILE_KEPT.
+HOSTILE_KEPT=$' \e[31mHOT\e[0m'
+HOSTILE_KEPT_RE=" $ESC\\[31mHOT$ESC\\[0m"
+# None of the rest of what a hostile host sent reached stdout: no screen clear
+# but the frame prefix's own, no title, no BEL.
+expect_no_hostile_rest() {
+  _expect
+  local s="${OUT//$'\e[H\e[2J'/}"
+  [[ "$s" != *2J* && "$s" != *owned* && "$s" != *$'\a'* ]] || FAILS+=("stdout carries a removed sequence's bytes: $(grep -a -m1 -E '2J|owned' <<<"$s" | cat -v; true)")
+}
+
+# The lines a `hostile` host sent, as TEXT shows them, against what the relay
+# must make of them: what build-1 sent, byte for byte — the HOST cell renamed,
+# the two names are the same width — with HOSTILE_KEPT on the end. A column
+# header and a note are the hostile host's when they carry it.
+relay_got() { # TEXT
+  grep -aF -- 'HOT' <<<"$1" || true
+}
+relay_want() { # TEXT
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      *HOT*)                    ;;
+      "build-1 "*)              printf '%s%s\n' "hostile ${line#build-1 }" "$HOSTILE_KEPT" ;;
+      *"HOST "*|note:*)         printf '%s%s\n' "$line" "$HOSTILE_KEPT" ;;
+    esac
+  done <<<"$1"
+}
+
+# relay_safe, byte for byte, under any locale. One line per rule: the issue's
+# three sequences; the 8-bit spellings of CSI and OSC; an OSC ended by ESC \;
+# an OSC ended by the next sequence, which is kept; a CSI and an OSC with no
+# end; two-byte escapes; SGRs that could hide text (conceal, a background, a
+# 38;5 colour, a `:` sub-parameter) and one too long, each removed whole and
+# its text kept; an SGR left on, which gains a reset, and one that ends reset,
+# which does not; term_safe's own rules on a line with no sequence, and on
+# one with a kept SGR (the walked path, not the shortcut); PLAIN,
+# which keeps no SGR; clean text, untouched. Then the issue's line through
+# term_safe, which leaves every tail, beside relay_safe, which leaves none:
+# the same rules underneath, and what the second one adds.
+case_relay_safe_pins_the_bytes() {
+  local f="$TMP/ghr101.lines" want loc
+  local -a in=(
+    $' a\e[2J\e]0;owned\a\e[31mHOT\e[0m'
+    $'csi8:\xc2\x9b2Jx osc8:\xc2\x9d0;t\ay'
+    $'st:\e]0;title\e\\after'
+    $'osc-then-sgr:\e]0;t\e[1mB\e[0m'
+    $'unterm-csi:\e[12;3'
+    $'unterm-osc:\e]0;never ends'
+    $'esc:\ec ok \e(B ok\e'
+    $'hide:\e[8mhidden\e[0m bg:\e[41mx\e[0m ext:\e[38;5;1my\e[0m colon:\e[4:3mz\e[0m'
+    $'long:\e[1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1;1mq\e[0m'
+    $'open:\e[1;31mred'
+    $'closed:\e[31mred\e[m'
+    $'c0:\ta\rb\x01c\x7fd bidi:\xe2\x80\xaex raw:\x9b'
+    $'mixed:\e[1mb\e[0m\tc\xe2\x80\xaed\xc2\x85e\x9b'
+    'clean ascii'
+    $'clean utf8 \xc3\xa6 \xe2\x80\x94'
+  )
+  want=$' a\e[31mHOT\e[0m\ncsi8:x osc8:y\nst:after\nosc-then-sgr:\e[1mB\e[0m\nunterm-csi:\nunterm-osc:\nesc: ok  ok\nhide:hidden\e[0m bg:x\e[0m ext:y\e[0m colon:z\e[0m\nlong:q\e[0m\nopen:\e[1;31mred\e[0m\nclosed:\e[31mred\e[m\nc0:abcd bidi:x raw:?\nmixed:\e[1mb\e[0mcde?\nclean ascii\nclean utf8 \xc3\xa6 \xe2\x80\x94\nplain:red\nterm_safe: a[2J]0;owned[31mHOT[0m\nrelay_safe: a\e[31mHOT\e[0m'
+  printf '%s\n' "${in[@]}" >"$f"
+  for loc in "${LC_ALL:-C}" C; do
+    # shellcheck disable=SC2016
+    LC_ALL="$loc" GHR101_F="$f" GHR101_1="${in[0]}" run_fn eval 'while IFS= read -r l; do relay_safe "$l"; printf "%s\n" "$RELAY_SAFE"; done <"$GHR101_F"
+      relay_safe $'"'"'plain:\e[31mred\e[0m'"'"' plain; printf "%s\n" "$RELAY_SAFE"
+      term_safe "$GHR101_1"; printf "term_safe:%s\n" "$TERM_SAFE"
+      relay_safe "$GHR101_1"; printf "relay_safe:%s\n" "$RELAY_SAFE"'
+    expect_rc 0
+    expect_text "relay_safe under LC_ALL=$loc" "$want" "$OUT"
+  done
+  rm -f "$f"
+}
+
+# `fleet status`: a hostile host's column header, host line, rows and note are
+# build-1's plus the painted word, and nothing else of what it sent; its error
+# row the same; and its `--json` payload, which carries raw ESCs, is not nested
+# at all — a terminal would act on it — while build-1's still is.
+case_fleet_status_relays_only_sgr_from_a_host() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 hostile" run fleet status --stall-after 600
+  expect_rc 0
+  expect_out_count '^hostile ' 4
+  expect_out_count '^note: STALLED' 2
+  expect_text "the hostile host's lines" "$(relay_want "$OUT")" "$(relay_got "$OUT")"
+  expect_no_hostile_rest
+  RUNNERCTL_STUB_FLEET_HOSTS="hostile-unreachable" run fleet status
+  expect_rc 1
+  expect_text "an error row from a hostile host's stderr" \
+    "hostile-unreachable unreachable — ssh: connect to host hostile-unreachable port 22: No route to host$HOSTILE_KEPT" "$(relay_got "$OUT")"
+  expect_no_hostile_rest
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 hostile" run fleet status --json
+  expect_rc 1
+  expect_no_control_bytes
+  expect_out '^  \{"host_name":"hostile","reachable":true,"exit_code":0,"error":"exit 0 but stdout carries raw control bytes, which no runnerctl JSON does — check FLEET_RUNNERCTL and the remote login.s output","status":null\}$'
+  if $HAVE_PYTHON3; then
+    expect_json 'd["fleet"][0]["status"]["slots"][0]["name"] == "example.slot-1" and d["fleet"][1]["status"] is None'
+  else
+    skip "python3 not installed — the GHR-101 --json shape is not parsed"
+  fi
+}
+
+# The mutating fan-out, `fleet health` and `fleet upgrade` print what a host
+# said with its name in front: each line from a hostile host, stdout and
+# stderr, keeps the painted word and nothing else — the read-back's first
+# line and an unrecognised `upgrade` answer included.
+case_fleet_reports_relay_only_sgr_from_a_host() {
+  RUNNERCTL_STUB_FLEET_NOSUDO=hostile-2 RUNNERCTL_STUB_FLEET_HOSTS="hostile hostile-2" run fleet restart
+  expect_rc 1
+  expect_text "fleet restart's host lines" "hostile: restart done.$HOSTILE_KEPT
+hostile-2: remote exit 1 — sudo: a password is required$HOSTILE_KEPT — the ssh login needs passwordless sudo on that host; see the fleet section of the README for the exact sudoers line" "$(relay_got "$OUT")"
+  expect_no_hostile_rest
+  RUNNERCTL_STUB_FLEET_HOSTS="hostile hostile-unreachable" run fleet health --stall-after 600
+  expect_rc 1
+  expect_text "fleet health's problem lines" "hostile: example.slot-1: stalled — job my-app:test running 12m, longer than 10m (--stall-after 600)$HOSTILE_KEPT
+hostile-unreachable: unreachable — ssh: connect to host hostile-unreachable port 22: No route to host$HOSTILE_KEPT" "$(relay_got "$OUT")"
+  expect_no_hostile_rest
+  RUNNERCTL_STUB_FLEET_HOSTS="hostile-weird hostile-oldver hostile-unreachable" run fleet upgrade
+  expect_rc 1
+  expect_text "fleet upgrade's rows" "hostile-weird       1.0.0          unrecognised: something this tool has never said before$HOSTILE_KEPT
+hostile-oldver      0.0.1 -> 9.9.9 wrote 9.9.9 but the read-back answered 'runnerctl 9.9.9$HOSTILE_KEPT', not a version
+hostile-unreachable —              unreachable — ssh: connect to host hostile-unreachable port 22: No route to host$HOSTILE_KEPT" "$(relay_got "$OUT")"
+  expect_no_hostile_rest
+}
+
+# `fleet watch`: the frame is assembled from what each host's fetch stored, so
+# the hostile host's lines are build-1's plus the painted word on a painted
+# frame too, the remote's own colours kept. When it stops answering, the age
+# line quoting its stderr keeps the word painted, and its kept rows (dimmed,
+# or plain with colour off) keep the word as text.
+case_fleet_watch_relays_only_sgr_from_a_host() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 hostile" run fleet watch --iterations 1 --color always
+  expect_rc 0
+  expect_out_count '^hostile ' 4
+  expect_text "the hostile host's painted lines" "$(relay_want "$OUT")" "$(relay_got "$OUT")"
+  expect_no_hostile_rest
+  TZ=UTC RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='-q' RUNNERCTL_STUB_FLEET_HOSTS="build-1 hostile" \
+    RUNNERCTL_STUB_FLEET_DOWN="hostile:2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 2
+  expect_frame_line 2 9 "^hostile no answer for 5s — last seen 01:58:40 — unreachable — ssh: connect to host hostile port 22: No route to host$HOSTILE_KEPT_RE\$"
+  expect_frame_line 2 10 '^hostile 0 +example\.slot-1 .* my-app:test \(12m\) HOT$'
+  expect_no_hostile_rest
+}
+
+# The watch's key reads: the notice an action leaves (its last output line, or
+# its stderr when it failed), L's error and the journal L hands the pager.
+case_fleet_watch_notices_relay_only_sgr_from_a_host() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjRy-q' RUNNERCTL_STUB_FLEET_HOSTS="build-1 hostile" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^example\.slot-1 on hostile: restart done\.$HOSTILE_KEPT_RE\$" 2
+  expect_no_hostile_rest
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_NOSUDO=hostile RUNNERCTL_STUB_KEYS='jjjRy-jjjLq' RUNNERCTL_STUB_FLEET_HOSTS="build-1 hostile" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^example\.slot-1 on hostile: restart failed — remote exit 1 — sudo: a password is required$HOSTILE_KEPT_RE — the ssh login needs passwordless sudo on that host; see the fleet section of the README for the exact sudoers line\$" 2
+  expect_out_count "^example\.slot-3 on hostile: logs — remote exit 1 — sudo: a password is required$HOSTILE_KEPT_RE — the ssh login " 1
+  expect_no_hostile_rest
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjLq' RUNNERCTL_STUB_FLEET_HOSTS="build-1 hostile" run fleet watch --color never
+  expect_rc 0
+  expect_log_count '^probe:page$' 1
+  expect_out_count "^-- journal of example\.slot-1 on hostile \(-n 50\) --$HOSTILE_KEPT_RE\$" 1
+  expect_out_count "^hostile example\.slot-1: Listening for Jobs$HOSTILE_KEPT_RE\$" 1
+  expect_no_hostile_rest
+}
+
+# The reads no stub host can reach. The facts S, R, K, T and P decide on, from
+# a host whose `status --json` fails on stderr — and from one whose payload
+# carries raw control bytes inside the two words a confirm line quotes. And
+# the pane of a host that is not answering, which quotes its stderr: relayed
+# text, with the SGR taken off because the pane paints its own rows.
+case_fleet_watch_key_reads_relay_only_sgr_from_a_host() {
+  local d="$TMP/ghr101.state"
+  mkdir -p "$d/tmp"
+  # shellcheck disable=SC2016
+  GHR101_D="$d" GHR101_ERR=$'nope \e[2J\e]0;owned\a\e[31mHOT\e[0m' \
+    GHR101_J1=$'  {"idx":0,"unit":"u","name":"s1","active":"fai\e[2Jled","sub":"dead","job":null,"idle_since":null,"working_on_access":"ok"}' \
+    GHR101_J2=$'  {"idx":0,"unit":"u","name":"s1","active":"deactivating","sub":"stop\e]0;owned\a-sigterm","job":null,"idle_since":null,"working_on_access":"ok"}' \
+    run_snippet "$STUB" 'FW_TMP="$GHR101_D/tmp" FLEET_RUNNERCTL=runnerctl
+    ssh_run() { printf "%s\n" "$GHR101_ERR" >&2; return 255; }
+    fleet_watch_facts h1 s1 || printf "%s\n" "$FW_NOTICE"
+    ssh_run() { printf "%s\n" "$GHR101_J1"; }
+    fleet_watch_slot_action R h1 s1; printf "%s\n" "$FW_NOTICE"
+    ssh_run() { printf "%s\n" "$GHR101_J2"; }
+    fleet_watch_slot_action K h1 s1; printf "%s\n" "$FW_PROMPT"'
+  expect_rc 0
+  expect_text "the notice and confirm lines" "s1 on h1: could not read its current state — unreachable — nope$HOSTILE_KEPT
+s1 on h1: not active (failed) — T starts it
+s1 on h1 is stuck stopping (deactivating/stop-sigterm) — SIGKILL the whole unit? runs on h1: runnerctl kill s1  [y/n]" "$OUT"
+  printf '%s\n' "ssh: one$HOSTILE_KEPT" $'second \e[1mline\e[0m' >"$d/0.err"
+  echo 255 >"$d/0.rc"
+  # shellcheck disable=SC2016
+  GHR101_D="$d" run_fn eval 'FLEET_HOSTS=(h1); FW_STATE="$GHR101_D" FW_HOST=h1 FW_NAME=s1 FW_PANE=host
+    fleet_watch_pane_build; printf "%s\n" "$PANE_OUT" | grep -E "^  (error|stderr) "'
+  expect_rc 0
+  expect_text "the pane's error and stderr rows" "  error         unreachable — ssh: one HOT
+  stderr        second line" "$OUT"
+  rm -rf "$d"
+}
+
+t "relay_safe: SGR kept, every other sequence gone whole, under any locale" case_relay_safe_pins_the_bytes
+t "fleet status: a host's rows, header, note, error and JSON relay only SGR" case_fleet_status_relays_only_sgr_from_a_host
+t "fleet run/health/upgrade: a host's lines relay only its SGR"              case_fleet_reports_relay_only_sgr_from_a_host
+t "fleet watch: a host's frame lines and age line relay only its SGR"        case_fleet_watch_relays_only_sgr_from_a_host
+t "fleet watch: action notices and L's journal relay only a host's SGR"      case_fleet_watch_notices_relay_only_sgr_from_a_host
+t "fleet watch: facts, confirm lines and the pane relay only a host's SGR"   case_fleet_watch_key_reads_relay_only_sgr_from_a_host
+
 # --- Summary ------------------------------------------------------------------
 echo
 echo "sim: $npass ok, $nxfail xfail (${XFAIL_KEYS# }), $nfail failed"
