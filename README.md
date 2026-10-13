@@ -511,9 +511,92 @@ and the result becomes the status line under the legend:
 | `P` | reap the `+N leaked` processes on an idle slot, exactly as `reap <IDX>` does | `kill -TERM …`, then `kill -KILL` for what survives |
 | `L` | show `logs <slot> -n 50` in `$PAGER` (`less`; `q` returns to the table). No confirm — it changes nothing | `journalctl -u <unit> -n 50` |
 | `O` | print the URL of the running job's run on the status line — `https://github.com/<owner>/<repo>/actions/runs/<id>/attempts/<n>` — to copy or click. It is printed, never opened: the node you watch from is usually a terminal with no browser. Says so when no job is running, or when the job's environment could not be read (between steps, a container job, no access to the slot's processes) | nothing |
+| `Enter` | show the selected slot in full, in place of the table — [below](#the-slot-in-full-enter) | nothing |
 | `PgUp` / `PgDn` | move the cursor a page (a window less one row, so the row you left is still on screen) | |
 | `g` / `G`, `Home` / `End` | the first / last slot | |
 | `q` | quit | |
+
+#### The slot in full: `Enter`
+
+A table row has room for a dozen cells, and a slot has more to say than that —
+enough that deciding whether it is *stuck* or *starved* used to mean leaving
+the view for `status --json`. `Enter` on a row replaces the table with
+everything known about that one slot, and its host:
+
+```
+build-1-a — slot details
+Identity
+  host          build-1
+  runner        build-1-a
+  unit          actions.runner.example-org.build-1-a.service
+  profile       ci
+  enabled       enabled
+  runnerctl     0.19.0
+State
+  active        active/running
+  since         3d 4h
+  restarts      3
+  result        success
+  last restart  oom-kill
+Job
+  repo          example-org/my-app
+  job           test
+  running for   12m
+  stalled       no
+  workflow      CI
+  run           #57 · id 1234567890 · attempt 2
+  ref           main
+  commit        0123456789abcdef0123456789abcdef01234567
+  actor         octocat
+  event         push
+  url           https://github.com/example-org/my-app/actions/runs/1234567890/attempts/2
+Memory
+  current       1.0G
+  peak          25.0G
+  high          22.0G
+  max           26.0G
+  bar           [#+++++++++++++++++++++++++++++++++++++--] 4% of max, peak 96%, high at 85%
+  pressure      full avg10 63.2% · avg60 41.0%
+  events        high 4 · max 1 · oom_kill 0
+Leaks
+  leaked        —
+Host
+  cores         16
+  memory        48.0G available of 64.0G
+  disk          / [docker,work] 24% (353.9G free)
+  events        none in the last 1h
+
+q/Esc/Enter back  h host  jk scroll  K R S T P L O this slot  Ctrl-C quits
+```
+
+| key, in the pane | does |
+| --- | --- |
+| `q` / `Esc` / `Enter` | back to the table, the cursor where it was. **`q` does not quit here** — `Ctrl-C` does, from anywhere |
+| `h` | the host's block alone, and back to the slot |
+| `↑` `↓` / `j` `k`, `PgUp` / `PgDn`, `g` / `G` | scroll, when the pane is taller than the terminal |
+| `K` `R` `S` `T` `P` `L` `O` | as in the table, on this slot, with the same confirm line |
+
+What to know about it:
+
+- **It refreshes like the table**: every `--interval`, and at once on a key. A
+  slot that goes away while its pane is up (a `scale` down) puts the table
+  back, with a line saying so.
+- **`—` means not known**, on any row: a slot that is not running has no memory
+  figures, a job between two steps has no run to name, a busy slot has no
+  leak count.
+- **The bar** is drawn against `MemoryMax` (against `MemoryHigh` where no max
+  is set): `#` is what is in use now, `+` reaches the peak since the unit
+  started, `-` is free. Plain ASCII, so it reads the same with `--color never`
+  and on a terminal that is not in UTF-8 mode. With neither limit set the row
+  says there is nothing to draw it against.
+- **`Leaks`** names the processes behind the table's `+N leaked`
+  (`4242/node, 4243/esbuild`) — the ones `P` would reap.
+- **Everything in it that somebody else chose is drawn as text.** A workflow's
+  name, a branch, an actor, a leaked process's name: control characters and
+  bidi overrides are taken out before a row is drawn, so a job cannot repaint
+  your terminal by naming its branch after an escape sequence.
+- **No cursor in it.** A pane taller than the terminal is windowed like the
+  table, with `↑ N more` / `↓ N more`; the keys move the window itself.
 
 **A table taller than the terminal.** The frame is cut to the terminal's
 height instead of scrolling its own top away. The header, the column header,
@@ -1096,8 +1179,43 @@ has its own `slot-1`:
 | `P` | reap processes a finished job leaked |
 | `L` | page the slot's last 50 journal lines through your `$PAGER` |
 | `O` | print the URL of the running job's run on the status line; no round trip |
+| `Enter` | show the selected slot in full, in place of the table; no round trip — below |
 | `!` `b` `i` `/` `a` `s` `c` `?` | [view keys](#a-live-fleet-view-fleet-watch): filter, sort, collapse, help — below |
 | `q` | quit |
+
+**The slot in full.** `Enter` on a slot row opens the same pane the local
+`watch` has ([the slot in full](#the-slot-in-full-enter)) for that *(host,
+slot)* pair, with the same keys — `q` / `Esc` / `Enter` go back, `h` shows the
+host's block alone, `K` `R` `S` `T` `P` `L` `O` act on that slot. What is
+different on a fleet:
+
+- **It asks no host anything.** The pane is read out of the `status --json`
+  payload the last tick already brought from that host — the one the summary
+  line counts from — so opening, scrolling and leaving it cost no round trip,
+  and it refreshes when the next tick's answer lands. An action key pressed in
+  the pane still reads the host afresh before it offers anything, exactly as
+  it does from the table.
+- **A host that has stopped answering still has a pane**: the facts it last
+  sent, with the table's age line (`no answer for 45s — last seen 14:02:10 —
+  unreachable — …`) at the top of the `Host` block and the rest of what ssh
+  said under it. A host that has sent nothing yet says so.
+- **`Enter` goes where the row leads.** On a slot row, the slot. On the one
+  row of a host that is not answering, that host's block, with the error in
+  full. On a folded host (`c`), it opens the fold, as before. A host's `Disk:`
+  line and the age line over kept rows are not rows the cursor stops on, so a
+  host's block is reached from any of its slots: `Enter`, then `h`.
+- **An older host shows `—` for what it does not report.** A `runnerctl` from
+  before a field — the run a job belongs to, the leak count, memory pressure —
+  simply has that row empty; nothing fails.
+- **The repository is the short name** (`my-app`), as that host's payload
+  carries it; the run's URL has the owner. The pids and names behind a leak
+  count are not in the payload: `runnerctl reap --dry-run <slot>` on the host
+  lists them.
+- **A remote's strings are a remote's.** They are decoded from the JSON and
+  then stripped of control characters like any other text in the pane, and a
+  run URL is shown only if it is a run page's address and nothing else.
+- In the pane the view keys do nothing: `!` `b` `i` `/` `a` `s` `c` `?` belong
+  to the table.
 
 `O` is the one key here that reads the frame's own facts rather than fresh
 ones: it prints the run URL out of the `status --json` payload the last tick

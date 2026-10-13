@@ -234,6 +234,22 @@ Traps:
   stall threshold of their own, `RUNNERCTL_STUB_FLEET_FULL` full disks and
   journal events.
 
+- **A detail pane (GHR-76) is asserted by frame, not by `expect_out`.** A pane
+  frame has no cursor row, so with colour off it carries no escape sequence
+  of its own: `expect_frame_plain N` holds the whole frame to "no control
+  byte", which `expect_no_control_bytes` cannot do for a watch (the frame
+  prefix and the table's cursor row are escapes). `frame_from N L` pins a pane
+  without the clock in the header — from line 2 locally, line 3 in `fleet
+  watch` (the summary is line 2). The version in a pane is `$(pane_ver)`,
+  never a literal: release-please moves it. Two knobs exist for the pane
+  alone: `RUNNERCTL_STUB_LEAK_COMM` (the comm of slot-2's first leaked
+  process, for hostile text) and `RUNNERCTL_STUB_SCALED_AFTER=N` with
+  `RUNNERCTL_STUB_CLOCK=1` (the LOCAL host loses slot-3 once the clock is N
+  seconds on, which one tick of `watch --interval N` does). A payload no stub
+  host sends — an older host's, a hostile one's — is a hand-written
+  `FW_STATE/0.json` handed to `fleet_watch_pane_build` through `run_fn`, with
+  `now_epoch` pinned in the same eval.
+
 ## migrate-test
 
 `bash tests/migrate-test.sh`. Runs `runnerctl migrate` against
