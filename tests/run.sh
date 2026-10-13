@@ -2964,6 +2964,317 @@ case_fleet_upgrade_ref_is_forwarded_and_bad_option_dies() {
   expect_no_log '^probe:ssh_run '
 }
 
+# --- GHR-82: targeted, staged and read back -----------------------------------
+# The stub's upgrade hosts, by name: *oldver* writes and then answers 9.9.9;
+# *shadowed* says it wrote and goes on answering 0.0.1; *writefail* answers
+# --check and fails the write; *verifydown* writes and cannot be reached for
+# the read-back; a plain name is already up to date.
+#
+# A WRITE is `-- runnerctl upgrade$` in the call log, a check `upgrade --check$`
+# and a read-back `-- runnerctl version$` — three different lines, so each
+# claim below is pinned on the call it is about.
+case_fleet_upgrade_host_targets_only_those_hosts() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver build-3-oldver" run fleet upgrade --host build-2-oldver
+  expect_rc 0
+  expect_out '^build-2-oldver +0\.0\.1 -> 9\.9\.9 +upgraded$'
+  expect_out '^1 host\(s\): 0 already level, 1 upgraded, 0 unreachable or unclear$'
+  expect_out '^1 host\(s\) on 9\.9\.9$'
+  # its write and its read-back, and nothing to anyone else
+  expect_log_count '^probe:ssh_run ' 2
+  expect_no_log '^probe:ssh_run build-1 '
+  expect_no_log '^probe:ssh_run build-3-oldver '
+  expect_no_out '^build-(1|3-oldver) '
+  # repeatable, and it narrows --check the same way
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver build-3-oldver" \
+    run fleet upgrade --check --host build-1 --host=build-3-oldver
+  expect_rc 0
+  expect_log_count '^probe:ssh_run ' 2
+  expect_no_log '^probe:ssh_run build-2-oldver '
+  expect_out '^2 host\(s\): 1 up to date, 1 would change, 0 unreachable or unclear$'
+  # FLEET_BUDGETS is indexed like FLEET_HOSTS: the narrowed host is index 0 of
+  # the fan-out and index 1 of the config, and it must still get the mutating
+  # budget for a write that takes longer than FLEET_TIMEOUT
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver" RUNNERCTL_STUB_FLEET_DELAY="build-2-oldver:45:upgrade" \
+    run fleet upgrade --host build-2-oldver
+  expect_rc 0
+  expect_out '^build-2-oldver +0\.0\.1 -> 9\.9\.9 +upgraded$'
+}
+
+case_fleet_upgrade_host_unknown_dies_before_dialling() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver" run fleet upgrade --host typo-1
+  expect_rc 1
+  expect_err "--host 'typo-1' is not in FLEET_HOSTS \(configured: build-1 build-2-oldver\)"
+  expect_no_log '^probe:ssh_run '
+}
+
+# THE READ-BACK. A host that printed `Upgraded` used to be `upgraded` on that
+# sentence alone. box-shadowed prints it and then answers the old version
+# through the fleet path — the home copy shadowing the system one — and that
+# is a failed row and a non-zero exit, with the two versions named.
+case_fleet_upgrade_read_back_mismatch_is_a_failed_row() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-shadowed build-3-oldver" run fleet upgrade
+  expect_rc 1
+  expect_out '^box-shadowed +0\.0\.1 -> 9\.9\.9 +wrote 9\.9\.9 but the fleet path still answers 0\.0\.1$'
+  expect_no_out '^box-shadowed .* upgraded$'
+  # the host beside it wrote for real, and the read-back says so
+  expect_out '^build-3-oldver +0\.0\.1 -> 9\.9\.9 +upgraded$'
+  expect_out '^3 host\(s\): 1 already level, 1 upgraded, 1 unreachable or unclear$'
+  # the fleet's state is what the hosts ANSWER, not what they said they wrote
+  expect_out '^not on one version — 1\.0\.0: build-1; 0\.0\.1: box-shadowed; 9\.9\.9: build-3-oldver$'
+  # one read-back per host that wrote, after its write; none for a host that
+  # did not write
+  expect_log_count '^probe:ssh_run box-shadowed -- runnerctl version$' 1
+  expect_log_count '^probe:ssh_run build-3-oldver -- runnerctl version$' 1
+  expect_no_log '^probe:ssh_run build-1 -- runnerctl version'
+  expect_log_order '^probe:ssh_run box-shadowed -- runnerctl upgrade$' '^probe:ssh_run box-shadowed -- runnerctl version$'
+}
+
+# A read-back that cannot reach the host is NOT a mismatch — nothing is known
+# about what it runs — and is not a pass either. And it is a READ: it runs on
+# FLEET_TIMEOUT (30 s), not on the 900 s the write was given. The delayed
+# `version` below takes 45 s, so it times out on the read budget and would
+# ANSWER on the mutating one.
+case_fleet_upgrade_read_back_unanswered_is_its_own_failure_on_the_read_budget() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver build-3-oldver-verifydown" run fleet upgrade
+  expect_rc 1
+  expect_out '^build-2-oldver +0\.0\.1 -> 9\.9\.9 +upgraded$'
+  expect_out '^build-3-oldver-verifydown +0\.0\.1 -> 9\.9\.9 +wrote 9\.9\.9 but the read-back did not answer: unreachable — ssh: connect to host build-3-oldver-verifydown port 22: No route to host$'
+  expect_no_out 'still answers'
+  expect_out '^2 host\(s\): 0 already level, 1 upgraded, 1 unreachable or unclear$'
+  expect_out '^not on one version — 9\.9\.9: build-2-oldver; unknown: build-3-oldver-verifydown$'
+  RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" RUNNERCTL_STUB_FLEET_DELAY="build-2-oldver:45:version" \
+    run fleet upgrade
+  expect_rc 1
+  # no "may still be running": the call that timed out changed nothing
+  expect_out '^build-2-oldver +0\.0\.1 -> 9\.9\.9 +wrote 9\.9\.9 but the read-back did not answer: timed out after 30s$'
+  expect_out '^not on one version — unknown: build-2-oldver$'
+  # ...while the write itself still has the mutating budget
+  RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" RUNNERCTL_STUB_FLEET_DELAY="build-2-oldver:45:upgrade" \
+    run fleet upgrade
+  expect_rc 0
+  expect_out '^1 host\(s\) on 9\.9\.9$'
+}
+
+# The negative control. --check dials each host exactly once, for `upgrade
+# --check`: no write, and no read-back. The fleet is chosen so that a read-back
+# aimed at "every host that answered" or at "every host that would change"
+# would both have something to dial here.
+case_fleet_upgrade_check_writes_nothing_and_reads_nothing_back() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver box-shadowed box-relocating" run fleet upgrade --check --ref v1.2.3
+  expect_rc 0
+  expect_log_count '^probe:ssh_run ' 4
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl upgrade --check --ref v1\.2\.3$' 4
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl version'
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl upgrade( --ref [^ ]+)?$'
+  expect_out '^4 host\(s\): 1 up to date, 3 would change, 0 unreachable or unclear$'
+  # the resulting-state line belongs to a write
+  expect_no_out '^[0-9]+ host\(s\) on '
+  expect_no_out '^not on one version'
+  # the staging flags stage a write, so with --check they are refused rather
+  # than silently ignored — before anything is dialled
+  local f
+  for f in --canary --serial --stop-on-failure; do
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver" run fleet upgrade --check "$f"
+    expect_rc 1
+    expect_err 'stage a write, and --check writes nothing'
+    expect_no_log '^probe:ssh_run '
+  done
+}
+
+# --canary with no name: the first host that WOULD CHANGE, not the first host.
+# build-1 is first and already up to date — upgrading it proves nothing about
+# the release — so the canary is build-2-oldver: checked, written, read back,
+# and only then is anyone else asked to write.
+case_fleet_upgrade_canary_is_the_first_host_that_would_change() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver build-3-oldver" run fleet upgrade --canary
+  expect_rc 0
+  expect_out '^canary build-2-oldver: upgraded 0\.0\.1 -> 9\.9\.9 and the fleet path answers 9\.9\.9 — continuing with 2 other host\(s\)$'
+  expect_out '^build-1 +1\.0\.0 +up to date$'
+  expect_out '^build-2-oldver +0\.0\.1 -> 9\.9\.9 +upgraded$'
+  expect_out '^build-3-oldver +0\.0\.1 -> 9\.9\.9 +upgraded$'
+  expect_out '^3 host\(s\): 1 already level, 2 upgraded, 0 unreachable or unclear$'
+  # the check round asks everyone and writes nowhere; then the canary's write
+  # and its read-back are both over before the next write is dialled
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl upgrade --check$' 3
+  expect_log_order '^probe:ssh_run build-3-oldver -- runnerctl upgrade --check$' \
+                   '^probe:ssh_run build-2-oldver -- runnerctl upgrade$' \
+                   '^probe:ssh_run build-2-oldver -- runnerctl version$' \
+                   '^probe:ssh_run_done build-2-oldver$' \
+                   '^probe:ssh_run build-3-oldver -- runnerctl upgrade$'
+  expect_log_order '^probe:ssh_run build-2-oldver -- runnerctl version$' \
+                   '^probe:ssh_run_done build-2-oldver$' \
+                   '^probe:ssh_run build-1 -- runnerctl upgrade$'
+  # each host is written once
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl upgrade$' 3
+  # --ref reaches the check round and the write alike
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver" run fleet upgrade --canary --ref v1.2.3
+  expect_rc 0
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl upgrade --check --ref v1\.2\.3$' 2
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl upgrade --ref v1\.2\.3$' 2
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl upgrade( --check)?$'
+}
+
+# A canary that does not end `upgraded` stops the run: no other host is
+# dialled for the write. Twice — a canary whose write is refused, and one that
+# wrote and failed its read-back, which is the failure only the read-back sees.
+case_fleet_upgrade_failed_canary_touches_no_other_host() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-shadowed build-3-oldver" run fleet upgrade --canary
+  expect_rc 1
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl upgrade$' 1
+  expect_no_log '^probe:ssh_run build-3-oldver -- runnerctl upgrade$'
+  expect_no_log '^probe:ssh_run build-1 -- runnerctl upgrade$'
+  expect_out '^box-shadowed +0\.0\.1 -> 9\.9\.9 +wrote 9\.9\.9 but the fleet path still answers 0\.0\.1$'
+  expect_out '^build-1 +1\.0\.0 +not attempted$'
+  expect_out '^build-3-oldver +0\.0\.1 -> 9\.9\.9 +not attempted$'
+  expect_out '^3 host\(s\): 0 already level, 0 upgraded, 1 unreachable or unclear, 2 not attempted$'
+  expect_out '^canary box-shadowed did not end upgraded — not attempted: build-1 build-3-oldver$'
+  expect_no_out 'continuing with'
+  # what the check round read is still what those hosts run
+  expect_out '^not on one version — 1\.0\.0: build-1; 0\.0\.1: box-shadowed build-3-oldver$'
+  RUNNERCTL_STUB_FLEET_HOSTS="box-writefail build-3-oldver" run fleet upgrade --canary
+  expect_rc 1
+  expect_out '^box-writefail +— +remote exit 1 — sudo: a password is required — the ssh login needs passwordless sudo on that host'
+  expect_no_log '^probe:ssh_run build-3-oldver -- runnerctl upgrade$'
+  # a write that failed is not read back
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl version'
+  expect_out '^canary box-writefail did not end upgraded — not attempted: build-3-oldver$'
+  # ...and a canary that FAILS nothing and changes nothing stops it too. The
+  # retire-only host answers the check `Update available.` and the write the
+  # same way (it could not write the system copy): not a failed row, and not
+  # a release tried on anything. A gate of "the canary did not fail" would
+  # wave the fleet through on it.
+  RUNNERCTL_STUB_FLEET_HOSTS="box-retireonly build-3-oldver" run fleet upgrade --canary
+  expect_rc 1
+  expect_out '^box-retireonly +1\.0\.0 -> 9\.9\.9 +update available$'
+  expect_no_log '^probe:ssh_run build-3-oldver -- runnerctl upgrade$'
+  expect_out '^build-3-oldver +0\.0\.1 -> 9\.9\.9 +not attempted$'
+  expect_out '^canary box-retireonly did not end upgraded — not attempted: build-3-oldver$'
+}
+
+# --canary H names it. A named canary that would not change is refused before
+# any write, naming the hosts that would; one that is not a target dies before
+# anything is dialled; and when NO host would change there is nothing to try
+# a release on, which is said rather than passed off as a successful canary.
+case_fleet_upgrade_canary_named_and_nothing_to_canary() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver build-3-oldver" run fleet upgrade --canary build-3-oldver
+  expect_rc 0
+  expect_out '^canary build-3-oldver: upgraded 0\.0\.1 -> 9\.9\.9 and the fleet path answers 9\.9\.9 — continuing with 2 other host\(s\)$'
+  expect_log_order '^probe:ssh_run build-3-oldver -- runnerctl upgrade$' \
+                   '^probe:ssh_run build-3-oldver -- runnerctl version$' \
+                   '^probe:ssh_run_done build-3-oldver$' \
+                   '^probe:ssh_run build-2-oldver -- runnerctl upgrade$'
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver build-3-oldver" run fleet upgrade --canary=build-1
+  expect_rc 1
+  expect_err "--canary 'build-1' would not change \(up to date\), so it proves nothing about this release — nothing was written\. Hosts that would change: build-2-oldver build-3-oldver$"
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl upgrade$'
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl version'
+  # a canary outside the targets — unknown, or narrowed away by --host
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver" run fleet upgrade --canary nope
+  expect_rc 1
+  expect_err "--canary 'nope' is not among the hosts this upgrade targets \(build-1 build-2-oldver\)"
+  expect_no_log '^probe:ssh_run '
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver" run fleet upgrade --host build-1 --canary build-2-oldver
+  expect_rc 1
+  expect_err "--canary 'build-2-oldver' is not among the hosts this upgrade targets \(build-1\)"
+  expect_no_log '^probe:ssh_run '
+  # nobody would change
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-ahead" run fleet upgrade --canary
+  expect_rc 0
+  expect_out '^2 host\(s\): 2 up to date, 0 would change, 0 unreachable or unclear$'
+  expect_out '^fleet upgrade --canary: no host would change, so there is nothing to try a release on — nothing was written$'
+  expect_no_out '^canary '
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl upgrade$'
+  expect_log_count '^probe:ssh_run ' 2
+}
+
+# --serial: one host at a time, each written AND read back before the next is
+# dialled — asserted with the overlap detector, for the reason the mutating
+# fan-out's own case gives. The default is still parallel, which is also what
+# shows the detector can fire here. And --serial alone does not stop: the host
+# after a failed one is still upgraded.
+case_fleet_upgrade_serial_is_one_host_at_a_time_and_does_not_stop() {
+  RUNNERCTL_STUB_DETECT_OVERLAP=1 RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver build-3-oldver build-4-oldver" \
+    run fleet upgrade --serial
+  expect_rc 0
+  expect_no_log '^probe:ssh_run_overlap '
+  expect_log_order '^probe:ssh_run build-2-oldver -- runnerctl upgrade$' \
+                   '^probe:ssh_run build-2-oldver -- runnerctl version$' \
+                   '^probe:ssh_run_done build-2-oldver$' \
+                   '^probe:ssh_run build-3-oldver -- runnerctl upgrade$' \
+                   '^probe:ssh_run build-3-oldver -- runnerctl version$' \
+                   '^probe:ssh_run_done build-3-oldver$' \
+                   '^probe:ssh_run build-4-oldver -- runnerctl upgrade$'
+  expect_out '^3 host\(s\) on 9\.9\.9$'
+  RUNNERCTL_STUB_DETECT_OVERLAP=1 RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver build-3-oldver build-4-oldver" \
+    run fleet upgrade
+  expect_rc 0
+  expect_log '^probe:ssh_run_overlap '
+  RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver box-shadowed build-4-oldver" run fleet upgrade --serial
+  expect_rc 1
+  expect_out '^build-4-oldver +0\.0\.1 -> 9\.9\.9 +upgraded$'
+  expect_no_out 'not attempted'
+  expect_out '^3 host\(s\): 0 already level, 2 upgraded, 1 unreachable or unclear$'
+}
+
+# --stop-on-failure: the same walk, halted at the first failed row, with the
+# hosts it did not attempt named. A failed READ-BACK halts it too — the write
+# said it went fine.
+case_fleet_upgrade_stop_on_failure_halts_and_names_the_rest() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver box-shadowed build-4-oldver build-5-oldver" \
+    run fleet upgrade --stop-on-failure
+  expect_rc 1
+  expect_out '^build-2-oldver +0\.0\.1 -> 9\.9\.9 +upgraded$'
+  expect_out '^box-shadowed +0\.0\.1 -> 9\.9\.9 +wrote 9\.9\.9 but the fleet path still answers 0\.0\.1$'
+  expect_out '^build-4-oldver +— +not attempted$'
+  expect_out '^build-5-oldver +— +not attempted$'
+  expect_no_log '^probe:ssh_run build-4-oldver '
+  expect_no_log '^probe:ssh_run build-5-oldver '
+  expect_out '^4 host\(s\): 0 already level, 1 upgraded, 1 unreachable or unclear, 2 not attempted$'
+  expect_out '^stopped at box-shadowed — not attempted: build-4-oldver build-5-oldver$'
+  expect_out '^not on one version — 9\.9\.9: build-2-oldver; 0\.0\.1: box-shadowed; unknown: build-4-oldver build-5-oldver$'
+  # a write that fails halts it as well
+  RUNNERCTL_STUB_FLEET_HOSTS="box-writefail build-4-oldver" run fleet upgrade --stop-on-failure
+  expect_rc 1
+  expect_no_log '^probe:ssh_run build-4-oldver '
+  expect_out '^stopped at box-writefail — not attempted: build-4-oldver$'
+  # nothing fails, nothing is skipped; and after a verified canary the rest
+  # are walked the same way
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver box-shadowed build-4-oldver" \
+    run fleet upgrade --canary --stop-on-failure
+  expect_rc 1
+  expect_out '^canary build-2-oldver: upgraded '
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl upgrade$' 1
+  expect_no_log '^probe:ssh_run build-4-oldver -- runnerctl upgrade$'
+  expect_out '^build-4-oldver +0\.0\.1 -> 9\.9\.9 +not attempted$'
+  expect_out '^stopped at box-shadowed — not attempted: build-4-oldver$'
+}
+
+# The two parsers the read-back rests on, against lines the stub did not
+# write: the real `version` command's output, and cmd_upgrade's sentence with
+# the trailing path a relocation gives it. (tests/upgrade-test.sh 1b runs them
+# over a real upgrade's captured output.)
+case_fleet_upgrade_read_back_parsers() {
+  "$RUNNERCTL" version >"$TMP/version.out"
+  run_fn fleet_version_answer "$TMP/version.out"
+  expect_rc 0
+  expect_out '^[0-9]+\.[0-9]+\.[0-9]+$'
+  expect_text "the version runnerctl version prints" "$(cut -d' ' -f2 "$TMP/version.out")" "$OUT"
+  printf 'installed: 0.0.1 (/a b/runnerctl)\nnote: x\nUpgraded 0.0.1 -> 1.2.3 at /a b/runnerctl\n' >"$TMP/upgrade.out"
+  run_fn fleet_upgrade_wrote "$TMP/upgrade.out"
+  expect_rc 0
+  expect_text "the version an Upgraded sentence names" "1.2.3" "$OUT"
+  # neither invents an answer: a die on the remote, and a host that only
+  # reported an update, name no version
+  printf "runnerctl: unknown command 'version'\n" >"$TMP/version.out"
+  run_fn fleet_version_answer "$TMP/version.out"
+  expect_rc 0
+  expect_text "a version answer that is not one" "" "$OUT"
+  printf 'Update available. Run: runnerctl upgrade\n' >"$TMP/upgrade.out"
+  run_fn fleet_upgrade_wrote "$TMP/upgrade.out"
+  expect_rc 0
+  expect_text "an output with no Upgraded sentence" "" "$OUT"
+}
+
 case_fleet_mutating_fans_out_and_forwards_flags() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet restart --when-idle --timeout 60
   expect_rc 0
@@ -6854,6 +7165,17 @@ t "fleet upgrade: a self-healing host is classified, not unrecognised" case_flee
 t "fleet upgrade: a failed host is a row, the rest still upgrade"      case_fleet_upgrade_failed_host_is_a_row_not_an_abort
 t "fleet upgrade: an unrecognised answer is shown, not guessed at"     case_fleet_upgrade_unrecognised_answer_is_shown_not_guessed
 t "fleet upgrade: --ref forwarded; unknown option dies before dialling" case_fleet_upgrade_ref_is_forwarded_and_bad_option_dies
+t "fleet upgrade --host: only those hosts are dialled, repeatable"     case_fleet_upgrade_host_targets_only_those_hosts
+t "fleet upgrade --host: an unknown host dies before dialling"         case_fleet_upgrade_host_unknown_dies_before_dialling
+t "fleet upgrade: a read-back that answers the old version fails the row" case_fleet_upgrade_read_back_mismatch_is_a_failed_row
+t "fleet upgrade: an unanswered read-back is its own failure, on FLEET_TIMEOUT" case_fleet_upgrade_read_back_unanswered_is_its_own_failure_on_the_read_budget
+t "fleet upgrade --check: no write and no read-back; staging flags refused" case_fleet_upgrade_check_writes_nothing_and_reads_nothing_back
+t "fleet upgrade --canary: the first host that would change goes first" case_fleet_upgrade_canary_is_the_first_host_that_would_change
+t "fleet upgrade --canary: a failed canary, no other host is written"  case_fleet_upgrade_failed_canary_touches_no_other_host
+t "fleet upgrade --canary H: named, refused if level; nothing to canary" case_fleet_upgrade_canary_named_and_nothing_to_canary
+t "fleet upgrade --serial: one host at a time, and it does not stop"   case_fleet_upgrade_serial_is_one_host_at_a_time_and_does_not_stop
+t "fleet upgrade --stop-on-failure: halts and names the hosts left"    case_fleet_upgrade_stop_on_failure_halts_and_names_the_rest
+t "fleet upgrade: the read-back parsers on the real version line"      case_fleet_upgrade_read_back_parsers
 t "fleet <mutating>: fans out and forwards the remote's own flags"     case_fleet_mutating_fans_out_and_forwards_flags
 t "fleet <mutating>: serial one host at a time; status stays parallel" case_fleet_mutating_is_serial_while_status_is_parallel
 t "fleet --host: targets exactly those hosts, repeatable"              case_fleet_host_targets_exactly_that_host

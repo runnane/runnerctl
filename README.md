@@ -1131,16 +1131,75 @@ $ runnerctl fleet upgrade
 build-1  0.8.1 -> 0.8.2  upgraded
 build-2  0.8.2           up to date
 2 host(s): 1 already level, 1 upgraded, 0 unreachable or unclear
+2 host(s) on 0.8.2
 ```
 
 `--check` writes nothing; it reports each host's installed and available
 version and whether it would change. `--ref <branch|tag>` is passed through,
-as it is for the single-host command.
+as it is for the single-host command — to the check, to the write, and to the
+check round `--canary` makes. `--host H` (repeatable) narrows any of it to the
+hosts you name; a name that is not in `FLEET_HOSTS` is refused before anything
+is dialled.
 
 **A host that fails is a reported row, never an abort.** A partly upgraded
 fleet is the normal outcome of a flaky network, and which host is still
 behind is exactly the thing you must not lose. The exit code is non-zero when
 any host failed, so a cron job still notices.
+
+**`upgraded` means the host was asked afterwards.** A host that says it wrote
+the new script is then asked for `version` through `FLEET_RUNNERCTL` — the
+exact command the fan-out runs — and the row reads `upgraded` only when that
+answers the version the host said it wrote. The other answers are failed rows
+and a non-zero exit:
+
+```
+build-1  0.8.1 -> 0.8.2  wrote 0.8.2 but the fleet path still answers 0.8.1
+build-2  0.8.1 -> 0.8.2  wrote 0.8.2 but the read-back did not answer: timed out after 30s
+```
+
+The first is a write that landed somewhere the fan-out does not execute — a
+copy under a home directory shadowing the system one, or a `FLEET_RUNNERCTL`
+pointing at a different file. The second says only that the question was not
+answered; the write itself was reported done. The read-back is a read, so it
+runs on `FLEET_TIMEOUT`, not on the upgrade's `FLEET_MUTATE_TIMEOUT`. It
+compares version numbers, so a `--ref <branch>` whose bytes changed under an
+unchanged version number verifies as that number and no further.
+
+The last line names where the fleet ended up: `N host(s) on X` when every
+host is known to be on one version, otherwise each version with its hosts,
+and `unknown` for the ones that did not say.
+
+##### Staging an upgrade: `--canary`, `--serial`, `--stop-on-failure`
+
+By default every host is upgraded at once, `FLEET_PARALLEL` at a time. Three
+flags make that more careful; none of them applies to `--check`.
+
+```
+$ runnerctl fleet upgrade --canary
+canary build-1: upgraded 0.8.1 -> 0.8.2 and the fleet path answers 0.8.2 — continuing with 2 other host(s)
+build-1  0.8.1 -> 0.8.2  upgraded
+build-2  0.8.1 -> 0.8.2  upgraded
+build-3  0.8.2           up to date
+3 host(s): 1 already level, 2 upgraded, 0 unreachable or unclear
+3 host(s) on 0.8.2
+```
+
+- **`--canary [H]`** upgrades one host first and continues only if it ends
+  `upgraded` — written *and* read back. Anything else stops there: no other
+  host is asked to write, the rest are listed as `not attempted`, and the exit
+  code is non-zero. Without a name, the canary is the first host in
+  `FLEET_HOSTS` order that **would actually change**, found with a `--check`
+  round first — a host that is already up to date proves nothing about the new
+  release. When no host would change, it says so and writes nothing. A named
+  canary that would not change is refused, naming the hosts that would.
+- **`--serial`** upgrades one host at a time, each one written and read back
+  before the next is dialled. Every host is still attempted and every row
+  reported.
+- **`--stop-on-failure`** is `--serial` that halts at the first failed row and
+  lists the hosts it did not attempt.
+
+They combine: `--canary --stop-on-failure` is one verified host, then the rest
+one at a time until something fails.
 
 An answer this does not recognise is shown verbatim rather than folded into
 "up to date" — quietly reporting a host as level when it said something else
