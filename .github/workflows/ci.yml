@@ -27,10 +27,14 @@ jobs:
   # Feature PRs never touch the version line or the changelog, so they never
   # conflict on either. Never bump RUNNERCTL_VERSION by hand.
   #
-  # RELEASE_PLEASE_TOKEN (optional repo secret, a PAT with contents+PR
-  # write) makes the release PR trigger this workflow's gates like any other
-  # PR; with the default GITHUB_TOKEN, GitHub suppresses that, and the bumped
-  # script is only gated by the post-merge run on main.
+  # RELEASE_APP_ID (repo variable) + RELEASE_APP_PRIVATE_KEY (repo secret)
+  # name a GitHub App installed on this repo with contents + pull-requests
+  # write. With both set, the release PR is authored by that app and its
+  # gates start like any other PR's. Without them the job falls back to the
+  # default GITHUB_TOKEN: the PR is then authored by github-actions[bot],
+  # whose pull_request runs GitHub creates but holds for a manual approval,
+  # so the bumped script is only gated unattended by the post-merge run on
+  # main.
   release:
     needs: gates
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -39,10 +43,16 @@ jobs:
       contents: write
       pull-requests: write
     steps:
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        if: ${{ vars.RELEASE_APP_ID != '' }}
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
       - uses: googleapis/release-please-action@v4
         id: release
         with:
-          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
       - uses: actions/checkout@v4
