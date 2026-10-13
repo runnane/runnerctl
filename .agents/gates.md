@@ -201,6 +201,28 @@ Traps:
   count four higher than pinned per stray dash. A lone Escape is `$'\e-'`:
   `read_key` looks for the rest of a sequence with a second short read, which
   would otherwise swallow the next scripted key.
+- **A copy of the script handed to the sim through `$RUNNERCTL` has to be a
+  file NAMED `runnerctl`** (GHR-78) — in a directory of its own, one per
+  mutant. `case_compose_reap_timer_install_status_remove` pins the script's
+  own path in the unit's `ExecStart=…/runnerctl compose-reap --apply`, so a
+  copy called `runnerctl.pristine` or `m_a` turns that case red in every run,
+  the unmutated control included, for a reason that has nothing to do with
+  the mutation. Run the control first: it is what tells that apart.
+- **The run a job belongs to (GHR-78) comes from `proc_job_env`, which the
+  stub shadows.** `RUNNERCTL_STUB_RUN=1` gives slot-1 the run's variables and
+  slot-2 an environment of its own — two busy slots of one repository, but
+  only under the /proc-only reader (`RUNNERCTL_STUB_JOURNAL_ACCESS=0
+  RUNNERCTL_STUB_CGROUP_READABLE=1`): the journal reader finds slot-2 idle and
+  never asks. `RUNNERCTL_STUB_RUN_<NAME>` replaces one of slot-1's values. The
+  hook's contract is one line per variable, so a value with a newline in it
+  cannot be a stub case: the real reader is `proc_environ_job_vars FILE`,
+  which `run_fn` calls on a NUL-separated fixture file.
+- **A remote's table in the fleet stub is `render_status` called directly, not
+  `cmd_status`.** So a case about a fleet row does not exercise anything
+  `cmd_status` decides before it renders — `STATUS_COLS` (GHR-78: the long
+  WORKING-ON cell is a terminal's) is reset by the stub itself, as the stall
+  threshold and the narrow table are. The gate on `stdout_is_tty` is pinned by
+  the local `status` cases; the fleet-row assertion stays green without it.
 - **`fleet watch`'s view keys go through `fleet_watch_view`, not
   `fleet_watch_rows`** (GHR-75): with a filter, a sort or a collapse on, the
   rows the cursor walks are the VIEW's. A case about an action key under a

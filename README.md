@@ -316,6 +316,31 @@ oversized. A running slot whose journal cannot be read shows `(no access)`,
 or `idle ?` when `/proc` is readable but the journal is not, with a one-line
 hint under the table — `—` means only that the slot is not running.
 
+`my-app:build` is the job's *id*, and `build` is the job of half the workflows
+of any organisation. Where the terminal has columns to spare **beyond the full
+table**, a running job is drawn with its workflow and its branch or tag instead
+— `my-app:CI / build @main (14m)` — which is what tells two slots on the same
+repository apart. The long form is used for a row only when the whole of it
+fits, each of the two names is cut to 40 characters, and a job whose
+environment names neither reads exactly as before. It is a terminal's cell
+only: piped, redirected, or fetched by `fleet status` / `fleet watch` (a remote
+draws its table for no terminal), the cell is the short one at any width — the
+rest of the run is in [`--json`](#machine-readable-output-status---json) and one
+key away in `watch` (`O`, below). The workflow, the ref and the run's other
+facts come from the same step environment as the repository, so they have its
+access needs (the runner's user or root) and its gap: between two steps, and
+for a container job, there is no step process to read them from.
+
+Those values — a branch name, a workflow's name, the repository, the job id —
+are text somebody outside the host chose, and any process in the slot can put
+what it likes in its own environment. The cell, and the `watch` lines that
+quote it, do not draw it as it came: control characters (C0, `DEL`, the C1
+range, and the Unicode bidirectional controls) are taken out before the cell
+is built, on the host that read them, so a ref carrying an escape sequence
+draws as the printable characters between the escapes and cannot move the
+cursor, recolour or retitle the terminal. Text that is not well-formed UTF-8
+has every non-ASCII byte replaced by `?`.
+
 A job that has been running for `STALL_SEC` seconds or more — `3600` (1 h)
 by default: no job on a build pool legitimately runs that long, so past it
 the runner is wedged, not slow — is flagged in the cell (`my-app:build
@@ -485,6 +510,7 @@ and the result becomes the status line under the legend:
 | `S` / `T` | stop / start the slot (stop carries the same warning while a job runs) | `systemctl stop\|start <unit>` |
 | `P` | reap the `+N leaked` processes on an idle slot, exactly as `reap <IDX>` does | `kill -TERM …`, then `kill -KILL` for what survives |
 | `L` | show `logs <slot> -n 50` in `$PAGER` (`less`; `q` returns to the table). No confirm — it changes nothing | `journalctl -u <unit> -n 50` |
+| `O` | print the URL of the running job's run on the status line — `https://github.com/<owner>/<repo>/actions/runs/<id>/attempts/<n>` — to copy or click. It is printed, never opened: the node you watch from is usually a terminal with no browser. Says so when no job is running, or when the job's environment could not be read (between steps, a container job, no access to the slot's processes) | nothing |
 | `PgUp` / `PgDn` | move the cursor a page (a window less one row, so the row you left is still on screen) | |
 | `g` / `G`, `Home` / `End` | the first / last slot | |
 | `q` | quit | |
@@ -538,7 +564,10 @@ rendered from one collector, so they cannot disagree on a value:
    "memory_max":27917287424,"memory_high":23622320128,"memory_current":3328599552,"memory_peak":26743545600,
    "restart":"always","env_file":null,"since":1757622000,
    "restarts":0,"result":"success","last_restart_reason":null,"profile":"ci",
-   "job":{"repo":"my-app","name":"test","since":1757707200,"stalled":false},
+   "job":{"repo":"my-app","name":"test","since":1757707200,"stalled":false,
+          "workflow":"CI","run_id":1234567890,"run_attempt":1,"run_number":57,"ref":"main",
+          "sha":"0123456789abcdef0123456789abcdef01234567","actor":"octocat","event":"push",
+          "url":"https://github.com/example-org/my-app/actions/runs/1234567890/attempts/1"},
    "idle_since":null,"jobs_completed":null,"working_on_access":"ok","leaked_procs":null,
    "memory_events":{"high":4,"max":1,"oom_kill":0},
    "memory_pressure":{"full_avg10":0.41,"full_avg60":0.12,"full_total":9876543}}
@@ -557,7 +586,8 @@ invocation's `Result`), `last_restart_reason` (`oom-kill` / `exit-code N` /
 "name", "since", "stalled"}` while a job is in flight (`repo`, `name` and
 `since` null when unknown; `stalled` true or false against `STALL_SEC` /
 `--stall-after`, null when the runtime is unknown), null when idle or
-stopped — `idle_since` and `jobs_completed`
+stopped; after those four the object names the run the job belongs to (the
+table below) — `idle_since` and `jobs_completed`
 (epoch second of the last completion and the count since the unit started,
 0 and the unit's own start when nothing has finished yet; null while busy or
 stopped), and `working_on_access`: `"ok"`, `"no-journal"` (only `/proc`
@@ -583,6 +613,29 @@ null when the journal cannot be read or `EVENTS_SEC=0`);
 `runnerctl` is the version of the script that produced the object, for
 inventorying a fleet.
 `--json` is one-shot and refuses `--watch`; poll it instead.
+
+**The run a job belongs to.** A `job` object carries, after `stalled`, what
+the job's step environment says about its run. Every key is always there, and
+`null` when the value could not be read (no step process between two steps or
+in a container job; no access to the slot's processes) **or is not what such a
+value has to be** — these are strings a job supplied, so they are held to a
+shape rather than passed on:
+
+| key | from | reported when |
+| --- | --- | --- |
+| `workflow` | `GITHUB_WORKFLOW` | any text; cut to 200 bytes on a character boundary |
+| `run_id`, `run_attempt`, `run_number` | `GITHUB_RUN_ID`, `GITHUB_RUN_ATTEMPT`, `GITHUB_RUN_NUMBER` | `0`, or up to 15 digits with no leading zero — JSON numbers |
+| `ref` | `GITHUB_REF_NAME` (the branch or tag, `main`, not `refs/heads/main`) | any text, cut like `workflow` |
+| `sha` | `GITHUB_SHA` | 40 or 64 lowercase hex digits |
+| `actor` | `GITHUB_ACTOR` | any text, cut like `workflow` |
+| `event` | `GITHUB_EVENT_NAME` | lowercase letters and `_` (`push`, `pull_request`), 64 at most |
+| `url` | `GITHUB_SERVER_URL`, `GITHUB_REPOSITORY`, the two ids | `<server>/<owner>/<repo>/actions/runs/<run_id>/attempts/<run_attempt>` — only when the server is `http://` or `https://` plus a host name and optional port and nothing else, the repository is two names of letters, digits, `.`, `_` and `-`, and `run_id` passed; without a valid attempt it ends at the run id |
+
+Free text is JSON-escaped like every other string (a control character is
+`\u001b`, never the byte), and made well-formed UTF-8 first — bytes that are
+not become `?` — so the object always parses. A `javascript:` "server", a run
+id of `12ab` or a repository of `../..` gives `"url":null`, not a link.
+`repo` stays the short name it always was; the `url` is where the owner is.
 
 `host.name` is what makes a saved payload self-describing — a file or a
 monitoring record says which host produced it with no out-of-band label.
@@ -1042,8 +1095,19 @@ has its own `slot-1`:
 | `R` / `S` / `T` | restart / stop / start the slot |
 | `P` | reap processes a finished job leaked |
 | `L` | page the slot's last 50 journal lines through your `$PAGER` |
+| `O` | print the URL of the running job's run on the status line; no round trip |
 | `!` `b` `i` `/` `a` `s` `c` `?` | [view keys](#a-live-fleet-view-fleet-watch): filter, sort, collapse, help — below |
 | `q` | quit |
+
+`O` is the one key here that reads the frame's own facts rather than fresh
+ones: it prints the run URL out of the `status --json` payload the last tick
+brought from that host, so it is the run of the job the row is showing, it
+costs nothing, and it still answers for a host whose rows are only being kept.
+A URL is checked again on this side before it is printed — it has to be a run
+page's address and nothing else — and a host whose `runnerctl` predates the key
+says so (`runnerctl fleet upgrade`). The `WORKING-ON` cells in a fleet table
+are always the short `repo:job` form: a remote draws its table for no
+terminal, so it never has the width for more.
 
 Each of `K` `R` `S` `T` `P` first reads that host's own `status --json` — one
 round trip over the held connection — and decides on *that*, not on the frame,
