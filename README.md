@@ -1042,6 +1042,7 @@ has its own `slot-1`:
 | `R` / `S` / `T` | restart / stop / start the slot |
 | `P` | reap processes a finished job leaked |
 | `L` | page the slot's last 50 journal lines through your `$PAGER` |
+| `!` `b` `i` `/` `a` `s` `c` `?` | [view keys](#a-live-fleet-view-fleet-watch): filter, sort, collapse, help — below |
 | `q` | quit |
 
 Each of `K` `R` `S` `T` `P` first reads that host's own `status --json` — one
@@ -1077,6 +1078,65 @@ rather than reporting `failed` about an action that then completes behind it.
 Every remote action needs what the same command needs run by
 hand over ssh: passwordless sudo on that host, `L` included (`logs` reads the
 journal through it). The facts read is a plain `status --json` and needs none.
+
+**View keys: filter, sort, collapse.** On a healthy fleet almost every row is
+noise — you are looking for the two that are wrong. These keys choose what the
+frame shows, and **none of them asks a host anything**: like moving the cursor,
+they redraw what the last tick brought.
+
+| key | shows |
+| --- | --- |
+| `!` | **problems only**: slots that are `STALLED`, not active (failed, stopped by hand, between restarts), leaking, at or over `MemoryHigh`, or under memory pressure at `PRESSURE_CRIT_PCT`; hosts that are not answering; hosts with a disk at `DISK_WARN_PCT` or worse, or an OOM / disk-full line |
+| `b` / `i` | busy only (a `STALLED` job is a busy slot) / idle only |
+| `/` | rows whose host, runner or `repo:job` contains the text you type, whatever its case; combines with `!` `b` `i` |
+| `a` | all: clears `!` `b` `i`, the text and the collapse |
+| `s` | cycle the order: config order → longest-running job first → most memory used first |
+| `c` | collapse to one line per host (`build-1  4 slots: 3 busy, 1 idle · Disk: / 41% (…)`); on a host, `c` or `Enter` opens it and `c` closes it again |
+| `?` | every key, in place of the table, until any key |
+
+```
+$ runnerctl fleet watch --problems
+runnerctl fleet watch — 3 host(s) — 14:02:11 — every 5s (q to quit) — view: problems only
+3/3 hosts answering · 9 slots: 6 busy, 2 idle, 1 STALLED · 1 host disk crit · capacity 2 free of 9
+HOST     IDX RUNNER          PROFILE  ACTIVE           SINCE  ENABLED  ...  WORKING-ON
+build-2  Disk: /var/lib/docker [docker] 96% (37.3G free), /srv/runners [work] 41% (602.4G free)
+build-3  Disk: / [docker,work] 24% (353.9G free)
+build-3  1   org.build-3-b   ci       active/running   1d 2h  enabled  ...  my-app:build (2h10m) STALLED
+```
+
+What to know about them:
+
+- **The header names the view** (`— view: problems only · longest job first`),
+  and the **summary line keeps counting the whole fleet** — it is the one line
+  that says what a filtered frame is a part of. A view that shows nothing says
+  `nothing matches — a shows all` instead of drawing an empty table.
+- **A disabled slot is not a problem.** Somebody scaled it away on purpose; the
+  summary dims it for the same reason. A slot that is merely not active is.
+- **A host's `Disk:` line** shows with any of its slots — and under `!` on its
+  own when the trouble is the host's (a full disk over healthy slots).
+- **A host that stopped answering** is a problem by definition: `!` keeps its
+  age line and *all* its kept rows. `b` and `i` filter its kept rows by the
+  state it last reported — they are dimmed and under their age, which already
+  says how far to trust them. A host with no rows at all (it never answered, or
+  its `runnerctl` exited non-zero) is one row under `!` and none under `b` /
+  `i`: nothing is known to be busy or idle there, and the summary still counts
+  it missing.
+- **A sorted table is a flat list.** `HOST` is on every row, so it reads without
+  the grouping; the host lines (`Disk:`, age lines, error rows, collapsed hosts)
+  move under the rows, in config order. Ties keep config order, and a slot
+  without the fact — no job, no memory accounting — sorts last.
+- **`/` filters as you type.** `Enter` keeps the text, `Esc` puts back what was
+  there before, `Backspace` and `Ctrl-U` edit it, and an empty text matches
+  everything. While it is open every printable key is text, `q` included.
+- **Action keys act on the row the cursor is on**, whatever the view did to the
+  order: the cursor is the *(host, slot)* pair, not a position. A row that
+  leaves the view moves the cursor as a row leaving the fleet does. On a
+  collapsed host there is no slot to act on — open it first.
+- `--problems` and `--sort config|job|mem` start a watch in a view, so a wall
+  display nobody types at shows the right thing from the first frame.
+
+The one-line legend is the one it always was; with a view on it also names the
+two keys that lead out of it, `a` and `?`.
 
 `fleet logs` remains unsupported: it streams one journal, and that only makes
 sense against one host. For a slot's recent lines, `L` in `fleet watch`.

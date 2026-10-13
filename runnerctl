@@ -61,7 +61,7 @@
 #                          [--narrow]
 #   runnerctl fleet watch  [--interval N] [--host H]... \
 #                          [--color auto|always|never] [--stall-after N] [--narrow] \
-#                          [--min-available K]
+#                          [--min-available K] [--problems] [--sort config|job|mem]
 #   runnerctl fleet health [--quiet] [--max-restarts N] [--stall-after N] \
 #                          [--restart-stalled]
 #   runnerctl fleet upgrade [--check] [--ref <branch|tag>] [--host H]... \
@@ -234,6 +234,17 @@
 # rows kept that way count for nothing in the summary or in S's floor. The
 # watch's reads have FLEET_WATCH_TIMEOUT seconds per host (default 10), not
 # FLEET_TIMEOUT.
+# View keys (GHR-75) choose what the frame shows and ask no host anything:
+# `!` problems only (slots STALLED, not active, leaking, at MemoryHigh or
+# under critical memory pressure; hosts not answering or with a disk/OOM line
+# at warn or worse), `b` / `i` busy / idle only, `/` rows whose host, runner
+# or repo:job contains the text typed, `a` all again; `s` cycles config order
+# → longest job first → most memory first (a flat list, host lines under it);
+# `c` folds every host to one line (`build-1 4 slots: 3 busy, 1 idle · Disk:
+# …`) and, on a host, c or Enter opens it; `?` lists every key. The header
+# names the view, the summary line goes on counting the whole fleet, and a
+# view that shows nothing says `nothing matches — a shows all`. --problems and
+# --sort config|job|mem start a watch in a view, for a wall display.
 # A frame wider than the terminal makes the next tick ask the hosts for
 # `status --narrow` (GHR-56), with the local watch's hysteresis; a host too
 # old for the flag is asked again without it and shows its full-width rows.
@@ -4558,15 +4569,116 @@ fleet_plural() { # COUNT NOUN
 # line — except capacity, which is printed whenever there are slots: `0 free`
 # is the one zero an operator most needs to see.
 #
-# Slots are read one per line with json_line_field, on the footing fleet_slots
+# Slots are read one per line with json_line_get, on the footing fleet_slots
 # and fleet_watch_facts read them: render_status_json writes each slot on a
 # line of its own and this script owns that emitter.
+#
+# GHR-75: WHAT a slot or a host is, is decided in the two classifiers below
+# and nowhere else. The summary counts by them and `fleet watch`'s filters
+# show by them, so a slot the summary calls STALLED is a slot the problems
+# view keeps — one reading of the JSON, not two that can drift apart.
+
+# One slot line of `status --json`, classified, into SC_*:
+#
+#   SC_NAME     the RUNNER cell, which is what a frame row is matched on
+#   SC_STATE    stalled | busy | idle (its unit is active: a job past the
+#               stall threshold, a job, none), disabled | down (it is not:
+#               UnitFileState disabled, or anything else — failed, stopped by
+#               hand, activating between two restarts)
+#   SC_LEAKING  a finished job left processes behind
+#   SC_PROBLEM  true when it is what an operator is looking for: stalled,
+#               down, leaking, at or over MemoryHigh (where the table paints
+#               USED red), or memory pressure at PRESSURE_CRIT_PCT. A DISABLED
+#               slot is not one: somebody scaled it away on purpose, which is
+#               why the summary dims it rather than painting it red.
+#   SC_SINCE    when its job started (epoch), SC_MEM its MemoryCurrent in
+#               bytes, SC_JOB the job as `repo:name` — each empty when the
+#               host does not say, which is every idle slot for the first.
+#
+# No subshell: `fleet watch` runs this for every slot of every host.
+SC_NAME="" SC_STATE="" SC_LEAKING=false SC_PROBLEM=false SC_SINCE="" SC_MEM="" SC_JOB=""
+fleet_slot_classify() { # SLOT-LINE
+  local job=null high
+  SC_STATE="" SC_LEAKING=false SC_PROBLEM=false SC_SINCE="" SC_MEM="" SC_JOB=""
+  [[ ! "$1" =~ \"job\":(.*),\"idle_since\": ]] || job="${BASH_REMATCH[1]}"
+  json_line_get "$1" name; SC_NAME="$JF"
+  json_line_get "$1" active
+  if [ "$JF" != active ]; then
+    json_line_get "$1" enabled
+    if [ "$JF" = disabled ]; then SC_STATE=disabled; else SC_STATE=down SC_PROBLEM=true; fi
+  elif [ "$job" = null ]; then
+    SC_STATE=idle
+  else
+    json_line_get "$job" stalled
+    if [ "$JF" = true ]; then SC_STATE=stalled SC_PROBLEM=true; else SC_STATE=busy; fi
+  fi
+  if [ "$job" != null ]; then
+    json_line_get "$job" since
+    [[ ! "$JF" =~ ^[0-9]+$ ]] || SC_SINCE="$JF"
+    json_line_get "$job" repo; SC_JOB="$JF"
+    json_line_get "$job" name; SC_JOB="${SC_JOB:+$SC_JOB:}$JF"
+  fi
+  json_line_get "$1" leaked_procs
+  if [[ "$JF" =~ ^[0-9]+$ ]] && [ "$JF" -gt 0 ]; then SC_LEAKING=true SC_PROBLEM=true; fi
+  json_line_get "$1" memory_current
+  [[ ! "$JF" =~ ^[0-9]+$ ]] || SC_MEM="$JF"
+  json_line_get "$1" memory_high; high="$JF"
+  if [ -n "$SC_MEM" ] && [[ "$high" =~ ^[0-9]+$ ]] && [ "$high" -gt 0 ] && [ "$SC_MEM" -ge "$high" ]; then
+    SC_PROBLEM=true
+  fi
+  # A percentage with decimals, which only awk compares — asked for a slot
+  # that reports any pressure at all, not for the many that report 0.00.
+  json_line_get "$1" full_avg10
+  if [[ "$JF" =~ [1-9] ]] && pressure_at_least "$JF" "$PRESSURE_CRIT_PCT"; then SC_PROBLEM=true; fi
+}
+
+# The first line of a `status --json` payload — the one carrying the host
+# object — classified, into HC_*: HC_VER its runnerctl version; HC_DISK `crit`
+# or `warn` at its WORST partition against this node's DISK_CRIT_PCT /
+# DISK_WARN_PCT, empty below both; HC_EVENTS true with an OOM kill or a
+# disk-full line in its window.
+HC_VER="" HC_DISK="" HC_EVENTS=false
+fleet_host_classify() { # HOST-LINE
+  local line="$1" lvl n
+  HC_DISK="" HC_EVENTS=false
+  json_line_get "$line" runnerctl; HC_VER="$JF"
+  while [[ "$line" =~ \"use_pct\":([0-9]+) ]]; do
+    lvl="$(disk_level "${BASH_REMATCH[1]}")"
+    line="${line#*"${BASH_REMATCH[0]}"}"
+    case "$lvl" in crit) HC_DISK=crit ;; warn) [ -n "$HC_DISK" ] || HC_DISK=warn ;; esac
+  done
+  # What is left of the line is past the disks: the events object.
+  json_line_get "$line" oom_kills; n="$JF"
+  json_line_get "$line" disk_full
+  if { [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt 0 ]; } || { [[ "$JF" =~ ^[0-9]+$ ]] && [ "$JF" -gt 0 ]; }; then
+    HC_EVENTS=true
+  fi
+}
+
+# `6 slots: 2 busy, 2 idle, 1 STALLED, 1 down` — the summary's slot segment,
+# and what a collapsed host says about itself in `fleet watch` (GHR-75). The
+# table's own colours: status_job_color for a job, a leak and an idle slot,
+# status_active_color for a unit that is not active, the ENABLED cell's dim
+# for a disabled one. A state nobody is in is left out.
+fleet_states_text() { # SLOTS BUSY IDLE STALLED DOWN DISABLED
+  local line
+  local -a states=()
+  [ "$2" -eq 0 ] || states+=("$(paint "$C_GREEN" "$2 busy")")
+  [ "$3" -eq 0 ] || states+=("$(paint "$C_DIM" "$3 idle")")
+  [ "$4" -eq 0 ] || states+=("$(paint "$C_BOLD$C_RED" "$4 STALLED")")
+  [ "$5" -eq 0 ] || states+=("$(paint "$C_RED" "$5 down")")
+  [ "$6" -eq 0 ] || states+=("$(paint "$C_DIM" "$6 disabled")")
+  line="$(fleet_plural "$1" slot)"
+  [ "${#states[@]}" -eq 0 ] || line+=": $(join_by ", " "${states[@]}")"
+  printf '%s\n' "$line"
+}
+
 fleet_summary_line() {
-  local i rc jrc line job pct lvl worst ver n
+  local i rc jrc line
   local hosts="${#FLEET_HOSTS[@]}" answering=0 slots=0 busy=0 idle=0 stalled=0 down=0 disabled=0
   local leaking=0 dcrit=0 dwarn=0 events=0 active
   local -A vers=()
-  local -a seg=() states=()
+  local -a seg=()
   for i in "${!FLEET_HOSTS[@]}"; do
     rc="$(fleet_rc "$i")"
     [ "$(fleet_reachable "$rc")" = true ] || continue
@@ -4580,49 +4692,28 @@ fleet_summary_line() {
     while IFS= read -r line; do
       case "$line" in
         '{"runnerctl":'*)
-          ver="$(json_line_field "$line" runnerctl)"
-          [ -z "$ver" ] || vers[$ver]=1
-          worst=""
-          while [[ "$line" =~ \"use_pct\":([0-9]+) ]]; do
-            lvl="$(disk_level "${BASH_REMATCH[1]}")"
-            line="${line#*"${BASH_REMATCH[0]}"}"
-            case "$lvl" in crit) worst=crit ;; warn) [ -n "$worst" ] || worst=warn ;; esac
-          done
-          case "$worst" in crit) dcrit=$((dcrit + 1)) ;; warn) dwarn=$((dwarn + 1)) ;; esac
-          # What is left of the line is past the disks: the events object.
-          n="$(json_line_field "$line" oom_kills)"; pct="$(json_line_field "$line" disk_full)"
-          if { [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt 0 ]; } || { [[ "$pct" =~ ^[0-9]+$ ]] && [ "$pct" -gt 0 ]; }; then
-            events=$((events + 1))
-          fi ;;
+          fleet_host_classify "$line"
+          [ -z "$HC_VER" ] || vers[$HC_VER]=1
+          case "$HC_DISK" in crit) dcrit=$((dcrit + 1)) ;; warn) dwarn=$((dwarn + 1)) ;; esac
+          ! $HC_EVENTS || events=$((events + 1)) ;;
         '  {"idx":'*)
           slots=$((slots + 1))
-          job=null
-          [[ ! "$line" =~ \"job\":(.*),\"idle_since\": ]] || job="${BASH_REMATCH[1]}"
-          if [ "$(json_line_field "$line" active)" != active ]; then
-            if [ "$(json_line_field "$line" enabled)" = disabled ]; then disabled=$((disabled + 1)); else down=$((down + 1)); fi
-          elif [ "$job" = null ]; then idle=$((idle + 1))
-          elif [ "$(json_line_field "$job" stalled)" = true ]; then stalled=$((stalled + 1))
-          else busy=$((busy + 1))
-          fi
-          n="$(json_line_field "$line" leaked_procs)"
-          if [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt 0 ]; then leaking=$((leaking + 1)); fi ;;
+          fleet_slot_classify "$line"
+          case "$SC_STATE" in
+            busy)     busy=$((busy + 1)) ;;
+            idle)     idle=$((idle + 1)) ;;
+            stalled)  stalled=$((stalled + 1)) ;;
+            disabled) disabled=$((disabled + 1)) ;;
+            *)        down=$((down + 1)) ;;
+          esac
+          ! $SC_LEAKING || leaking=$((leaking + 1)) ;;
       esac
     done <"$FLEET_DIR/$i.json"
   done
   line="$answering/$hosts host$([ "$hosts" -eq 1 ] || echo s) answering"
   if [ "$answering" -lt "$hosts" ]; then seg+=("$(paint "$C_RED" "$line")"); else seg+=("$line"); fi
   if [ "$answering" -gt 0 ]; then
-    # The table's own colours: status_job_color for a job, a leak and an idle
-    # slot, status_active_color for a unit that is not active, the ENABLED
-    # cell's dim for a disabled one.
-    [ "$busy" -eq 0 ] || states+=("$(paint "$C_GREEN" "$busy busy")")
-    [ "$idle" -eq 0 ] || states+=("$(paint "$C_DIM" "$idle idle")")
-    [ "$stalled" -eq 0 ] || states+=("$(paint "$C_BOLD$C_RED" "$stalled STALLED")")
-    [ "$down" -eq 0 ] || states+=("$(paint "$C_RED" "$down down")")
-    [ "$disabled" -eq 0 ] || states+=("$(paint "$C_DIM" "$disabled disabled")")
-    line="$(fleet_plural "$slots" slot)"
-    [ "${#states[@]}" -eq 0 ] || line+=": $(join_by ", " "${states[@]}")"
-    seg+=("$line")
+    seg+=("$(fleet_states_text "$slots" "$busy" "$idle" "$stalled" "$down" "$disabled")")
   fi
   [ "$leaking" -eq 0 ] || seg+=("$(paint "$C_YELLOW" "$leaking leaking")")
   [ "$dcrit" -eq 0 ] || seg+=("$(paint "$C_RED" "$(fleet_plural "$dcrit" host) disk crit")")
@@ -5906,14 +5997,25 @@ fleet_watch_highlight() { # FRAME LINE-NO
 # a number or boolean as written, nothing for null or a missing key (an older
 # host that does not report it). render_status_json writes each slot on one
 # line and this script owns it — the same footing fleet_slots reads it on.
-json_line_field() { # LINE KEY
+#
+# json_line_get leaves it in JF (JF_SET false for null or a missing key) and
+# starts no subshell, for the callers that read several fields of every slot
+# on every redraw (GHR-75); json_line_field prints it. (Not json_field: that
+# name is the GitHub API reader's, further down, which reads stdin.)
+JF="" JF_SET=false
+json_line_get() { # LINE KEY
   local re="\"$2\":(\"(([^\"\\\\]|\\\\.)*)\"|[-0-9.a-z]+)"
+  JF="" JF_SET=false
   [[ "$1" =~ $re ]] || return 0
   case "${BASH_REMATCH[1]}" in
-    \"*) printf '%s\n' "${BASH_REMATCH[2]}" ;;
+    \"*) JF="${BASH_REMATCH[2]}" JF_SET=true ;;
     null) ;;
-    *)   printf '%s\n' "${BASH_REMATCH[1]}" ;;
+    *)   JF="${BASH_REMATCH[1]}" JF_SET=true ;;
   esac
+}
+json_line_field() { # LINE KEY
+  json_line_get "$1" "$2"
+  ! $JF_SET || printf '%s\n' "$JF"
 }
 
 # The selected slot's facts, fresh from its host, into FF. 1 with FW_NOTICE
@@ -6002,7 +6104,12 @@ fleet_watch_key_action() { # KEY
   FW_NOTICE="" FW_PROMPT="" FW_ACTION="" FW_ACT_HOST="$host" FW_ACT_NAME="$name"
   if [ "$FW_POS" -lt 0 ]; then FW_NOTICE="no slot to act on"; return 0; fi
   # What the cursor is ON, not the slot it remembers: a host that is not
-  # answering has no slot on the screen to act on.
+  # answering has no slot on the screen to act on — and neither has a folded
+  # one (GHR-75), whose line stands for all of its slots at once.
+  if [ "${FW_KIND[$FW_POS]:-}" = host ]; then
+    FW_NOTICE="$host: folded to one line — c or Enter opens it, then pick a slot"
+    return 0
+  fi
   if [ -z "${FW_ROWS[$FW_POS]#*$'\t'}" ]; then
     FW_NOTICE="$host: not answering — no slot there to act on"
     return 0
@@ -6098,6 +6205,347 @@ fleet_watch_run_action() {
   FW_ACTION="" FW_PROMPT="" FW_REFRESH=true
 }
 
+# --- Fleet watch views (GHR-75) ------------------------------------------------
+# On a healthy fleet almost every row is noise: the operator is looking for
+# the two that are wrong. The view keys choose what the frame shows, and none
+# of them asks a host anything — like cursor movement, they redraw what the
+# last tick brought:
+#
+#   !  problems only      slots that are STALLED, not active, leaking, at
+#                         MemoryHigh or under critical memory pressure
+#                         (fleet_slot_classify's SC_PROBLEM); hosts that are
+#                         not answering; hosts with a disk at warn or worse
+#                         or an OOM/disk-full line
+#   b / i                 busy only (a STALLED job is a busy slot) / idle only
+#   /                     rows whose host, runner or repo:job contains the
+#                         text typed, whatever its case; ANDed with ! b i
+#   a                     all: clears ! b i, the text and the collapse
+#   s                     config order → longest-running job first → most
+#                         memory used first
+#   c                     one line per host; on a host, c or Enter opens it
+#                         and c closes it again
+#   ?                     every key, in place of the table, until a key
+#
+# The view is a LAYER OVER THE ASSEMBLED FRAME (fleet_watch_view), not a
+# second renderer. Each frame line is identified by its two leftmost cells —
+# the cursor's own footing, safe where a column position is not — and whether
+# it is shown is decided on that host's `status --json` facts, by the
+# classifier the summary line counts with. Never on a painted cell.
+#
+# With nothing chosen the layer is not entered at all: the frame is the one
+# fleet_status_table drew, byte for byte, and the rows are read off it as
+# they always were.
+#
+# What a view does to the lines that are not slots:
+#
+#   * A host's Disk/OOM line shows with any of its slots, and under ! on its
+#     own when the trouble is the host's (a full disk over healthy slots).
+#   * A host that stopped answering is a problem by definition: under ! its
+#     age line and ALL its kept rows stay. Under b / i its kept rows are
+#     filtered by the last state the host reported — they are dimmed and
+#     under their age, which already says how far to trust them — and losing
+#     a host's jobs from the busy view at the moment it hiccups would be
+#     worse. A host with no rows (never answered, or its runnerctl exited
+#     non-zero) is one row under ! and none under b / i: nothing is known to
+#     be busy or idle there, and the summary line still counts it missing.
+#   * A slot row its host sent no facts for is shown under ! (nothing says it
+#     is healthy) and hidden under b / i.
+#   * A sort other than config order makes the table a FLAT list — the HOST
+#     cell is on every row, so it reads without the grouping — and moves the
+#     host lines (Disk/OOM, age lines, error rows, collapsed hosts) under the
+#     rows, in config order. Ties keep config order, and a slot without the
+#     fact (no job; no memory accounting) sorts last. Where a host too old
+#     for --narrow answers under a column header of its own, rows are sorted
+#     within each header's block, never across two column layouts.
+#   * The summary line keeps counting the WHOLE fleet: it is the one line that
+#     says what a filtered frame is a part of. So the header names the view.
+#   * A view that shows nothing says so (FLEET_WATCH_EMPTY) under the column
+#     header, and the notes stay.
+#
+# FW_ROWS / FW_LINES are filled here for a view, with FW_KIND saying what each
+# row is: `slot`, `down` (a host that did not answer: one error row) or `host`
+# (a collapsed host). The cursor stays the (host, name) pair it always was, so
+# an action key under a filter acts on the row it is on however the rows were
+# reordered, and fleet_watch_place handles a row leaving the view exactly as it
+# handles one leaving the frame.
+FW_FILTER=all FW_SORT=config FW_COLLAPSE=false FW_SEARCH="" FW_SEARCH_WAS="" FW_MODE=""
+FW_VIEW="" FW_VIEW_NAME="" FW_FACTS_OK=false
+FW_KIND=()
+declare -A FW_FACT=() FW_HOSTBAD=() FW_HOSTSUM=() FW_OPEN=()
+FLEET_WATCH_EMPTY="nothing matches — a shows all"
+FLEET_WATCH_VIEW_LEGEND="$WATCH_LEGEND  a all  ? keys"
+# Thirteen lines, so that with the header, the summary and the three lines
+# under it the list fits a terminal of 24 rows; none is wider than 80 columns.
+FLEET_WATCH_HELP="fleet watch — keys
+  ↑ ↓ j k   PgUp PgDn   g G Home End   move the cursor: a row, a page, the ends
+  !     problems only: slots STALLED, not active, leaking, at MemoryHigh or under
+        critical memory pressure; hosts not answering or with a disk/OOM line
+  b i   busy only / idle only
+  /     rows whose host, runner or repo:job has the text (Enter keeps, Esc cancels)
+  a     all: clears ! b i, the text and the collapse
+  s     order: config → longest job first → most memory first
+  c     one line per host; on a host, c or Enter opens it and c closes it
+  K R S T P L   kill job, restart, stop, start, reap, logs: the cursor's slot
+  ?     this list
+  q     quit
+! b i / a s c ask no host anything, and the summary counts the whole fleet."
+
+# Whether nothing is chosen — the frame as fleet_status_table drew it.
+fleet_watch_view_plain() {
+  [ "$FW_FILTER" = all ] && [ "$FW_SORT" = config ] && ! $FW_COLLAPSE && [ -z "$FW_SEARCH" ]
+}
+
+# The view in words, for the header, into FW_VIEW_NAME; empty when plain.
+fleet_watch_view_name() {
+  local p
+  local -a parts=()
+  case "$FW_FILTER" in
+    problems) parts+=("problems only") ;;
+    busy)     parts+=("busy only") ;;
+    idle)     parts+=("idle only") ;;
+  esac
+  [ -z "$FW_SEARCH" ] || parts+=("matching \"$FW_SEARCH\"")
+  case "$FW_SORT" in
+    job) parts+=("longest job first") ;;
+    mem) parts+=("most memory first") ;;
+  esac
+  ! $FW_COLLAPSE || parts+=("collapsed")
+  FW_VIEW_NAME=""
+  for p in ${parts[@]+"${parts[@]}"}; do FW_VIEW_NAME+="${FW_VIEW_NAME:+ · }$p"; done
+}
+
+# Every watched host's facts, from the payload it last returned — a host that
+# has stopped answering still has the one from before. FW_FACT is keyed
+# "HOST<TAB>RUNNER" and holds `state|problem|since|mem|job` (the job last: it
+# is the one field that may contain the separator); FW_HOSTBAD marks a host
+# with a disk or event line worth seeing; FW_HOSTSUM is its collapsed line's
+# `4 slots: 3 busy, 1 idle`. Once per frame at most, and only for a view that
+# needs it.
+fleet_watch_load_facts() {
+  local i host line n busy idle stalled down disabled
+  FW_FACT=() FW_HOSTBAD=() FW_HOSTSUM=()
+  for i in "${!FLEET_HOSTS[@]}"; do
+    host="${FLEET_HOSTS[$i]}"
+    [ -f "$FW_STATE/$i.json" ] || continue
+    n=0 busy=0 idle=0 stalled=0 down=0 disabled=0
+    while IFS= read -r line; do
+      case "$line" in
+        '{"runnerctl":'*)
+          fleet_host_classify "$line"
+          if [ -n "$HC_DISK" ] || $HC_EVENTS; then FW_HOSTBAD[$host]=1; fi ;;
+        '  {"idx":'*)
+          fleet_slot_classify "$line"
+          n=$((n + 1))
+          case "$SC_STATE" in
+            busy)     busy=$((busy + 1)) ;;
+            idle)     idle=$((idle + 1)) ;;
+            stalled)  stalled=$((stalled + 1)) ;;
+            disabled) disabled=$((disabled + 1)) ;;
+            *)        down=$((down + 1)) ;;
+          esac
+          FW_FACT["$host"$'\t'"$SC_NAME"]="$SC_STATE|$SC_PROBLEM|$SC_SINCE|$SC_MEM|$SC_JOB" ;;
+      esac
+    done <"$FW_STATE/$i.json"
+    [ "$n" -eq 0 ] || FW_HOSTSUM[$host]="$(fleet_states_text "$n" "$busy" "$idle" "$stalled" "$down" "$disabled")"
+  done
+  FW_FACTS_OK=true
+}
+
+# FRAME as the view shows it, into FW_VIEW, with its selectable rows in
+# FW_ROWS / FW_LINES / FW_KIND. See the block above.
+fleet_watch_view() { # FRAME
+  local line s k h nm j sc fact st prob since mem job ok hm hs col out rk want list
+  local sec=0 n=0 hostw=4 shown=0 pending="" hdr1="" nl=$'\n'
+  local re_slot='^([^ ]+) +[0-9]+ +([^ ]+)( |$)' re_host='^([^ ]+) '
+  local -a text=() lkind=() lhost=() lname=() lsec=() vis=() keys=() order=() notes=() sorted=()
+  local -A known=() stale=() info=() rows=() total=() emitted=() picked=()
+  FW_VIEW="$1" FW_KIND=()
+  if fleet_watch_view_plain; then
+    fleet_watch_rows "$1"
+    for j in "${!FW_ROWS[@]}"; do
+      if [ -n "${FW_ROWS[$j]#*$'\t'}" ]; then FW_KIND[j]=slot; else FW_KIND[j]=down; fi
+    done
+    return 0
+  fi
+  $FW_FACTS_OK || fleet_watch_load_facts
+  for h in "${FLEET_HOSTS[@]}"; do
+    known[$h]=1
+    [ "${#h}" -le "$hostw" ] || hostw="${#h}"
+  done
+  want="${FW_SEARCH,,}"
+  # What each frame line is. A line is a host's by its first word, as in
+  # fleet_watch_rows, and the tests are in that function's order.
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    strip_sgr "$line"; s="$SGR_STRIPPED"
+    k=other h="" nm=""
+    if [[ "$s" =~ $re_host ]] && [ -n "${known[${BASH_REMATCH[1]}]:-}" ]; then
+      h="${BASH_REMATCH[1]}"
+      if [[ "$s" =~ $FLEET_INFO_RE ]]; then
+        # The line without its HOST cell, the remote's colours kept: what a
+        # collapsed host carries after its counts.
+        k=info info[$h]="${line:$((hostw + 1))}"
+      elif [[ "$s" =~ $FLEET_STALE_RE ]]; then
+        k=stale stale[$h]="$line"
+      elif [[ "$s" =~ $re_slot ]]; then
+        k=slot nm="${BASH_REMATCH[2]}"
+      else
+        k=err
+      fi
+    elif [[ "$s" =~ ^HOST\ +IDX\  ]]; then
+      k=hdr sec=$((sec + 1))
+      [ -n "$hdr1" ] || hdr1="$line"
+    fi
+    text+=("$line") lkind+=("$k") lhost+=("$h") lname+=("$nm") lsec+=("$sec")
+  done <<<"$1"
+  # Which slot rows the filter and the text keep, and each one's sort key.
+  for j in "${!lkind[@]}"; do
+    [ "${lkind[$j]}" = slot ] || continue
+    h="${lhost[$j]}" nm="${lname[$j]}"
+    fact="${FW_FACT["$h"$'\t'"$nm"]-}"
+    st="" prob="" since="" mem="" job=""
+    [ -z "$fact" ] || IFS='|' read -r st prob since mem job <<<"$fact"
+    ok=true
+    case "$FW_FILTER" in
+      busy) [[ "$st" == busy || "$st" == stalled ]] || ok=false ;;
+      idle) [ "$st" = idle ] || ok=false ;;
+      problems)
+        if [ -n "$fact" ] && [ "$prob" != true ] && [ -z "${stale[$h]:-}" ]; then ok=false; fi ;;
+    esac
+    if $ok && [ -n "$want" ]; then
+      s="${h,,}$nl${nm,,}$nl${job,,}"
+      [[ "$s" == *"$want"* ]] || ok=false
+    fi
+    vis[j]="$ok"
+    total[$h]=$((${total[$h]:-0} + 1))
+    ! $ok || rows[$h]=$((${rows[$h]:-0} + 1))
+    case "$FW_SORT" in
+      job) keys[j]="${since:-99999999999}" ;;
+      mem) if [ -n "$mem" ]; then keys[j]="-$mem"; else keys[j]=1; fi ;;
+    esac
+  done
+  # The order the lines are taken in: the frame's own, or — sorted — each
+  # column header, the rows under it by key, then everything else under it.
+  if [ "$FW_SORT" = config ]; then
+    order=("${!lkind[@]}")
+  else
+    for ((sc = 0; sc <= sec; sc++)); do
+      list=""
+      for j in "${!lkind[@]}"; do
+        [ "${lsec[$j]}" = "$sc" ] || continue
+        if [ "${lkind[$j]}" = hdr ]; then order+=("$j"); picked[$j]=1; continue; fi
+        [ "${lkind[$j]}" = slot ] || continue
+        "${vis[$j]}" || continue
+        h="${lhost[$j]}"
+        if $FW_COLLAPSE && [ -z "${FW_OPEN[$h]:-}" ]; then continue; fi
+        list+="${keys[$j]} $j$nl"
+      done
+      if [ -n "$list" ]; then
+        mapfile -t sorted < <(sort -n -k1,1 -k2,2 <<<"${list%"$nl"}")
+        for line in "${sorted[@]}"; do order+=("${line#* }"); picked[${line#* }]=1; done
+      fi
+      for j in "${!lkind[@]}"; do
+        [ "${lsec[$j]}" = "$sc" ] || continue
+        [ -n "${picked[$j]:-}" ] || order+=("$j")
+      done
+    done
+  fi
+  FW_VIEW="" FW_ROWS=() FW_LINES=()
+  for j in ${order[@]+"${order[@]}"}; do
+    k="${lkind[$j]}" h="${lhost[$j]}"
+    case "$k" in
+      hdr)   pending="${text[$j]}"; continue ;;
+      other) notes+=("${text[$j]}"); continue ;;
+    esac
+    hm=true
+    [ -z "$want" ] || [[ "${h,,}" == *"$want"* ]] || hm=false
+    # Whether this host has anything in the view beyond an error row.
+    hs=false
+    if [ "${rows[$h]:-0}" -gt 0 ]; then hs=true
+    elif $hm && [ "$FW_FILTER" = problems ] && [ -n "${FW_HOSTBAD[$h]:-}" ]; then hs=true
+    fi
+    col=false
+    if $FW_COLLAPSE && [ -z "${FW_OPEN[$h]:-}" ]; then col=true; fi
+    ok=false out="" rk=""
+    if [ "$k" = err ]; then
+      if $hm && [[ "$FW_FILTER" == all || "$FW_FILTER" == problems ]]; then ok=true out="${text[$j]}" rk=down; fi
+    elif $col; then
+      # One line for the whole host, where its first line would have been: the
+      # age line of a host that stopped answering, else its counts and what
+      # its Disk/OOM line says.
+      if $hs && [ -z "${emitted[$h]:-}" ]; then
+        emitted[$h]=1 ok=true rk=host
+        if [ -n "${stale[$h]:-}" ]; then
+          out="${stale[$h]}"
+        else
+          s="${FW_HOSTSUM[$h]:-}"
+          if [ -z "$s" ]; then
+            s="${total[$h]:-0} slots"
+            [ "${total[$h]:-0}" -ne 1 ] || s="1 slot"
+          fi
+          printf -v out '%-*s %s' "$hostw" "$h" "$s"
+          [ -z "${info[$h]:-}" ] || out+=" · ${info[$h]}"
+        fi
+      fi
+    elif [ "$k" = slot ]; then
+      if "${vis[$j]}"; then ok=true out="${text[$j]}" rk=slot; fi
+    elif $hs; then
+      ok=true out="${text[$j]}"
+    fi
+    $ok || continue
+    if [ -n "$pending" ]; then
+      FW_VIEW+="${FW_VIEW:+$nl}$pending"
+      n=$((n + 1)) pending=""
+    fi
+    FW_VIEW+="${FW_VIEW:+$nl}$out"
+    n=$((n + 1)) shown=$((shown + 1))
+    if [ -n "$rk" ]; then
+      nm=""
+      [ "$rk" != slot ] || nm="${lname[$j]}"
+      FW_ROWS+=("$h"$'\t'"$nm") FW_LINES+=("$n") FW_KIND+=("$rk")
+    fi
+  done
+  if [ "$shown" -eq 0 ]; then
+    [ -z "$hdr1" ] || FW_VIEW="$hdr1"
+    FW_VIEW+="${FW_VIEW:+$nl}${C_YELLOW}${FLEET_WATCH_EMPTY}${C_YELLOW:+$C_RESET}"
+  fi
+  for line in ${notes[@]+"${notes[@]}"}; do FW_VIEW+="$nl$line"; done
+}
+
+# c: fold every host to one line; with the hosts folded, open or close the one
+# the cursor is on. Enter opens a folded host and does nothing anywhere else —
+# on a slot row it is left free (GHR-76's detail pane), and the two cannot
+# meet: a folded host has no slot row for the cursor to be on.
+fleet_watch_fold_key() { # c|enter
+  if [ "$1" = enter ]; then
+    if $FW_COLLAPSE && [ "$FW_POS" -ge 0 ] && [ "${FW_KIND[$FW_POS]:-}" = host ]; then FW_OPEN[$FW_HOST]=1; fi
+    return 0
+  fi
+  if ! $FW_COLLAPSE; then
+    FW_COLLAPSE=true FW_OPEN=()
+  elif [ "$FW_POS" -ge 0 ] && [ -n "$FW_HOST" ]; then
+    if [ -n "${FW_OPEN[$FW_HOST]:-}" ]; then FW_OPEN[$FW_HOST]=""; else FW_OPEN[$FW_HOST]=1; fi
+  fi
+}
+
+# A key while the / text is being typed. The text filters as it is typed —
+# every key is a redraw of the frame in hand, like any other — so there is no
+# second read loop here to starve the background fetches or a resize: the
+# watch's own key read brings each character. Enter keeps the text, Esc puts
+# back what was there before, Backspace takes a character and Ctrl-U all of
+# them; an empty text matches everything, which is how it is cleared (as `a`
+# clears it). Every other key that is one printable character is text, `q`
+# and the view keys included; arrows and the paging keys are ignored.
+fleet_watch_search_key() { # KEY
+  case "$1" in
+    enter) FW_MODE="" ;;
+    esc)   FW_SEARCH="$FW_SEARCH_WAS" FW_MODE="" ;;
+    $'\x7f'|$'\b') FW_SEARCH="${FW_SEARCH%?}" ;;
+    $'\x15') FW_SEARCH="" ;;
+    ?) if [[ "$1" == [[:print:]] ]]; then FW_SEARCH+="$1"; fi ;;
+  esac
+}
+
 # PgUp/PgDn and g/G (GHR-73). A page is measured in FRAME LINES, not rows: a
 # host's Disk/OOM line and the notes take window rows too, so a step counted
 # in rows would jump further than a screenful and skip slots nobody saw. The
@@ -6124,8 +6572,15 @@ fleet_watch_page() { # KEY
 
 # One key against the watch. Returns 1 on `q`. At a confirm only `y` runs it
 # and anything else — `q` included — cancels, as in the local watch.
+#
+# GHR-75: the view keys only set what the next draw shows. None of them sets
+# FW_REFRESH, so none of them costs a round trip. Any key closes the help
+# (and is spent doing it — `q` there closes the help, not the watch), and
+# while the / text is being typed every key belongs to it.
 fleet_watch_handle_key() { # KEY
   local n="${#FW_ROWS[@]}"
+  if [ "$FW_MODE" = help ]; then FW_MODE=""; return 0; fi
+  if [ "$FW_MODE" = search ]; then fleet_watch_search_key "$1"; return 0; fi
   if [ -n "$FW_ACTION" ]; then
     case "$1" in
       y|Y) fleet_watch_run_action ;;
@@ -6140,13 +6595,22 @@ fleet_watch_handle_key() { # KEY
     up|k)   [ "$FW_POS" -le 0 ] || fleet_watch_select $((FW_POS - 1)) ;;
     pgdn|pgup|g|G|home|end) fleet_watch_page "$1" ;;
     K|R|S|T|P|L) fleet_watch_key_action "$1" ;;
+    '!') FW_FILTER=problems ;;
+    b)   FW_FILTER=busy ;;
+    i)   FW_FILTER=idle ;;
+    a)   FW_FILTER=all FW_SEARCH="" FW_COLLAPSE=false FW_OPEN=() ;;
+    s)   case "$FW_SORT" in config) FW_SORT=job ;; job) FW_SORT=mem ;; *) FW_SORT=config ;; esac ;;
+    c|enter) fleet_watch_fold_key "$1" ;;
+    /)   FW_MODE=search FW_SEARCH_WAS="$FW_SEARCH" ;;
+    '?') FW_MODE=help ;;
   esac
   return 0
 }
 
-cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] [--stall-after N] [--narrow] [--min-available K]
+cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] [--stall-after N] [--narrow] [--min-available K] [--problems] [--sort ORDER]
   local interval=5 iterations="" tick=0 header="" frame="" summary="" remote_color=never
   local narrow=false forced=false wide fetch=tick launched draw=false hl lead tail step left polling i
+  local head legend status
   local -a hosts=() fwd=() narrow_arg=()
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
@@ -6179,6 +6643,16 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
         need_val "$@"
         [[ "$2" =~ ^[0-9]+$ ]] || die "--min-available value '$2' is invalid — want a whole number of slots (0 turns the floor off)"
         FLEET_WATCH_MIN_AVAILABLE="$2"; shift 2 ;;
+      # GHR-75: the view a watch STARTS in, for a wall display nobody is
+      # going to press ! on. The keys change it from there as usual.
+      --problems) FW_FILTER=problems; shift ;;
+      --sort)
+        need_val "$@"
+        case "$2" in
+          config|job|mem) FW_SORT="$2" ;;
+          *) die "--sort value '$2' is invalid — want config (the hosts' own order), job (longest-running job first) or mem (most memory used first)" ;;
+        esac
+        shift 2 ;;
       *) die "unknown option: $1" ;;
     esac
   done
@@ -6238,7 +6712,11 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
       fleet_watch_collect
       if $FW_DIRTY; then
         FW_DIRTY=false draw=true
-        header="$(paint "$C_BOLD" "runnerctl fleet watch — ${#FLEET_HOSTS[@]} host(s) — $(date +%H:%M:%S) — every ${interval}s (q to quit)")"
+        # Unpainted: the view's name is added when the frame is drawn, since a
+        # view key changes it without a new frame (GHR-75). The facts a view
+        # reads are this frame's, and are read when a view first asks.
+        header="runnerctl fleet watch — ${#FLEET_HOSTS[@]} host(s) — $(date +%H:%M:%S) — every ${interval}s (q to quit)"
+        FW_FACTS_OK=false
         # A frame is rendered whatever the hosts said: a host that is not
         # answering is a row or its kept rows (fleet_status_table's own
         # contract), and the non-zero return is not a reason to stop watching
@@ -6260,17 +6738,31 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
         fi
       fi
     fi
+    # GHR-75: the header names the view, so a filtered frame is never taken
+    # for the fleet. With nothing chosen it is the header of before.
+    if $draw || [ -n "$iterations" ]; then
+      fleet_watch_view_name
+      head="$(paint "$C_BOLD" "$header${FW_VIEW_NAME:+ — view: $FW_VIEW_NAME}")"
+    fi
     if [ -n "$iterations" ]; then
-      printf '\033[H\033[2J%s\n%s\n%s\n' "$header" "$summary" "$frame"
+      fleet_watch_view "$frame"
+      printf '\033[H\033[2J%s\n%s\n%s\n' "$head" "$summary" "$FW_VIEW"
       pause "$interval"
       tick=$((tick + 1))
       [ "$tick" -lt "$iterations" ] || break
       fetch=tick
       continue
     fi
-    if $draw && ! $launched; then
+    if $draw && ! $launched && [ "$FW_MODE" = help ]; then
+      # GHR-75: the keys, where the table was, until a key. Chrome and all
+      # through the viewport, so the terminal is left as any frame leaves it;
+      # the fetches go on behind it and the next draw shows what they brought.
       draw=false
-      fleet_watch_rows "$frame"
+      viewport_draw "$head"$'\n'"$summary" "$FLEET_WATCH_HELP" \
+        $'\n'"$(paint "$C_DIM" "any key closes this list")"$'\n' 0 0 0
+    elif $draw && ! $launched; then
+      draw=false
+      fleet_watch_view "$frame"
       fleet_watch_place
       # GHR-73: fitted to the terminal's height where it is known, with the
       # summary line as fixed chrome beside the header. The cursor's group runs
@@ -6283,8 +6775,14 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
         [ "$FW_POS" -eq 0 ] || lead=$((FW_LINES[FW_POS - 1] + 1))
         [ "$FW_POS" -lt $((${#FW_ROWS[@]} - 1)) ] || tail="$VIEW_END"
       fi
-      viewport_draw "$header"$'\n'"$summary" "$(fleet_watch_highlight "$frame" "$hl")" \
-        $'\n'"$(paint "$C_DIM" "$WATCH_LEGEND")"$'\n'"${FW_PROMPT:-$FW_NOTICE}" "$hl" "$lead" "$tail"
+      # The legend is the one of before unless a view is on, when it also
+      # names the two keys that lead out of it; the status line is the text
+      # being typed while / is open.
+      legend="$WATCH_LEGEND" status="${FW_PROMPT:-$FW_NOTICE}"
+      fleet_watch_view_plain || legend="$FLEET_WATCH_VIEW_LEGEND"
+      [ "$FW_MODE" != search ] || status="filter: /${FW_SEARCH}_ — Enter keeps it, Esc cancels, an empty one matches everything"
+      viewport_draw "$head"$'\n'"$summary" "$(fleet_watch_highlight "$FW_VIEW" "$hl")" \
+        $'\n'"$(paint "$C_DIM" "$legend")"$'\n'"$status" "$hl" "$lead" "$tail"
     fi
     # GHR-74: the wait is the key read, always. A step while a call is out,
     # so an answer is drawn soon after it lands; what is left of the interval

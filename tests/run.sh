@@ -6570,14 +6570,15 @@ case_fleet_watch_first_frame_before_any_host_has_answered() {
 
 # Nothing outlives the watch: not the fetch job of a host that never answered,
 # not the call under it, not a file. Quit with q, and with Ctrl-C (the stub's
-# `!` is a real SIGINT, so the script's own INT and EXIT traps are what run);
+# ETX, $'\x03', is a real SIGINT, so the script's own INT and EXIT traps are
+# what run — it was `!` until GHR-75 made that a key the watch reads);
 # the hung call wrote its pid and its job's down, and both are gone. TMPDIR
 # points every mktemp of the run at one directory, which is empty afterwards —
 # the buffer of each host's last answer, the action keys' buffer and the ssh
 # control directory. `--iterations` ending leaves it empty as well.
 case_fleet_watch_exit_ends_its_fetches_and_removes_its_files() {
   local d="$TMP/ghr74-tmp" how
-  for how in q '!'; do
+  for how in q $'\x03'; do
     rm -rf "$d"; mkdir -p "$d"
     TMPDIR="$d" RUN_TIMEOUT=10 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS="$how" RUNNERCTL_STUB_FLEET_HOSTS="build-1 slow-1" \
       RUNNERCTL_STUB_FLEET_HANG="slow-1" run fleet watch --color never
@@ -6898,6 +6899,537 @@ EOF
   expect_cfg "$d/calls" '^-o BatchMode=yes -o ConnectTimeout=10 -- hang-1 runnerctl status --color never$'
   expect_cfg_count "$d/calls" ' -- hang-1 ' 1
   rm -rf "$d"
+}
+
+# --- GHR-75: fleet watch views — filter, sort, collapse ------------------------
+# The view keys choose what the frame shows and ask no host anything. The
+# fixture is two hosts of three slots (slot-1 running my-app:test for 12m,
+# slot-2 idle, slot-3 inactive and disabled), and RUNNERCTL_STUB_FLEET_STALL
+# names the hosts whose OWN stall threshold is ten minutes — so build-2's
+# slot-1 is STALLED while build-1's is merely busy, and one host of the fleet
+# is healthy while the other is not.
+#
+# Frame line numbers at unknown height: 1 the header, 2 the summary, 3 the
+# column header, the view from 4. Every probe:ssh_run count is PINNED: two
+# hosts cost four calls a round (a table and a --json each), and a view key
+# must not add one.
+SUM_MIX='2/2 hosts answering · 6 slots: 1 busy, 2 idle, 1 STALLED, 2 disabled · capacity 2 free of 4'
+V_ROW="^(${REV})?[^ ]+ +[0-9]+ +example\.slot-"
+V_DISK='Disk: / \[docker,work\] 24% \(353\.9G free\)'
+V_LEGEND="${FLEET_WATCH_LEGEND%\$}  a all  \? keys\$"
+# The header of a frame, with the view it names after it (nothing for none).
+view_hdr() { # VIEW-SUFFIX [HOSTS]
+  echo "^runnerctl fleet watch — ${2:-2} host\(s\) — [0-9]{2}:[0-9]{2}:[0-9]{2} — every 5s \(q to quit\)$1\$"
+}
+expect_frame_count_of() { # N PATTERN COUNT
+  _expect
+  local n
+  n="$(grep -Ec -- "$2" <<<"${FRAMES[$1]-}"; true)"
+  [ "$n" -eq "$3" ] || FAILS+=("frame $1 lines matching /$2/: want $3, got $n")
+}
+
+# The acceptance case. `!` leaves the stalled slot, under its host's line, and
+# nothing of the healthy host; the header names the view and the summary goes
+# on describing the whole fleet. Frame 1, drawn before the key, has both
+# hosts — so what frame 2 lacks is what the filter took, not what the fixture
+# never had. `a` brings everything back, with the cursor still on the slot the
+# filter moved it to. The `!` reached the script as a KEY (the stub used to
+# take it for Ctrl-C), and no host was asked anything for either key.
+case_fleet_watch_problems_view_hides_a_healthy_host_and_keeps_a_stalled_slot() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='!aq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_STALL="build-2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 3
+  expect_frame_line 1 1 "$(view_hdr '')"
+  expect_frame_count_of 1 "$V_ROW" 6
+  expect_frame 1 "^build-1 +$V_DISK\$"
+  expect_frame 1 "$FLEET_WATCH_LEGEND"
+  expect_frame_line 2 1 "$(view_hdr ' — view: problems only')"
+  expect_frame_line 2 2 "^${SUM_MIX}\$"
+  expect_frame_line 2 3 '^HOST +IDX +RUNNER '
+  expect_frame_line 2 4 "^build-2 +$V_DISK\$"
+  expect_frame_line 2 5 "^${REV}build-2 +0 +example\.slot-1 .* my-app:test \(12m\) STALLED$ESC\[0m\$"
+  expect_frame_line 2 6 '^note: STALLED = '
+  expect_frame_count_of 2 "$V_ROW" 1
+  expect_no_frame 2 "^(${REV})?build-1 "
+  expect_frame 2 "$V_LEGEND"
+  expect_frame_line 3 1 "$(view_hdr '')"
+  expect_frame_line 3 2 "^${SUM_MIX}\$"
+  expect_frame_count_of 3 "$V_ROW" 6
+  expect_frame 3 "$(fw_row build-2 0 1)"
+  expect_log_count '^probe:tty_read_char 5 \\!$' 1
+  expect_no_log '^probe:sig'
+  expect_log_count '^probe:ssh_run ' 4
+  expect_no_log '^direct:'
+}
+
+# What else is a problem, and what a host that is not answering looks like
+# under each filter. `--problems` is the same view from the first frame:
+# build-2's disks are past both thresholds over healthy slots, so it is its
+# host line ALONE; a host that cannot be reached is its error row; healthy
+# build-1 is nowhere.
+#
+# Then a host that STOPS answering (build-2, down for ticks 2 and 3): under
+# --problems a healthy fleet shows nothing but the hint, and at tick 2 build-2
+# is there whole — its age line and all three kept rows, healthy as they were
+# when last seen, because not answering is the problem. `b` filters kept rows
+# by the state the host last reported, under their age line.
+case_fleet_watch_problem_hosts_and_hosts_that_stopped_answering() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 gw-unreachable" RUNNERCTL_STUB_FLEET_FULL="build-2" \
+    run fleet watch --problems --iterations 1 --color never
+  expect_rc 0
+  expect_out_count "${FRAME_PREFIX}runnerctl fleet watch — 3 host\(s\) — [0-9:]{8} — every 5s \(q to quit\) — view: problems only\$" 1
+  expect_out_count '^2/3 hosts answering · 6 slots: 2 busy, 2 idle, 2 disabled · 1 host disk crit · 1 host OOM/disk-full · capacity 2 free of 4$' 1
+  expect_out_count '^build-2 +Disk: /var/lib/docker \[docker\] 96% ' 1
+  expect_out_count '^gw-unreachable +unreachable — ' 1
+  expect_out_count '^HOST +IDX +RUNNER ' 1
+  expect_no_out '^build-1 '
+  expect_no_out 'example\.slot-'
+  expect_no_out 'nothing matches'
+  TZ=UTC RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='-bq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_DOWN="build-2:2,3" run fleet watch --problems --color never
+  expect_rc 0
+  frames
+  expect_frame_count 3
+  expect_frame_line 1 2 "^${SUM_OK}\$"
+  expect_frame_line 1 4 '^nothing matches — a shows all$'
+  expect_frame_line 2 1 "$(view_hdr ' — view: problems only')"
+  expect_frame_line 2 2 "^${SUM_ONE}\$"
+  expect_frame_line 2 4 '^build-2 +no answer for 5s — last seen 01:58:40 — unreachable — ssh: connect to host build-2 port 22: No route to host$'
+  expect_frame_line 2 5 "$(fw_row build-2 0 1)"
+  expect_frame_line 2 6 '^build-2 +1 +example\.slot-2 .* idle 2h31m \(2 jobs\)$'
+  expect_frame_line 2 7 '^build-2 +2 +example\.slot-3 '
+  expect_frame_count_of 2 "$V_ROW" 3
+  expect_no_frame 2 "^(${REV})?build-1 "
+  expect_frame_line 3 1 "$(view_hdr ' — view: busy only')"
+  expect_frame_line 3 4 "^build-1 +$V_DISK\$"
+  expect_frame_line 3 5 '^build-1 +0 +example\.slot-1 '
+  expect_frame_line 3 6 '^build-2 +no answer for 5s — '
+  expect_frame_line 3 7 "$(fw_row build-2 0 1)"
+  expect_frame_count_of 3 "$V_ROW" 2
+  # the tick's round and nothing else: build-2 failed its table call at tick
+  # 2 and is not asked for a payload
+  expect_log_count '^probe:ssh_run ' 7
+  # folded, a host that stopped answering is its age line and nothing else
+  TZ=UTC RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='-cq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_DOWN="build-2:2,3" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 3
+  expect_frame_line 3 4 "^${REV}build-1 +3 slots: 1 busy, 1 idle, 1 disabled · $V_DISK$ESC\[0m\$"
+  expect_frame_line 3 5 '^build-2 +no answer for 5s — last seen 01:58:40 — unreachable — '
+  expect_frame_count_of 3 'example\.slot-' 0
+}
+
+# `c`: one line per host, with that host's own counts and what its Disk line
+# says — and exactly one, however many lines the host had. A key on a folded
+# host acts on nothing and reads nothing. Enter opens the host the cursor is
+# on (and only it), and `c` there folds it again.
+case_fleet_watch_collapse_is_one_line_per_host() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=$'cKj\ncq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_STALL="build-2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 6
+  expect_frame_line 2 1 "$(view_hdr ' — view: collapsed')"
+  expect_frame_line 2 2 "^${SUM_MIX}\$"
+  expect_frame_line 2 3 '^HOST +IDX +RUNNER '
+  expect_frame_line 2 4 "^${REV}build-1 +3 slots: 1 busy, 1 idle, 1 disabled · $V_DISK$ESC\[0m\$"
+  expect_frame_line 2 5 "^build-2 +3 slots: 1 idle, 1 STALLED, 1 disabled · $V_DISK\$"
+  expect_frame_count_of 2 "^(${REV})?build-1 " 1
+  expect_frame_count_of 2 "^(${REV})?build-2 " 1
+  expect_no_frame 2 'example\.slot-'
+  expect_frame 3 '^build-1: folded to one line — c or Enter opens it, then pick a slot$'
+  expect_frame_line 4 5 "^${REV}build-2 +3 slots: "
+  # Enter: build-2 open — its Disk line and three rows — build-1 still one line
+  expect_frame_line 5 4 "^build-1 +3 slots: 1 busy, 1 idle, 1 disabled · "
+  expect_frame_line 5 5 "^build-2 +$V_DISK\$"
+  expect_frame_line 5 6 "$(fw_row build-2 0 1)"
+  expect_frame_count_of 5 "$V_ROW" 3
+  expect_frame_count_of 5 "^(${REV})?build-1 " 1
+  # c on it: folded again
+  expect_frame_line 6 5 "^${REV}build-2 +3 slots: "
+  expect_frame_count_of 6 "^(${REV})?build-[12] " 2
+  expect_log_count '^probe:tty_read_char 5 \$.\\n.$' 1
+  expect_log_count '^probe:ssh_run ' 4
+  expect_no_out '\[y/n\]'
+}
+
+# A view that shows nothing says so, and says the way out. Nothing is selected
+# there, so a key acts on nothing; `a` puts the fleet back with the cursor
+# where it was.
+case_fleet_watch_an_empty_view_prints_the_hint() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='!Kaq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 4
+  expect_frame_line 2 1 "$(view_hdr ' — view: problems only')"
+  expect_frame_line 2 2 "^${SUM_OK}\$"
+  expect_frame_line 2 3 '^HOST +IDX +RUNNER '
+  expect_frame_line 2 4 '^nothing matches — a shows all$'
+  expect_frame_count_of 2 "^${REV}" 0
+  expect_frame_count_of 2 '^build-' 0
+  expect_frame 3 '^no slot to act on$'
+  expect_frame_line 4 1 "$(view_hdr '')"
+  expect_frame_count_of 4 "$V_ROW" 6
+  expect_frame 4 "$(fw_row build-1 0 1)"
+  expect_log_count '^probe:ssh_run ' 4
+}
+
+# An action key under a view acts on the row the cursor is ON. Each run is
+# hostile to a cursor that indexed the unfiltered frame instead: the row the
+# view has at the cursor's position is not the row the fleet has there.
+#   b j    busy only is build-1/slot-1, build-2/slot-1; the second row of the
+#          FLEET is build-1/slot-2
+#   i      idle only starts on build-1/slot-2; the first row of the fleet is
+#          build-1/slot-1
+#   s j j  longest job first is build-1/slot-1, build-2/slot-1, build-1/slot-2;
+#          the third row of the fleet is build-1/slot-3
+case_fleet_watch_an_action_key_under_a_view_acts_on_the_cursor_row() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='bjRyq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_line 3 1 "$(view_hdr ' — view: busy only')"
+  expect_frame_line 3 7 "$(fw_row build-2 0 1)"
+  expect_out_count '^Restart example\.slot-1 on build-2\? runs on build-2: runnerctl restart example\.slot-1  \[y/n\]$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl restart example\.slot-1$' 1
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap) ' 1
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='iRyq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_line 2 5 "$(fw_row build-1 1 2)"
+  expect_out_count '^Restart example\.slot-2 on build-1\? runs on build-1: runnerctl restart example\.slot-2  \[y/n\]$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart example\.slot-2$' 1
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap) ' 1
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='sjjRyq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_line 4 6 "$(fw_row build-1 1 2)"
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart example\.slot-2$' 1
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap) ' 1
+}
+
+# The summary and the views read ONE classification, and both sides are pinned
+# to literals — two surfaces that merely agree could be wrong together. The
+# summary says 1 busy, 2 idle, 1 STALLED, 2 disabled: so busy-only is the busy
+# slot and the stalled one, idle-only the two idle ones, and each folded host
+# carries its own share of those counts.
+case_fleet_watch_views_count_what_the_summary_counts() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='bicq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_STALL="build-2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 4
+  expect_under_header "$SUM_MIX" 4
+  expect_frame_count_of 2 "$V_ROW" 2
+  expect_frame_line 2 5 "$(fw_row build-1 0 1)"
+  expect_frame_line 2 7 '^build-2 +0 +example\.slot-1 .* STALLED$'
+  expect_frame_line 3 1 "$(view_hdr ' — view: idle only')"
+  expect_frame_count_of 3 "$V_ROW" 2
+  expect_frame_line 3 5 "$(fw_row build-1 1 2)"
+  expect_frame_line 3 7 '^build-2 +1 +example\.slot-2 '
+  expect_frame_line 4 1 "$(view_hdr ' — view: idle only · collapsed')"
+  expect_frame_line 4 4 "^${REV}build-1 +3 slots: 1 busy, 1 idle, 1 disabled · "
+  expect_frame_line 4 5 "^build-2 +3 slots: 1 idle, 1 STALLED, 1 disabled · "
+  expect_log_count '^probe:ssh_run ' 4
+}
+
+# What a problem IS, pinned on the classifier itself — one `status --json`
+# slot line per state the stub's fleet cannot be put in from outside. At
+# MemoryHigh and at PRESSURE_CRIT_PCT (50) are problems, one byte and one
+# hundredth below are not; a slot switched off on purpose is not, one that is
+# merely not active is; a job that has not said its name yet is busy.
+case_fleet_slot_classify_says_what_a_problem_is() {
+  local f="$TMP/ghr75.slots" tail=',"idle_since":null,"jobs_completed":null,"working_on_access":"ok"'
+  local up='"active":"active","sub":"running","enabled":"enabled"' job='"job":{"repo":"my-app","name":"test","since":500,"stalled":false}'
+  {
+    echo "  {\"idx\":0,\"unit\":\"u\",\"name\":\"busy\",$up,\"memory_high\":100,\"memory_current\":99,$job$tail,\"leaked_procs\":null,\"memory_pressure\":{\"full_avg10\":49.99,\"full_avg60\":1.00,\"full_total\":5}}"
+    echo "  {\"idx\":1,\"unit\":\"u\",\"name\":\"stalled\",$up,\"memory_high\":100,\"memory_current\":1,${job/false/true}$tail,\"leaked_procs\":null,\"memory_pressure\":null}"
+    echo "  {\"idx\":2,\"unit\":\"u\",\"name\":\"idle\",$up,\"memory_high\":null,\"memory_current\":null,\"job\":null$tail,\"leaked_procs\":0,\"memory_pressure\":null}"
+    echo "  {\"idx\":3,\"unit\":\"u\",\"name\":\"leaky\",$up,\"memory_high\":100,\"memory_current\":1,\"job\":null$tail,\"leaked_procs\":2,\"memory_pressure\":null}"
+    echo "  {\"idx\":4,\"unit\":\"u\",\"name\":\"at-high\",$up,\"memory_high\":100,\"memory_current\":100,$job$tail,\"leaked_procs\":null,\"memory_pressure\":{\"full_avg10\":0.00,\"full_avg60\":0.00,\"full_total\":0}}"
+    echo "  {\"idx\":5,\"unit\":\"u\",\"name\":\"pressed\",$up,\"memory_high\":100,\"memory_current\":1,$job$tail,\"leaked_procs\":null,\"memory_pressure\":{\"full_avg10\":50.00,\"full_avg60\":1.00,\"full_total\":5}}"
+    echo "  {\"idx\":6,\"unit\":\"u\",\"name\":\"off\",\"active\":\"inactive\",\"sub\":\"dead\",\"enabled\":\"disabled\",\"memory_high\":null,\"memory_current\":null,\"job\":null$tail,\"leaked_procs\":null,\"memory_pressure\":null}"
+    echo "  {\"idx\":7,\"unit\":\"u\",\"name\":\"stopped\",\"active\":\"inactive\",\"sub\":\"dead\",\"enabled\":\"enabled\",\"memory_high\":null,\"memory_current\":null,\"job\":null$tail,\"leaked_procs\":null,\"memory_pressure\":null}"
+    echo "  {\"idx\":8,\"unit\":\"u\",\"name\":\"restarting\",\"active\":\"activating\",\"sub\":\"auto-restart\",\"enabled\":\"enabled\",\"memory_high\":null,\"memory_current\":null,\"job\":null$tail,\"leaked_procs\":null,\"memory_pressure\":null}"
+    echo "  {\"idx\":9,\"unit\":\"u\",\"name\":\"starting\",$up,\"memory_high\":100,\"memory_current\":1,\"job\":{\"repo\":null,\"name\":null,\"since\":null,\"stalled\":false}$tail,\"leaked_procs\":null,\"memory_pressure\":null}"
+  } >"$f"
+  # shellcheck disable=SC2016
+  GHR75_F="$f" run_fn eval 'while IFS= read -r l; do fleet_slot_classify "$l"; echo "$SC_NAME state=$SC_STATE leaking=$SC_LEAKING problem=$SC_PROBLEM since=$SC_SINCE mem=$SC_MEM job=$SC_JOB"; done <"$GHR75_F"'
+  expect_rc 0
+  expect_text "the classification of each slot" "busy state=busy leaking=false problem=false since=500 mem=99 job=my-app:test
+stalled state=stalled leaking=false problem=true since=500 mem=1 job=my-app:test
+idle state=idle leaking=false problem=false since= mem= job=
+leaky state=idle leaking=true problem=true since= mem=1 job=
+at-high state=busy leaking=false problem=true since=500 mem=100 job=my-app:test
+pressed state=busy leaking=false problem=true since=500 mem=1 job=my-app:test
+off state=disabled leaking=false problem=false since= mem= job=
+stopped state=down leaking=false problem=true since= mem= job=
+restarting state=down leaking=false problem=true since= mem= job=
+starting state=busy leaking=false problem=false since= mem=1 job=" "$OUT"
+  rm -f "$f"
+}
+
+# `s` cycles config order → longest job first → most memory first → config.
+# A sorted table is a flat list with the host lines under the rows; the stub's
+# two hosts are identical, so the frames here show the SHAPE and that a tie
+# keeps config order. `--sort` starts a watch in an order; a value it does not
+# know dies before anything is dialled.
+case_fleet_watch_sort_cycles_and_flattens_the_table() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='sssq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 4
+  expect_frame_line 2 1 "$(view_hdr ' — view: longest job first')"
+  expect_frame_line 2 3 '^HOST +IDX +RUNNER '
+  expect_frame_line 2 4 "$(fw_row build-1 0 1)"
+  expect_frame_line 2 5 '^build-2 +0 +example\.slot-1 '
+  expect_frame_line 2 6 '^build-1 +1 +example\.slot-2 '
+  expect_frame_line 2 7 '^build-1 +2 +example\.slot-3 '
+  expect_frame_line 2 8 '^build-2 +1 +example\.slot-2 '
+  expect_frame_line 2 9 '^build-2 +2 +example\.slot-3 '
+  expect_frame_line 2 10 "^build-1 +$V_DISK\$"
+  expect_frame_line 2 11 "^build-2 +$V_DISK\$"
+  expect_frame_line 3 1 "$(view_hdr ' — view: most memory first')"
+  expect_frame_line 3 4 "$(fw_row build-1 0 1)"
+  expect_frame_line 3 5 '^build-1 +1 +example\.slot-2 '
+  expect_frame_line 3 6 '^build-2 +0 +example\.slot-1 '
+  expect_frame_line 3 7 '^build-2 +1 +example\.slot-2 '
+  expect_frame_line 3 8 '^build-1 +2 +example\.slot-3 '
+  expect_frame_line 3 9 '^build-2 +2 +example\.slot-3 '
+  expect_frame_line 4 1 "$(view_hdr '')"
+  expect_frame_line 4 4 "^build-1 +$V_DISK\$"
+  expect_frame_line 4 8 "^build-2 +$V_DISK\$"
+  expect_log_count '^probe:ssh_run ' 4
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --sort job --iterations 1 --color never
+  expect_rc 0
+  expect_out_count "${FRAME_PREFIX}runnerctl fleet watch — 2 host\(s\) — [0-9:]{8} — every 5s \(q to quit\) — view: longest job first\$" 1
+  expect_out_count '^build-[12] +0 +example\.slot-1 ' 2
+  _expect
+  [ "$(grep -n -E '^build-2 +0 +example' <<<"$OUT" | cut -d: -f1; true)" -lt "$(grep -n -E '^build-1 +1 +example' <<<"$OUT" | cut -d: -f1; true)" ] \
+    || FAILS+=("--sort job: build-2's slot-1 is not above build-1's slot-2")
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --sort=mem --problems --iterations 1 --color never
+  expect_rc 0
+  expect_out ' — view: problems only · most memory first$'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --sort age
+  expect_rc 1
+  expect_err "^runnerctl: --sort value 'age' is invalid — want config \(the hosts' own order\), job \(longest-running job first\) or mem \(most memory used first\)\$"
+  expect_no_log '^probe:ssh_run '
+}
+
+# The ORDER, on facts that differ — which the stub's identical hosts cannot
+# show. fleet_watch_view on a frame and two payloads written here: jobs
+# started at 900 (a/young), 100 (b/old) and 500 (b/mid), and memory of 5, 50,
+# none, 7 and 7. Longest job first is by start, the two without a job after in
+# config order; most memory first puts the 7/7 tie in config order and the
+# slot without accounting last. Config order is the frame untouched.
+case_fleet_watch_sort_orders_by_the_hosts_own_facts() {
+  local d="$TMP/ghr75-sort" s
+  rm -rf "$d"; mkdir -p "$d"
+  s() { # IDX NAME MEM JOB
+    echo "  {\"idx\":$1,\"unit\":\"u\",\"name\":\"$2\",\"active\":\"active\",\"sub\":\"running\",\"enabled\":\"enabled\",\"memory_high\":null,\"memory_current\":$3,\"job\":$4,\"idle_since\":null,\"jobs_completed\":null,\"working_on_access\":\"ok\",\"leaked_procs\":null,\"memory_pressure\":null}"
+  }
+  {
+    echo '{"runnerctl":"1.0.0","host":{"name":"a","disks":[],"events":{"oom_kills":0,"disk_full":0}},'
+    s 0 young 5 '{"repo":"r","name":"j","since":900,"stalled":false}'
+    s 1 fat-idle 50 null
+    s 2 nomem null null
+  } >"$d/0.json"
+  {
+    echo '{"runnerctl":"1.0.0","host":{"name":"b","disks":[],"events":{"oom_kills":0,"disk_full":0}},'
+    s 0 old 7 '{"repo":"r","name":"j","since":100,"stalled":false}'
+    s 1 mid 7 '{"repo":"r","name":"j","since":500,"stalled":false}'
+  } >"$d/1.json"
+  unset -f s
+  # shellcheck disable=SC2016
+  GHR75_DIR="$d" run_fn eval '
+    color_setup never
+    FLEET_HOSTS=(a b) FW_STATE="$GHR75_DIR"
+    frame="HOST IDX RUNNER
+a    Disk: / 10% (1.0G free)
+a    0   young
+a    1   fat-idle
+a    2   nomem
+b    0   old
+b    1   mid
+note: a note"
+    for FW_SORT in config job mem; do
+      FW_FACTS_OK=false
+      fleet_watch_view "$frame"
+      echo "== $FW_SORT"
+      echo "$FW_VIEW"
+      echo "rows:$(printf " %s" "${FW_ROWS[@]}" | tr "\t" ":")"
+      echo "lines: ${FW_LINES[*]}"
+    done
+  '
+  expect_rc 0
+  expect_text "the three orders" "== config
+HOST IDX RUNNER
+a    Disk: / 10% (1.0G free)
+a    0   young
+a    1   fat-idle
+a    2   nomem
+b    0   old
+b    1   mid
+note: a note
+rows: a:young a:fat-idle a:nomem b:old b:mid
+lines: 3 4 5 6 7
+== job
+HOST IDX RUNNER
+b    0   old
+b    1   mid
+a    0   young
+a    1   fat-idle
+a    2   nomem
+a    Disk: / 10% (1.0G free)
+note: a note
+rows: b:old b:mid a:young a:fat-idle a:nomem
+lines: 2 3 4 5 6
+== mem
+HOST IDX RUNNER
+a    1   fat-idle
+b    0   old
+b    1   mid
+a    0   young
+a    2   nomem
+a    Disk: / 10% (1.0G free)
+note: a note
+rows: a:fat-idle b:old b:mid a:young a:nomem
+lines: 2 3 4 5 6" "$OUT"
+  rm -rf "$d"
+}
+
+# `/`: the text filters as it is typed, on host, runner or repo:job, whatever
+# its case. Each character arrives through the watch's own key read — the one
+# with the interval as its timeout, logged below — so typing holds up neither
+# a tick nor a resize; the status line shows the text and the way out. Enter
+# keeps it and the header names it; Backspace takes a character; a `q` typed
+# there is text; Esc puts back what was there before; and none of it asks a
+# host anything.
+#
+# No text here has a `-` in it: in RUNNERCTL_STUB_KEYS that is a tick, not a
+# character. So the runner is matched by its digit and the host by `2`.
+case_fleet_watch_slash_filters_by_text_as_it_is_typed() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=$'/3x\x7f\nq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 6
+  # frame 2: the prompt, nothing typed, nothing hidden
+  expect_frame_line 2 1 "$(view_hdr '')"
+  expect_frame_count_of 2 "$V_ROW" 6
+  expect_frame 2 '^filter: /_ — Enter keeps it, Esc cancels, an empty one matches everything$'
+  # frame 3: `3`, already filtering — the two slot-3 rows
+  expect_frame_line 3 1 "$(view_hdr ' — view: matching "3"')"
+  expect_frame_count_of 3 "$V_ROW" 2
+  expect_frame 3 '^filter: /3_ — '
+  # frame 4: `3x` matches nothing; frame 5: Backspace, and they are back
+  expect_frame_line 4 4 '^nothing matches — a shows all$'
+  expect_frame 4 '^filter: /3x_ — '
+  expect_frame_count_of 5 "$V_ROW" 2
+  # frame 6: Enter — under their host lines, the prompt gone, the name kept
+  expect_frame_line 6 1 "$(view_hdr ' — view: matching "3"')"
+  expect_frame_line 6 4 "^build-1 +$V_DISK\$"
+  expect_frame_line 6 5 "$(fw_row build-1 2 3)"
+  expect_frame_line 6 6 "^build-2 +$V_DISK\$"
+  expect_frame_line 6 7 '^build-2 +2 +example\.slot-3 '
+  expect_no_frame 6 '^filter: '
+  expect_log_count '^probe:tty_read_char 5 3$' 1
+  expect_log_count '^probe:tty_read_char 5 ' 6
+  expect_log_count '^probe:ssh_run ' 4
+  # repo:job whatever its case; q is text; Esc puts the old text back; Ctrl-U
+  # empties it; the host matches too, and the text is ANDed with b
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=$'/APP:T\n/q\e-/\x152\nbq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 16
+  expect_frame_line 8 1 "$(view_hdr ' — view: matching "APP:T"')"
+  expect_frame_count_of 8 "$V_ROW" 2
+  expect_frame_line 8 5 "$(fw_row build-1 0 1)"
+  expect_frame_line 8 7 '^build-2 +0 +example\.slot-1 '
+  expect_frame_line 10 1 "$(view_hdr ' — view: matching "APP:Tq"')"
+  expect_frame_line 10 4 '^nothing matches — a shows all$'
+  expect_frame_line 11 1 "$(view_hdr ' — view: matching "APP:T"')"
+  expect_frame_count_of 11 "$V_ROW" 2
+  expect_no_frame 11 '^filter: '
+  expect_frame_line 13 1 "$(view_hdr '')"
+  expect_frame_count_of 13 "$V_ROW" 6
+  # `2`: all of build-2 by its host name, and build-1's slot-2 by its own
+  expect_frame_line 15 1 "$(view_hdr ' — view: matching "2"')"
+  expect_frame_count_of 15 "$V_ROW" 4
+  expect_frame_count_of 15 "^(${REV})?build-2 +[0-9]+ +example" 3
+  expect_frame_count_of 15 "^(${REV})?build-1 +1 +example\.slot-2 " 1
+  expect_frame_line 16 1 "$(view_hdr ' — view: busy only · matching "2"')"
+  expect_frame_count_of 16 "$V_ROW" 1
+  expect_frame 16 '^(.\[7m)?build-2 +0 +example\.slot-1 '
+  expect_log_count '^probe:ssh_run ' 4
+}
+
+# `?`: every key, where the table was, between the same header, summary and
+# status line — and gone on any key, which is spent closing it: the `j` moves
+# nothing and a `q` there does not quit. No host is asked anything.
+case_fleet_watch_question_mark_lists_every_key() {
+  local k
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='?j?qq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 5
+  for k in 2 4; do
+    expect_frame_line "$k" 1 "$(view_hdr '')"
+    expect_frame_line "$k" 2 "^${SUM_OK}\$"
+    expect_frame_line "$k" 3 '^fleet watch — keys$'
+    expect_frame "$k" '^any key closes this list$'
+    expect_frame_count_of "$k" '^HOST +IDX|example\.slot-' 0
+  done
+  # a line per key, and the list short enough for a 24-row terminal: its 13
+  # lines, the header, the summary and the three lines under it
+  for k in '!' 'b i' '/' 'a' 's' 'c' 'K R S T P L' '\?' 'q' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
+    expect_frame 2 "^  $k   +[a-z]"
+  done
+  expect_frame_lines 2 19
+  expect_frame 3 "$(fw_row build-1 0 1)"
+  expect_frame 5 "$(fw_row build-1 0 1)"
+  expect_frame_count_of 3 "$V_ROW" 6
+  expect_log_count '^probe:ssh_run ' 4
+}
+
+# A view goes through the viewport like any frame (GHR-73): two hosts of nine
+# slots, idle only — fourteen rows and two host lines on a ten-row terminal.
+# Every frame is exactly ten lines with one cursor row in it, G and PgUp move
+# over the rows the VIEW has, and the markers count the view's lines.
+case_fleet_watch_a_view_is_fitted_and_paged_like_any_frame() {
+  local f
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_LINES=10 RUNNERCTL_STUB_SLOTS=9 RUNNERCTL_STUB_KEYS=$'iG\e[5~g-q' \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 6
+  for f in 2 3 4 5; do
+    expect_frame_lines "$f" 10
+    expect_frame_line "$f" 1 "$(view_hdr ' — view: idle only')"
+    expect_frame_line "$f" 3 '^HOST +IDX +RUNNER '
+    expect_frame_line "$f" 9 "$V_LEGEND"
+    expect_frame_count_of "$f" "^${REV}" 1
+    expect_frame_count_of "$f" 'my-app:test|example\.slot-3 ' 0
+  done
+  # i: the cursor's own slot is gone, so its host's first idle one
+  expect_frame_line 2 4 "^build-1 +$V_DISK\$"
+  expect_frame_line 2 5 "$(fw_row build-1 1 2)"
+  expect_frame_line 2 7 "$(down_mark 13)"
+  # G: the last row of the view
+  expect_frame_line 3 4 "$(up_mark 13)"
+  expect_frame_line 3 7 "$(fw_row build-2 8 9)"
+  # PgUp, then g: back to the first
+  expect_frame 4 "$(fw_row build-2 6 7)"
+  expect_frame_line 5 5 "$(fw_row build-1 1 2)"
 }
 
 t "status: header and one row per discovered slot"                case_status_table
@@ -7272,6 +7804,20 @@ t "fleet watch: its reads are on FLEET_WATCH_TIMEOUT; fleet status is not" case_
 t "fleet watch: the background fetches respect FLEET_PARALLEL"            case_fleet_watch_fetches_respect_fleet_parallel
 t "now_ms: the real one is epoch milliseconds; ms_to_secs keeps 5 a 5"    case_now_ms_real_function_is_epoch_milliseconds
 t "fleet watch: the real fetch job and the ssh under it end at cleanup"   case_fleet_watch_real_fetch_job_and_its_ssh_end_at_cleanup
+
+# --- GHR-75: fleet watch views — filter, sort, collapse ------------------------
+t "fleet watch: ! hides a healthy host and keeps a stalled slot"          case_fleet_watch_problems_view_hides_a_healthy_host_and_keeps_a_stalled_slot
+t "fleet watch: ! keeps problem hosts, and one that stopped answering"    case_fleet_watch_problem_hosts_and_hosts_that_stopped_answering
+t "fleet watch: c is one line per host; Enter or c opens the host"        case_fleet_watch_collapse_is_one_line_per_host
+t "fleet watch: a view that shows nothing prints the hint"                case_fleet_watch_an_empty_view_prints_the_hint
+t "fleet watch: an action key under a view acts on the cursor's row"      case_fleet_watch_an_action_key_under_a_view_acts_on_the_cursor_row
+t "fleet watch: the views count what the summary counts"                  case_fleet_watch_views_count_what_the_summary_counts
+t "fleet watch: what a problem slot is, on the classifier itself"         case_fleet_slot_classify_says_what_a_problem_is
+t "fleet watch: s cycles the sort and flattens the table; --sort"         case_fleet_watch_sort_cycles_and_flattens_the_table
+t "fleet watch: a sort orders by the hosts' own facts, ties in order"     case_fleet_watch_sort_orders_by_the_hosts_own_facts
+t "fleet watch: / filters by text as it is typed; Esc, Backspace, Enter"  case_fleet_watch_slash_filters_by_text_as_it_is_typed
+t "fleet watch: ? lists every key and closes on any"                      case_fleet_watch_question_mark_lists_every_key
+t "fleet watch: a view is fitted to the terminal and paged like a frame"  case_fleet_watch_a_view_is_fitted_and_paged_like_any_frame
 
 
 # --- GHR-45: provision --------------------------------------------------------
