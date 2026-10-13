@@ -3818,6 +3818,25 @@ fleet_status_json() {
 # painted `note:` line stops looking like a note and is printed as a slot row
 # on every host instead of being collected and deduped once.
 FLEET_REMOTE_COLOR=false
+
+# The host line (GHR-66): what a remote's header carries after its
+# `Host: <cores, RAM>` fragment — `Disk: …` and `last 1h: …` (GHR-64) —
+# printed once per host above its slots. Cut from the RAW line, so the
+# remote's own colours survive under `fleet watch`: host_header_suffix joins
+# its fragments with an unpainted " — " and host_line never contains one, so
+# the first " — " after "Host: " is where the suffix starts. A host older
+# than 0.16.0 has no suffix and gets no line.
+fleet_host_info() { # RAW-HEADER-LINE
+  local rest="${1#* — Host: }"
+  [ "$rest" != "$1" ] || return 0
+  [[ "$rest" == *" — "* ]] || return 0
+  printf '%s\n' "${rest#* — }"
+}
+# A host line as it appears in the assembled frame: the HOST cell, then
+# `Disk: ` or `last <window>: ` — never a slot (no IDX) and never a host that
+# did not answer, so `fleet watch`'s cursor must not stop on it.
+FLEET_INFO_RE='^[^ ]+ +(Disk: |last [^:]*: )'
+
 fleet_status_table() {
   local i host rc hostw=4 ver first_ver="" skew=false bad=0 n=0 hdr=""
   local -a lines notes=()
@@ -3867,7 +3886,9 @@ fleet_status_table() {
       fi
     fi
     n=$((n + 1))
-    local l
+    local l info
+    info="$(fleet_host_info "${lines[0]}")"
+    [ -z "$info" ] || printf '%-*s %s\n' "$hostw" "$host" "$info"
     for l in "${lines[@]:3}"; do
       strip_sgr "$l"
       case "$SGR_STRIPPED" in
@@ -4541,7 +4562,9 @@ declare -A FF=()
 # This frame's selectable rows, in order: "HOST<TAB>NAME" for a slot row and
 # "HOST<TAB>" for a host that did not answer, with the frame line each is on.
 # Only a first word that IS a watched host counts, so the column header, a
-# note and the skew line are never rows.
+# note and the skew line are never rows; nor is a host line (GHR-66), which
+# starts with a watched host but would otherwise read as that host's
+# did-not-answer row — and fleet_watch_place prefers that row.
 fleet_watch_rows() { # FRAME
   local line n=0 h re_slot='^([^ ]+) +[0-9]+ +([^ ]+)( |$)' re_host='^([^ ]+) '
   local -A known=()
@@ -4550,6 +4573,7 @@ fleet_watch_rows() { # FRAME
   while IFS= read -r line; do
     n=$((n + 1))
     strip_sgr "$line"
+    [[ ! "$SGR_STRIPPED" =~ $FLEET_INFO_RE ]] || continue
     if [[ "$SGR_STRIPPED" =~ $re_slot ]] && [ -n "${known[${BASH_REMATCH[1]}]:-}" ]; then
       FW_ROWS+=("${BASH_REMATCH[1]}"$'\t'"${BASH_REMATCH[2]}"); FW_LINES+=("$n")
     elif [[ "$SGR_STRIPPED" =~ $re_host ]] && [ -n "${known[${BASH_REMATCH[1]}]:-}" ]; then
