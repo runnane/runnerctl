@@ -1,0 +1,12 @@
+# Actions are pinned to full commit SHAs in .github/workflows/ci.yml; this
+# turns each upstream release into a reviewed bump PR (SHA + version comment).
+# It does not cover the shellcheck tarball pin (see .agents/gates.md).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      # `ci:` is hidden from the release-please changelog and bumps nothing.
+      prefix: ci
