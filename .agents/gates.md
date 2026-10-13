@@ -307,7 +307,10 @@ is green (`release-please-config.json`, `.release-please-manifest.json`):
 - that PR changes exactly three things: the `RUNNERCTL_VERSION` line (through
   the annotation), `CHANGELOG.md`, and the manifest;
 - merging it tags `vX.Y.Z`, publishes a GitHub release, and attaches the
-  `runnerctl` file to it after asserting `runnerctl version` prints the tag;
+  `runnerctl` file to it after asserting `runnerctl version` prints the tag.
+  The attach step checks out **the tag**, not the run's own commit, and the
+  job runs one at a time (`concurrency`, never cancelling a run in progress)
+  — see the trap below;
 - `bootstrap-sha` in the config is the commit carrying 0.3.1, the last
   hand-stamped version, so the first release PR only lists what came after
   it. It is inert once a `vX.Y.Z` tag from release-please exists.
@@ -344,6 +347,31 @@ Two things the automation cannot do for you:
   → Allow GitHub Actions to create and approve pull requests* must be on, or
   the action fails with `GitHub Actions is not permitted to create or approve
   pull requests`.
+
+**Trap — the run that creates a release is not necessarily the release
+commit's (GHR-106).** release-please acts on the branch, so once the release PR
+has merged, whichever `push` run reaches the release step first creates the tag
+and the release and is the only run that gets `release_created: true`. On
+2026-10-13 four merges landed within 23 seconds; the run for an *earlier*
+commit created `v0.20.0`, checked out its own commit (still stamped 0.19.0),
+failed the version assertion — correctly, it refused the wrong bytes — and
+attached nothing. The later runs saw the release already created and skipped
+the attach, so `v0.20.0` shipped with no asset and
+`releases/latest/download/runnerctl`, the default `UPGRADE_URL`, answered 404.
+The checkout now names `steps.release.outputs.tag_name`. Three things follow
+for whoever merges:
+
+- **After a release PR merges, read the release's assets**, not the run's
+  colour: `gh release view vX.Y.Z --json assets --jq '.assets[].name'` must
+  print `runnerctl`. A green run on the release commit proves nothing here —
+  that run may not be the one that created the release.
+- A release missing its asset is repaired by hand from the tag
+  (`git show vX.Y.Z:runnerctl`, check `version`, `gh release upload`), never
+  by re-running a job: no later run gets `release_created` for it again.
+- With the `concurrency` group, a release job that is still *waiting* when a
+  newer push queues behind it is replaced by the newer one and shows as
+  cancelled. That is expected and loses nothing: `gates` for that commit has
+  already run, and the surviving job does the same work on the same branch.
 
 `runnerctl upgrade` defaults to the latest tagged GitHub release, so hosts
 only ever pick up released behaviour under its correct version stamp.

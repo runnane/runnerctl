@@ -52,10 +52,23 @@ jobs:
   # whose pull_request runs GitHub creates but holds for a manual approval,
   # so the bumped script is only gated unattended by the post-merge run on
   # main.
+  #
+  # release-please acts on the BRANCH, not on this run's commit, so the run
+  # that creates a release is whichever one gets there first once the release
+  # PR has merged — not necessarily the release commit's own (GHR-106: four
+  # merges in 23 seconds, the release was created by an earlier commit's run,
+  # which then attached nothing, and v0.20.0 went out with no asset). Hence
+  # the attach step's checkout names the tag the release step just created,
+  # and the job runs one at a time so two pushes never interleave it. A run
+  # in progress is never cancelled; of several waiting, GitHub keeps the
+  # newest, which is fine: any of them does the same work on the same branch.
   release:
     needs: gates
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
+    concurrency:
+      group: release-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: write
       pull-requests: write
@@ -72,8 +85,12 @@ jobs:
           token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+      # The tagged commit, not this run's: see the note above the job. The
+      # version assertion below stays as the guard that refuses wrong bytes.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: ${{ steps.release.outputs.release_created }}
+        with:
+          ref: ${{ steps.release.outputs.tag_name }}
       - name: Attach runnerctl to the release
         if: ${{ steps.release.outputs.release_created }}
         env:
