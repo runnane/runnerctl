@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.0](https://github.com/runnane/runnerctl/compare/v0.16.0...v0.17.0) (2026-10-13)
+
+
+### Features
+
+* fleet status/watch show each host's Disk: / OOM / disk-full line above its slots (GHR-66) ([#74](https://github.com/runnane/runnerctl/issues/74)) ([9299d7a](https://github.com/runnane/runnerctl/commit/9299d7a9e389d14e3bfa2b0c9d98803606b58364))
+
 ## [0.16.0](https://github.com/runnane/runnerctl/compare/v0.15.0...v0.16.0) (2026-10-12)
 
 
