@@ -384,6 +384,9 @@ U3="actions.runner.example.slot-3.service"
 # writes land where status's plain read looks for them; see _mirror_path above.
 DROPIN_DIR="$WRITES/etc/systemd/system"
 DEPLOY_ENV="/etc/runnerctl/deploy.env"
+# GHR-78: the run's keys of a `job` object whose environment names no run —
+# what follows `"stalled":…` in every case from before those keys existed.
+RUN_NULLS=',"workflow":null,"run_id":null,"run_attempt":null,"run_number":null,"ref":null,"sha":null,"actor":null,"event":null,"url":null'
 
 case_status_table() {
   run status
@@ -1494,7 +1497,8 @@ case_status_json_parses_and_carries_the_slot_facts() {
   expect_json '[s["idx"] for s in d["slots"]] == [0, 1, 2]'
   expect_json 'd["slots"][0]["unit"] == "actions.runner.example.slot-1.service" and d["slots"][0]["name"] == "example.slot-1"'
   # slot-1: raw bytes, not 26.0G; the running job with its journal stamp.
-  expect_json 'd["slots"][0]["job"] == {"repo": "my-app", "name": "test", "since": 1000000000, "stalled": False}'
+  # GHR-78: the run's keys are there and null — this environment names no run.
+  expect_json 'd["slots"][0]["job"] == {"repo": "my-app", "name": "test", "since": 1000000000, "stalled": False, "workflow": None, "run_id": None, "run_attempt": None, "run_number": None, "ref": None, "sha": None, "actor": None, "event": None, "url": None}'
   expect_json 'd["slots"][0]["memory_max"] == 27917287424 and d["slots"][0]["memory_high"] == 23622320128'
   expect_json 'd["slots"][0]["memory_current"] == 1073741824 and d["slots"][0]["memory_peak"] == 26843545600'
   expect_json 'd["slots"][0]["env_file"] is None and d["slots"][0]["idle_since"] is None and d["slots"][0]["jobs_completed"] is None'
@@ -1588,7 +1592,7 @@ case_status_json_working_on_access_states() {
   RUNNERCTL_STUB_JOURNAL_ACCESS=0 RUNNERCTL_STUB_CGROUP_READABLE=1 run status --json
   expect_rc 0
   # no worker pid visible → no runtime → stalled is unknowable, null
-  expect_out '"name":"example.slot-1".*"job":\{"repo":"my-app","name":"test","since":null,"stalled":null\}.*"working_on_access":"no-journal"'
+  expect_out '"name":"example.slot-1".*"job":\{"repo":"my-app","name":"test","since":null,"stalled":null'"$RUN_NULLS"'\}.*"working_on_access":"no-journal"'
   expect_out '"name":"example.slot-2".*"job":null,"idle_since":null,"jobs_completed":null,"working_on_access":"no-journal"'
 }
 
@@ -1741,7 +1745,7 @@ case_status_stall_after_invalid_rejected() {
 case_status_json_stalled_field() {
   run status --stall-after 600 --json
   expect_rc 0
-  expect_out '"name":"example.slot-1".*"job":\{"repo":"my-app","name":"test","since":1000000000,"stalled":true\}'
+  expect_out '"name":"example.slot-1".*"job":\{"repo":"my-app","name":"test","since":1000000000,"stalled":true'"$RUN_NULLS"'\}'
   expect_out '"name":"example.slot-2".*"job":null'
   expect_no_out 'STALLED'
   expect_no_out "$SGR"
@@ -7389,12 +7393,12 @@ case_fleet_watch_question_mark_lists_every_key() {
     expect_frame "$k" '^any key closes this list$'
     expect_frame_count_of "$k" '^HOST +IDX|example\.slot-' 0
   done
-  # a line per key, and the list short enough for a 24-row terminal: its 13
-  # lines, the header, the summary and the three lines under it
-  for k in '!' 'b i' '/' 'a' 's' 'c' 'K R S T P L' '\?' 'q' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
+  # a line per key, and the list short enough for a 24-row terminal: its 14
+  # lines (GHR-78 added O), the header, the summary and the three lines under it
+  for k in '!' 'b i' '/' 'a' 's' 'c' 'K R S T P L' 'O' '\?' 'q' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
     expect_frame 2 "^  $k   +[a-z]"
   done
-  expect_frame_lines 2 19
+  expect_frame_lines 2 20
   expect_frame 3 "$(fw_row build-1 0 1)"
   expect_frame 5 "$(fw_row build-1 0 1)"
   expect_frame_count_of 3 "$V_ROW" 6
@@ -7877,6 +7881,501 @@ t "compose-reap --standalone: kept while a job older than it runs"    case_compo
 t "compose-reap: COMPOSE_REAP_STANDALONE=1 opts in; --project; bad value" case_compose_reap_standalone_from_config_and_project_filter
 t "compose-reap --standalone: a failed image removal fails the run"   case_compose_reap_standalone_failed_image_removal_fails_the_run
 t "compose-reap: the real standalone hook lists only non-compose ids" case_compose_reap_standalone_real_hook
+
+# --- GHR-78: the run a job belongs to ------------------------------------------
+# The fixture is RUNNERCTL_STUB_RUN=1 (tests/stub.config, proc_job_env): slot-1
+# is on run 1234567890 attempt 2 of workflow CI at ref main, and slot-2 — busy
+# only under the /proc-only reader — on run 1234567891 of the same repository.
+# The stub's proc_job_env is what those cases read; the real reader has cases
+# of its own further down, on a fixture environ file.
+RUN_JOB1='{"repo":"my-app","name":"test","since":1000000000,"stalled":false,"workflow":"CI","run_id":1234567890,"run_attempt":2,"run_number":57,"ref":"main","sha":"0123456789abcdef0123456789abcdef01234567","actor":"octocat","event":"push","url":"https://github.com/example/my-app/actions/runs/1234567890/attempts/2"}'
+RUN_URL1='https://github\.com/example/my-app/actions/runs/1234567890/attempts/2'
+RUN_URL2='https://github\.com/example/my-app/actions/runs/1234567891/attempts/1'
+READ_ONLY_LOG='^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+
+# The `job` object of slot-1's line in OUT, as written: from after `"job":`
+# to the first `,"idle_since":` — which no value can contain unescaped.
+slot1_job() {
+  local l
+  l="$(grep -m1 '"name":"example.slot-1"' <<<"$OUT" || true)"
+  l="${l#*\"job\":}"
+  printf '%s\n' "${l%%,\"idle_since\":*}"
+}
+# The WORKING-ON cell of slot-1's row in OUT: what follows the row's last run
+# of two spaces (no cell these cases draw has two in a row).
+slot1_cell() {
+  local l
+  l="$(grep -m1 '^0 ' <<<"$OUT" || true)"
+  printf '%s\n' "${l##*  }"
+}
+# OUT carries no control byte but its newlines. Bytes, so under LC_ALL=C.
+expect_no_control_bytes() {
+  _expect
+  local LC_ALL=C s="${OUT//$'\n'/}"
+  [[ "$s" != *[$'\001'-$'\037'$'\177']* ]] || FAILS+=("stdout carries a control byte: $(cat -v <<<"$OUT" | grep -m1 -F -e '^[' -e '^G' -e '^?'; true)")
+}
+
+# Acceptance 1: the variables set → the job object carries them, the three
+# ids as numbers, and the URL in its exact form. The object is pinned as
+# TEXT, python or no python; the parse is the second opinion.
+case_run_facts_in_status_json() {
+  RUNNERCTL_STUB_RUN=1 run status --json
+  expect_rc 0
+  expect_text "slot-1's job object" "$RUN_JOB1" "$(slot1_job)"
+  # the journal reader finds slot-2 idle and never reads its environment
+  expect_out '"name":"example.slot-2".*"job":null,"idle_since":999991660,'
+  expect_no_log "$READ_ONLY_LOG"
+  if $HAVE_PYTHON3; then
+    expect_json 'd["slots"][0]["job"]["run_id"] == 1234567890 and d["slots"][0]["job"]["run_attempt"] == 2 and d["slots"][0]["job"]["run_number"] == 57'
+    expect_json 'd["slots"][0]["job"]["url"] == "https://github.com/example/my-app/actions/runs/1234567890/attempts/2"'
+    expect_json 'list(d["slots"][0]["job"]) == ["repo", "name", "since", "stalled", "workflow", "run_id", "run_attempt", "run_number", "ref", "sha", "actor", "event", "url"]'
+  else
+    skip "python3 not on PATH: the run facts' JSON parse assertions not run"
+  fi
+  # the /proc-only reader: both slots busy, each on its own run
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_JOURNAL_ACCESS=0 RUNNERCTL_STUB_CGROUP_READABLE=1 run status --json
+  expect_rc 0
+  expect_text "slot-1's job object, /proc only" "${RUN_JOB1/\"since\":1000000000,\"stalled\":false/\"since\":null,\"stalled\":null}" "$(slot1_job)"
+  expect_out '"name":"example.slot-2".*"job":\{"repo":"my-app","name":"build","since":null,"stalled":null,"workflow":"Release","run_id":1234567891,"run_attempt":1,"run_number":12,"ref":"v1\.2\.3","sha":"89abcdef0123456789abcdef0123456789abcdef","actor":"octocat","event":"release","url":"'"$RUN_URL2"'"\},"idle_since":null'
+}
+
+# Acceptance 2: the variables absent → every key present and null, and the
+# table cell what it was — on a terminal with any amount of room.
+case_run_facts_absent_are_null_and_the_cell_is_unchanged() {
+  run status --json
+  expect_rc 0
+  expect_text "slot-1's job object, no run named" '{"repo":"my-app","name":"test","since":1000000000,"stalled":false'"$RUN_NULLS"'}' "$(slot1_job)"
+  if $HAVE_PYTHON3; then
+    expect_json 'all(k in d["slots"][0]["job"] and d["slots"][0]["job"][k] is None for k in ("workflow", "run_id", "run_attempt", "run_number", "ref", "sha", "actor", "event", "url"))'
+  else
+    skip "python3 not on PATH: the null run keys' parse assertion not run"
+  fi
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run status
+  expect_rc 0
+  expect_text "the cell on a 300-column terminal, no run named" 'my-app:test (12m)' "$(slot1_cell)"
+  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +always +— +my-app:test \(12m\)$'
+}
+
+# The long cell, `repo:workflow / job @ref`, only where the terminal has the
+# columns for it BEYOND the full table (144 here, so 28 more at 172), only on
+# a terminal, and never through `fleet`. The short cell is what every other
+# width, a pipe and a remote's table draw — byte for byte what it was.
+case_run_facts_wide_cell_only_where_it_fits() {
+  local short='my-app:test (12m)' long='my-app:CI / test @main (12m)'
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=172 run status
+  expect_rc 0
+  expect_text "172 columns: the long cell fits exactly" "$long" "$(slot1_cell)"
+  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +always +— +my-app:CI / test @main \(12m\)$'
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=171 run status
+  expect_text "171 columns: one short of it" "$short" "$(slot1_cell)"
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_COLS=300 run status
+  expect_text "300 columns, stdout not a terminal" "$short" "$(slot1_cell)"
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 run status
+  expect_text "a terminal of unknown width" "$short" "$(slot1_cell)"
+  # one of the two is enough for the long form, and STALLED still ends it
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_REF_NAME='' RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run status
+  expect_text "a workflow and no ref" 'my-app:CI / test (12m)' "$(slot1_cell)"
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_WORKFLOW='' RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run status
+  expect_text "a ref and no workflow" 'my-app:test @main (12m)' "$(slot1_cell)"
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run status --stall-after 600
+  expect_text "a stalled job" 'my-app:CI / test @main (12m) STALLED' "$(slot1_cell)"
+  # a part longer than 40 characters is cut to 40, the last one an ellipsis
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_REF_NAME='feature/a-branch-name-that-goes-on-for-a-good-deal-longer-than-a-cell-should' \
+    RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run status
+  expect_text "a long ref" 'my-app:CI / test @feature/a-branch-name-that-goes-on-for-… (12m)' "$(slot1_cell)"
+  # watch reads the width per frame. At 150 the table is narrow and the cell
+  # short. 178 is where this table gets MAX, HIGH and ENVFILE back with or
+  # without a run named (slot-2's row is 156 wide when narrow, plus the
+  # margin of 22) — and there it is the full table AND the long cell.
+  local narrow='^0 +example\.slot-1 +— +active/running +3d 4h +enabled +1\.0G/25\.0G +— +always +' full='^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +always +— +'
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=150,178 run watch --iterations 2 --color never
+  expect_rc 0
+  expect_out_count "${narrow}my-app:test \\(12m\\)\$" 1
+  expect_out_count "${full}my-app:CI / test @main \\(12m\\)\$" 1
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=150,178 run watch --iterations 2 --color never
+  expect_out_count "${narrow}my-app:test \\(12m\\)\$" 1
+  expect_out_count "${full}my-app:test \\(12m\\)\$" 1
+  # The long cell is measured against the FULL table, so it is never what
+  # keeps those columns away: a 50-character one would fit beside the narrow
+  # table at 178 (56 to spare) and, drawn there, hold the table narrow for
+  # good. It does not fit beside the full one (34), so the cell is the short
+  # one and the columns are back.
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_REF_NAME='release/2026-10-candidate1' RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=150,178 \
+    run watch --iterations 2 --color never
+  expect_out_count "${full}my-app:test \\(12m\\)\$" 1
+  expect_no_out 'candidate1'
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_REF_NAME='release/2026-10-candidate1' RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=194 run status
+  expect_text "194 columns: the 50-character cell fits" 'my-app:CI / test @release/2026-10-candidate1 (12m)' "$(slot1_cell)"
+  # the fit is counted in characters, like every padded cell (GHR-21): this
+  # one is 34 of them and 37 bytes, and 34 is what 178 columns leave
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_WORKFLOW='Bygg æøå' RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=178 run status
+  expect_text "178 columns: 34 characters fit" 'my-app:Bygg æøå / test @main (12m)' "$(slot1_cell)"
+  # a remote's table is drawn for no terminal: the fleet row is the short cell
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=400 RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet status
+  expect_out '^build-1 +0 +example\.slot-1 .* my-app:test \(12m\)$'
+  expect_no_out 'CI / test'
+}
+
+# Acceptance 3: text a job supplied cannot repaint the terminal. The TABLE's
+# bytes are pinned on their own — an escape sequence in the ref, an OSC in the
+# repository, a C1 CSI and a bidi override in the workflow all draw as the
+# printable characters that were between the controls, and the whole output
+# carries no control byte — and the JSON's are pinned separately, as escapes.
+# Two expected texts, so the two surfaces cannot agree with each other and
+# both be wrong.
+case_run_facts_hostile_text_is_neutralised_where_drawn() {
+  local ref=$'ma\e[2J\e[31min\a' repo=$'example/my\e]0;x\a-app' wf=$'C\xc2\x9bI\xe2\x80\xae'
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_REF_NAME="$ref" RUNNERCTL_STUB_RUN_REPOSITORY="$repo" RUNNERCTL_STUB_RUN_WORKFLOW="$wf" \
+    RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run status
+  expect_rc 0
+  expect_text "the long cell, hostile ref, repository and workflow" 'my]0;x-app:CI / test @ma[2J[31min (12m)' "$(slot1_cell)"
+  expect_no_control_bytes
+  expect_no_out $'\xc2\x9b|\xe2\x80\xae'
+  # the short cell: the repository reached it raw before GHR-78
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_REF_NAME="$ref" RUNNERCTL_STUB_RUN_REPOSITORY="$repo" run status
+  expect_text "the short cell, hostile repository" 'my]0;x-app:test (12m)' "$(slot1_cell)"
+  expect_no_control_bytes
+  # the /proc-only reader takes the job's NAME from the environment too
+  RUNNERCTL_STUB_RUN_JOB=$'te\e[1;1Hst\x7f' RUNNERCTL_STUB_JOURNAL_ACCESS=0 RUNNERCTL_STUB_CGROUP_READABLE=1 run status
+  expect_text "the short cell, hostile job name" 'my-app:te[1;1Hst' "$(slot1_cell)"
+  expect_no_control_bytes
+  # JSON: the same ref and repository, escaped — and no URL from that repository
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_REF_NAME="$ref" RUNNERCTL_STUB_RUN_REPOSITORY="$repo" run status --json
+  expect_rc 0
+  expect_text "slot-1's job object, hostile ref and repository" \
+    '{"repo":"my\u001b]0;x\u0007-app","name":"test","since":1000000000,"stalled":false,"workflow":"CI","run_id":1234567890,"run_attempt":2,"run_number":57,"ref":"ma\u001b[2J\u001b[31min\u0007","sha":"0123456789abcdef0123456789abcdef01234567","actor":"octocat","event":"push","url":null}' \
+    "$(slot1_job)"
+  expect_no_control_bytes
+  if $HAVE_PYTHON3; then
+    expect_json 'd["slots"][0]["job"]["ref"] == "ma\x1b[2J\x1b[31min\x07" and d["slots"][0]["job"]["repo"] == "my\x1b]0;x\x07-app"'
+  else
+    skip "python3 not on PATH: the escaped ref's round trip not checked"
+  fi
+  # a confirm line quotes the cell: the watch's own frame codes are the only
+  # escapes in it (no OSC, and the prompt is the neutralised text)
+  RUNNERCTL_STUB_RUN_REPOSITORY="$repo" RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Knq' run watch --color never
+  expect_rc 0
+  expect_out_count '^Kill the job on example\.slot-1 \(my\]0;x-app:test \(12m\)\)\? ' 1
+  expect_no_out "$ESC\\]"
+  # `fleet watch`: the remote drew its row without the override, and the
+  # confirm line this node builds from the remote's JSON is without it too
+  RUNNERCTL_STUB_RUN_REPOSITORY=$'example/my\xe2\x80\xae-app' RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Knq' \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^Kill the job on example\.slot-1 on build-1 \(my-app:test \(12m\)\)\? ' 1
+  expect_no_out $'\xe2\x80\xae'
+}
+
+# The quote, the backslash and the over-long value: JSON carries them escaped
+# and cut, the table as they are and clipped.
+case_run_facts_quotes_backslashes_and_long_values() {
+  local long
+  long="$(printf 'a%.0s' {1..300})"
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_WORKFLOW='Build "x" \ y' RUNNERCTL_STUB_RUN_ACTOR="$long" run status --json
+  expect_rc 0
+  expect_text "slot-1's job object, quote, backslash and a 300-byte actor" \
+    '{"repo":"my-app","name":"test","since":1000000000,"stalled":false,"workflow":"Build \"x\" \\ y","run_id":1234567890,"run_attempt":2,"run_number":57,"ref":"main","sha":"0123456789abcdef0123456789abcdef01234567","actor":"'"$(printf 'a%.0s' {1..200})"'","event":"push","url":"https://github.com/example/my-app/actions/runs/1234567890/attempts/2"}' \
+    "$(slot1_job)"
+  if $HAVE_PYTHON3; then
+    expect_json 'd["slots"][0]["job"]["workflow"] == "Build \"x\" \\ y" and d["slots"][0]["job"]["actor"] == "a" * 200'
+  else
+    skip "python3 not on PATH: the quoted workflow's round trip not checked"
+  fi
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_WORKFLOW='Build "x" \ y' RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run status
+  expect_text "the long cell, quote and backslash" 'my-app:Build "x" \ y / test @main (12m)' "$(slot1_cell)"
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_WORKFLOW="$long" RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run status
+  expect_text "the long cell, a 300-byte workflow" "my-app:$(printf 'a%.0s' {1..39})… / test @main (12m)" "$(slot1_cell)"
+  # a run id that is not a number is no id and no URL — and `007` is not a
+  # JSON number, so it is not one here either; a server that is no http(s)
+  # host is no URL, with every id intact
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_RUN_ID='12ab' run status --json
+  expect_out '"name":"example.slot-1".*"workflow":"CI","run_id":null,"run_attempt":2,"run_number":57,.*"event":"push","url":null\},"idle_since":null'
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_RUN_ID='007' run status --json
+  expect_out '"name":"example.slot-1".*"workflow":"CI","run_id":null,"run_attempt":2,"run_number":57,.*"event":"push","url":null\},"idle_since":null'
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_SERVER_URL='javascript:alert(1)' run status --json
+  expect_out '"name":"example.slot-1".*"workflow":"CI","run_id":1234567890,"run_attempt":2,"run_number":57,.*"event":"push","url":null\},"idle_since":null'
+  expect_no_out 'javascript'
+}
+
+# What job_env_facts keeps, on the function itself: one line per input, the
+# hostile variable first (the first line of a variable wins) over a base that
+# would otherwise give a URL. A number is digits or nothing, a commit is hex,
+# and the URL exists only when every part of it passed.
+case_job_env_facts_keeps_only_what_a_value_has_to_be() {
+  local sha=0123456789abcdef0123456789abcdef01234567 u='https://github.com/example-org/my-app/actions/runs'
+  # shellcheck disable=SC2016
+  GHR78_SHA="$sha" run_fn eval '
+    base=(GITHUB_REPOSITORY=example-org/my-app GITHUB_RUN_ID=1234567890 GITHUB_RUN_ATTEMPT=3 GITHUB_SERVER_URL=https://github.com)
+    f() { job_env_facts "$(printf "%s\n" "$@" "${base[@]}")"; echo "$JOB_RUN_ID|$JOB_RUN_ATTEMPT|$JOB_RUN_NUMBER|$JOB_SHA|$JOB_EVENT|$JOB_URL"; }
+    f
+    f GITHUB_RUN_ID=12ab
+    f GITHUB_RUN_ID=007
+    f "GITHUB_RUN_ID=12 34"
+    f GITHUB_RUN_ID=-5
+    f GITHUB_RUN_ID=1234567890123456
+    f GITHUB_RUN_ID=0
+    f GITHUB_RUN_ATTEMPT=x
+    f GITHUB_RUN_NUMBER=57 GITHUB_SHA="$GHR78_SHA" GITHUB_EVENT_NAME=pull_request
+    f GITHUB_RUN_NUMBER=5.7 GITHUB_SHA="${GHR78_SHA^^}" "GITHUB_EVENT_NAME=push;rm"
+    f GITHUB_SHA=abc123 GITHUB_EVENT_NAME=Push
+    for s in "javascript:alert(1)" https://github.com/evil "https://github.com " https://user@github.com ftp://github.com \
+             "$(printf "https://git\thub.com")" https://github.com:99999x //github.com https://-bad.example "https://github.com?x" ""; do
+      echo "server [$s] $(f "GITHUB_SERVER_URL=$s")"
+    done
+    f GITHUB_SERVER_URL=http://ghe.example.com:8443
+    for r in ../.. example-org "example-org/my app" example-org/my-app/extra ./x "example-org/my\"app" ""; do
+      echo "repo [$r] $(f "GITHUB_REPOSITORY=$r")"
+    done'
+  expect_rc 0
+  expect_text "what is kept of each input" "1234567890|3||||$u/1234567890/attempts/3
+|3||||
+|3||||
+|3||||
+|3||||
+|3||||
+0|3||||$u/0/attempts/3
+1234567890|||||$u/1234567890
+1234567890|3|57|$sha|pull_request|$u/1234567890/attempts/3
+1234567890|3||||$u/1234567890/attempts/3
+1234567890|3||||$u/1234567890/attempts/3
+server [javascript:alert(1)] 1234567890|3||||
+server [https://github.com/evil] 1234567890|3||||
+server [https://github.com ] 1234567890|3||||
+server [https://user@github.com] 1234567890|3||||
+server [ftp://github.com] 1234567890|3||||
+server [https://git	hub.com] 1234567890|3||||
+server [https://github.com:99999x] 1234567890|3||||
+server [//github.com] 1234567890|3||||
+server [https://-bad.example] 1234567890|3||||
+server [https://github.com?x] 1234567890|3||||
+server [] 1234567890|3||||
+1234567890|3||||http://ghe.example.com:8443/example-org/my-app/actions/runs/1234567890/attempts/3
+repo [../..] 1234567890|3||||
+repo [example-org] 1234567890|3||||
+repo [example-org/my app] 1234567890|3||||
+repo [example-org/my-app/extra] 1234567890|3||||
+repo [./x] 1234567890|3||||
+repo [example-org/my\"app] 1234567890|3||||
+repo [] 1234567890|3||||" "$OUT"
+  # free text: cut to 200 bytes on a character boundary, and made well-formed
+  # shellcheck disable=SC2016
+  GHR78_W="x$(printf 'æ%.0s' {1..150})" GHR78_B=$'bad\xff\xc3\xa6' run_fn eval '
+    job_env_facts "$(printf "%s\n" "GITHUB_WORKFLOW=$GHR78_W" "GITHUB_REF_NAME=$GHR78_B" "GITHUB_ACTOR=first" "GITHUB_ACTOR=second")"
+    printf "%s\n" "$JOB_WORKFLOW" "$JOB_REF" "$JOB_ACTOR"'
+  expect_rc 0
+  expect_text "the free-text facts" "x$(printf 'æ%.0s' {1..99})
+bad???
+first" "$OUT"
+}
+
+# The REAL reader. Every case above reads the stub's proc_job_env; this one
+# hands proc_environ_job_vars — what the real proc_job_env calls for each
+# process — a file laid out like /proc/<pid>/environ, NUL-separated. The
+# eleven variables come back one per line in the block's own order, nothing
+# else does (not GITHUB_REF, not a credential), and a newline inside a value
+# is a space: the `GITHUB_RUN_ID=999` an actor's name carries after one stays
+# part of that name instead of becoming the run's id.
+case_proc_environ_job_vars_reads_the_real_block() {
+  local f="$TMP/ghr78.environ" sha=0123456789abcdef0123456789abcdef01234567
+  printf '%s\0' 'PATH=/usr/bin' 'GITHUB_REPOSITORY=example-org/my-app' 'GITHUB_JOB=build' 'GITHUB_REF=refs/heads/main' \
+    'GITHUB_WORKFLOW=CI' $'GITHUB_ACTOR=octo\nGITHUB_RUN_ID=999' 'GITHUB_RUN_ID=1234567890' 'GITHUB_RUN_ATTEMPT=1' \
+    'GITHUB_RUN_NUMBER=7' 'GITHUB_REF_NAME=main' "GITHUB_SHA=$sha" 'GITHUB_EVENT_NAME=push' \
+    'GITHUB_SERVER_URL=https://github.com' 'GITHUB_TOKEN=placeholder' 'HOME=/home/runner' >"$f"
+  run_fn proc_environ_job_vars "$f"
+  expect_rc 0
+  expect_text "the variables read from the block" "GITHUB_REPOSITORY=example-org/my-app
+GITHUB_JOB=build
+GITHUB_WORKFLOW=CI
+GITHUB_ACTOR=octo GITHUB_RUN_ID=999
+GITHUB_RUN_ID=1234567890
+GITHUB_RUN_ATTEMPT=1
+GITHUB_RUN_NUMBER=7
+GITHUB_REF_NAME=main
+GITHUB_SHA=$sha
+GITHUB_EVENT_NAME=push
+GITHUB_SERVER_URL=https://github.com" "$OUT"
+  # and through job_env_facts: the facts a slot would carry
+  # shellcheck disable=SC2016
+  GHR78_F="$f" run_fn eval 'job_env_facts "$(proc_environ_job_vars "$GHR78_F")"; echo "$JOB_REPO|$JOB_ENV_NAME|$JOB_WORKFLOW|$JOB_RUN_ID|$JOB_RUN_ATTEMPT|$JOB_RUN_NUMBER|$JOB_REF|$JOB_SHA|$JOB_ACTOR|$JOB_EVENT|$JOB_URL"'
+  expect_rc 0
+  expect_text "the facts from the block" "my-app|build|CI|1234567890|1|7|main|$sha|octo GITHUB_RUN_ID=999|push|https://github.com/example-org/my-app/actions/runs/1234567890/attempts/1" "$OUT"
+  # a process that is not a step's: no GITHUB_REPOSITORY, so not this one
+  printf '%s\0' 'PATH=/usr/bin' 'GITHUB_ACTOR=octocat' >"$f"
+  run_fn proc_environ_job_vars "$f"
+  expect_rc 1
+  expect_text "a block with no repository" "" "$OUT"
+  # the real walk on a cgroup that cannot be read: nothing, and no failure
+  run_fn proc_job_env /ghr78-no-such-cgroup
+  expect_rc 0
+  expect_text "an unreadable cgroup" "" "$OUT"
+  rm -f "$f"
+}
+
+# term_safe, byte for byte, and the same under any locale: C0 and DEL, the C1
+# controls as UTF-8, the bidi controls — gone; well-formed text beyond ASCII —
+# kept; a raw 8-bit control, which is not well-formed — every high byte a `?`.
+case_term_safe_pins_the_bytes() {
+  local want loc
+  want=$'a[31mbcdef\nC1:31m||\nbidi:evilxyz\nkeep: \xc3\xa6\xc3\xb8 \xf0\x9f\x9a\x80 \xe2\x80\x94\nraw:?31m ??\n[]'
+  for loc in "${LC_ALL:-C}" C; do
+    # shellcheck disable=SC2016
+    LC_ALL="$loc" GHR78_1=$'a\e[31mb\x7fc\td\re\nf\x01' GHR78_2=$'C1:\xc2\x9b31m|\xc2\x85|' \
+      GHR78_3=$'bidi:\xe2\x80\xaeevil\xe2\x81\xa6x\xe2\x80\x8f\xd8\x9cy\xe2\x80\xa8z' \
+      GHR78_4=$'keep: \xc3\xa6\xc3\xb8 \xf0\x9f\x9a\x80 \xe2\x80\x94' GHR78_5=$'raw:\x9b31m \xc3\xa6' \
+      run_fn eval 'for v in "$GHR78_1" "$GHR78_2" "$GHR78_3" "$GHR78_4" "$GHR78_5"; do term_safe "$v"; printf "%s\n" "$TERM_SAFE"; done; term_safe ""; printf "[%s]\n" "$TERM_SAFE"'
+    expect_rc 0
+    expect_text "term_safe under LC_ALL=$loc" "$want" "$OUT"
+  done
+}
+
+# O in `watch`: the URL of the run the CURSOR's job belongs to, printed on the
+# status line. Two busy slots of one repository under the /proc-only reader,
+# so a key that printed the first slot's — or any slot's but the cursor's —
+# prints the wrong run. Nothing is run and nothing is asked for a password.
+case_watch_O_prints_the_cursors_run_url() {
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_JOURNAL_ACCESS=0 RUNNERCTL_STUB_CGROUP_READABLE=1 \
+    RUNNERCTL_STUB_KEYS='jOkOjjOq' run watch --color never
+  expect_rc 0
+  expect_out_count "^example\.slot-2: $RUN_URL2\$" 1
+  expect_out_count "^example\.slot-1: $RUN_URL1\$" 1
+  expect_out_count '^example\.slot-3: no job running — no run URL to print$' 1
+  expect_out_count 'actions/runs/' 2
+  expect_no_out '\[y/n\]'
+  expect_no_log "$READ_ONLY_LOG"
+  # a job whose environment names no run: said so, not an empty line
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='OjOq' run watch --color never
+  expect_rc 0
+  expect_out_count '^example\.slot-1: a job is running, but its run URL is not known — it is read from a step.s environment, which is not there between steps or for a container job, and needs access to the slot.s processes$' 1
+  expect_out_count '^example\.slot-2: no job running — no run URL to print$' 1
+  # a server that is no http(s) host: no URL, whatever else is right
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_SERVER_URL='javascript:alert(1)' RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Oq' run watch --color never
+  expect_out_count '^example\.slot-1: a job is running, but its run URL is not known ' 1
+  expect_no_out 'javascript'
+  # neither source readable: it cannot tell
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_JOURNAL_ACCESS=0 RUNNERCTL_STUB_KEYS='Oq' run watch --color never
+  expect_out_count '^example\.slot-1: cannot tell whether a job is running — needs journal read access \(systemd-journal group\) or root$' 1
+}
+
+# O in `fleet watch`: the same, for the (host, slot) the cursor is on, from
+# the payload the tick already brought — the key asks no host anything, so the
+# only ssh calls are the first frame's four (a table and a --json per host).
+case_fleet_watch_O_prints_the_cursors_run_url() {
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_JOURNAL_ACCESS=0 RUNNERCTL_STUB_CGROUP_READABLE=1 \
+    RUNNERCTL_STUB_KEYS='jOkOjjjOjjOq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^example\.slot-2 on build-1: $RUN_URL2\$" 1
+  expect_out_count "^example\.slot-1 on build-1: $RUN_URL1\$" 1
+  expect_out_count "^example\.slot-1 on build-2: $RUN_URL1\$" 1
+  expect_out_count '^example\.slot-3 on build-2: no job running — no run URL to print$' 1
+  expect_out_count 'actions/runs/' 3
+  expect_no_out '\[y/n\]'
+  expect_log_count '^probe:ssh_run ' 4
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl status --json' 2
+}
+
+# What O does with a payload it cannot take a URL from, on the function: an
+# older host's job object has no `url` key, a URL that is not a run page's is
+# not printed however it got there, and a URL is only ever a run page's
+# address (run_url_ok).
+case_fleet_watch_run_url_trusts_no_remote_string() {
+  local d="$TMP/ghr78.state" pre='"unit":"u","name":' up='"active":"active","job":' tail=',"idle_since":null,"working_on_access":"ok"}'
+  local job='{"repo":"my-app","name":"test","since":5,"stalled":false'
+  mkdir -p "$d"
+  {
+    echo '{"runnerctl":"0.0.1","host":{"name":"h"},'
+    echo ' "slots":['
+    echo "  {\"idx\":0,$pre\"old\",$up$job}$tail,"
+    echo "  {\"idx\":1,$pre\"script\",$up$job,\"url\":\"javascript:alert(1)\"}$tail,"
+    echo "  {\"idx\":2,$pre\"escaped\",$up$job,\"url\":\"https://github.com/a/b/actions/runs/1\\u001b[2J\"}$tail,"
+    echo "  {\"idx\":3,$pre\"good\",$up$job,\"url\":\"https://github.com/example-org/my-app/actions/runs/1234567890\"}$tail,"
+    echo "  {\"idx\":4,$pre\"between\",$up$job,\"url\":null}$tail,"
+    echo "  {\"idx\":5,$pre\"idle\",\"active\":\"active\",\"job\":null$tail,"
+    echo "  {\"idx\":6,$pre\"blind\",\"active\":\"active\",\"job\":null,\"idle_since\":null,\"working_on_access\":\"no-access\"}"
+    echo ']}'
+  } >"$d/0.json"
+  # shellcheck disable=SC2016
+  GHR78_D="$d" run_fn eval 'FLEET_HOSTS=(h1 h2); FW_STATE="$GHR78_D"
+    for n in old script escaped good between idle blind gone; do echo "$n: $(fleet_watch_run_url h1 "$n")"; done
+    echo "h2: $(fleet_watch_run_url h2 good)"'
+  expect_rc 0
+  expect_text "what O says for each slot" "old: a job is running, but that host's runnerctl does not report run URLs — 'runnerctl fleet upgrade' brings it up to date
+script: that host reported a run URL this node will not print — it is not a run page's address
+escaped: that host reported a run URL this node will not print — it is not a run page's address
+good: https://github.com/example-org/my-app/actions/runs/1234567890
+between: a job is running, but its run URL is not known — it is read from a step's environment, which is not there between steps or for a container job, and needs access to the slot's processes
+idle: no job running — no run URL to print
+blind: cannot tell whether a job is running — needs journal read access (systemd-journal group) or root
+gone: not in that host's last answer — no run URL to print
+h2: no facts from that host yet — its 'status --json' has not answered" "$OUT"
+  # shellcheck disable=SC2016
+  run_fn eval 'for u in https://github.com/example-org/my-app/actions/runs/1234567890/attempts/2 http://ghe.example.com:8443/a/b/actions/runs/1 \
+      "javascript:alert(1)" https://github.com/a/b/actions/runs/1/../../x https://github.com/a/b/actions/runs/1?x=1 \
+      "https://github.com/a/b/actions/runs/1 " https://github.com/a/b/c/actions/runs/1 https://github.com/a/b/actions/runs/x ""; do
+      if run_url_ok "$u"; then echo "ok [$u]"; else echo "no [$u]"; fi; done'
+  expect_text "what counts as a run page's address" "ok [https://github.com/example-org/my-app/actions/runs/1234567890/attempts/2]
+ok [http://ghe.example.com:8443/a/b/actions/runs/1]
+no [javascript:alert(1)]
+no [https://github.com/a/b/actions/runs/1/../../x]
+no [https://github.com/a/b/actions/runs/1?x=1]
+no [https://github.com/a/b/actions/runs/1 ]
+no [https://github.com/a/b/c/actions/runs/1]
+no [https://github.com/a/b/actions/runs/x]
+no []" "$OUT"
+  rm -rf "$d"
+}
+
+# The slot line is read back by this script. A workflow and a ref written to
+# look like the rest of the line — a `leaked_procs`, a memory pressure, a
+# `"stalled":true`, an `,"idle_since":` to end the job object early — go
+# through the REAL emitter, and the classifier still reads a busy, healthy
+# slot: json_str escaped every quote, so none of it is a key.
+case_run_facts_cannot_forge_the_slot_line() {
+  local f="$TMP/ghr78.line"
+  local wf='w","idx":7,"active":"failed","leaked_procs":7,"memory_pressure":{"full_avg10":99.00},"working_on_access":"no-access","x":"'
+  local ref='r"},"idle_since":1,"stalled":true,"job":null,"active":"failed","z":{"a":"'
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_WORKFLOW="$wf" RUNNERCTL_STUB_RUN_REF_NAME="$ref" run status --json
+  expect_rc 0
+  grep -m1 '"name":"example.slot-1"' <<<"$OUT" >"$f" || true
+  if $HAVE_PYTHON3; then
+    expect_json 'd["slots"][0]["job"]["workflow"] == "w\",\"idx\":7,\"active\":\"failed\",\"leaked_procs\":7,\"memory_pressure\":{\"full_avg10\":99.00},\"working_on_access\":\"no-access\",\"x\":\""'
+    expect_json 'd["slots"][0]["idx"] == 0 and d["slots"][0]["active"] == "active"'
+    expect_json 'd["slots"][0]["job"]["stalled"] is False and d["slots"][0]["leaked_procs"] is None and d["slots"][0]["working_on_access"] == "ok" and d["slots"][0]["idle_since"] is None'
+  else
+    skip "python3 not on PATH: the forged slot line's parse not checked"
+  fi
+  # shellcheck disable=SC2016
+  GHR78_F="$f" run_fn eval 'IFS= read -r l <"$GHR78_F"; fleet_slot_classify "$l"
+    echo "$SC_NAME state=$SC_STATE leaking=$SC_LEAKING problem=$SC_PROBLEM since=$SC_SINCE mem=$SC_MEM job=$SC_JOB"
+    echo "access=$(json_line_field "$l" working_on_access) leaked=[$(json_line_field "$l" leaked_procs)] active=$(json_line_field "$l" active)"
+    [[ "$l" =~ \"job\":(.*),\"idle_since\": ]]; j="${BASH_REMATCH[1]}"
+    echo "stalled=$(json_line_field "$j" stalled) url=$(json_line_field "$j" url)"'
+  expect_rc 0
+  expect_text "how the readers take the forged line" "example.slot-1 state=busy leaking=false problem=false since=1000000000 mem=1073741824 job=my-app:test
+access=ok leaked=[] active=active
+stalled=false url=https://github.com/example/my-app/actions/runs/1234567890/attempts/2" "$OUT"
+  rm -f "$f"
+  # fleet_slots — the budget walk's and S's floor's reader — takes the LAST
+  # `"idx":` and the last `"active":"…"` on a line, so it is the one a forged
+  # key after `job` would fool: four of the six slots are active, as they are
+  # with an honest workflow (case_fleet_watch_S_stops_the_selected_pair…)
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_WORKFLOW="$wf" RUNNERCTL_STUB_RUN_REF_NAME="$ref" RUNNERCTL_STUB_TTY=1 \
+    RUNNERCTL_STUB_KEYS='Snq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^Stop example\.slot-1 on build-1\? runs on build-1: runnerctl stop example\.slot-1 — leaves 3 of 6 slot\(s\) active across the watched hosts  \[y/n\]$' 1
+}
+
+t "status --json: the job names its run — workflow, ids, ref, sha, actor, url" case_run_facts_in_status_json
+t "status: no run in the environment is null keys and the cell of before"  case_run_facts_absent_are_null_and_the_cell_is_unchanged
+t "status / watch: workflow / job @ref only where the terminal has room"   case_run_facts_wide_cell_only_where_it_fits
+t "status: an escape sequence in a ref is text in the table, \\u001b in JSON" case_run_facts_hostile_text_is_neutralised_where_drawn
+t "status: quotes, backslashes and over-long values"                        case_run_facts_quotes_backslashes_and_long_values
+t "job_env_facts: digits or nothing, hex or nothing, a URL only from valid parts" case_job_env_facts_keeps_only_what_a_value_has_to_be
+t "proc_environ_job_vars: the real reader on an environ block"              case_proc_environ_job_vars_reads_the_real_block
+t "term_safe: the bytes that are drawn, under any locale"                   case_term_safe_pins_the_bytes
+t "watch: O prints the run URL of the cursor's job"                         case_watch_O_prints_the_cursors_run_url
+t "fleet watch: O prints the cursor's run URL and asks no host"             case_fleet_watch_O_prints_the_cursors_run_url
+t "fleet watch: O prints nothing that is not a run page's address"          case_fleet_watch_run_url_trusts_no_remote_string
+t "status --json: a job's text cannot forge the slot line its readers parse" case_run_facts_cannot_forge_the_slot_line
 
 # --- Summary ------------------------------------------------------------------
 echo

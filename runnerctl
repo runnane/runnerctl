@@ -112,10 +112,14 @@
 # own processes, the Listener stays up and reports it failed — for a STALLED
 # row), R restarts the service (warned when a job is
 # in flight), S/T stop/start it, P reaps its `+N leaked` processes, L opens
-# `logs <slot> -n 50` in $PAGER. Privileged keys go through sudo like the
-# commands do. Too narrow a terminal drops MAX, HIGH and ENVFILE from the
-# table, never WORKING-ON; --narrow (GHR-56, on `status` too) asks for that
-# narrow table outright. Too short a terminal (GHR-73) shows a window of the
+# `logs <slot> -n 50` in $PAGER, O prints the URL of the job's run on the
+# status line (GHR-78; printed, never opened). Privileged keys go through
+# sudo like the commands do. Too narrow a terminal drops MAX, HIGH and ENVFILE
+# from the table, never WORKING-ON; --narrow (GHR-56, on `status` too) asks
+# for that narrow table outright. A terminal with columns to spare beyond the
+# full table shows a running job as `repo:workflow / job @ref` instead of
+# `repo:job` (GHR-78) — on a terminal only: piped, or fetched by `fleet`, the
+# cell is the short one at any width. Too short a terminal (GHR-73) shows a window of the
 # rows that follows the cursor, the header, legend and status line staying
 # put and `↑ N more` / `↓ N more` counting the hidden lines; PgUp/PgDn move
 # the cursor a page, g/G (Home/End) to the first and last slot, and a resize
@@ -161,7 +165,12 @@
 # `status --json` prints the same facts as one JSON object — raw bytes, epoch
 # seconds, null where the table shows — — for monitoring and inventory
 # tooling; the keys are listed in the README. It is one-shot: poll it rather
-# than --watch it.
+# than --watch it. A slot's `job` names the run as well as the job (GHR-78):
+# workflow, run_id, run_attempt, run_number, ref, sha, actor, event and the
+# run page's `url`, each null when it could not be read or is not what such a
+# value has to be — they come from a job's environment, so a number is digits
+# or null, and the WORKING-ON cell draws none of it with a control character
+# left in.
 # An idle slot whose cgroup still holds processes that are not the runner's
 # own — a dev server or watcher a finished job left behind — shows `+N
 # leaked` in WORKING-ON, `leaked_procs` in --json and a `health` problem;
@@ -224,7 +233,8 @@
 # watch's keys act on it over the held connection (GHR-55): K kill job, R
 # restart, S stop, T start, P reap, each decided on facts read from that host
 # at the keypress and confirmed with a line naming the exact remote command,
-# and L pages that slot's last 50 journal lines. S keeps a floor: it refuses
+# and L pages that slot's last 50 journal lines. O prints the run URL of the
+# cursor's job, from the payload the last tick brought (GHR-78). S keeps a floor: it refuses
 # a stop that would leave fewer than --min-available K (default 1) slots
 # active across the watched hosts, so a cursor walked down the fleet pressing
 # S cannot take it to zero. `q` quits.
@@ -839,19 +849,41 @@ proc_worker_pid() { # CGROUP
   done <"/sys/fs/cgroup${1}/cgroup.procs"
 }
 
-# GITHUB_REPOSITORY / GITHUB_JOB from the environment of the first process in
-# the cgroup that carries them (GITHUB_* is injected into the STEP processes,
-# not into Runner.Worker, so between steps and for container jobs there is
-# none). Prints the two KEY=VALUE lines; nothing otherwise.
+# The job's own variables out of one environment block — FILE is a
+# /proc/<pid>/environ, NUL-separated. Prints them as KEY=VALUE lines, one per
+# variable; 1 and nothing when the block has no GITHUB_REPOSITORY. GHR-78: the
+# run's identity sits in the block that was already being read for the
+# repository and the job id, so it costs no second read and no new access.
+#
+# A newline INSIDE a value becomes a space before the NULs become newlines:
+# the output is one line per variable, and a value could otherwise end its own
+# line and start one that reads as a different variable. Split from the walk
+# below so a test can hand it a fixture file — the walk itself needs a cgroup.
+PROC_JOB_ENV_RE='^GITHUB_(REPOSITORY|JOB|WORKFLOW|RUN_ID|RUN_ATTEMPT|RUN_NUMBER|REF_NAME|SHA|ACTOR|EVENT_NAME|SERVER_URL)='
+proc_environ_job_vars() { # FILE
+  local env
+  env="$(tr '\n\0' ' \n' <"$1" 2>/dev/null || true)"
+  case "$env" in
+    *GITHUB_REPOSITORY=*) grep -E "$PROC_JOB_ENV_RE" <<<"$env" ;;
+    *)                    return 1 ;;
+  esac
+}
+
+# The job's variables from the environment of the first process in the cgroup
+# that carries them (GITHUB_* is injected into the STEP processes, not into
+# Runner.Worker, so between steps and for container jobs there is none).
+# Prints KEY=VALUE lines (proc_environ_job_vars); nothing otherwise.
+#
+# Every one of these values is whatever a process in the slot chose to put in
+# its environment — a step can start a child with any GITHUB_* it likes — so
+# the readers treat them as hostile text: job_env_facts for what is kept,
+# term_safe for what is drawn.
 proc_job_env() { # CGROUP
-  local pid env
+  local pid
   cgroup_readable "$1" || return 0
   while read -r pid; do
     [ -r "/proc/$pid/environ" ] || continue
-    env="$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null || true)"
-    case "$env" in
-      *GITHUB_REPOSITORY=*) grep -E '^GITHUB_(REPOSITORY|JOB)=' <<<"$env"; return 0 ;;
-    esac
+    if proc_environ_job_vars "/proc/$pid/environ"; then return 0; fi
   done <"/sys/fs/cgroup${1}/cgroup.procs"
 }
 
@@ -1049,8 +1081,165 @@ ms_to_secs() { # MILLISECONDS
 #               finished job left in it, their pids (space-separated) and
 #               their comms (comma-separated); JOB_LEAKED empty when the
 #               slot is busy or the cgroup cannot be read (GHR-29)
+#   JOB_REPO_FULL / JOB_WORKFLOW / JOB_RUN_ID / JOB_RUN_ATTEMPT / JOB_RUN_NUMBER
+#   / JOB_REF / JOB_SHA / JOB_ACTOR / JOB_EVENT / JOB_URL
+#               the run the job belongs to (GHR-78), from the same environment
+#               block as JOB_REPO: `owner/name`, the workflow's name, the run's
+#               id, attempt and number, the branch or tag, the commit, who
+#               triggered it, the event, and the run's page. Each empty when
+#               the block is not readable or the value does not pass
+#               job_env_facts' rules — see there
 JOB_STATE="" JOB_NAME="" JOB_REPO="" JOB_SINCE="" JOB_RUNTIME="" JOB_STALLED="" JOB_IDLE_SINCE="" JOB_DONE="" JOB_ACCESS=""
 JOB_LEAKED="" JOB_LEAKED_PIDS="" JOB_LEAKED_COMMS=""
+JOB_REPO_FULL="" JOB_ENV_NAME="" JOB_WORKFLOW="" JOB_RUN_ID="" JOB_RUN_ATTEMPT="" JOB_RUN_NUMBER=""
+JOB_REF="" JOB_SHA="" JOB_ACTOR="" JOB_EVENT="" JOB_URL=""
+
+# --- Text a job supplied (GHR-78) ---------------------------------------------
+# A workflow's name, a branch, an actor, the repository and the job id are
+# strings somebody outside this host chose, read out of a process environment
+# anything in the slot can set. Two rules keep them from being more than text:
+#
+#   * What is KEPT (JOB_*, SLOT, `status --json`) is validated by
+#     job_env_facts: a number is digits or it is nothing, a commit is hex, the
+#     URL is built only from parts that passed. Free text is kept as it came,
+#     capped, and json_str escapes it on the way out.
+#   * What is DRAWN — a table cell, a watch's status line — goes through
+#     term_safe first, on the host that read it: a control character never
+#     reaches a table, so no later hop (a `fleet` relay of this host's table)
+#     has anything to neutralise.
+#
+# Both work on BYTES under a function-local LC_ALL=C: a range like [a-z] or a
+# class like [[:cntrl:]] means what the caller's locale says it means, and a
+# check that changes with LANG is not a check.
+
+# TEXT made safe to draw, into TERM_SAFE (no subshell: a table row asks for
+# several). Removed outright, not replaced — a marker would be one more thing
+# a hostile value could aim at a column:
+#
+#   C0 controls and DEL   ESC, CR, BEL, backspace, tab… (0x01-0x1f, 0x7f)
+#   C1 controls           U+0080-U+009F as UTF-8 (0xc2 0x80-0x9f): U+009B is
+#                         CSI, the 8-bit spelling of ESC [
+#   bidi controls         U+200E/F, U+2028-U+202E, U+2066-U+2069, U+061C: an
+#                         override reorders what follows it on the line, so a
+#                         branch name could make the row read as another slot's
+#
+# Then, if what is left is not well-formed UTF-8, every byte from 0x80 up
+# becomes `?`. That is the case a raw 8-bit control (a lone 0x9b) falls in: it
+# cannot be told from half a character, and a terminal not in UTF-8 mode acts
+# on it. Well-formed text beyond ASCII — `ærlig`, an emoji in a workflow name
+# — is kept untouched.
+TERM_SAFE=""
+term_safe() { # TEXT
+  local LC_ALL=C s="${1-}"
+  s="${s//[$'\001'-$'\037'$'\177']/}"
+  s="${s//$'\xc2'[$'\x80'-$'\x9f']/}"
+  s="${s//$'\xe2\x80'[$'\x8e'$'\x8f'$'\xa8'-$'\xae']/}"
+  s="${s//$'\xe2\x81'[$'\xa6'-$'\xa9']/}"
+  s="${s//$'\xd8\x9c'/}"
+  utf8_or_ascii "$s"
+  TERM_SAFE="$UTF8_TEXT"
+}
+# TEXT, into UTF8_TEXT: as it is when it is well-formed UTF-8, otherwise with
+# every byte from 0x80 up replaced by `?`. Well-formed by shape (a lead byte
+# and its continuation bytes) — an overlong form passes, which a terminal
+# draws as a replacement character and a JSON reader accepts or refuses whole.
+UTF8_TEXT=""
+utf8_or_ascii() { # TEXT
+  local LC_ALL=C s="${1-}" t
+  UTF8_TEXT="$s"
+  [[ "$s" == *[$'\x80'-$'\xff']* ]] || return 0
+  t="${s//[$'\xf0'-$'\xf4'][$'\x80'-$'\xbf'][$'\x80'-$'\xbf'][$'\x80'-$'\xbf']/}"
+  t="${t//[$'\xe0'-$'\xef'][$'\x80'-$'\xbf'][$'\x80'-$'\xbf']/}"
+  t="${t//[$'\xc2'-$'\xdf'][$'\x80'-$'\xbf']/}"
+  [[ "$t" != *[$'\x80'-$'\xff']* ]] || UTF8_TEXT="${s//[$'\x80'-$'\xff']/?}"
+}
+# TEXT cut to N characters for a cell, the last one `…` when something went.
+clip() { # TEXT N
+  if [ "${#1}" -le "$2" ]; then printf '%s\n' "$1"; else printf '%s…\n' "${1:0:$(($2 - 1))}"; fi
+}
+
+# The run a job belongs to, from proc_job_env's KEY=VALUE lines, into JOB_REPO
+# (short, as it always was), JOB_ENV_NAME (GITHUB_JOB, the name the /proc-only
+# reader uses) and the JOB_* run facts. The first line of a variable wins.
+#
+# What is kept, and what is refused (empty, so null in --json):
+#
+#   run id / attempt / number   0 or digits with no leading zero, 15 at most —
+#                               a JSON number as written, and exact in a reader
+#                               that holds numbers as doubles
+#   sha                         40 or 64 lowercase hex digits (SHA-1, SHA-256)
+#   event                       lowercase letters and `_`, 64 at most — what
+#                               GitHub's event names are made of
+#   workflow / ref / actor      free text: kept, cut to JOB_FACT_MAX bytes on
+#                               a character boundary, and made well-formed
+#                               (utf8_or_ascii) so the JSON stays parseable
+#   url                         <server>/<owner>/<name>/actions/runs/<id>, and
+#                               /attempts/<n> when the attempt passed. Only
+#                               when the server is http:// or https://, a host
+#                               name and an optional port and NOTHING else (no
+#                               path, no user@, no space, no control byte);
+#                               the repository is two `[A-Za-z0-9_.-]` names,
+#                               neither `.` nor `..`; and the run id passed.
+#                               A `javascript:` server is no URL at all.
+#
+# JOB_REPO and JOB_ENV_NAME are left exactly as they were read: the `repo` and
+# `name` keys carried them before any of this existed.
+JOB_FACT_MAX=200
+JOB_RUN_NUM_RE='^(0|[1-9][0-9]{0,14})$'
+JOB_SERVER_RE='^https?://[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(:[0-9]{1,5})?$'
+JOB_REPO_RE='^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$'
+job_env_facts() { # ENV-LINES
+  local LC_ALL=C line k v server=""
+  local -A seen=()
+  JOB_REPO="" JOB_REPO_FULL="" JOB_ENV_NAME="" JOB_WORKFLOW="" JOB_RUN_ID="" JOB_RUN_ATTEMPT="" JOB_RUN_NUMBER=""
+  JOB_REF="" JOB_SHA="" JOB_ACTOR="" JOB_EVENT="" JOB_URL=""
+  while IFS= read -r line; do
+    [[ "$line" == GITHUB_*=* ]] || continue
+    k="${line%%=*}" v="${line#*=}"
+    [ -z "${seen[$k]:-}" ] || continue
+    seen[$k]=1
+    case "$k" in
+      GITHUB_REPOSITORY)  JOB_REPO_FULL="$v" JOB_REPO="${v##*/}" ;;
+      GITHUB_JOB)         JOB_ENV_NAME="$v" ;;
+      GITHUB_WORKFLOW)    job_fact_text "$v"; JOB_WORKFLOW="$UTF8_TEXT" ;;
+      GITHUB_REF_NAME)    job_fact_text "$v"; JOB_REF="$UTF8_TEXT" ;;
+      GITHUB_ACTOR)       job_fact_text "$v"; JOB_ACTOR="$UTF8_TEXT" ;;
+      GITHUB_RUN_ID)      [[ ! "$v" =~ $JOB_RUN_NUM_RE ]] || JOB_RUN_ID="$v" ;;
+      GITHUB_RUN_ATTEMPT) [[ ! "$v" =~ $JOB_RUN_NUM_RE ]] || JOB_RUN_ATTEMPT="$v" ;;
+      GITHUB_RUN_NUMBER)  [[ ! "$v" =~ $JOB_RUN_NUM_RE ]] || JOB_RUN_NUMBER="$v" ;;
+      GITHUB_SHA)         [[ ! "$v" =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || JOB_SHA="$v" ;;
+      GITHUB_EVENT_NAME)  [[ ! "$v" =~ ^[a-z_]{1,64}$ ]] || JOB_EVENT="$v" ;;
+      GITHUB_SERVER_URL)  [[ ! "$v" =~ $JOB_SERVER_RE ]] || server="$v" ;;
+    esac
+  done <<<"${1-}"
+  [ -n "$server" ] && [ -n "$JOB_RUN_ID" ] && [[ "$JOB_REPO_FULL" =~ $JOB_REPO_RE ]] || return 0
+  case "/$JOB_REPO_FULL/" in */./*|*/../*) return 0 ;; esac
+  JOB_URL="$server/$JOB_REPO_FULL/actions/runs/$JOB_RUN_ID${JOB_RUN_ATTEMPT:+/attempts/$JOB_RUN_ATTEMPT}"
+}
+# One free-text fact as it is kept, into UTF8_TEXT. Called under LC_ALL=C, so
+# the cut is in bytes — and where the first byte cut away was a continuation
+# byte the cut went through a character, whose head goes too.
+job_fact_text() { # TEXT
+  local v="$1" next
+  if [ "${#v}" -gt "$JOB_FACT_MAX" ]; then
+    next="${v:JOB_FACT_MAX:1}"
+    v="${v:0:JOB_FACT_MAX}"
+    if [[ "$next" == [$'\x80'-$'\xbf'] ]]; then
+      v="${v%%+([$'\x80'-$'\xbf'])}"
+      v="${v%[$'\xc0'-$'\xff']}"
+    fi
+  fi
+  utf8_or_ascii "$v"
+}
+# Whether URL is a run page this script would have built itself — for a URL
+# that arrived from another host's `status --json` and is about to be printed
+# on this terminal (`fleet watch`'s O). The same shape job_env_facts builds.
+run_url_ok() { # URL
+  local LC_ALL=C
+  [ "${#1}" -le 600 ] || return 1
+  [[ "$1" =~ ^https?://[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(:[0-9]{1,5})?/[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}/actions/runs/[0-9]{1,15}(/attempts/[0-9]{1,15})?$ ]]
+}
+
 # The JOB_LEAKED_* facts from one proc_leaked walk of CGROUP, per the
 # contract above. Only called on an idle slot.
 job_leak_check() { # CGROUP
@@ -1091,6 +1280,7 @@ job_facts() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
   local u="$1" cg="$2" lines rj ii ts env worker age=""
   JOB_STATE=none JOB_NAME="" JOB_REPO="" JOB_SINCE="" JOB_RUNTIME="" JOB_STALLED="" JOB_IDLE_SINCE="" JOB_DONE="" JOB_ACCESS=ok
   JOB_LEAKED="" JOB_LEAKED_PIDS="" JOB_LEAKED_COMMS=""
+  job_env_facts ""
   # The cgroup this picture was read from, for a caller that then has to act
   # on the processes in it (`kill`, GHR-36).
   JOB_CGROUP="$cg"
@@ -1112,8 +1302,9 @@ job_facts() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
     fi
     JOB_STATE=running
     JOB_NAME="${rj%%$'\t'*}"; ts="${rj#*$'\t'}"
-    JOB_REPO="$(proc_job_env "$cg" | grep -m1 '^GITHUB_REPOSITORY=' | cut -d= -f2- || true)"
-    JOB_REPO="${JOB_REPO##*/}"
+    # The journal names the job; the environment says whose it is and which
+    # run (GHR-78) — nothing where no step process is up to read it from.
+    job_env_facts "$(proc_job_env "$cg")"
     worker="$(proc_worker_pid "$cg")"
     if [ -n "$worker" ]; then
       age="$(proc_age "$worker")"
@@ -1135,9 +1326,8 @@ job_facts() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
   env="$(proc_job_env "$cg")"
   if [ -n "$env" ]; then
     JOB_STATE=running
-    JOB_REPO="$(grep -m1 '^GITHUB_REPOSITORY=' <<<"$env" | cut -d= -f2- || true)"
-    JOB_REPO="${JOB_REPO##*/}"
-    JOB_NAME="$(grep -m1 '^GITHUB_JOB=' <<<"$env" | cut -d= -f2- || true)"
+    job_env_facts "$env"
+    JOB_NAME="$JOB_ENV_NAME"
     job_stall_check "$age"
   elif [ -n "$worker" ]; then
     JOB_STATE=starting
@@ -1148,11 +1338,36 @@ job_facts() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
 }
 
 # The WORKING-ON cell from the JOB_* facts job_facts left behind.
-job_cell() {
+#
+# GHR-78: a running job is `repo:job (12m)`, as it always was — and, where
+# ROOM says the terminal has the columns for it, `repo:workflow / job @ref
+# (12m)`: the workflow and the branch are what tell two `build` jobs of one
+# repository apart. ROOM is the width the cell may take, 0 (the default, and
+# what every caller but the table passes) for the short form only; the long
+# form is used when it fits in ROOM and there is a workflow or a ref to add,
+# so a job with neither reads exactly as before at any width. Each of the two
+# is cut to JOB_CELL_PART characters: one long branch name must not be what
+# decides whether the row fits.
+#
+# Everything a job supplied is drawn through term_safe — the repository and
+# the job's name too, which reached this cell raw before.
+JOB_CELL_PART=40
+job_cell() { # [ROOM]
+  local repo name wf ref rest long
   case "$JOB_STATE" in
     none)         echo "—" ;;
-    running)      printf '%s%s%s%s\n' "${JOB_REPO:+$JOB_REPO:}" "${JOB_NAME:-?}" "${JOB_RUNTIME:+ ($JOB_RUNTIME)}" \
-                    "$([ "$JOB_STALLED" != true ] || echo " STALLED")" ;;
+    running)
+      term_safe "$JOB_REPO"; repo="$TERM_SAFE"
+      term_safe "$JOB_NAME"; name="${TERM_SAFE:-?}"
+      rest="${JOB_RUNTIME:+ ($JOB_RUNTIME)}"
+      [ "$JOB_STALLED" != true ] || rest+=" STALLED"
+      if [ "${1:-0}" -gt 0 ] && [ -n "$JOB_WORKFLOW$JOB_REF" ]; then
+        term_safe "$JOB_WORKFLOW"; wf="$(clip "$TERM_SAFE" "$JOB_CELL_PART")"
+        term_safe "$JOB_REF"; ref="$(clip "$TERM_SAFE" "$JOB_CELL_PART")"
+        long="${repo:+$repo:}${wf:+$wf / }$name${ref:+ @$ref}$rest"
+        if [ "${#long}" -le "$1" ]; then printf '%s\n' "$long"; return 0; fi
+      fi
+      printf '%s%s%s\n' "${repo:+$repo:}" "$name" "$rest" ;;
     idle)         printf 'idle %s (%s job%s)%s\n' "$(fmt_dur "$([ -z "$JOB_IDLE_SINCE" ] || echo $(( $(now_epoch) - JOB_IDLE_SINCE )))")" \
                     "$JOB_DONE" "$([ "$JOB_DONE" -eq 1 ] || echo s)" "$(leaked_suffix)" ;;
     idle-fresh)   echo "idle $(fmt_dur "$([ -z "$JOB_IDLE_SINCE" ] || echo $(( $(now_epoch) - JOB_IDLE_SINCE )))") (no jobs yet)$(leaked_suffix)" ;;
@@ -1766,9 +1981,18 @@ STATUS_WIDTHS=(3 40 8 19 8 9 6 6 12 6 8 7)
 # the hysteresis both watches use to put the columns back: the table has to
 # fit with this many columns to spare, or a terminal a few columns either
 # side of the threshold would flip the table on every redraw.
+#
+# STATUS_COLS (GHR-78): the width of the terminal the table is being drawn ON,
+# 0 when it is not going to one or the width is unknown. Set by the caller —
+# `status` when its stdout is a terminal, `watch` per frame — never read from
+# tput in here: render_status runs inside "$(...)" for `watch`, where stdout
+# is a pipe, and a `status` whose output is piped or fetched over ssh by a
+# `fleet` node must print the same rows whatever terminal happens to be
+# around it. With 0, WORKING-ON is the short cell (job_cell).
 STATUS_DROP=""
 STATUS_NARROW_DROP="6 7 11"
 STATUS_NARROW_MARGIN=22
+STATUS_COLS=0
 status_narrow() { # [true|false]
   if "${1:-true}"; then STATUS_DROP="$STATUS_NARROW_DROP"; else STATUS_DROP=""; fi
 }
@@ -1862,7 +2086,12 @@ status_job_color() { # JOB-STATE JOB-STALLED [LEAKED]
 #                              where the cgroup or the file is not there
 #   job_*                      the JOB_* facts of job_facts, same names
 #                              (job_leaked / job_leaked_pids / job_leaked_comms
-#                              included, GHR-29)
+#                              included, GHR-29; and the run's, GHR-78:
+#                              job_repo_full job_workflow job_run_id
+#                              job_run_attempt job_run_number job_ref job_sha
+#                              job_actor job_event job_url). The run's are
+#                              text a job supplied: validated by job_env_facts,
+#                              and to be drawn through term_safe, never raw
 declare -A SLOT=()
 collect_slot() { # UNIT IDX
   local u="$1" k v n
@@ -1908,6 +2137,9 @@ collect_slot() { # UNIT IDX
   SLOT[job_since]="$JOB_SINCE" SLOT[job_runtime]="$JOB_RUNTIME" SLOT[job_stalled]="$JOB_STALLED"
   SLOT[job_idle_since]="$JOB_IDLE_SINCE" SLOT[job_done]="$JOB_DONE" SLOT[job_access]="$JOB_ACCESS"
   SLOT[job_leaked]="$JOB_LEAKED" SLOT[job_leaked_pids]="$JOB_LEAKED_PIDS" SLOT[job_leaked_comms]="$JOB_LEAKED_COMMS"
+  SLOT[job_repo_full]="$JOB_REPO_FULL" SLOT[job_workflow]="$JOB_WORKFLOW" SLOT[job_run_id]="$JOB_RUN_ID"
+  SLOT[job_run_attempt]="$JOB_RUN_ATTEMPT" SLOT[job_run_number]="$JOB_RUN_NUMBER" SLOT[job_ref]="$JOB_REF"
+  SLOT[job_sha]="$JOB_SHA" SLOT[job_actor]="$JOB_ACTOR" SLOT[job_event]="$JOB_EVENT" SLOT[job_url]="$JOB_URL"
 }
 
 # The status table itself, printed once to stdout. `status` calls it once;
@@ -1923,7 +2155,18 @@ render_status() {
   echo "runnerctl $RUNNERCTL_VERSION — Host: $(host_line)$(host_header_suffix)"
   echo
   paint "$C_BOLD" "$(status_row IDX RUNNER PROFILE ACTIVE SINCE ENABLED MAX HIGH USED PRESS RESTART ENVFILE WORKING-ON)"
-  local i=0 u no_access=false stalled=false leaked=false
+  local i=0 u no_access=false stalled=false leaked=false w room=0
+  # GHR-78: what a terminal STATUS_COLS wide leaves for WORKING-ON beyond the
+  # FULL table — all twelve columns, whether or not this render drops three.
+  # Measured against the full table on purpose: a long cell that only fits
+  # the narrow one would be exactly the width that keeps `watch` from putting
+  # MAX, HIGH and ENVFILE back (narrow_wanted's margin), and a workflow name
+  # is not worth three columns of limits.
+  if [ "$STATUS_COLS" -gt 0 ]; then
+    room="$STATUS_COLS"
+    for w in "${STATUS_WIDTHS[@]}"; do room=$((room - w - 1)); done
+    [ "$room" -gt 0 ] || room=0
+  fi
   while read -r u; do
     [ -n "$u" ] || continue
     collect_slot "$u" "$i"
@@ -1943,7 +2186,7 @@ render_status() {
                "$(status_used_cell "${SLOT[memory_current]}" "${SLOT[memory_peak]}")")" \
       "$(paint "$(status_press_color "${SLOT[mem_pressure_full_avg10]}")" "$(status_press_cell "${SLOT[mem_pressure_full_avg10]}")")" \
       "${SLOT[restart]}" "${SLOT[env_file]:-—}" \
-      "$(paint "$(status_job_color "${SLOT[job_state]}" "${SLOT[job_stalled]}" "${SLOT[job_leaked]}")" "$(job_cell)")"
+      "$(paint "$(status_job_color "${SLOT[job_state]}" "${SLOT[job_stalled]}" "${SLOT[job_leaked]}")" "$(job_cell "$room")")"
     i=$((i+1))
   done < <(discover)
   # Once under the table, not per row, so the rows stay parseable.
@@ -2324,7 +2567,13 @@ host_events_json() {
 #   profile job idle_since jobs_completed working_on_access
 # `job` is {"repo","name","since","stalled"} while a job is in flight (repo,
 # name and since null when unknown; `stalled` true/false against STALL_SEC,
-# null when the runtime is unknown — GHR-27), null when idle or not running;
+# null when the runtime is unknown — GHR-27), null when idle or not running.
+# After those four it carries the run (GHR-78), each null when unknown:
+# `workflow`, `run_id`, `run_attempt`, `run_number`, `ref`, `sha`, `actor`,
+# `event` and `url`, the run's page —
+# <server>/<owner>/<name>/actions/runs/<run_id>[/attempts/<run_attempt>].
+# The three ids are numbers; job_env_facts says what each value has to be to
+# be reported at all, and a value that fails is null, never a best guess.
 # `idle_since` and
 # `jobs_completed` are set while the slot is idle with a readable journal
 # (`jobs_completed` 0 when nothing has finished since the unit started);
@@ -2359,7 +2608,16 @@ render_status_json() {
     collect_slot "$u" "$i"
     case "${SLOT[job_state]}" in
       running|starting)
-        job="{\"repo\":$(json_strn "${SLOT[job_repo]}"),\"name\":$(json_strn "${SLOT[job_name]}"),\"since\":$(json_num "${SLOT[job_since]}"),\"stalled\":$(json_bool "${SLOT[job_stalled]}")}" ;;
+        # GHR-78: the run's keys are APPENDED, after `stalled`. The slot line
+        # is read back by this script (fleet_slot_classify, fleet_watch_facts
+        # and the rest take the first occurrence of a key, json_line_get), so
+        # the four keys they read stay first and in their order; and every
+        # value below is either a string through json_str or a number
+        # job_env_facts already held to digits, so nothing a job supplied can
+        # close the object or start a key of its own.
+        job="{\"repo\":$(json_strn "${SLOT[job_repo]}"),\"name\":$(json_strn "${SLOT[job_name]}"),\"since\":$(json_num "${SLOT[job_since]}"),\"stalled\":$(json_bool "${SLOT[job_stalled]}")"
+        job+=",\"workflow\":$(json_strn "${SLOT[job_workflow]}"),\"run_id\":$(json_num "${SLOT[job_run_id]}"),\"run_attempt\":$(json_num "${SLOT[job_run_attempt]}"),\"run_number\":$(json_num "${SLOT[job_run_number]}")"
+        job+=",\"ref\":$(json_strn "${SLOT[job_ref]}"),\"sha\":$(json_strn "${SLOT[job_sha]}"),\"actor\":$(json_strn "${SLOT[job_actor]}"),\"event\":$(json_strn "${SLOT[job_event]}"),\"url\":$(json_strn "${SLOT[job_url]}")}" ;;
       *) job=null ;;
     esac
     case "${SLOT[job_state]}" in
@@ -2637,7 +2895,14 @@ cmd_status() { # [--json] [--watch|-w] [--once] [--interval N] [--color WHEN] [-
   else
     [ "${#args[@]}" -eq 0 ] || die "unknown option: ${args[0]}"
     ! $narrow || status_narrow
-    if $json; then render_status_json; else color_setup "$COLOR_MODE"; render_status; fi
+    if $json; then
+      render_status_json
+    else
+      color_setup "$COLOR_MODE"
+      # GHR-78: only a table going to a terminal may use its width.
+      if stdout_is_tty; then STATUS_COLS="$(term_cols)"; fi
+      render_status
+    fi
   fi
 }
 
@@ -2782,10 +3047,14 @@ WATCH_TABLE=""
 WATCH_NARROW_FORCED=false
 watch_table() {
   local now=false want=false
+  # GHR-78: the width is read once per frame, BEFORE the render, which draws
+  # the long WORKING-ON cell by it; the narrow decision below reads the same
+  # number, so the two cannot be taken on different sizes mid-resize.
+  STATUS_COLS="$(term_cols)"
   WATCH_TABLE="$(render_status)"
   ! $WATCH_NARROW_FORCED || return 0
   [ -z "$STATUS_DROP" ] || now=true
-  if narrow_wanted "$now" "$(watch_table_width "$WATCH_TABLE")" "$(term_cols)"; then want=true; fi
+  if narrow_wanted "$now" "$(watch_table_width "$WATCH_TABLE")" "$STATUS_COLS"; then want=true; fi
   [ "$now" != "$want" ] || return 0
   status_narrow "$want"
   WATCH_TABLE="$(render_status)"
@@ -3087,6 +3356,22 @@ watch_key_action() { # KEY UNIT
       else
         WATCH_NOTICE="$short: no leaked processes shown — nothing to reap"
       fi ;;
+    O)
+      # GHR-78: the run's page, PRINTED — the node this runs on is usually a
+      # terminal with no browser, and a key that launched one would be a key
+      # that runs a program on a string a job supplied. job_env_facts built
+      # the URL from validated parts or not at all.
+      WATCH_NOTICE="$short: $(run_url_notice "${SLOT[job_state]}" "${SLOT[job_url]}")" ;;
+  esac
+}
+# What O says about a slot: the run's URL, or why there is none to print.
+RUN_URL_UNKNOWN="a job is running, but its run URL is not known — it is read from a step's environment, which is not there between steps or for a container job, and needs access to the slot's processes"
+run_url_notice() { # JOB-STATE URL
+  case "$1" in
+    running|starting)
+      if [ -n "$2" ]; then printf '%s\n' "$2"; else printf '%s\n' "$RUN_URL_UNKNOWN"; fi ;;
+    no-access) echo "cannot tell whether a job is running — needs journal read access (systemd-journal group) or root" ;;
+    *)         echo "no job running — no run URL to print" ;;
   esac
 }
 # The confirmed action. Runs outside any `read`, so the terminal is in its
@@ -3151,7 +3436,7 @@ watch_handle_key() { # KEY UNITS...
       [ "$i" -lt "$n" ] || i=$((n - 1))
       [ "$i" -ge 0 ] || i=0
       WATCH_CURSOR="${units[$i]}" ;;
-    K|R|S|T|P|L) watch_key_action "$key" "$WATCH_CURSOR" ;;
+    K|R|S|T|P|L|O) watch_key_action "$key" "$WATCH_CURSOR" ;;
   esac
   return 0
 }
@@ -6060,6 +6345,51 @@ fleet_watch_facts() { # HOST NAME
       [[ ! "$since" =~ ^[0-9]+$ ]] || FF[job_cell]+=" ($(fmt_dur $(($(now_epoch) - since))))"
       [ "$stalled" != true ] || FF[job_cell]+=" STALLED"
     fi
+    # GHR-78: text a job supplied, about to be drawn in a confirm line here.
+    # json_str on the host already escaped every control character; what it
+    # passes through verbatim (a bidi override) is taken out on this side.
+    term_safe "${FF[job_cell]}"; FF[job_cell]="$TERM_SAFE"
+  fi
+}
+
+# GHR-78: what O prints for NAME on HOST — the run's URL, or why there is
+# none — from the `status --json` payload the last tick ALREADY brought
+# (FW_STATE), not from a fresh read like the action keys make. Two reasons:
+# the URL wanted is the one of the job the row on screen shows, and that
+# payload is the tick the row came from, where a read at the keypress can
+# answer for the job that started since; and printing a line is not worth
+# holding the key for a round trip to a host that may be slow — the frame of a
+# host that stopped answering keeps its rows, and its last payload with them.
+#
+# The URL crossed a hop, so it is checked again here (run_url_ok) before it is
+# printed: this node does not print a string as a link on another host's word.
+fleet_watch_run_url() { # HOST NAME
+  local i at="" line job=null
+  for i in "${!FLEET_HOSTS[@]}"; do
+    if [ "${FLEET_HOSTS[$i]}" = "$1" ]; then at="$i"; break; fi
+  done
+  if [ -z "$at" ] || [ ! -s "$FW_STATE/$at.json" ]; then
+    echo "no facts from that host yet — its 'status --json' has not answered"
+    return 0
+  fi
+  line="$(grep -F -m1 ",\"name\":$(json_str "$2"),\"active\":" "$FW_STATE/$at.json" || true)"
+  if [ -z "$line" ]; then echo "not in that host's last answer — no run URL to print"; return 0; fi
+  [[ ! "$line" =~ \"job\":(.*),\"idle_since\": ]] || job="${BASH_REMATCH[1]}"
+  if [ "$job" = null ]; then
+    json_line_get "$line" working_on_access
+    if [ "$JF" = no-access ]; then run_url_notice no-access ""; else run_url_notice idle ""; fi
+    return 0
+  fi
+  if [[ "$job" != *'"url":'* ]]; then
+    echo "a job is running, but that host's runnerctl does not report run URLs — 'runnerctl fleet upgrade' brings it up to date"
+    return 0
+  fi
+  json_line_get "$job" url
+  if ! $JF_SET; then run_url_notice running ""; return 0; fi
+  if run_url_ok "$JF"; then
+    printf '%s\n' "$JF"
+  else
+    echo "that host reported a run URL this node will not print — it is not a run page's address"
   fi
 }
 
@@ -6125,6 +6455,10 @@ fleet_watch_key_action() { # KEY
     term_cursor show
     page <"$FW_TMP/logs"
     term_cursor hide
+    return 0
+  fi
+  if [ "$1" = O ]; then
+    FW_NOTICE="$lbl: $(fleet_watch_run_url "$host" "$name")"
     return 0
   fi
   fleet_watch_facts "$host" "$name" || return 0
@@ -6274,7 +6608,7 @@ FW_KIND=()
 declare -A FW_FACT=() FW_HOSTBAD=() FW_HOSTSUM=() FW_OPEN=()
 FLEET_WATCH_EMPTY="nothing matches — a shows all"
 FLEET_WATCH_VIEW_LEGEND="$WATCH_LEGEND  a all  ? keys"
-# Thirteen lines, so that with the header, the summary and the three lines
+# Fourteen lines, so that with the header, the summary and the three lines
 # under it the list fits a terminal of 24 rows; none is wider than 80 columns.
 FLEET_WATCH_HELP="fleet watch — keys
   ↑ ↓ j k   PgUp PgDn   g G Home End   move the cursor: a row, a page, the ends
@@ -6286,6 +6620,7 @@ FLEET_WATCH_HELP="fleet watch — keys
   s     order: config → longest job first → most memory first
   c     one line per host; on a host, c or Enter opens it and c closes it
   K R S T P L   kill job, restart, stop, start, reap, logs: the cursor's slot
+  O     print the run URL of the cursor's job — nothing is opened
   ?     this list
   q     quit
 ! b i / a s c ask no host anything, and the summary counts the whole fleet."
@@ -6594,7 +6929,7 @@ fleet_watch_handle_key() { # KEY
     down|j) [ "$FW_POS" -lt 0 ] || [ "$FW_POS" -ge $((n - 1)) ] || fleet_watch_select $((FW_POS + 1)) ;;
     up|k)   [ "$FW_POS" -le 0 ] || fleet_watch_select $((FW_POS - 1)) ;;
     pgdn|pgup|g|G|home|end) fleet_watch_page "$1" ;;
-    K|R|S|T|P|L) fleet_watch_key_action "$1" ;;
+    K|R|S|T|P|L|O) fleet_watch_key_action "$1" ;;
     '!') FW_FILTER=problems ;;
     b)   FW_FILTER=busy ;;
     i)   FW_FILTER=idle ;;
