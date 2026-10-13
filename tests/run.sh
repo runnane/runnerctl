@@ -102,7 +102,7 @@ XFAIL_KEYS=""  # issue keys of the xfail cases that failed as expected
 RUN_TIMEOUT="${RUN_TIMEOUT:-30}"
 
 run() {
-  : >"$LOG"; rm -f "$LOG.cols"
+  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines"
   rm -rf "$WRITES"; mkdir -p "$WRITES"
   RC=0
   OUT="$(RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
@@ -114,7 +114,7 @@ run() {
 # that seeds the writes-mirror tree with seed_dropin before running a
 # read-only command that reads it back (status's PROFILE column).
 run_keep() {
-  : >"$LOG"; rm -f "$LOG.cols"
+  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines"
   RC=0
   OUT="$(RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
          timeout "$RUN_TIMEOUT" "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
@@ -138,7 +138,7 @@ seed_dropin() {
 # define its functions and return instead of running main, so nothing is
 # sourced from a config and nothing touches the host.
 run_fn() {
-  : >"$LOG"; rm -f "$LOG.cols"
+  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines"
   RC=0
   OUT="$(RUNNERCTL_NO_MAIN=1 bash -c '. "$0" && "$@"' "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
   ERR="$(cat "$TMP/err")"
@@ -157,7 +157,7 @@ save_config() { # PATH   (further config body on stdin)
 
 run_cfg() { # CONFIG-PATH ARGS...
   local cfg="$1"; shift
-  : >"$LOG"; rm -f "$LOG.cols"
+  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines"
   rm -rf "$WRITES"; mkdir -p "$WRITES"
   RC=0
   OUT="$(RUNNERCTL_CONFIG="$cfg" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
@@ -171,7 +171,7 @@ run_cfg() { # CONFIG-PATH ARGS...
 # config file IS the stub and therefore always exists, and a run with no
 # config at all dies at require_runners long before the save.
 run_snippet() { # CONFIG-PATH SNIPPET
-  : >"$LOG"; rm -f "$LOG.cols"
+  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines"
   RC=0
   # shellcheck disable=SC2016  # the child expands $1/$2/$3, not this shell
   OUT="$(RUNNERCTL_NO_MAIN=1 RUNNERCTL_CONFIG="$1" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
@@ -5602,6 +5602,532 @@ case_fleet_watch_summary_sits_under_the_header() {
   expect_under_header '1/2 hosts answering · 3 slots: 1 busy, 1 idle, 1 disabled · capacity 1 free of 2' 1
 }
 
+# --- GHR-73: a frame that fits the terminal -----------------------------------
+# The stub pins the height (RUNNERCTL_STUB_LINES, 0 = unknown) and can grow the
+# pool (RUNNERCTL_STUB_SLOTS) so a frame is taller than it. Nine slots make the
+# local watch's frame 16 lines: the header, the version/host line, a blank,
+# the column header, nine rows, a blank, the legend and the status line. Seven
+# of those are chrome, so a terminal of H rows has a window of H - 7.
+#
+# `frames` splits OUT on the home+clear prefix: FRAMES[1] is the first frame.
+# A FITTED frame is written without a final newline, so its text is exactly
+# its lines, and a frame drawn whole (unknown height, or a terminal too small
+# to fit to) counts ONE MORE than it has, for the newline it ends in — which
+# is how these cases tell the two apart. Never count a run's LAST frame:
+# "$(...)" strips the newlines it ends in, and an empty status line is one of
+# them. Every run below ends `-q` for that reason: the tick draws a frame
+# nobody asserts on.
+FRAMES=()
+frames() {
+  local rest="$OUT" sep=$'\033[H\033[2J'
+  FRAMES=("${rest%%"$sep"*}")
+  [[ "$rest" == *"$sep"* ]] || return 0
+  rest="${rest#*"$sep"}"
+  while [[ "$rest" == *"$sep"* ]]; do
+    FRAMES+=("${rest%%"$sep"*}")
+    rest="${rest#*"$sep"}"
+  done
+  FRAMES+=("$rest")
+}
+# How many frames the run drew. Not `expect_out_count "$FRAME_PREFIX"`: that
+# pattern is anchored to a line start, and a fitted frame's status line has no
+# newline between it and the next frame's prefix.
+expect_frame_count() { # COUNT
+  _expect
+  [ $((${#FRAMES[@]} - 1)) -eq "$1" ] || FAILS+=("frames drawn: want $1, got $((${#FRAMES[@]} - 1))")
+}
+expect_frame_lines() { # N COUNT
+  _expect
+  local nl="${FRAMES[$1]-}" n
+  nl="${nl//[!$'\n']/}"
+  n=$((${#nl} + 1))
+  [ "$n" -eq "$2" ] || FAILS+=("frame $1: want $2 lines, got $n")
+}
+expect_frame() { # N PATTERN
+  _expect
+  grep -Eq -- "$2" <<<"${FRAMES[$1]-}" || FAILS+=("frame $1 has no line matching /$2/")
+}
+expect_no_frame() { # N PATTERN
+  _expect
+  ! grep -Eq -- "$2" <<<"${FRAMES[$1]-}" || FAILS+=("frame $1 has a line matching /$2/")
+}
+# Line L of frame N against PATTERN: where a line is, not only that it exists.
+expect_frame_line() { # N L PATTERN
+  _expect
+  local got
+  got="$(sed -n "${2}p" <<<"${FRAMES[$1]-}")"
+  grep -Eq -- "$3" <<<"$got" || FAILS+=("frame $1 line $2: want /$3/, got '$got'")
+}
+# Two texts, byte for byte. The report shows the first differing lines with
+# the escape sequences made visible.
+expect_text() { # LABEL WANT GOT
+  _expect
+  [ "$2" = "$3" ] || FAILS+=("$1 differs from the pinned text: $(diff <(cat -v <<<"$2") <(cat -v <<<"$3") | head -n 14; true)")
+}
+# TABLE with the line matching PATTERN in reverse video — the cursor row as
+# the watches draw it where no cell in it is painted.
+with_cursor() { # TABLE PATTERN
+  local line
+  while IFS= read -r line; do
+    if [[ "$line" =~ $2 ]]; then printf '%s%s%s\n' "${ESC}[7m" "$line" "${ESC}[0m"; else printf '%s\n' "$line"; fi
+  done <<<"$1"
+}
+# OUT with the clock in every watch header replaced, so two frames a second
+# apart compare equal.
+out_without_clock() {
+  sed -E 's/^(.*runnerctl (fleet )?watch — .* — )[0-9]{2}:[0-9]{2}:[0-9]{2}( — every )/\1TIME\3/' <<<"$OUT"
+}
+# The two marker lines, whole: a count of hidden lines and the keys that page.
+up_mark() { echo "^↑ $1 more  PgUp/g\$"; }
+down_mark() { echo "^↓ $1 more  PgDn/G\$"; }
+w_row() { echo "^$1 +example\.slot-$2 "; }
+
+# Height 0 is "unknown", and unknown must be the frame of before, byte for
+# byte. The expected text is PINNED here — prefix, header, blank line, legend,
+# status line and the newline each frame ends in — around a table taken from
+# the one-shot `status`, which never goes near the viewport. Two frames, not
+# one: the newline that ends a frame is only observable where another frame
+# follows it.
+case_watch_unknown_height_draws_the_frame_of_before() {
+  local table want sep=$'\033[H\033[2J' legend="${LEGEND#^}" hdr
+  legend="${legend%\$}"
+  hdr="runnerctl watch — ${HOSTNAME:-$(uname -n)} — TIME — every 1s (Ctrl-C to quit)"
+  run status
+  expect_rc 0
+  table="$OUT"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jq' run watch --interval 1
+  expect_rc 0
+  want="$(printf '%s%s\n%s\n\n%s\n\n%s%s\n%s\n\n%s' \
+    "$sep" "$hdr" "$(with_cursor "$table" '^0 +example')" "$legend" \
+    "$sep" "$hdr" "$(with_cursor "$table" '^1 +example')" "$legend")"
+  expect_text "watch at unknown height" "$want" "$(out_without_clock)"
+  # the height was asked for (the frame went through the viewport) and the
+  # width, which only a known height needs, was asked for by watch_table alone
+  expect_cfg "$LOG.lines" '^2$'
+  expect_cfg "$LOG.cols" '^2$'
+}
+
+case_fleet_watch_unknown_height_draws_the_frame_of_before() {
+  local table want sep=$'\033[H\033[2J' legend="${FLEET_WATCH_LEGEND#^}" hdr
+  legend="${legend%\$}"
+  hdr="runnerctl fleet watch — 2 host(s) — TIME — every 4s (q to quit)"
+  RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet status --color never
+  expect_rc 0
+  expect_last_line "$SUM_OK"
+  table="${OUT%$'\n'*}"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never --interval 4
+  expect_rc 0
+  want="$(printf '%s%s\n%s\n%s\n\n%s\n\n%s%s\n%s\n%s\n\n%s' \
+    "$sep" "$hdr" "$SUM_OK" "$(with_cursor "$table" '^build-1 +0 +example')" "$legend" \
+    "$sep" "$hdr" "$SUM_OK" "$(with_cursor "$table" '^build-1 +1 +example')" "$legend")"
+  expect_text "fleet watch at unknown height" "$want" "$(out_without_clock)"
+}
+
+# The acceptance case: a 16-line frame on an 11-row terminal is exactly 11
+# lines, and what is cut is the middle. Line by line — header, version/host
+# line, blank, column header, the window with the cursor row in it, the count
+# of what is hidden, blank, legend, status line. K and n put a confirm and
+# then a notice on the status line, which stays the LAST line of the frame.
+case_watch_tall_frame_is_cut_to_the_terminal_height() {
+  local f
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_SLOTS=9 RUNNERCTL_STUB_LINES=11 RUNNERCTL_STUB_KEYS='Kn-q' \
+    run watch --interval 1
+  expect_rc 0
+  frames
+  expect_frame_count 4
+  for f in 1 2 3; do
+    expect_frame_lines "$f" 11
+    expect_frame_line "$f" 1 '^runnerctl watch — [^ ]+ — [0-9]{2}:[0-9]{2}:[0-9]{2} — every 1s \(Ctrl-C to quit\)$'
+    expect_frame_line "$f" 2 '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: '
+    expect_frame_line "$f" 3 '^$'
+    expect_frame_line "$f" 4 '^IDX +RUNNER +PROFILE .* WORKING-ON$'
+    expect_frame_line "$f" 5 "$(cursor_row 0 1)"
+    expect_frame_line "$f" 6 "$(w_row 1 2)"
+    expect_frame_line "$f" 7 "$(w_row 2 3)"
+    expect_frame_line "$f" 8 "$(down_mark 6)"
+    expect_frame_line "$f" 9 '^$'
+    expect_frame_line "$f" 10 "$LEGEND"
+    expect_no_frame "$f" 'example\.slot-[4-9]'
+    expect_no_frame "$f" '^↑ [0-9]'
+  done
+  expect_frame_line 1 11 '^$'
+  expect_frame_line 2 11 "^Kill the job on example\.slot-1 \(.*\)\? .*runs: systemctl kill -s KILL $SLOT1_UNIT  \[y/n\]$"
+  expect_frame_line 3 11 '^cancelled — nothing run$'
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+}
+
+# Every frame of a run: exactly HEIGHT lines, one cursor row, and the rows on
+# screen plus the two counts add up to the pool — a marker that is off by one
+# cannot hide behind a frame that happens to be the right length.
+_ghr73_every_frame_accounts_for_the_pool() { # FRAMES HEIGHT POOL
+  local f shown up down
+  for ((f = 1; f <= $1; f++)); do
+    expect_frame_lines "$f" "$2"
+    _expect
+    shown="$(grep -Ec 'example\.slot-[0-9]' <<<"${FRAMES[$f]-}"; true)"
+    up="$(sed -n -E 's/^↑ ([0-9]+) more .*/\1/p' <<<"${FRAMES[$f]-}")"
+    down="$(sed -n -E 's/^↓ ([0-9]+) more .*/\1/p' <<<"${FRAMES[$f]-}")"
+    [ $((shown + ${up:-0} + ${down:-0})) -eq "$3" ] \
+      || FAILS+=("frame $f: $shown rows shown + ${up:-0} above + ${down:-0} below is not the pool of $3")
+    _expect
+    [ "$(grep -c "^${ESC}\[7m" <<<"${FRAMES[$f]-}"; true)" -eq 1 ] || FAILS+=("frame $f: not exactly one cursor row")
+  done
+}
+
+# The window follows the cursor. Three j's on a window of three rows: the
+# first two stay inside it and nothing moves; the third crosses the bottom
+# edge and the window scrolls by exactly as much as brings the row back, the
+# counts saying what went where. Then the paging keys: G and g, PgDn twice
+# and PgUp (a window less one line), and End / Home as their sequences.
+case_watch_window_scrolls_with_the_cursor() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_SLOTS=9 RUNNERCTL_STUB_LINES=11 \
+    RUNNERCTL_STUB_KEYS=$'jjjGg\e[6~\e[6~\e[5~\e[F\e[1~-q' run watch
+  expect_rc 0
+  frames
+  expect_frame_count 12
+  _ghr73_every_frame_accounts_for_the_pool 11 11 9
+  # j, j: inside the window
+  expect_frame_line 3 7 "$(cursor_row 2 3)"
+  expect_frame_line 3 8 "$(down_mark 6)"
+  expect_no_frame 3 '^↑ [0-9]'
+  # j: past the bottom edge — slot-1 and slot-2 go above, slot-4 comes in
+  expect_frame_line 4 5 "$(up_mark 2)"
+  expect_frame_line 4 6 "$(w_row 2 3)"
+  expect_frame_line 4 7 "$(cursor_row 3 4)"
+  expect_frame_line 4 8 "$(down_mark 5)"
+  # G: the last slot, nothing under it
+  expect_frame_line 5 5 "$(up_mark 6)"
+  expect_frame_line 5 6 "$(w_row 6 7)"
+  expect_frame_line 5 7 "$(w_row 7 8)"
+  expect_frame_line 5 8 "$(cursor_row 8 9)"
+  expect_no_frame 5 '^↓ [0-9]'
+  # g: back to the first, nothing above it
+  expect_frame_line 6 5 "$(cursor_row 0 1)"
+  expect_frame_line 6 8 "$(down_mark 6)"
+  expect_no_frame 6 '^↑ [0-9]'
+  # PgDn: two rows down (a window of three, less one) — still on screen
+  expect_frame_line 7 7 "$(cursor_row 2 3)"
+  expect_no_frame 7 '^↑ [0-9]'
+  # PgDn again: slot-5, and the window has to move
+  expect_frame_line 8 5 "$(up_mark 3)"
+  expect_frame_line 8 6 "$(w_row 3 4)"
+  expect_frame_line 8 7 "$(cursor_row 4 5)"
+  expect_frame_line 8 8 "$(down_mark 4)"
+  # PgUp: the window is two rows now, so one row up; nothing scrolls
+  expect_frame_line 9 5 "$(up_mark 3)"
+  expect_frame_line 9 6 "$(cursor_row 3 4)"
+  expect_frame_line 9 8 "$(down_mark 4)"
+  # End (ESC [ F) and Home (ESC [ 1 ~)
+  expect_frame_line 10 8 "$(cursor_row 8 9)"
+  expect_frame_line 11 5 "$(cursor_row 0 1)"
+  # the `~` that ends a numbered sequence was read with it, not as a key
+  expect_no_log '^probe:tty_read_char 2 \\~$'
+  expect_log_count '^probe:tty_read_char 0\.05 \\~$' 4
+}
+
+# The notes under the table are below the last row, where the cursor cannot
+# go — so the last row brings them into view, in both watches. TWO notes
+# (STALLED and +N leaked), deliberately: a single trailing line is drawn in
+# the row its `↓ 1 more` would have taken whether or not anything asked for
+# it, so one note would be on screen with this wiring deleted.
+case_watch_last_row_shows_the_notes_under_the_table() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 RUNNERCTL_STUB_SLOTS=9 \
+    RUNNERCTL_STUB_LINES=11 RUNNERCTL_STUB_KEYS='G-q' run watch --stall-after 600
+  expect_rc 0
+  frames
+  expect_frame_count 3
+  # the top of the table says how much is under it: nine rows and two notes
+  expect_frame_line 1 8 "$(down_mark 8)"
+  expect_frame_lines 2 11
+  expect_frame_line 2 5 "$(up_mark 8)"
+  expect_frame_line 2 6 "$(cursor_row 8 9)"
+  expect_frame_line 2 7 '^note: STALLED = '
+  expect_frame_line 2 8 '^note: \+N leaked = '
+  expect_frame_line 2 10 "$LEGEND"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 RUNNERCTL_STUB_LINES=10 \
+    RUNNERCTL_STUB_KEYS='G-q' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never --stall-after 600
+  expect_rc 0
+  frames
+  expect_frame_count 3
+  expect_frame_lines 2 10
+  expect_frame_line 2 4 "$(up_mark 7)"
+  expect_frame_line 2 5 "$(fw_row build-2 2 3)"
+  expect_frame_line 2 6 '^note: '
+  expect_frame_line 2 7 '^note: '
+  expect_frame_line 2 9 "$FLEET_WATCH_LEGEND"
+}
+
+# Heights around the frame's own 16 lines, one run each — a frame exactly as
+# tall as the window is the size that hides an off-by-one, so the sizes on
+# either side of each boundary are pinned too.
+#   10  the smallest fitted: a window of 3 is two rows and a count
+#    9  a window of 2 is under the minimum: drawn whole, as for unknown
+#   15  one short: seven rows and `↓ 2 more`
+#   16  fits exactly: everything, no marker, and NO final newline — on the
+#       last row a newline would scroll the header off
+#   17  room to spare: the same 16 lines, not padded
+case_watch_heights_around_the_frame() {
+  local h small
+  _ghr73_at() { RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_SLOTS=9 RUNNERCTL_STUB_LINES="$1" RUNNERCTL_STUB_KEYS='-q' run watch; frames; }
+  _ghr73_at 10
+  expect_frame_lines 1 10
+  expect_frame_line 1 5 "$(cursor_row 0 1)"
+  expect_frame_line 1 6 "$(w_row 1 2)"
+  expect_frame_line 1 7 "$(down_mark 7)"
+  _ghr73_at 15
+  expect_frame_lines 1 15
+  expect_frame_line 1 11 "$(w_row 6 7)"
+  expect_frame_line 1 12 "$(down_mark 2)"
+  expect_frame_line 1 14 "$LEGEND"
+  for h in 16 17; do
+    _ghr73_at "$h"
+    expect_frame_lines 1 16
+    expect_frame_line 1 13 "$(w_row 8 9)"
+    expect_frame_line 1 15 "$LEGEND"
+    expect_no_frame 1 '^[↑↓] [0-9]+ more'
+  done
+  # too small to fit to: the whole frame and its newline, exactly what an
+  # unknown height draws — compared with that run, and pinned by its shape
+  _ghr73_at 9
+  small="$(out_without_clock)"
+  expect_frame_lines 1 17
+  expect_frame_line 1 13 "$(w_row 8 9)"
+  expect_no_frame 1 '^[↑↓] [0-9]+ more'
+  _ghr73_at 0
+  expect_frame_lines 1 17
+  expect_text "watch on a 9-row terminal" "$(out_without_clock)" "$small"
+}
+
+# A resize while the loop waits for a key redraws AT ONCE: the stub's `%`
+# sends this process a real SIGWINCH from inside the key read, where the trap
+# is armed. The second frame is the first one's table cut for the new height
+# — no tick passed, no key was read and nothing was fetched again — and the
+# cursor is still restored once, on the way out.
+case_watch_resize_redraws_the_frame_in_hand() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_SLOTS=9 RUNNERCTL_STUB_LINES=11,15 RUNNERCTL_STUB_KEYS='%-q' run watch
+  expect_rc 0
+  frames
+  expect_frame_count 3
+  expect_frame_lines 1 11
+  expect_frame_line 1 8 "$(down_mark 6)"
+  expect_frame_lines 2 15
+  expect_frame_line 2 12 "$(down_mark 2)"
+  expect_frame_line 2 5 "$(cursor_row 0 1)"
+  expect_log_order '^probe:term_cursor hide$' '^probe:winch$' '^probe:pause 2$' '^probe:tty_read_char 2 q$' '^probe:term_cursor show$'
+  expect_log_count '^probe:winch$' 1
+  expect_log_count '^probe:pause ' 1
+  expect_log_count '^probe:term_cursor ' 2
+  # two fetches of nine slots: the first frame and the tick, not the resize
+  expect_log_count '^probe:unit_props ' 18
+}
+
+# --iterations is the headless path and does not come through the viewport:
+# a pinned height is never even asked for, and every row is drawn.
+case_watch_iterations_ignores_the_height() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_SLOTS=9 RUNNERCTL_STUB_LINES=5 run watch --iterations 2
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 2
+  expect_out_count '^[0-9] +example\.slot-[1-9] ' 18
+  expect_no_out '^[↑↓] [0-9]+ more'
+  expect_no_path "$LOG.lines"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_LINES=5 RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --iterations 2 --color never
+  expect_rc 0
+  expect_out_count '^build-[12] +[0-9] +example\.slot-[1-3] ' 12
+  expect_under_header "$SUM_OK" 2
+  expect_no_out '^[↑↓] [0-9]+ more'
+  expect_no_path "$LOG.lines"
+}
+
+# `fleet watch`, two hosts of three slots on a 10-row terminal: the 14-line
+# frame is 10, with the header, the SUMMARY LINE directly under it (GHR-72 —
+# fixed chrome here, not a table line that can scroll away) and the column
+# header on top, and the legend and status line at the bottom. The window is
+# over frame lines, so the counts include the hosts' Disk lines. A host line
+# comes into view WITH its host's first slot: by itself going down (frame 4),
+# and going up because the window gives a row to it (frame 7: k k from
+# build-2's last slot leaves the cursor inside the window, which moves anyway).
+case_fleet_watch_tall_frame_is_cut_and_scrolls() {
+  local f
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_LINES=10 RUNNERCTL_STUB_KEYS=$'jjjGkkkg\e[6~\e[5~-q' \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_under_header "$SUM_OK" 12
+  frames
+  expect_frame_count 12
+  for f in 1 2 3 4 5 6 7 8 9 10 11; do
+    expect_frame_lines "$f" 10
+    expect_frame_line "$f" 1 '^runnerctl fleet watch — 2 host\(s\) — [0-9]{2}:[0-9]{2}:[0-9]{2} — every 5s \(q to quit\)$'
+    expect_frame_line "$f" 2 "^${SUM_OK}\$"
+    expect_frame_line "$f" 3 '^HOST +IDX +RUNNER +PROFILE .* WORKING-ON$'
+    expect_frame_line "$f" 8 '^$'
+    expect_frame_line "$f" 9 "$FLEET_WATCH_LEGEND"
+    expect_frame_line "$f" 10 '^$'
+    _expect
+    [ "$(grep -c "^${ESC}\[7m" <<<"${FRAMES[$f]}"; true)" -eq 1 ] || FAILS+=("frame $f: not exactly one cursor row")
+  done
+  # the top: build-1's host line, its first two slots, five lines below
+  expect_frame_line 1 4 '^build-1 +Disk: '
+  expect_frame_line 1 5 "$(fw_row build-1 0 1)"
+  expect_frame_line 1 6 '^build-1 +1 +example\.slot-2 '
+  expect_frame_line 1 7 "$(down_mark 5)"
+  # j j: build-1's last slot crosses the edge
+  expect_frame_line 3 4 "$(up_mark 2)"
+  expect_frame_line 3 6 "$(fw_row build-1 2 3)"
+  expect_frame_line 3 7 "$(down_mark 4)"
+  # j: build-2's first slot, under its own host line
+  expect_frame_line 4 4 "$(up_mark 4)"
+  expect_frame_line 4 5 '^build-2 +Disk: '
+  expect_frame_line 4 6 "$(fw_row build-2 0 1)"
+  expect_frame_line 4 7 "$(down_mark 2)"
+  # G: the last row of the fleet, nothing under it
+  expect_frame_line 5 4 "$(up_mark 5)"
+  expect_frame_line 5 7 "$(fw_row build-2 2 3)"
+  expect_no_frame 5 '^↓ [0-9]'
+  # k: inside the window, nothing moves
+  expect_frame_line 6 4 "$(up_mark 5)"
+  expect_frame_line 6 6 "$(fw_row build-2 1 2)"
+  # k: build-2's first slot was already on screen — its host line joins it
+  expect_frame_line 7 4 "$(up_mark 4)"
+  expect_frame_line 7 5 '^build-2 +Disk: '
+  expect_frame_line 7 6 "$(fw_row build-2 0 1)"
+  expect_frame_line 7 7 "$(down_mark 2)"
+  # k: up over the host line, onto build-1's last slot
+  expect_frame_line 8 4 "$(up_mark 3)"
+  expect_frame_line 8 5 "$(fw_row build-1 2 3)"
+  expect_frame_line 8 6 '^build-2 +Disk: '
+  expect_frame_line 8 7 "$(down_mark 3)"
+  # g: the first row, and build-1's host line above it
+  expect_frame_line 9 4 '^build-1 +Disk: '
+  expect_frame_line 9 5 "$(fw_row build-1 0 1)"
+  expect_no_frame 9 '^↑ [0-9]'
+  # PgDn: a window of three lines less one — build-1's last slot
+  expect_frame_line 10 4 "$(up_mark 2)"
+  expect_frame_line 10 6 "$(fw_row build-1 2 3)"
+  # PgUp: the window is two lines now, so one row up
+  expect_frame_line 11 5 "$(fw_row build-1 1 2)"
+  expect_frame_line 11 7 "$(down_mark 4)"
+  # every one of those frames off the first fan-out; the tick is the second
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 2
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 2
+}
+
+# viewport_frame itself, on frames the stub cannot produce. Each expected
+# frame is the whole text, pinned.
+#   * A line longer than the terminal is the ROWS it wraps to: a 25-character
+#     status line on 10 columns is three rows, so the window is two rows
+#     smaller than the line count says and the frame is 10 lines on 12 rows.
+#   * Rows that cannot be used — the next line needs three, one is left — are
+#     blank lines above the legend, so it stays on the terminal's last rows.
+#   * The cursor on the LAST row brings the notes under it into view (TAIL);
+#     on any other row the window stops at the cursor.
+#   * A cursor line taller than the window, or no room for a window at all:
+#     not fitted, the frame comes back whole.
+_ghr73_frame() { # HEIGHT COLS BODY STATUS CURSOR LEAD TAIL
+  run_snippet "$STUB" "VIEW_TOP=${8:-0}; viewport_frame $1 $2 HEAD $(printf %q "$3") $(printf %q $'\nLEGEND\n'"$4") $5 $6 $7; printf '%s\n[%s %s %s]\n' \"\$VIEW_OUT\" \"\$VIEW_FITTED\" \"\$VIEW_PAGE\" \"\$VIEW_TOP\""
+}
+case_viewport_frame_counts_rows_not_lines() {
+  local body=$'IDX X\n0 a\n1 b\n2 c\n3 d\n4 e\n5 f\n6 g\n7 h\n8 i\n9 j' long=xxxxxxxxxxxxxxxxxxxxxxxxx
+  _ghr73_frame 12 10 "$body" "$long" 2 2 2
+  expect_rc 0
+  expect_text "a wrapped status line" $'HEAD\nIDX X\n0 a\n1 b\n2 c\n3 d\n↓ 6 more  PgDn/G\n\nLEGEND\n'"$long"$'\n[true 4 1]' "$OUT"
+  # the same frame with the width unknown: every line is one row
+  _ghr73_frame 12 0 "$body" "$long" 2 2 2
+  expect_text "width unknown" $'HEAD\nIDX X\n0 a\n1 b\n2 c\n3 d\n4 e\n5 f\n↓ 4 more  PgDn/G\n\nLEGEND\n'"$long"$'\n[true 6 1]' "$OUT"
+  # a three-row line that does not fit in the two rows left: one padding line
+  _ghr73_frame 9 10 $'IDX X\n0 a\n1 b\n2 '"$long"$'\n3 d\n4 e' st 2 2 2
+  expect_text "padding above the legend" $'HEAD\nIDX X\n0 a\n1 b\n↓ 3 more  PgDn/G\n\n\nLEGEND\nst\n[true 2 1]' "$OUT"
+}
+case_viewport_frame_brings_the_notes_in_with_the_last_row() {
+  local body=$'IDX X\n0 a\n1 b\n2 c\n3 d\n4 e\n5 f\nnote: one\nnote: two'
+  _ghr73_frame 9 0 "$body" st 7 7 1000000
+  expect_rc 0
+  expect_text "the last row and its notes" $'HEAD\nIDX X\n↑ 5 more  PgUp/g\n5 f\nnote: one\nnote: two\n\nLEGEND\nst\n[true 3 6]' "$OUT"
+  # the benign twin, pinned so the case above keeps meaning something: the
+  # same cursor line WITHOUT a tail stops at the cursor and leaves the notes
+  _ghr73_frame 9 0 "$body" st 7 7 7
+  expect_text "the same row with no tail" $'HEAD\nIDX X\n↑ 4 more  PgUp/g\n4 e\n5 f\n↓ 2 more  PgDn/G\n\nLEGEND\nst\n[true 2 5]' "$OUT"
+  # nothing selected: the window stays where it was (VIEW_TOP 3)
+  _ghr73_frame 9 0 "$body" st 0 0 0 3
+  expect_text "no cursor" $'HEAD\nIDX X\n↑ 2 more  PgUp/g\n2 c\n3 d\n↓ 4 more  PgDn/G\n\nLEGEND\nst\n[true 2 3]' "$OUT"
+  # A window left BELOW the cursor (VIEW_TOP 8, on the notes — a table that
+  # shrank under it) comes back up to the cursor line. Four notes, so that
+  # the window from the cursor's LEAD cannot reach the TAIL: wherever it can,
+  # the LEAD step moves the window up as well and this pull is never the one
+  # being tested — which is what every j/k/g case above is, and why deleting
+  # the pull left all of them green.
+  _ghr73_frame 9 0 "$body"$'\nnote: three\nnote: four' st 7 7 1000000 8
+  expect_text "a window below the cursor" $'HEAD\nIDX X\n↑ 5 more  PgUp/g\n5 f\nnote: one\n↓ 3 more  PgDn/G\n\nLEGEND\nst\n[true 2 6]' "$OUT"
+}
+case_viewport_frame_too_small_is_drawn_whole() {
+  local body=$'IDX X\n0 a\n1 b\n2 c\n3 d\n4 e' long=xxxxxxxxxxxxxxxxxxxxxxxxx
+  # chrome 5 + window 2: under the minimum of 3
+  _ghr73_frame 7 0 "$body" st 2 2 2
+  expect_rc 0
+  expect_text "window under the minimum" $'HEAD\n'"$body"$'\n\nLEGEND\nst\n[false 0 0]' "$OUT"
+  # one row more and it is fitted: two lines and a count
+  _ghr73_frame 8 0 "$body" st 2 2 2
+  expect_text "window at the minimum" $'HEAD\nIDX X\n0 a\n1 b\n↓ 3 more  PgDn/G\n\nLEGEND\nst\n[true 2 1]' "$OUT"
+  # a cursor line of three rows in a window of four, with a count on each side
+  _ghr73_frame 9 10 $'IDX X\n0 a\n1 b\n2 '"$long"$'\n3 d\n4 e' st 4 4 4
+  expect_text "cursor line taller than the window" $'HEAD\nIDX X\n0 a\n1 b\n2 '"$long"$'\n3 d\n4 e\n\nLEGEND\nst\n[false 0 0]' "$OUT"
+}
+
+# The paging keys through the REAL read_key, one character per read: every
+# spelling of Home and End, a numbered sequence nobody binds (`other`), and
+# the `~` each numbered one ends in read with it rather than left to arrive
+# as a key of its own.
+case_read_key_decodes_the_paging_keys() {
+  RUNNERCTL_STUB_KEYS=$'\e[5~\e[6~\e[H\e[F\e[1~\e[4~\e[7~\e[8~\eOH\eOF\e[3~x' \
+    run_snippet "$STUB" "while read_key 1; do echo \"\$KEY\"; done"
+  expect_rc 0
+  expect_text "decoded keys" $'pgup\npgdn\nhome\nend\nhome\nend\nhome\nend\nhome\nend\nother\nx' "$OUT"
+}
+
+# The REAL term_lines — every case above reads the height through the stub's.
+# run_fn sources the script with no config, so the function is the script's
+# own, against a fake tput first on PATH: a number is the height, and a tput
+# that fails, answers something that is not a number, or is not there at all
+# is 0 — unknown, which draws the frame whole.
+_ghr73_fake_tput() { # NAME BODY
+  local dir="$TMP/ghr73-$1"
+  mkdir -p "$dir"
+  printf '#!/usr/bin/env bash\n%s\n' "$2" >"$dir/tput"
+  chmod +x "$dir/tput"
+  echo "$dir"
+}
+case_term_lines_real_function_reads_tput() {
+  local bin saved="$PATH" tool
+  bin="$(_ghr73_fake_tput ok "case \"\$1\" in lines) echo 37 ;; cols) echo 120 ;; *) exit 2 ;; esac")"
+  PATH="$bin:$PATH"
+  run_fn term_lines
+  PATH="$saved"
+  expect_rc 0
+  expect_text "tput lines" 37 "$OUT"
+  bin="$(_ghr73_fake_tput fails 'echo "tput: no value for TERM" >&2; exit 2')"
+  PATH="$bin:$PATH"
+  run_fn term_lines
+  PATH="$saved"
+  expect_rc 0
+  expect_text "a failing tput" 0 "$OUT"
+  expect_no_err '.'
+  bin="$(_ghr73_fake_tput garbage 'echo unknown')"
+  PATH="$bin:$PATH"
+  run_fn term_lines
+  PATH="$saved"
+  expect_text "a tput that answers no number" 0 "$OUT"
+  # no tput at all: a PATH holding only what the harness itself needs
+  bin="$TMP/ghr73-none"
+  mkdir -p "$bin"
+  for tool in bash cat rm; do ln -sf "$(command -v "$tool")" "$bin/$tool"; done
+  PATH="$bin"
+  run_fn term_lines
+  PATH="$saved"
+  expect_rc 0
+  expect_text "no tput on PATH" 0 "$OUT"
+}
+
 t "status: header and one row per discovered slot"                case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
 t "status: EnvironmentFiles value with embedded '=' survives"       case_status_envfile_value_with_embedded_equals
@@ -5933,6 +6459,22 @@ t "fleet watch: walking S down the fleet stops at --min-available"      case_fle
 t "fleet watch: T starts and P reaps on the selected host only"         case_fleet_watch_T_starts_and_P_reaps_on_the_selected_host
 t "fleet watch: L pages the host's journal; a sudo refusal is a notice"  case_fleet_watch_L_pages_the_remote_journal
 t "fleet watch: a failed remote action is a notice, the watch goes on"  case_fleet_watch_a_failed_action_is_a_notice_not_an_exit
+
+# --- GHR-73: a frame that fits the terminal -----------------------------------
+t "watch: unknown height (0) is the frame of before, byte for byte"       case_watch_unknown_height_draws_the_frame_of_before
+t "fleet watch: unknown height (0) is the frame of before, byte for byte" case_fleet_watch_unknown_height_draws_the_frame_of_before
+t "watch: a tall frame is cut to the height, chrome and cursor row kept"   case_watch_tall_frame_is_cut_to_the_terminal_height
+t "watch: the window scrolls with the cursor; PgUp/PgDn, g/G, Home/End"   case_watch_window_scrolls_with_the_cursor
+t "watch, fleet watch: the last row brings the notes under the table in"  case_watch_last_row_shows_the_notes_under_the_table
+t "watch: heights around the frame — too small, one short, exact, spare"  case_watch_heights_around_the_frame
+t "watch: a resize redraws the frame in hand at once (SIGWINCH)"           case_watch_resize_redraws_the_frame_in_hand
+t "watch --iterations: headless, the height is never asked for"           case_watch_iterations_ignores_the_height
+t "fleet watch: a tall frame keeps the summary; host lines scroll in"     case_fleet_watch_tall_frame_is_cut_and_scrolls
+t "viewport: a wrapped line is the rows it takes; unused rows are padded"  case_viewport_frame_counts_rows_not_lines
+t "viewport: the last row brings the notes under it into view"            case_viewport_frame_brings_the_notes_in_with_the_last_row
+t "viewport: no room for a window, or for the cursor line — drawn whole"  case_viewport_frame_too_small_is_drawn_whole
+t "read_key: PgUp/PgDn/Home/End in every spelling, the ~ read with them"  case_read_key_decodes_the_paging_keys
+t "term_lines: the real one reads tput; failing, garbage or absent is 0"  case_term_lines_real_function_reads_tput
 
 
 # --- GHR-45: provision --------------------------------------------------------
