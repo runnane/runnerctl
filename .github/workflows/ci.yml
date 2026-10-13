@@ -39,7 +39,8 @@ jobs:
   # RUNNERCTL_VERSION (via the x-release-please-version annotation), writes
   # CHANGELOG.md and .release-please-manifest.json. Merging that PR creates
   # the vX.Y.Z tag and GitHub release; the script is then attached to the
-  # release so `runnerctl upgrade --ref vX.Y.Z` has a stable artifact.
+  # release so `runnerctl upgrade --ref vX.Y.Z` has a stable artifact, with
+  # its SHA-256 beside it as runnerctl.sha256 for `upgrade` to verify against.
   #
   # Feature PRs never touch the version line or the changelog, so they never
   # conflict on either. Never bump RUNNERCTL_VERSION by hand.
@@ -91,6 +92,18 @@ jobs:
         if: ${{ steps.release.outputs.release_created }}
         with:
           ref: ${{ steps.release.outputs.tag_name }}
+      # GHR-84: the digest `runnerctl upgrade` checks a release download
+      # against — one `sha256sum` line naming `runnerctl`, written from the
+      # same checked-out tag bytes the next step uploads, and only once they
+      # carry the tag's version. tests/upgrade-test.sh pins this exact command
+      # and verifies digests made with it.
+      - name: Write runnerctl.sha256
+        if: ${{ steps.release.outputs.release_created }}
+        env:
+          TAG: ${{ steps.release.outputs.tag_name }}
+        run: |
+          ./runnerctl version | grep -qx "runnerctl ${TAG#v}"
+          sha256sum runnerctl > runnerctl.sha256
       - name: Attach runnerctl to the release
         if: ${{ steps.release.outputs.release_created }}
         env:
@@ -98,4 +111,4 @@ jobs:
           TAG: ${{ steps.release.outputs.tag_name }}
         run: |
           ./runnerctl version | grep -qx "runnerctl ${TAG#v}"
-          gh release upload "$TAG" runnerctl --clobber
+          gh release upload "$TAG" runnerctl runnerctl.sha256 --clobber

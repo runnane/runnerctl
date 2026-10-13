@@ -316,6 +316,32 @@ piped form. The piped case is offline: a temp config sets
 (a real GitHub release or raw.githubusercontent.com fetch), so verify that
 end-to-end path by hand.
 
+## upgrade-test
+
+`bash tests/upgrade-test.sh`. `upgrade` against a `file://` `UPGRADE_URL`, with
+the fake-`sudo` tripwire above. Since GHR-84 every download is also checked
+against a digest, and two things about the fixture follow:
+
+- **A `file://` source's digest is the sibling `runnerctl.sha256`, and a
+  missing one is that source's 404** (curl exits 37 with status `000`). The
+  older cases point at the checkout itself, which carries no digest, so they
+  install `not verified` — case 1 pins that line. A stray `runnerctl.sha256`
+  left in the repo root (by running the release job's command by hand, say)
+  would make every one of them verify against it and go red on a mismatch:
+  delete it (`.gitignore` keeps it out of a commit, not out of the test).
+- **The https rule is exercised through a fake `curl`** first on `PATH` for
+  case 15 only, with `UPGRADE_URL` set to a release-asset URL of a generic
+  `example` repo: it serves the checkout for any URL ending in `/runnerctl`
+  and answers the digest URL as `FAKE_DIGEST` says (`404`, `503`, `timeout`,
+  `file:PATH`), logging every URL to `FAKE_LOG`. `file://` cannot answer a 503
+  or time out, and a 404 versus any other failure is exactly the distinction
+  that decides between installing unverified and refusing.
+
+Case 12 also pins the release job's digest command (`sha256sum runnerctl >
+runnerctl.sha256`) and its upload line in `.github/workflows/ci.yml`, and
+makes its digests with that command — so a change to the job that would
+publish something `upgrade` cannot read turns this gate red.
+
 ## release
 
 `release: release-please`. Nobody bumps `RUNNERCTL_VERSION` or writes
@@ -335,7 +361,12 @@ is green (`release-please-config.json`, `.release-please-manifest.json`):
 - that PR changes exactly three things: the `RUNNERCTL_VERSION` line (through
   the annotation), `CHANGELOG.md`, and the manifest;
 - merging it tags `vX.Y.Z`, publishes a GitHub release, and attaches the
-  `runnerctl` file to it after asserting `runnerctl version` prints the tag.
+  `runnerctl` file to it after asserting `runnerctl version` prints the tag —
+  and, since GHR-84, `runnerctl.sha256` beside it, written from the same
+  checked-out bytes with `sha256sum runnerctl > runnerctl.sha256`. `upgrade`
+  verifies a release download against that file; a release without one
+  installs `not verified`, and a digest that cannot be read for any reason
+  other than a 404 refuses the upgrade.
   The attach step checks out **the tag**, not the run's own commit, and the
   job runs one at a time (`concurrency`, never cancelling a run in progress)
   — see the trap below;
@@ -391,11 +422,15 @@ for whoever merges:
 
 - **After a release PR merges, read the release's assets**, not the run's
   colour: `gh release view vX.Y.Z --json assets --jq '.assets[].name'` must
-  print `runnerctl`. A green run on the release commit proves nothing here —
-  that run may not be the one that created the release.
+  print `runnerctl` and `runnerctl.sha256`. A green run on the release commit
+  proves nothing here — that run may not be the one that created the release.
 - A release missing its asset is repaired by hand from the tag
   (`git show vX.Y.Z:runnerctl`, check `version`, `gh release upload`), never
-  by re-running a job: no later run gets `release_created` for it again.
+  by re-running a job: no later run gets `release_created` for it again. The
+  digest is repaired the same way and from the same bytes: `sha256sum
+  runnerctl > runnerctl.sha256` beside the file taken from the tag, then
+  upload both. A digest made from any other copy refuses every upgrade to
+  that release.
 - With the `concurrency` group, a release job that is still *waiting* when a
   newer push queues behind it is replaced by the newer one and shows as
   cancelled. That is expected and loses nothing: `gates` for that commit has

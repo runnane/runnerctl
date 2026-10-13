@@ -217,7 +217,9 @@ runnerctl profiles
 runnerctl config-example
 runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
 runnerctl install [--prefix DIR] [--ref <branch|tag>] [--no-migrate] [--dry-run]
-runnerctl upgrade [--check] [--ref <branch|tag>]
+runnerctl upgrade [--check] [--ref <branch|tag>] [--sha256 SUM] [--prefix DIR] \
+                  [--no-relocate]
+runnerctl upgrade --rollback
 runnerctl version
 ```
 
@@ -1398,7 +1400,8 @@ build-2  0.8.2           up to date
 ```
 
 `--check` writes nothing; it reports each host's installed and available
-version and whether it would change. `--ref <branch|tag>` is passed through,
+version and whether it would change. `--ref <branch|tag>` (and `--sha256 SUM`,
+see [Verifying the download](#verifying-the-download)) is passed through,
 as it is for the single-host command — to the check, to the write, and to the
 check round `--canary` makes. `--host H` (repeatable) narrows any of it to the
 hosts you name; a name that is not in `FLEET_HOSTS` is refused before anything
@@ -1463,6 +1466,31 @@ build-3  0.8.2           up to date
 
 They combine: `--canary --stop-on-failure` is one verified host, then the rest
 one at a time until something fails.
+
+##### Rolling the fleet back: `--rollback`
+
+`fleet upgrade --rollback` runs `upgrade --rollback` on each host (see
+[Rolling back](#rolling-back-upgrade---rollback)) and reads each one's
+`version` back, as an upgrade is read back — against the version that host
+said it rolled back to:
+
+```
+$ runnerctl fleet upgrade --rollback
+build-1  0.21.0 -> 0.20.0  rolled back
+build-2  —                 remote exit 1 — runnerctl: no rollback copy at /usr/local/bin/runnerctl.prev — nothing to roll back to …
+2 host(s): 1 rolled back, 1 unreachable or unclear
+not on one version — 0.20.0: build-1; unknown: build-2
+```
+
+A host with nothing to roll back to, one whose rollback the fan-out's path
+does not see (`rolled back to X but the fleet path still answers Y`), and one
+that answers anything but the rollback sentence (an older runnerctl that does
+not know the flag) are failed rows and a non-zero exit. `--host`, `--serial`
+and `--stop-on-failure` stage it as they stage an upgrade —
+`--rollback --serial --stop-on-failure` is the careful shape. `--check`,
+`--canary`, `--ref` and `--sha256` are refused before anything is dialled: a
+rollback has no dry run and downloads nothing, and a canary is chosen by what
+an *upgrade* would change.
 
 An answer this does not recognise is shown verbatim rather than folded into
 "up to date" — quietly reporting a host as level when it said something else
@@ -1802,6 +1830,8 @@ runnerctl upgrade              # install the latest tagged release
 runnerctl upgrade --ref v0.1.0 # pin a specific release
 runnerctl upgrade --ref main   # track main instead of tagged releases
 runnerctl upgrade --no-relocate # upgrade exactly where this copy stands
+runnerctl upgrade --sha256 SUM # install only bytes with this SHA-256
+runnerctl upgrade --rollback   # put back the version the last upgrade replaced
 ```
 
 `upgrade` downloads the script from `UPGRADE_URL` (default: this repository's
@@ -1821,6 +1851,67 @@ tags `vX.Y.Z` and publishes a GitHub release with the script attached. Hosts
 on the default `UPGRADE_URL` only ever pick up a tagged release; `--ref main`
 opts a host into the next version's changes under the last version's tag,
 and `--ref vX.Y.Z` pins one explicitly.
+
+#### Verifying the download
+
+Each release publishes `runnerctl.sha256` beside the script — one `sha256sum`
+line, written by the release job from the same tagged bytes it attaches. When
+the source is a release asset (the default `UPGRADE_URL`, or `--ref vX.Y.Z`),
+`upgrade` fetches it and checks the download against it **before anything is
+written**:
+
+| what the digest request gets | what `upgrade` does |
+| --- | --- |
+| a digest that matches | installs, with `verified: sha256 … matches <url>` |
+| a digest that does not match | refuses; the installed file is untouched |
+| not found (404) — releases published before the digest was | installs, with one `not verified: …` line |
+| anything else — a timeout, a 5xx, a body that is not a `sha256sum` line | refuses |
+
+The last row is deliberate. If every failure to read the digest fell back to
+installing unverified, anyone able to block that one request would switch
+verification off. A source that is not a release asset — a branch `--ref`,
+raw.githubusercontent.com, a mirror elsewhere — has no digest and installs
+with a `not verified:` line. (A `file://` `UPGRADE_URL` ending in `/runnerctl`
+is checked against a `runnerctl.sha256` beside it when there is one, so a
+local mirror can carry its own.)
+
+`--sha256 SUM` pins the digest by hand — the same flag and the same 64
+lowercase hex characters as `provision --sha256`. It replaces the published
+digest, which is then not fetched at all, so a host can install a release
+whose digest you obtained some other way. `fleet upgrade --sha256 SUM`
+forwards it to every host.
+
+**What this protects against, and what it does not.** The digest comes from
+the same place as the script. It catches a corrupted or truncated download
+and a tampered mirror or proxy between you and GitHub; it does **not** catch a
+compromised release, because whoever can replace the script asset can
+replace its digest too. Signing the release is a separate, larger step that
+this does not take.
+
+#### Rolling back: `upgrade --rollback`
+
+Every upgrade that replaces a script keeps the one it replaced as
+`<path>.prev` — written before the swap, with the script's own owner and mode,
+staged and renamed like the script itself. Exactly one is kept: the version
+immediately before.
+
+```
+$ runnerctl upgrade --rollback
+installed: 0.21.0 (/usr/local/bin/runnerctl)
+rollback: 0.20.0 (/usr/local/bin/runnerctl.prev)
+Rolled back 0.21.0 -> 0.20.0 at /usr/local/bin/runnerctl
+
+runnerctl 0.20.0
+```
+
+It renames `.prev` back over the script you are running and runs the result's
+`version` as proof. It downloads nothing, so a release that broke its own
+download path can still be undone, and it takes no other option. The
+rollback **uses up** `.prev`: a second `--rollback` refuses, because there is
+nothing left to go back to — going forward again is `upgrade` (or `upgrade
+--ref vX.Y.Z`). A fresh install, a relocation onto a new path and a
+pre-config script leave no `.prev`. `upgrade --check` says which version a
+rollback would restore (`rollback: 0.20.0 (…)` or `rollback: none (…)`).
 
 #### Upgrade heals *where* runnerctl is, not only which version it is
 
