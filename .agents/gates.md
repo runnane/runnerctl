@@ -179,10 +179,12 @@ Traps:
   `RUNNERCTL_STUB_FLEET_DOWN` fails table calls only: a host that must also
   fail the reads an action key makes needs the delay's fourth field.
 - **A case that signals the script inherits the gate's signal dispositions.**
-  The stub's `!` key is Ctrl-C, a real SIGINT — but a gate started in the
+  The stub's Ctrl-C is the byte Ctrl-C is, `$'\x03'` in `RUNNERCTL_STUB_KEYS`
+  (it was `!` until GHR-75 made that a key `fleet watch` reads): a real SIGINT
+  — but a gate started in the
   background (`make gates &`, or under a wrapper that does that) runs every
   case with SIGINT ignored, and bash cannot trap a signal that was ignored
-  when it started. The `!` case passed under a plain `make sim` and sat out
+  when it started. That case passed under a plain `make sim` and sat out
   its `RUN_TIMEOUT` under a backgrounded one. The stub now reads `SigIgn` and
   sends SIGTERM there instead (logged `probe:sigterm`, not `probe:sigint`), so
   check which of the two a log shows before claiming the SIGINT path ran.
@@ -191,6 +193,24 @@ Traps:
   exit-code, shape and read-only assertions, prints a `skip` notice for the
   rest and still passes — it is not an xfail and never counts as a failure.
   ubuntu-latest has python3, so CI runs the full case.
+- **Four characters of `RUNNERCTL_STUB_KEYS` are not keys** (GHR-75), so a
+  case cannot type them — into `fleet watch`'s `/` filter, say: `-` is a tick,
+  `%` a SIGWINCH and `$'\x03'` a SIGINT, and a newline is Enter (the real
+  `read -n1` hands back an empty character for it). A text with a `-` in it
+  reads as shorter text and extra ticks, and the tell is a `probe:ssh_run`
+  count four higher than pinned per stray dash. A lone Escape is `$'\e-'`:
+  `read_key` looks for the rest of a sequence with a second short read, which
+  would otherwise swallow the next scripted key.
+- **`fleet watch`'s view keys go through `fleet_watch_view`, not
+  `fleet_watch_rows`** (GHR-75): with a filter, a sort or a collapse on, the
+  rows the cursor walks are the VIEW's. A case about an action key under a
+  view has to make the view's row order differ from the frame's at the
+  cursor's position (`b j`, `i`, `s j j` on two identical hosts do), or a
+  cursor indexing the unfiltered frame acts on the right slot by accident.
+  The stub's hosts are identical unless a knob says otherwise:
+  `RUNNERCTL_STUB_FLEET_STALL="host…"` gives the named hosts a ten-minute
+  stall threshold of their own, `RUNNERCTL_STUB_FLEET_FULL` full disks and
+  journal events.
 
 ## migrate-test
 
