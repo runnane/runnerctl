@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.0](https://github.com/runnane/runnerctl/compare/v0.17.0...v0.18.0) (2026-10-13)
+
+
+### Features
+
+* Disk: watches only the filesystems holding docker and the runners' work folders, labelled, every partition coloured (GHR-67) ([#76](https://github.com/runnane/runnerctl/issues/76)) ([949db69](https://github.com/runnane/runnerctl/commit/949db69133085baeafb5db064519df53c1b52511))
+
 ## [0.17.0](https://github.com/runnane/runnerctl/compare/v0.16.0...v0.17.0) (2026-10-13)
 
 
