@@ -8021,7 +8021,7 @@ case_run_facts_wide_cell_only_where_it_fits() {
 # Acceptance 3: text a job supplied cannot repaint the terminal. The TABLE's
 # bytes are pinned on their own — an escape sequence in the ref, an OSC in the
 # repository, a C1 CSI and a bidi override in the workflow all draw as the
-# printable characters that were between the controls, and the whole output
+# value's own characters, each sequence gone whole (GHR-100), and the whole output
 # carries no control byte — and the JSON's are pinned separately, as escapes.
 # Two expected texts, so the two surfaces cannot agree with each other and
 # both be wrong.
@@ -8030,16 +8030,19 @@ case_run_facts_hostile_text_is_neutralised_where_drawn() {
   RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_REF_NAME="$ref" RUNNERCTL_STUB_RUN_REPOSITORY="$repo" RUNNERCTL_STUB_RUN_WORKFLOW="$wf" \
     RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run status
   expect_rc 0
-  expect_text "the long cell, hostile ref, repository and workflow" 'my]0;x-app:CI / test @ma[2J[31min (12m)' "$(slot1_cell)"
+  # since GHR-100 a sequence is removed whole (relay_safe's PLAIN form), so
+  # neither the OSC's `]0;x` nor the CSIs' `[2J` and `[31m` are left as text —
+  # and the workflow's `I` is the final byte of the 8-bit CSI before it
+  expect_text "the long cell, hostile ref, repository and workflow" 'my-app:C / test @main (12m)' "$(slot1_cell)"
   expect_no_control_bytes
   expect_no_out $'\xc2\x9b|\xe2\x80\xae'
   # the short cell: the repository reached it raw before GHR-78
   RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_REF_NAME="$ref" RUNNERCTL_STUB_RUN_REPOSITORY="$repo" run status
-  expect_text "the short cell, hostile repository" 'my]0;x-app:test (12m)' "$(slot1_cell)"
+  expect_text "the short cell, hostile repository" 'my-app:test (12m)' "$(slot1_cell)"
   expect_no_control_bytes
   # the /proc-only reader takes the job's NAME from the environment too
   RUNNERCTL_STUB_RUN_JOB=$'te\e[1;1Hst\x7f' RUNNERCTL_STUB_JOURNAL_ACCESS=0 RUNNERCTL_STUB_CGROUP_READABLE=1 run status
-  expect_text "the short cell, hostile job name" 'my-app:te[1;1Hst' "$(slot1_cell)"
+  expect_text "the short cell, hostile job name" 'my-app:test' "$(slot1_cell)"
   expect_no_control_bytes
   # JSON: the same ref and repository, escaped — and no URL from that repository
   RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_REF_NAME="$ref" RUNNERCTL_STUB_RUN_REPOSITORY="$repo" run status --json
@@ -8057,7 +8060,7 @@ case_run_facts_hostile_text_is_neutralised_where_drawn() {
   # escapes in it (no OSC, and the prompt is the neutralised text)
   RUNNERCTL_STUB_RUN_REPOSITORY="$repo" RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Knq' run watch --color never
   expect_rc 0
-  expect_out_count '^Kill the job on example\.slot-1 \(my\]0;x-app:test \(12m\)\)\? ' 1
+  expect_out_count '^Kill the job on example\.slot-1 \(my-app:test \(12m\)\)\? ' 1
   expect_no_out "$ESC\\]"
   # `fleet watch`: the remote drew its row without the override, and the
   # confirm line this node builds from the remote's JSON is without it too
@@ -8601,7 +8604,8 @@ case_watch_pane_draws_job_and_process_text_safely() {
   frames
   expect_frame_count 4
   expect_frame 3 '^  leaked        2$'
-  expect_frame 3 '^  processes     4242/no\[31mde, 4243/esbuild$'
+  # GHR-100: the comm was made safe where it was collected, sequence and all
+  expect_frame 3 '^  processes     4242/node, 4243/esbuild$'
   expect_frame_plain 3
 }
 
@@ -9400,6 +9404,223 @@ t "num_int: what shell arithmetic can take, and pane_int is the same rule"      
 t "fleet watch: a job's since no arithmetic can take is left out, not fatal"    case_fleet_watch_facts_reads_a_since_no_arithmetic_can_take
 t "fleet: the classifiers hold a host's numbers to what a test can take"        case_fleet_classifiers_hold_a_hosts_numbers_to_what_a_test_can_take
 t "fleet health: only counts arithmetic can take are added"                     case_fleet_health_adds_only_counts_arithmetic_can_take
+
+# --- GHR-100: text a job or a process chose, on this host's own lines -----------
+# The issue's fixture: a repository, a job name and a process's comm, each
+# carrying `ESC [ 2 J`. The job's name comes from the /proc-only reader (the
+# journal names the job otherwise), which needs a visible Runner.Worker for an
+# age: RUNNERCTL_STUB_COMPOSE_WORKER=1 gives slot-1 one, 8000 s old (2h13m).
+# Every surface pins its own bytes, and each expected text has the value's own
+# characters with the sequence gone WHOLE — `term_safe` alone would leave
+# `[2J` behind, so a draw site that used it instead goes red here too.
+GHR100_REPO=$'example/my\e[2J-app' GHR100_JOB=$'te\e[2Jst' GHR100_COMM=$'de\e[2Jv'
+# The first stdout line matching ERE, or nothing.
+ghr100_line() { grep -m1 -E -- "$1" <<<"$OUT" || true; }
+ghr100_proc_run() { # ARGS... — the /proc-only reader, hostile repository and job
+  RUNNERCTL_STUB_JOURNAL_ACCESS=0 RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_COMPOSE_WORKER=1 \
+    RUNNERCTL_STUB_RUN_REPOSITORY="$GHR100_REPO" RUNNERCTL_STUB_RUN_JOB="$GHR100_JOB" run "$@"
+}
+
+# health's stalled line: what cron mails and `fleet health` relays.
+case_ghr100_health_stalled_line() {
+  ghr100_proc_run health --stall-after 600
+  expect_rc 1
+  expect_text "health's stalled line" \
+    'example.slot-1: stalled — job my-app:test running 2h13m, longer than 10m (--stall-after 600)' \
+    "$(ghr100_line '^example\.slot-1: stalled')"
+  expect_no_control_bytes
+}
+
+# restart/stop/kill --if-stalled: the per-slot line of the gate.
+case_ghr100_if_stalled_line() {
+  ghr100_proc_run restart --if-stalled --stall-after 600
+  expect_rc 0
+  expect_text "the --if-stalled line" \
+    'example.slot-1: stalled — my-app:test, 2h13m, longer than 10m — restarting' \
+    "$(ghr100_line '^example\.slot-1: stalled')"
+  expect_no_control_bytes
+  expect_log_count "^systemctl restart $SLOT1_UNIT\$" 1
+}
+
+case_ghr100_reap_dry_run_line() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 RUNNERCTL_STUB_LEAK_COMM="$GHR100_COMM" run reap --dry-run
+  expect_rc 0
+  expect_text "reap --dry-run's line" 'example.slot-2: would kill 2 leaked process(es): 4242/dev, 4243/esbuild' \
+    "$(ghr100_line '^example\.slot-2: ')"
+  expect_no_control_bytes
+  expect_no_log '^kill '
+}
+
+case_ghr100_kill_dry_run_line() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_TREE_COMM="$GHR100_COMM" run kill --dry-run 0
+  expect_rc 0
+  expect_text "kill --dry-run's line" 'example.slot-1: would kill 2 process(es): 4100/Runner.Worker, 4101/dev' \
+    "$(ghr100_line '^example\.slot-1: ')"
+  expect_no_control_bytes
+  expect_no_log '^(kill|systemctl) '
+}
+
+# The watch's confirm lines. A frame's own prefix and the cursor row are
+# escapes, so the line itself is what is held to "no control byte".
+case_ghr100_watch_P_confirm_line() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 RUNNERCTL_STUB_LEAK_COMM="$GHR100_COMM" \
+    RUNNERCTL_STUB_KEYS='jPnq' run watch
+  expect_rc 0
+  expect_text "the P confirm line" \
+    'Reap 2 leaked process(es) on example.slot-2 (4242/dev, 4243/esbuild)? runs: kill -TERM 4242 4243, then kill -KILL what is still alive after 5s  [y/n]' \
+    "$(ghr100_line '^Reap ')"
+  expect_no_log '^kill '
+}
+
+case_ghr100_watch_K_confirm_line() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_TREE_COMM="$GHR100_COMM" RUNNERCTL_STUB_KEYS='Knq' ghr100_proc_run watch
+  expect_rc 0
+  expect_text "the K confirm line" \
+    'Kill the job on example.slot-1 (my-app:test (2h13m) STALLED)? runs: kill -KILL 4100 4101 (4100/Runner.Worker, 4101/dev) — the runner stays up and reports it failed  [y/n]' \
+    "$(ghr100_line '^Kill the job ')"
+  expect_no_log '^(kill|systemctl) '
+}
+
+# health's leaked line names the comms too.
+case_ghr100_health_leaked_line() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 RUNNERCTL_STUB_LEAK_COMM="$GHR100_COMM" run health
+  expect_rc 1
+  expect_text "health's leaked line" 'example.slot-2: 2 leaked process(es) left by finished jobs (dev, esbuild) — runnerctl reap 1' \
+    "$(ghr100_line '^example\.slot-2: ')"
+  expect_no_control_bytes
+}
+
+# What is KEPT is the raw value: --json carries the same fixture escaped.
+case_ghr100_json_keeps_the_raw_value_escaped() {
+  ghr100_proc_run status --json
+  expect_rc 0
+  expect_text "slot-1's job, repository and name" \
+    '{"repo":"my\u001b[2J-app","name":"te\u001b[2Jst","since":999992720,"stalled":true,"workflow":null,"run_id":null,"run_attempt":null,"run_number":null,"ref":null,"sha":null,"actor":null,"event":null,"url":null}' \
+    "$(slot1_job)"
+  expect_no_control_bytes
+  if $HAVE_PYTHON3; then
+    expect_json 'd["slots"][0]["job"]["repo"] == "my\x1b[2J-app" and d["slots"][0]["job"]["name"] == "te\x1b[2Jst"'
+  else
+    skip "python3 not on PATH: the escaped repository's round trip not checked"
+  fi
+}
+
+# A comm is ONE name however many commas and spaces it has: joined on a byte
+# no collected comm can carry, each stays next to its own pid. (The list used
+# to be split on `,` after its spaces were removed: `4242/dev, 4243/server`.)
+case_ghr100_comm_with_a_comma_keeps_its_pid() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 RUNNERCTL_STUB_LEAK_COMM='dev server,1' run reap --dry-run
+  expect_rc 0
+  expect_text "reap --dry-run's pairs" 'example.slot-2: would kill 2 leaked process(es): 4242/dev server,1, 4243/esbuild' \
+    "$(ghr100_line '^example\.slot-2: ')"
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 RUNNERCTL_STUB_LEAK_COMM='dev server,1' run health
+  expect_text "health's leaked names" 'example.slot-2: 2 leaked process(es) left by finished jobs (dev server,1, esbuild) — runnerctl reap 1' \
+    "$(ghr100_line '^example\.slot-2: ')"
+}
+
+# Only the NAMES are made safe: the pids signalled are exactly the ones read,
+# whatever a comm looks like — digits and spaces included.
+case_ghr100_hostile_comm_leaves_the_signalled_pids_alone() {
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_BUSY_POLLS=1 RUNNERCTL_STUB_TREE_COMM=$'1\e[2J2 3' run kill 0
+  expect_rc 0
+  expect_log_count '^kill ' 1
+  expect_log_count '^kill -KILL 4100 4101$' 1
+  expect_text "kill's line" 'example.slot-1: killed 2 process(es): 4100/Runner.Worker, 4101/12 3 — the runner stayed up and reports the job failed' \
+    "$(ghr100_line '^example\.slot-1: killed')"
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 RUNNERCTL_STUB_LEAK_COMM=$'4\e[2J4 5' run reap 1
+  expect_rc 0
+  expect_log_count '^kill ' 1
+  expect_log_count '^kill -TERM 4242 4243$' 1
+  expect_text "reap's line" 'example.slot-2: reaped 2 leaked process(es): 4242/44 5, 4243/esbuild' \
+    "$(ghr100_line '^example\.slot-2: ')"
+}
+
+# Site 4: the journal's OOM-killed process and disk-full identifier. Not
+# reachable through this box's journalctl (see host_problems), drawn safely
+# anyway; --json keeps them raw, escaped.
+case_ghr100_host_events_text_is_drawn_safely() {
+  RUNNERCTL_STUB_HOST_EVENTS=hostile run health --max-restarts 99
+  expect_rc 1
+  expect_text "health's OOM line" \
+    "host: the kernel OOM-killed 1 process(es) host-wide in the last 1h (last: ld) — 'journalctl -k -g \"Out of memory\"' shows them" \
+    "$(ghr100_line '^host: the kernel')"
+  expect_text "health's disk-full line" \
+    "host: 1 'No space left on device' line(s) in the journal in the last 1h (last from dockerd)" \
+    "$(ghr100_line "^host: 1 'No space")"
+  expect_no_control_bytes
+  RUNNERCTL_STUB_HOST_EVENTS=hostile run status --json
+  expect_rc 0
+  expect_out '"last_oom_process":"l\\u001b\[2Jd",'
+  expect_out '"last_disk_full_source":"dock\\u001b\]0;x\\u0007erd"\}'
+  expect_no_control_bytes
+}
+
+# compose-reap: a project is a label any job with docker can set. Drawn safe;
+# matched and removed by its raw value and its objects' ids.
+case_ghr100_compose_reap_project_label_is_drawn_safely() {
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_STALE=$'st\e[2Jale' run compose-reap
+  expect_rc 0
+  expect_text "the stale project's verdict" 'reap stale reason=age idle=240m containers=1 networks=1 volumes=1' \
+    "$(ghr100_line '^reap stale ')"
+  expect_no_control_bytes
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_STALE=$'st\e[2Jale' run compose-reap --apply --project $'st\e[2Jale'
+  expect_rc 0
+  expect_out_count '^reap stale reason=age ' 1
+  expect_log_order '^docker rm container c-stale$' '^docker rm network n-stale$' '^docker rm volume v-stale$'
+  expect_no_control_bytes
+}
+
+# The REAL collectors, not the stub's: job_leak_check and job_tree_check over
+# a reader answering hostile lines (the stub's hooks answer one fixed shape),
+# and then the real proc_leaked over this run's own cgroup, with a process
+# whose /proc/<pid>/comm really is an escape sequence, a comma and a space.
+case_ghr100_real_collectors_make_comms_safe() {
+  # shellcheck disable=SC2016  # the child expands these, as run_snippet's does
+  GHR100_C="$GHR100_COMM" run_fn eval 'cgroup_readable() { :; }
+    proc_leaked()   { printf "11\t%s\n12\t\e[2J\n13\ta,b c\n" "$GHR100_C"; }
+    proc_job_tree() { printf "21\t%s\nx\tnot-a-pid\n22\tok\n" "$GHR100_C"; }
+    job_leak_check /x; printf "%s|%s\n" "$JOB_LEAKED_PIDS" "$(pid_comm_list "$JOB_LEAKED_PIDS" "$JOB_LEAKED_COMMS")"
+    job_tree_check /x; printf "%s|%s\n" "$JOB_TREE_PIDS" "$(pid_comm_list "$JOB_TREE_PIDS" "$JOB_TREE_COMMS")"'
+  expect_rc 0
+  expect_text "the real collectors' pids and pairs" $'11 12 13|11/dev, 12/?, 13/a,b c\n21 22|21/dev, 22/ok' "$OUT"
+  expect_no_control_bytes
+  # a real process, named by the file it was started from
+  local dir="$TMP/ghr100-comm" exe pid sleep_bin
+  sleep_bin="$(command -v sleep)"
+  mkdir -p "$dir"; exe="$dir/"$'x\e[2Jy,z w'
+  if ! cp "$sleep_bin" "$exe" 2>/dev/null || ! [ -x "$exe" ]; then skip "could not copy sleep: the real proc_leaked not exercised"; return 0; fi
+  "$exe" 30 </dev/null >/dev/null 2>&1 & pid=$!
+  # until the exec has happened, the child's comm is still this shell's
+  local i
+  for ((i = 0; i < 100; i++)); do
+    [ "$(cat "/proc/$pid/comm" 2>/dev/null; true)" != $'x\e[2Jy,z w' ] || break
+    sleep 0.05
+  done
+  # shellcheck disable=SC2016  # the child expands these
+  GHR100_PID="$pid" run_fn eval 'cg="$(sed -n "s/^0:://p" /proc/self/cgroup)"
+    if ! cgroup_readable "$cg"; then echo "unreadable:$cg"; exit 0; fi
+    job_leak_check "$cg"; pid_comm_list "$JOB_LEAKED_PIDS" "$JOB_LEAKED_COMMS"'
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  if [[ "$OUT" == unreadable:* ]]; then skip "this run's cgroup (${OUT#unreadable:}) cannot be read: the real proc_leaked not exercised"; return 0; fi
+  expect_rc 0
+  expect_out "(^|, )$pid/xy,z w(, |\$)"
+  expect_no_control_bytes
+}
+
+t "GHR-100: health's stalled line draws a job's text without its sequences"  case_ghr100_health_stalled_line
+t "GHR-100: the --if-stalled line draws a job's text without its sequences"  case_ghr100_if_stalled_line
+t "GHR-100: reap --dry-run draws a comm without its sequence"                case_ghr100_reap_dry_run_line
+t "GHR-100: kill --dry-run draws a comm without its sequence"                case_ghr100_kill_dry_run_line
+t "GHR-100: watch's P confirm line draws a comm without its sequence"        case_ghr100_watch_P_confirm_line
+t "GHR-100: watch's K confirm line draws job text and comm without sequences" case_ghr100_watch_K_confirm_line
+t "GHR-100: health's leaked line draws a comm without its sequence"          case_ghr100_health_leaked_line
+t "GHR-100: --json keeps the raw repository and name, escaped"                case_ghr100_json_keeps_the_raw_value_escaped
+t "GHR-100: a comm with a comma or a space stays next to its own pid"        case_ghr100_comm_with_a_comma_keeps_its_pid
+t "GHR-100: a hostile comm leaves the signalled pids exactly as read"         case_ghr100_hostile_comm_leaves_the_signalled_pids_alone
+t "GHR-100: the journal's process name and identifier are drawn safely"      case_ghr100_host_events_text_is_drawn_safely
+t "GHR-100: compose-reap draws a project label safely, acts on the raw one"  case_ghr100_compose_reap_project_label_is_drawn_safely
+t "GHR-100: the real collectors, and the real proc_leaked, make comms safe"  case_ghr100_real_collectors_make_comms_safe
 
 # --- Summary ------------------------------------------------------------------
 echo

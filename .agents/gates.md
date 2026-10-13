@@ -262,6 +262,21 @@ Traps:
   host sends — an older host's, a hostile one's — is a hand-written
   `FW_STATE/0.json` handed to `fleet_watch_pane_build` through `run_fn`, with
   `now_epoch` pinned in the same eval.
+- **A process's or a job's text on this host's own lines (GHR-100)** is drawn
+  through `relay_safe … plain`, so an expected text has a sequence gone WHOLE
+  (`my-app`, never `my[2J-app` — that is `term_safe` alone, and what a
+  mutation back to it looks like). The comm lists are made safe where
+  `job_leak_check` / `job_tree_check` collect them and are joined on
+  `COMM_SEP` (0x1f), never on `,`. Knobs for hostile text beyond
+  `RUNNERCTL_STUB_LEAK_COMM`: `RUNNERCTL_STUB_TREE_COMM` (the comm of `kill`'s
+  step child, pid 4101), `RUNNERCTL_STUB_HOST_EVENTS=hostile` (an OOM line and
+  a disk-full line whose process name and identifier carry sequences) and
+  `RUNNERCTL_STUB_COMPOSE_STALE` (the `stale` compose project's label). A
+  stalled job under the /proc-only reader needs a visible Runner.Worker for
+  its age: `RUNNERCTL_STUB_COMPOSE_WORKER=1` (8000 s, 2h13m). The real
+  `proc_leaked` is covered by one `run_fn` case over the run's own cgroup,
+  with a copy of `sleep` named so its comm is hostile; it prints a `skip` where
+  that cgroup cannot be read.
 
 ## migrate-test
 
