@@ -64,7 +64,8 @@
 #                          [--min-available K]
 #   runnerctl fleet health [--quiet] [--max-restarts N] [--stall-after N] \
 #                          [--restart-stalled]
-#   runnerctl fleet upgrade [--check] [--ref <branch|tag>]
+#   runnerctl fleet upgrade [--check] [--ref <branch|tag>] [--host H]... \
+#                           [--canary [H]] [--serial] [--stop-on-failure]
 #   runnerctl fleet <apply|scale|start|stop|restart|drain|kill|reap| \
 #                    remove-limits|enable|disable> [--host H]... \
 #                   [--all-hosts] [--max-unavailable N|N%] [--min-available K] \
@@ -253,7 +254,15 @@
 # abort: a partly upgraded fleet is the normal outcome of a flaky network,
 # and which host is still behind is the thing you must not lose. Writing the
 # script needs root on a normal host, so this is the first fan-out that
-# needs passwordless sudo there.
+# needs passwordless sudo there. A host that says it wrote is then asked for
+# `version` through FLEET_RUNNERCTL, and is `upgraded` only if that answers
+# the version it said it wrote: `wrote X but the fleet path still answers Y`
+# is a write that landed where the fan-out does not execute, and a failed
+# row. The last line names where the fleet ended up. --host H narrows it;
+# --canary [H] upgrades one host first — unnamed, the first that would
+# actually change — and continues only if it ends `upgraded`; --serial goes
+# one host at a time; --stop-on-failure also halts at the first failed row
+# and names the hosts it did not attempt.
 # The MUTATING commands fan out too (GHR-43), and differ from the read-only
 # ones in three ways. They go ONE HOST AT A TIME (FLEET_PARALLEL is ignored),
 # so with the per-host --when-idle the blast radius is a single host at any
@@ -5034,29 +5043,215 @@ fleet_run_report() { # SUBCOMMAND
 # A host that fails to upgrade is a REPORTED ROW, not an abort. A partly
 # upgraded fleet is the normal outcome of a flaky network, and the one thing
 # you must not lose in that case is which host is still behind.
-cmd_fleet_upgrade() { # [--check] [--ref REF]
-  local check=false rc=0
-  local -a fwd=()
+#
+# That is the DEFAULT, and GHR-82 added the conservative shapes beside it,
+# because "every host at FLEET_PARALLEL, report afterwards" lands a release
+# that breaks on the fleet's distribution on eight hosts in the same second:
+#
+#   --host H           narrow it, like every other mutating fan-out.
+#   --canary [H]       one host first; the rest only if it ends `upgraded` —
+#                      written AND read back. Unnamed, the canary is the first
+#                      host that WOULD CHANGE, which takes a --check round to
+#                      know: a host that answers `Already up to date.` proves
+#                      nothing about the release being rolled out.
+#   --serial           one host at a time, each written and read back before
+#                      the next is dialled; every host still attempted.
+#   --stop-on-failure  --serial that halts at the first failed row and names
+#                      the hosts it did not attempt.
+#
+# And `upgraded` is no longer the remote's word alone. A host that says it
+# wrote is asked for `version` through FLEET_RUNNERCTL — the exact path the
+# fan-out executes — which is the step `install` has always ended on ("the
+# proof comes from the installed file, not from this process") and `upgrade`
+# never had. See fleet_upgrade_stage.
+#
+# The run's rows live in these arrays, indexed like FLEET_UP_HOSTS (the hosts
+# this upgrade targets, in config order), rather than being read out of one
+# fan-out's FLEET_DIR: a staged run is several fan-outs over different subsets
+# of the hosts, and each one's directory is gone before the next starts.
+#   KIND   level | changed | wrote | upgraded | bad | skipped
+#          (`wrote` is a host between its write and its read-back)
+#   NOW    the version the host is known to run after this, empty if unknown
+#   WANT   the version a host that wrote said it wrote
+FLEET_UP_HOSTS=() FLEET_UP_VERS=() FLEET_UP_STATE=() FLEET_UP_KIND=()
+FLEET_UP_NOW=() FLEET_UP_WANT=()
+# --ref R as given, forwarded identically to the check round, the write and
+# therefore to the version each host says it wrote.
+FLEET_UP_FWD=()
+cmd_fleet_upgrade() { # [--check] [--ref REF] [--host H]... [--canary [H]] [--serial] [--stop-on-failure]
+  local check=false canary=false canary_host="" serial=false stop=false
+  local rc=0 k n c="" halted="" names=""
+  local -a hosts=() all=() rest=() left=() would=()
+  FLEET_UP_FWD=()
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     case "$1" in
-      --check) check=true; fwd+=(--check); shift ;;
-      --ref)   need_val "$@"; fwd+=(--ref "$2"); shift 2 ;;
+      --check) check=true; shift ;;
+      --ref)   need_val "$@"; FLEET_UP_FWD+=(--ref "$2"); shift 2 ;;
+      --host)  need_val "$@"; hosts+=("$2"); shift 2 ;;
+      # The host is optional, and `fleet upgrade` takes no positional
+      # argument, so the next word is the canary's name exactly when it is
+      # not another flag.
+      --canary)
+        canary=true; shift
+        if [ $# -gt 0 ] && [[ "$1" != -* ]]; then canary_host="$1"; shift; fi ;;
+      --serial) serial=true; shift ;;
+      --stop-on-failure) serial=true; stop=true; shift ;;
       *)       die "unknown option: $1" ;;
     esac
   done
+  # A flag that would quietly do nothing is refused rather than accepted, as
+  # the budget flags are in cmd_fleet_run.
+  if $check && { $canary || $serial; }; then
+    die "--canary, --serial and --stop-on-failure stage a write, and --check writes nothing — drop --check, or drop them"
+  fi
   require_fleet
-  # GHR-81: the remote downloads with `curl --max-time 30` (fetch_script), so
-  # under FLEET_TIMEOUT — the same 30 s — a slow download and the fan-out's
-  # own timeout raced each other. --check downloads too, so it gets the same
-  # budget; only a real upgrade is reported as possibly still running.
-  local i
-  FLEET_BUDGETS=()
-  for i in "${!FLEET_HOSTS[@]}"; do FLEET_BUDGETS[i]="$(fleet_mutate_budget upgrade 1)"; done
-  fleet_fanout "$FLEET_RUNNERCTL" upgrade ${fwd[@]+"${fwd[@]}"}
-  fleet_upgrade_report "$check" || rc=$?
-  fleet_cleanup
+  [ "${#hosts[@]}" -eq 0 ] || fleet_select_hosts "${hosts[@]}"
+  FLEET_UP_HOSTS=("${FLEET_HOSTS[@]}")
+  FLEET_UP_VERS=() FLEET_UP_STATE=() FLEET_UP_KIND=() FLEET_UP_NOW=() FLEET_UP_WANT=()
+  all=("${!FLEET_UP_HOSTS[@]}")
+  if [ -n "$canary_host" ]; then
+    for k in "${all[@]}"; do
+      [ "${FLEET_UP_HOSTS[$k]}" != "$canary_host" ] || c="$k"
+    done
+    [ -n "$c" ] || die "--canary '$canary_host' is not among the hosts this upgrade targets (${FLEET_UP_HOSTS[*]})"
+  fi
+  if $check; then
+    fleet_upgrade_stage true "${all[@]}"
+    fleet_upgrade_report true || rc=$?
+    return "$rc"
+  fi
+  if $canary; then
+    # Which hosts would change is only known by asking, and --check is that
+    # question. It costs each host one download and writes nothing.
+    fleet_upgrade_stage true "${all[@]}"
+    for k in "${all[@]}"; do
+      [ "${FLEET_UP_KIND[$k]}" != changed ] || would+=("$k")
+    done
+    if [ "${#would[@]}" -eq 0 ]; then
+      fleet_upgrade_report true || rc=$?
+      echo "fleet upgrade --canary: no host would change, so there is nothing to try a release on — nothing was written"
+      return "$rc"
+    fi
+    if [ -z "$c" ]; then
+      c="${would[0]}"
+    elif [ "${FLEET_UP_KIND[$c]}" != changed ]; then
+      for k in "${would[@]}"; do names+="${names:+ }${FLEET_UP_HOSTS[$k]}"; done
+      die "--canary '$canary_host' would not change (${FLEET_UP_STATE[$c]}), so it proves nothing about this release — nothing was written. Hosts that would change: $names"
+    fi
+    for k in "${all[@]}"; do
+      [ "$k" = "$c" ] || rest+=("$k")
+    done
+    fleet_upgrade_stage false "$c"
+    if [ "${FLEET_UP_KIND[$c]}" = upgraded ]; then
+      echo "canary ${FLEET_UP_HOSTS[$c]}: upgraded ${FLEET_UP_VERS[$c]} and the fleet path answers ${FLEET_UP_NOW[$c]} — continuing with ${#rest[@]} other host(s)"
+    else
+      # Anything short of written-and-read-back. That includes a canary that
+      # answered politely and changed nothing: it has verified nothing.
+      halted="canary ${FLEET_UP_HOSTS[$c]} did not end upgraded"
+      left=(${rest[@]+"${rest[@]}"})
+    fi
+  else
+    rest=("${all[@]}")
+  fi
+  if [ -z "$halted" ] && [ "${#rest[@]}" -gt 0 ]; then
+    if $serial; then
+      # One host per stage, so each is written and read back before the next
+      # is dialled. FLEET_PARALLEL is pinned as cmd_fleet_run pins it, so the
+      # shape does not rest on a stage happening to hold a single host.
+      FLEET_PARALLEL=1
+      for n in "${!rest[@]}"; do
+        k="${rest[$n]}"
+        fleet_upgrade_stage false "$k"
+        if $stop && [ "${FLEET_UP_KIND[$k]}" = bad ]; then
+          halted="stopped at ${FLEET_UP_HOSTS[$k]}"
+          left=("${rest[@]:$((n + 1))}")
+          break
+        fi
+      done
+    else
+      fleet_upgrade_stage false "${rest[@]}"
+    fi
+  fi
+  # A host this run decided not to dial keeps the versions the check round
+  # read off it, where there was one, and loses whatever verdict that round
+  # gave it: `update available` would read as an upgrade's result.
+  for k in ${left[@]+"${left[@]}"}; do
+    FLEET_UP_KIND[k]=skipped
+    FLEET_UP_STATE[k]="not attempted"
+    [ -n "${FLEET_UP_VERS[$k]:-}" ] || FLEET_UP_VERS[k]="—"
+    [ -n "${FLEET_UP_NOW[$k]:-}" ] || FLEET_UP_NOW[k]=""
+  done
+  fleet_upgrade_report false || rc=$?
+  if [ -n "$halted" ]; then
+    names=""
+    for k in ${left[@]+"${left[@]}"}; do names+="${names:+ }${FLEET_UP_HOSTS[$k]}"; done
+    echo "$halted${names:+ — not attempted: $names}"
+    rc=1
+  fi
+  fleet_upgrade_state_line
   return "$rc"
+}
+
+# The version a host's `upgrade` output says it WROTE: the second version in
+# cmd_upgrade's `Upgraded A -> B at PATH`, empty when it wrote nothing. Taken
+# from the remote's own sentence rather than from --ref or from this node's
+# idea of the release: a --ref that is a branch has no version in its name,
+# and the remote is the one that read the number out of the file it placed.
+fleet_upgrade_wrote() { # FILE
+  sed -n 's/^Upgraded [^ ]* -> \([^ ]*\) at .*/\1/p' "$1" 2>/dev/null | head -1 || true
+}
+# The version in a `version` answer (`runnerctl X`), empty for anything else.
+fleet_version_answer() { # FILE
+  sed -n 's/^runnerctl \([^ ]*\)$/\1/p' "$1" 2>/dev/null | head -1 || true
+}
+
+# One stage: `upgrade` on the hosts at INDEX... of FLEET_UP_HOSTS, then the
+# read-back on those of them that wrote.
+#
+# FLEET_HOSTS is narrowed to the stage for the two fan-outs and restored, so
+# fleet_fanout is used exactly as it is. FLEET_BUDGETS is rebuilt for the
+# stage's own hosts — it is indexed like FLEET_HOSTS, and a budget left
+# aligned to the full list would hand a narrowed host its neighbour's.
+#
+# The write is a mutating call (GHR-81): the remote downloads with `curl
+# --max-time 30` (fetch_script), so under FLEET_TIMEOUT — the same 30 s — a
+# slow download and the fan-out's own timeout raced each other. --check
+# downloads too, so it gets the same budget; only a real upgrade is reported
+# as possibly still running.
+#
+# The read-back is a READ. FLEET_BUDGETS is a global that fleet_fanout_one
+# consults for every fan-out, so it is emptied first: left set, `version`
+# would inherit fifteen minutes to answer one line.
+fleet_upgrade_stage() { # CHECK INDEX...
+  local check="$1" j k
+  shift
+  local -a idx=("$@") wrote=() args=(upgrade)
+  ! $check || args+=(--check)
+  args+=(${FLEET_UP_FWD[@]+"${FLEET_UP_FWD[@]}"})
+  FLEET_HOSTS=() FLEET_BUDGETS=()
+  for k in "${idx[@]}"; do
+    FLEET_HOSTS+=("${FLEET_UP_HOSTS[$k]}")
+    FLEET_BUDGETS+=("$(fleet_mutate_budget upgrade 1)")
+  done
+  fleet_fanout "$FLEET_RUNNERCTL" "${args[@]}"
+  for j in "${!idx[@]}"; do
+    k="${idx[$j]}"
+    fleet_upgrade_classify "$check" "$j" "$k"
+    [ "${FLEET_UP_KIND[$k]}" != wrote ] || wrote+=("$k")
+  done
+  fleet_cleanup
+  FLEET_BUDGETS=()
+  if [ "${#wrote[@]}" -gt 0 ]; then
+    FLEET_HOSTS=()
+    for k in "${wrote[@]}"; do FLEET_HOSTS+=("${FLEET_UP_HOSTS[$k]}"); done
+    fleet_fanout "$FLEET_RUNNERCTL" version
+    for j in "${!wrote[@]}"; do
+      fleet_upgrade_verify "$j" "${wrote[$j]}"
+    done
+    fleet_cleanup
+  fi
+  FLEET_HOSTS=("${FLEET_UP_HOSTS[@]}")
 }
 
 # First capture group of "KEY: <value> (...)" in a host's upgrade output.
@@ -5074,68 +5269,149 @@ fleet_upgrade_field() { # INDEX KEY
   sed -n "s/^$2: \([^ ]*\).*/\1/p" "$FLEET_DIR/$1.out" 2>/dev/null | head -1
 }
 
-# One row per host, then a count. The state word comes from the verdict line
-# `upgrade` already prints rather than from comparing versions here: the
-# remote is the only thing that knows whether it actually wrote the file, and
-# re-deriving that locally would be a second implementation to keep in step.
-fleet_upgrade_report() { # CHECK
-  local check="$1" i host rc cur avail state vers mutating=mutating
+# What host J of the fan-out in flight said to `upgrade`, into row K. The
+# state word comes from the verdict line `upgrade` already prints rather than
+# from comparing versions here: the remote is the only thing that knows
+# whether it actually wrote the file, and re-deriving that locally would be a
+# second implementation to keep in step.
+fleet_upgrade_classify() { # CHECK J K
+  local check="$1" j="$2" k="$3" rc cur avail kind state mutating=mutating
   ! $check || mutating=""
-  local level=0 changed=0 bad=0
-  # Three parallel arrays rather than one delimited string per row: a state
-  # word carrying the delimiter would otherwise split a row in half, and the
-  # states include remote text this code does not control.
-  local -a r_host=() r_vers=() r_state=()
-  for i in "${!FLEET_HOSTS[@]}"; do
-    host="${FLEET_HOSTS[$i]}"
-    rc="$(fleet_rc "$i")"
-    if [ "$rc" != 0 ]; then
-      bad=$((bad + 1))
-      r_host+=("$host"); r_vers+=("—")
-      r_state+=("$(fleet_error_text "$rc" "$FLEET_DIR/$i.err" "${FLEET_BUDGETS[$i]:-}" "$mutating")")
+  rc="$(fleet_rc "$j")"
+  FLEET_UP_NOW[k]="" FLEET_UP_WANT[k]=""
+  if [ "$rc" != 0 ]; then
+    FLEET_UP_KIND[k]=bad FLEET_UP_VERS[k]="—"
+    FLEET_UP_STATE[k]="$(fleet_error_text "$rc" "$FLEET_DIR/$j.err" "${FLEET_BUDGETS[$j]:-}" "$mutating")"
+    return 0
+  fi
+  cur="$(fleet_upgrade_field "$j" installed)"
+  avail="$(fleet_upgrade_field "$j" available)"
+  FLEET_UP_WANT[k]="$(fleet_upgrade_wrote "$FLEET_DIR/$j.out")"
+  if [ -n "${FLEET_UP_WANT[$k]}" ]; then
+    # Its word, until the read-back has had its say.
+    state="upgraded"; kind=wrote
+  elif grep -q '^Update available\.' "$FLEET_DIR/$j.out"; then
+    state="update available"; kind=changed
+  elif grep -q '^Already up to date\.' "$FLEET_DIR/$j.out"; then
+    state="up to date"; kind=level
+  elif grep -q 'not downgrading' "$FLEET_DIR/$j.out"; then
+    state="ahead of the source — left alone"; kind=level
+  else
+    # An answer this does not recognise is shown, not guessed at: a silent
+    # "up to date" for a host that said something else is the one outcome
+    # that would send someone to the wrong box.
+    state="unrecognised: $(tail -1 "$FLEET_DIR/$j.out" 2>/dev/null || true)"
+    kind=bad
+  fi
+  if [ -n "$cur" ] && [ -n "$avail" ] && [ "$cur" != "$avail" ]; then
+    FLEET_UP_VERS[k]="$cur -> $avail"
+  else
+    FLEET_UP_VERS[k]="${cur:-?}"
+  fi
+  # What it ran when it answered. A host that wrote has this replaced by the
+  # read-back, or emptied when the read-back cannot say.
+  FLEET_UP_NOW[k]="$cur"
+  FLEET_UP_KIND[k]="$kind" FLEET_UP_STATE[k]="$state"
+}
+
+# What host J of the read-back fan-out answered to `version`, into row K — a
+# host that said it wrote FLEET_UP_WANT. Three failures, kept apart because
+# they send someone to three different places:
+#   it answers another version   the write landed somewhere the fan-out does
+#                                not execute — a home copy shadowing the
+#                                system one, a FLEET_RUNNERCTL naming another
+#                                file. The host is NOT upgraded as far as the
+#                                fleet is concerned.
+#   it did not answer            nothing is known about what it runs now; the
+#                                write was reported done. Not a mismatch, and
+#                                not worded as one.
+#   it answered something else   shown, as an unrecognised `upgrade` answer is.
+# All three are failed rows: `upgraded` is a claim this command now checks,
+# and an unchecked one is not a pass.
+fleet_upgrade_verify() { # J K
+  local j="$1" k="$2" rc got want="${FLEET_UP_WANT[$2]}"
+  rc="$(fleet_rc "$j")"
+  FLEET_UP_NOW[k]="" FLEET_UP_KIND[k]=bad
+  if [ "$rc" != 0 ]; then
+    FLEET_UP_STATE[k]="wrote $want but the read-back did not answer: $(fleet_error_text "$rc" "$FLEET_DIR/$j.err")"
+    return 0
+  fi
+  got="$(fleet_version_answer "$FLEET_DIR/$j.out")"
+  if [ -z "$got" ]; then
+    FLEET_UP_STATE[k]="wrote $want but the read-back answered '$(head -1 "$FLEET_DIR/$j.out" 2>/dev/null || true)', not a version"
+    return 0
+  fi
+  FLEET_UP_NOW[k]="$got"
+  if [ "$got" = "$want" ]; then
+    FLEET_UP_KIND[k]=upgraded FLEET_UP_STATE[k]="upgraded"
+  else
+    FLEET_UP_STATE[k]="wrote $want but the fleet path still answers $got"
+  fi
+}
+
+# One row per host, then a count. `not attempted` is only named when a staged
+# run stopped short, so the count line of an unstaged run reads as it always
+# has.
+fleet_upgrade_report() { # CHECK
+  local check="$1" k host level=0 changed=0 bad=0 skipped=0 hostw=4 versw=7 tail=""
+  for k in "${!FLEET_UP_HOSTS[@]}"; do
+    host="${FLEET_UP_HOSTS[$k]}"
+    case "${FLEET_UP_KIND[$k]}" in
+      level)                  level=$((level + 1)) ;;
+      changed|wrote|upgraded) changed=$((changed + 1)) ;;
+      skipped)                skipped=$((skipped + 1)) ;;
+      *)                      bad=$((bad + 1)) ;;
+    esac
+    [ "${#host}" -le "$hostw" ] || hostw="${#host}"
+    [ "${#FLEET_UP_VERS[$k]}" -le "$versw" ] || versw="${#FLEET_UP_VERS[$k]}"
+  done
+  for k in "${!FLEET_UP_HOSTS[@]}"; do
+    printf '%s %s %s\n' "$(fleet_pad "$hostw" "${FLEET_UP_HOSTS[$k]}")" \
+      "$(fleet_pad "$versw" "${FLEET_UP_VERS[$k]}")" "${FLEET_UP_STATE[$k]}"
+  done
+  [ "$skipped" -eq 0 ] || tail=", $skipped not attempted"
+  if $check; then
+    echo "${#FLEET_UP_HOSTS[@]} host(s): $level up to date, $changed would change, $bad unreachable or unclear"
+  else
+    echo "${#FLEET_UP_HOSTS[@]} host(s): $level already level, $changed upgraded, $bad unreachable or unclear$tail"
+  fi
+  [ "$bad" -eq 0 ] && [ "$skipped" -eq 0 ]
+}
+
+# Where the fleet ended up, as the last line of a write: `N host(s) on X` when
+# every host is known to be on one version, else each version with its hosts
+# in the order they first appear, and `unknown` for the hosts that did not
+# say. Grouped by what the hosts ANSWER rather than measured against a target
+# version, because this node does not know one: the release each host
+# downloaded is only ever named by that host.
+fleet_upgrade_state_line() {
+  local k n v found unknown="" out=""
+  local -a on=() who=()
+  for k in "${!FLEET_UP_HOSTS[@]}"; do
+    v="${FLEET_UP_NOW[$k]:-}"
+    if [ -z "$v" ]; then
+      unknown+="${unknown:+ }${FLEET_UP_HOSTS[$k]}"
       continue
     fi
-    cur="$(fleet_upgrade_field "$i" installed)"
-    avail="$(fleet_upgrade_field "$i" available)"
-    if grep -q '^Upgraded ' "$FLEET_DIR/$i.out"; then
-      state="upgraded"; changed=$((changed + 1))
-    elif grep -q '^Update available\.' "$FLEET_DIR/$i.out"; then
-      state="update available"; changed=$((changed + 1))
-    elif grep -q '^Already up to date\.' "$FLEET_DIR/$i.out"; then
-      state="up to date"; level=$((level + 1))
-    elif grep -q 'not downgrading' "$FLEET_DIR/$i.out"; then
-      state="ahead of the source — left alone"; level=$((level + 1))
+    found=""
+    for n in "${!on[@]}"; do
+      [ "${on[$n]}" != "$v" ] || found="$n"
+    done
+    if [ -z "$found" ]; then
+      on+=("$v"); who+=("${FLEET_UP_HOSTS[$k]}")
     else
-      # An answer this does not recognise is shown, not guessed at: a silent
-      # "up to date" for a host that said something else is the one outcome
-      # that would send someone to the wrong box.
-      state="unrecognised: $(tail -1 "$FLEET_DIR/$i.out" 2>/dev/null || true)"
-      bad=$((bad + 1))
+      who[found]+=" ${FLEET_UP_HOSTS[$k]}"
     fi
-    if [ -n "$cur" ] && [ -n "$avail" ] && [ "$cur" != "$avail" ]; then
-      vers="$cur -> $avail"
-    else
-      vers="${cur:-?}"
-    fi
-    r_host+=("$host"); r_vers+=("$vers"); r_state+=("$state")
   done
-  local hostw=4 versw=7
-  for host in "${FLEET_HOSTS[@]}"; do
-    [ "${#host}" -le "$hostw" ] || hostw="${#host}"
-  done
-  for i in "${!r_vers[@]}"; do
-    [ "${#r_vers[$i]}" -le "$versw" ] || versw="${#r_vers[$i]}"
-  done
-  for i in "${!r_host[@]}"; do
-    printf '%s %s %s\n' "$(fleet_pad "$hostw" "${r_host[$i]}")" \
-      "$(fleet_pad "$versw" "${r_vers[$i]}")" "${r_state[$i]}"
-  done
-  if $check; then
-    echo "${#FLEET_HOSTS[@]} host(s): $level up to date, $changed would change, $bad unreachable or unclear"
-  else
-    echo "${#FLEET_HOSTS[@]} host(s): $level already level, $changed upgraded, $bad unreachable or unclear"
+  if [ "${#on[@]}" -eq 1 ] && [ -z "$unknown" ]; then
+    echo "${#FLEET_UP_HOSTS[@]} host(s) on ${on[0]}"
+    return 0
   fi
-  [ "$bad" -eq 0 ]
+  for n in "${!on[@]}"; do
+    out+="${out:+; }${on[$n]}: ${who[$n]}"
+  done
+  [ -z "$unknown" ] || out+="${out:+; }unknown: $unknown"
+  echo "not on one version — $out"
 }
 
 # `fleet health`: one exit code for the whole fleet, so a central node needs

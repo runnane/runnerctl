@@ -81,6 +81,25 @@ grep -qE "^(relocated|retired):" "$tmp/o1" && fail "1: a copy outside a home mov
 cmp -s runnerctl "$tmp/sys1/runnerctl" || fail "1: new bytes did not land"
 no_sudo "$tmp/o1" "1"
 
+# 1b. GHR-82: `fleet upgrade` reads two things off a host — the version its
+#     `Upgraded` sentence says it wrote, and what `version` answers afterwards
+#     — and every sim case feeds those two parsers the STUB's canned lines. So
+#     here they read the real ones: the output case 1 just captured, and the
+#     `version` of the file it wrote. A reworded sentence or a changed
+#     `version` line fails this rather than turning every fleet row into a
+#     read-back mismatch on the first real fleet.
+wrote="$(RUNNERCTL_NO_MAIN=1 bash -c '. "$0" && fleet_upgrade_wrote "$1"' "$PWD/runnerctl" "$tmp/o1")" \
+  || fail "1b: fleet_upgrade_wrote exited $?"
+[ "$wrote" = "$ver" ] || fail "1b: fleet_upgrade_wrote read '$wrote' off the real upgrade output, want '$ver': $(cat "$tmp/o1")"
+"$tmp/sys1/runnerctl" version >"$tmp/v1" 2>&1 || fail "1b: version exited $? — $(cat "$tmp/v1")"
+answer="$(RUNNERCTL_NO_MAIN=1 bash -c '. "$0" && fleet_version_answer "$1"' "$PWD/runnerctl" "$tmp/v1")" \
+  || fail "1b: fleet_version_answer exited $?"
+[ "$answer" = "$ver" ] || fail "1b: fleet_version_answer read '$answer' off the real version output, want '$ver': $(cat "$tmp/v1")"
+# ...and a host that did not write has no such version to compare against.
+wrote="$(RUNNERCTL_NO_MAIN=1 bash -c '. "$0" && fleet_upgrade_wrote "$1"' "$PWD/runnerctl" "$tmp/v1")" \
+  || fail "1b: fleet_upgrade_wrote exited $? on a file with no Upgraded sentence"
+[ -z "$wrote" ] || fail "1b: fleet_upgrade_wrote read '$wrote' off output that never said Upgraded"
+
 # 2. THE CASE THIS ISSUE EXISTS FOR. A home copy with nothing installed
 #    system-wide relocates to the prefix and is retired behind it.
 old_at "$HOME/.local/bin/runnerctl" 0.0.1
