@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.20.0](https://github.com/runnane/runnerctl/compare/v0.19.0...v0.20.0) (2026-10-13)
+
+
+### Features
+
+* fleet watch view keys — ! problems only, b/i busy/idle, / text filter, s sort, c collapse, ? keys, and --problems/--sort to start in a view (GHR-75) ([#86](https://github.com/runnane/runnerctl/issues/86)) ([9981043](https://github.com/runnane/runnerctl/commit/9981043180b5f9a06e70fe095ad5b5ea7d9ad8e5))
+* status --json names a job's run (workflow, ids, ref, sha, actor, url), WORKING-ON shows workflow / job [@ref](https://github.com/ref) where there is room, and O prints the run URL in both watches (GHR-78) ([#91](https://github.com/runnane/runnerctl/issues/91)) ([832b15c](https://github.com/runnane/runnerctl/commit/832b15c13730d7d0c6f454e95b772389aaffa203))
+
 ## [0.19.0](https://github.com/runnane/runnerctl/compare/v0.18.0...v0.19.0) (2026-10-13)
 
 
