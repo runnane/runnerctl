@@ -7393,12 +7393,14 @@ case_fleet_watch_question_mark_lists_every_key() {
     expect_frame "$k" '^any key closes this list$'
     expect_frame_count_of "$k" '^HOST +IDX|example\.slot-' 0
   done
-  # a line per key, and the list short enough for a 24-row terminal: its 14
-  # lines (GHR-78 added O), the header, the summary and the three lines under it
-  for k in '!' 'b i' '/' 'a' 's' 'c' 'K R S T P L' 'O' '\?' 'q' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
+  # a line per key, and the list short enough for a 24-row terminal: its 17
+  # lines (GHR-78 added O, GHR-76 Enter and what the pane's own keys are), the
+  # header, the summary and the three lines under it
+  for k in '!' 'b i' '/' 'a' 's' 'c' 'Enter' 'K R S T P L' 'O' '\?' 'q' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
     expect_frame 2 "^  $k   +[a-z]"
   done
-  expect_frame_lines 2 20
+  expect_frame 2 '^          host that is not answering: that host\)\. There q Esc Enter go back, h$'
+  expect_frame_lines 2 23
   expect_frame 3 "$(fw_row build-1 0 1)"
   expect_frame 5 "$(fw_row build-1 0 1)"
   expect_frame_count_of 3 "$V_ROW" 6
@@ -8376,6 +8378,687 @@ t "watch: O prints the run URL of the cursor's job"                         case
 t "fleet watch: O prints the cursor's run URL and asks no host"             case_fleet_watch_O_prints_the_cursors_run_url
 t "fleet watch: O prints nothing that is not a run page's address"          case_fleet_watch_run_url_trusts_no_remote_string
 t "status --json: a job's text cannot forge the slot line its readers parse" case_run_facts_cannot_forge_the_slot_line
+
+# --- GHR-76: the slot detail pane ------------------------------------------------
+# Enter on a slot row replaces the table with that slot in full; q, Esc or
+# Enter goes back. One renderer (pane_render) behind both watches, so the
+# local cases pin what it draws and the fleet cases what their filler reads —
+# from the payload the tick brought, which is why every fleet case pins its
+# probe:ssh_run count: opening, scrolling, switching and leaving a pane ask no
+# host anything.
+#
+# A pane frame at unknown height: line 1 the watch's header (in `fleet watch`
+# line 2 the summary), then the pane, a blank line, the pane's own legend and
+# the status line. frame_from N L is frame N from its line L on, so a text can
+# be pinned without the clock in the header.
+PANE_KEYS_SLOT='q/Esc/Enter back  h host  jk scroll  K R S T P L O this slot  Ctrl-C quits'
+PANE_KEYS_HOST='q/Esc/Enter back  h slot  jk scroll  Ctrl-C quits'
+PANE_KEYS_DOWN='q/Esc/Enter back  jk scroll  Ctrl-C quits'
+PANE_HOST_ROWS='  cores         16
+  memory        48.0G available of 64.0G
+  disk          / [docker,work] 24% (353.9G free)
+  events        none in the last 1h'
+# The version the script under test reports: release-please moves it, so no
+# case can carry it as a literal.
+pane_ver() {
+  local v
+  v="$("$RUNNERCTL" version)"
+  echo "${v#runnerctl }"
+}
+frame_from() { # N L
+  tail -n +"$2" <<<"${FRAMES[$1]-}"
+}
+# Frame N carries no control byte but its newlines — a pane has no cursor row,
+# so with colour off there is no escape sequence of the watch's own in it.
+expect_frame_plain() { # N
+  _expect
+  local LC_ALL=C s="${FRAMES[$1]-}"
+  s="${s//$'\n'/}"
+  [[ "$s" != *[$'\001'-$'\037'$'\177']* ]] || FAILS+=("frame $1 carries a control byte: $(cat -v <<<"${FRAMES[$1]-}" | grep -m1 -F -e '^[' -e '^G' -e '^?' -e '^I'; true)")
+}
+# Slot-1's pane in the local watch, with the run's facts (RUNNERCTL_STUB_RUN)
+# and memory pressure (RUNNERCTL_STUB_PRESSURE): RUNTIME is the one fact that
+# moves with the stub's clock.
+pane_local_slot1() { # RUNTIME
+  cat <<EOF
+example.slot-1 — slot details
+Identity
+  host          stub-host-1
+  runner        example.slot-1
+  unit          actions.runner.example.slot-1.service
+  profile       —
+  enabled       enabled
+  runnerctl     $(pane_ver)
+State
+  active        active/running
+  since         3d 4h
+  restarts      0
+  result        success
+  last restart  —
+Job
+  repo          example/my-app
+  job           test
+  running for   $1
+  stalled       no
+  workflow      CI
+  run           #57 · id 1234567890 · attempt 2
+  ref           main
+  commit        0123456789abcdef0123456789abcdef01234567
+  actor         octocat
+  event         push
+  url           https://github.com/example/my-app/actions/runs/1234567890/attempts/2
+Memory
+  current       1.0G
+  peak          25.0G
+  high          22.0G
+  max           26.0G
+  bar           [#+++++++++++++++++++++++++++++++++++++--] 4% of max, peak 96%, high at 85%
+  pressure      full avg10 63.2% · avg60 41.0%
+  events        high 4 · max 1 · oom_kill 0
+Leaks
+  leaked        —
+Host
+$PANE_HOST_ROWS
+
+$PANE_KEYS_SLOT
+EOF
+}
+
+# The acceptance case, locally. Enter draws the pane where the table was, with
+# every fact pinned — the bar included: 1.0G of a 26G max is one `#` of forty,
+# the 25G peak takes the `+` to the thirty-eighth. A tick redraws it from
+# fresh facts: the stub's clock moves a minute per tick here, and the job's
+# runtime with it. q goes BACK (the second q is the one that quits), and the
+# table is the one of before, the cursor where it was.
+case_watch_enter_opens_the_slot_pane_and_a_tick_refreshes_it() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_PRESSURE=1 RUNNERCTL_STUB_CLOCK=1 \
+    RUNNERCTL_STUB_KEYS=$'\n-q-q' run watch --interval 60
+  expect_rc 0
+  frames
+  expect_frame_count 5
+  expect_frame 1 "$(cursor_row 0 1)"
+  expect_frame_line 2 1 '^runnerctl watch — [^ ]+ — [0-9]{2}:[0-9]{2}:[0-9]{2} — every 60s \(Ctrl-C to quit\)$'
+  expect_text "the pane, as Enter opens it" "$(pane_local_slot1 12m)" "$(frame_from 2 2)"
+  expect_text "the pane, a tick later" "$(pane_local_slot1 13m)" "$(frame_from 3 2)"
+  expect_frame_plain 2
+  expect_frame_count_of 2 '^IDX |^[0-9]+ +example\.slot-' 0
+  expect_frame 4 "$(cursor_row 0 1)"
+  expect_frame 4 "$LEGEND"
+  expect_frame_count_of 4 'slot details' 0
+  expect_log_count '^probe:tty_read_char 60 \$.\\n.$' 1
+  expect_log_count '^probe:tty_read_char 60 q$' 2
+  expect_log_count '^probe:pause 60$' 2
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+  # Ctrl-C quits from the pane as it does from the table: the cursor comes
+  # back, and the pane was the last thing drawn. (SIGTERM where the gate
+  # started this run with SIGINT ignored — see the stub's tty_read_char.)
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=$'\n\x03' run watch
+  expect_rc 0
+  frames
+  expect_frame_count 2
+  expect_frame_line 2 2 '^example\.slot-1 — slot details$'
+  expect_log_count '^probe:(sigint|sigterm)$' 1
+  expect_log_order '^probe:term_cursor hide$' '^probe:(sigint|sigterm)$' '^probe:term_cursor show$'
+}
+
+# The pane is opened from a row that is not the first, and a `j` pressed in it
+# is the pane's (a scroll) — not the table's: the cursor is still on slot-2
+# when Esc puts the table back, which the K pressed there says in words. P in
+# the pane names the command the table's P names, on the pane's slot, and `y`
+# runs it with the pane still up. The idle slot's own rows are pinned here:
+# what it did last, how often it restarted and why, and the processes behind
+# the table's `+2 leaked`.
+case_watch_pane_keeps_the_cursor_and_acts_on_its_slot() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 \
+    RUNNERCTL_STUB_KEYS=$'j\njPy\e-K-q' run watch
+  expect_rc 0
+  frames
+  expect_frame_count 9
+  expect_frame 2 "$(cursor_row 1 2)"
+  expect_frame_line 3 2 '^example\.slot-2 — slot details$'
+  expect_frame 3 '^  restarts      3$'
+  expect_frame 3 '^  last restart  oom-kill$'
+  expect_frame 3 '^  job           idle$'
+  expect_frame 3 '^  idle for      2h31m$'
+  expect_frame 3 '^  jobs done     2$'
+  expect_frame 3 '^  bar           \[#-{39}\] 4% of max, high at 85%$'
+  expect_frame 3 '^  leaked        2$'
+  expect_frame 3 '^  processes     4242/node, 4243/esbuild$'
+  expect_frame 3 "^$PANE_KEYS_SLOT\$"
+  expect_frame_line 4 2 '^example\.slot-2 — slot details$'
+  expect_frame_line 5 2 '^example\.slot-2 — slot details$'
+  expect_frame 5 '^Reap 2 leaked process\(es\) on example\.slot-2 \(4242/node, 4243/esbuild\)\? runs: kill -TERM 4242 4243, then kill -KILL what is still alive after 5s  \[y/n\]$'
+  expect_frame_line 6 2 '^example\.slot-2 — slot details$'
+  expect_frame 6 '^example\.slot-2: reaped 2 leaked process\(es\): 4242/node, 4243/esbuild$'
+  expect_log_count '^kill -TERM 4242 4243$' 1
+  expect_log_count '^kill ' 1
+  expect_frame 7 "$(cursor_row 1 2)"
+  expect_frame_count_of 7 "^${REV}" 1
+  expect_frame 7 "$LEGEND"
+  expect_frame 8 '^example\.slot-2: no job running — nothing to kill$'
+  expect_no_log '^systemctl '
+}
+
+# h: the host's block alone, pinned, and back. The action keys have no slot to
+# act on there and say so; a key that is the table's (`!` is nothing locally,
+# `G` would send the cursor to the last slot) does nothing to it — the cursor
+# is on slot-1 when Esc returns. Then a host with trouble: every watched
+# filesystem on a row of its own, and the journal's events in words.
+case_watch_pane_h_shows_the_host_block_alone() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=$'\nhKh!G\e-q' run watch
+  expect_rc 0
+  frames
+  expect_frame_count 8
+  expect_frame_line 2 2 '^example\.slot-1 — slot details$'
+  expect_text "the host block" "stub-host-1 — host details
+Host
+  host          stub-host-1
+  runnerctl     $(pane_ver)
+$PANE_HOST_ROWS
+
+$PANE_KEYS_HOST" "$(frame_from 3 2)"
+  expect_frame 4 '^the host block — K R S T P L O act on a slot; h goes back to the slot$'
+  expect_frame_line 4 2 '^stub-host-1 — host details$'
+  expect_frame_line 5 2 '^example\.slot-1 — slot details$'
+  expect_frame_line 7 2 '^example\.slot-1 — slot details$'
+  expect_frame 8 "$(cursor_row 0 1)"
+  expect_no_out '\[y/n\]'
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_DISKS=full RUNNERCTL_STUB_HOST_EVENTS=events \
+    RUNNERCTL_STUB_KEYS=$'\nhqq' run watch
+  expect_rc 0
+  frames
+  expect_frame 3 '^  disk          /var/lib/docker \[docker\] 96% \(37\.3G free\)$'
+  expect_frame 3 '^  disk          /srv/runner work \[work\] 88% \(223\.5G free\)$'
+  expect_frame 3 '^  events        last 1h: 2 OOM kills \(last: cc1plus\), 1 at a cgroup limit, 1 disk-full \(last from dockerd\)$'
+  expect_frame_count_of 3 '^  disk ' 2
+}
+
+# Text somebody else chose is drawn as text. The run's facts are a job's — an
+# escape sequence in the ref, an OSC in the repository, a C1 CSI and a bidi
+# override in the workflow — and a leaked process's comm is that process's:
+# each is on its row as the printable characters between the controls, and the
+# pane's frame carries no control byte at all. (The repository is not one this
+# script builds a URL from, so the pane has none to show.)
+case_watch_pane_draws_job_and_process_text_safely() {
+  local ref=$'ma\e[2J\e[31min\a' repo=$'example/my\e]0;x\a-app' wf=$'C\xc2\x9bI\xe2\x80\xae'
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_REF_NAME="$ref" RUNNERCTL_STUB_RUN_REPOSITORY="$repo" RUNNERCTL_STUB_RUN_WORKFLOW="$wf" \
+    RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=$'\nQq' run watch --color never
+  expect_rc 0
+  frames
+  # Q in the pane is q in the pane: back to the table, which the q then quits
+  expect_frame_count 3
+  expect_frame 3 "$LEGEND"
+  expect_frame 2 '^  repo          example/my\]0;x-app$'
+  expect_frame 2 '^  workflow      CI$'
+  expect_frame 2 '^  ref           ma\[2J\[31min$'
+  expect_frame 2 '^  url           —$'
+  expect_frame_plain 2
+  expect_no_frame 2 $'\xc2\x9b|\xe2\x80\xae'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 RUNNERCTL_STUB_LEAK_COMM=$'no\e[31mde\a' \
+    RUNNERCTL_STUB_KEYS=$'j\nqq' run watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 4
+  expect_frame 3 '^  leaked        2$'
+  expect_frame 3 '^  processes     4242/no\[31mde, 4243/esbuild$'
+  expect_frame_plain 3
+}
+
+# A slot that goes away while its pane is up: the tick finds two slots where
+# there were three, and the frame is the table again — saying why, with the
+# cursor dropped to the top as it is when a slot leaves the table. The pane of
+# a slot that is not running is pinned on the way: no memory figure, so no bar.
+case_watch_pane_closes_when_its_slot_goes_away() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_SCALED_AFTER=60 \
+    RUNNERCTL_STUB_KEYS=$'jj\n-q' run watch --interval 60
+  expect_rc 0
+  frames
+  expect_frame_count 5
+  expect_frame_line 4 2 '^example\.slot-3 — slot details$'
+  expect_frame 4 '^  active        inactive/dead$'
+  expect_frame 4 '^  since         6d$'
+  expect_frame 4 '^  enabled       disabled$'
+  expect_frame 4 '^  job           —$'
+  expect_frame 4 '^  current       —$'
+  expect_frame 4 '^  max           —$'
+  expect_frame 4 '^  bar           —$'
+  expect_frame 5 '^IDX +RUNNER '
+  expect_frame 5 "$(cursor_row 0 1)"
+  expect_frame_count_of 5 '^[0-9]+ +example\.slot-3 ' 0
+  expect_frame 5 '^example\.slot-3: no longer on this host — back to the table$'
+  expect_log_count '^probe:tty_read_char 60 q$' 1
+}
+
+# A pane taller than the terminal goes through the viewport like any frame:
+# forty-one lines on twenty rows are a window with the hidden lines counted,
+# the header and the pane's legend staying put. There is no cursor line, so
+# the keys move the window: j from the top is two lines (one would only swap
+# the hidden line for its own marker), G is the end, g the top, PgDn a window
+# less a line. A resize redraws the pane in hand at the new height.
+case_watch_pane_is_windowed_and_scrolls() {
+  local f
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_LINES=20 \
+    RUNNERCTL_STUB_KEYS=$'\njGg\e[6~q-q' run watch
+  expect_rc 0
+  frames
+  expect_frame_count 8
+  for f in 2 3 4 5 6; do
+    expect_frame_lines "$f" 20
+    expect_frame_line "$f" 1 '^runnerctl watch — '
+    expect_frame_line "$f" 19 "^$PANE_KEYS_SLOT\$"
+  done
+  expect_frame_line 2 2 '^example\.slot-1 — slot details$'
+  expect_frame_line 2 17 '^↓ 26 more  PgDn/G$'
+  expect_frame_count_of 2 '^↑ ' 0
+  expect_frame_line 3 2 '^↑ 2 more  PgUp/g$'
+  expect_frame_line 3 3 '^  host          stub-host-1$'
+  expect_frame_line 3 17 '^↓ 25 more  PgDn/G$'
+  expect_frame_line 4 2 '^↑ 26 more  PgUp/g$'
+  expect_frame_line 4 17 '^  events        none in the last 1h$'
+  expect_frame_count_of 4 '^↓ ' 0
+  expect_text "g is the top again" "$(frame_from 2 2)" "$(frame_from 5 2)"
+  expect_frame_line 6 2 '^↑ 14 more  PgUp/g$'
+  expect_frame_line 6 17 '^↓ 13 more  PgDn/G$'
+  # back in the table, which fits: its own window starts where it was
+  expect_frame_line 7 5 "$(cursor_row 0 1)"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_LINES=20,20,30 \
+    RUNNERCTL_STUB_KEYS=$'\n%-qq' run watch
+  expect_rc 0
+  frames
+  expect_frame_count 5
+  expect_frame_lines 2 20
+  expect_frame_lines 3 30
+  expect_frame_line 3 2 '^example\.slot-1 — slot details$'
+  expect_frame_line 3 27 '^↓ 16 more  PgDn/G$'
+  expect_log_count '^probe:winch$' 1
+}
+
+# Slot-1 of build-1 in `fleet watch`, as its pane reads it off the host's
+# payload: the alias and the host's own name, the repository as the payload
+# names it (short), and nothing the JSON does not carry (no pids).
+pane_fleet_slot1() {
+  cat <<EOF
+example.slot-1 on build-1 — slot details
+Identity
+  host          build-1 (stub-host-1)
+  runner        example.slot-1
+  unit          actions.runner.example.slot-1.service
+  profile       —
+  enabled       enabled
+  runnerctl     $(pane_ver)
+State
+  active        active/running
+  since         3d 4h
+  restarts      0
+  result        success
+  last restart  —
+Job
+  repo          my-app
+  job           test
+  running for   12m
+  stalled       no
+  workflow      CI
+  run           #57 · id 1234567890 · attempt 2
+  ref           main
+  commit        0123456789abcdef0123456789abcdef01234567
+  actor         octocat
+  event         push
+  url           https://github.com/example/my-app/actions/runs/1234567890/attempts/2
+Memory
+  current       1.0G
+  peak          25.0G
+  high          22.0G
+  max           26.0G
+  bar           [#+++++++++++++++++++++++++++++++++++++--] 4% of max, peak 96%, high at 85%
+  pressure      full avg10 63.2% · avg60 41.0%
+  events        high 4 · max 1 · oom_kill 0
+Leaks
+  leaked        —
+Host
+$PANE_HOST_ROWS
+
+$PANE_KEYS_SLOT
+EOF
+}
+
+# The acceptance case, on a fleet. The pane is the host's own `status --json`
+# as the last tick brought it — and ONLY that: two rounds of a table and a
+# payload are the four calls of the whole run, so opening the pane dialled
+# nobody. The tick's answer refreshes it: the job the first payload has
+# running is finished in the second (RUNNERCTL_STUB_BUSY_POLLS), and the pane
+# says idle without a key being pressed. q goes back to the table.
+case_fleet_watch_enter_opens_the_slot_pane_from_the_payload_in_hand() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_PRESSURE=1 RUNNERCTL_STUB_BUSY_POLLS=2 \
+    RUNNERCTL_STUB_KEYS=$'\n-qq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 4
+  expect_frame 1 "$(fw_row build-1 0 1)"
+  expect_frame_line 2 1 "$(view_hdr '' 1)"
+  expect_frame_line 2 2 '^1/1 host answering · 3 slots: 1 busy, 1 idle, 1 disabled · capacity 1 free of 2$'
+  expect_text "the pane, from build-1's payload" "$(pane_fleet_slot1)" "$(frame_from 2 3)"
+  expect_frame_plain 2
+  expect_frame_line 3 3 '^example\.slot-1 on build-1 — slot details$'
+  expect_frame 3 '^  job           idle$'
+  expect_frame 3 '^  idle for      20s$'
+  expect_frame 3 '^  jobs done     1$'
+  expect_frame_count_of 3 '^  (workflow|running for) ' 0
+  expect_frame 4 "$(fw_row build-1 0 1)"
+  expect_frame 4 "$FLEET_WATCH_LEGEND"
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 2
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 2
+  expect_log_count '^probe:ssh_run ' 4
+  expect_log_count '^probe:tty_read_char 5 q$' 2
+  expect_no_log '^direct:'
+}
+
+# The pane's slot is the cursor's, and stays it. Under `b` the second row is
+# build-2/slot-1 where the fleet's second row is build-1/slot-2, and the `k`
+# pressed in the pane would take a cursor that still listened up to
+# build-1/slot-1: O prints build-2's run, R then names build-2's slot-1 on the
+# confirm line, `y` runs the restart on build-2 and nowhere else, the frame
+# after it is the pane again with the result, and Esc puts the busy view back
+# with the cursor on build-2/slot-1. Ten calls: the first round's four, the
+# facts read R makes of build-2, the restart, and the round an action asks
+# for — O, like the pane, reads the payload in hand.
+case_fleet_watch_pane_keeps_the_cursor_and_acts_on_its_pair() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_KEYS=$'bj\nkORy\e-q' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 9
+  expect_frame_line 3 7 "$(fw_row build-2 0 1)"
+  expect_frame_line 4 3 '^example\.slot-1 on build-2 — slot details$'
+  expect_frame 4 '^  host          build-2 \(stub-host-1\)$'
+  expect_frame_line 5 3 '^example\.slot-1 on build-2 — slot details$'
+  expect_frame_line 6 3 '^example\.slot-1 on build-2 — slot details$'
+  expect_frame 6 '^example\.slot-1 on build-2: https://github\.com/example/my-app/actions/runs/1234567890/attempts/2$'
+  expect_frame_line 7 3 '^example\.slot-1 on build-2 — slot details$'
+  expect_frame 7 '^Restart example\.slot-1 on build-2\? runs on build-2: runnerctl restart example\.slot-1  \[y/n\]$'
+  expect_frame 7 '^warning: a job is running \(my-app:test \(12m\)\) — .* runnerctl restart --when-idle on the host waits for it instead$'
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl restart example\.slot-1$' 1
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap) ' 1
+  expect_frame_line 8 3 '^example\.slot-1 on build-2 — slot details$'
+  expect_frame 8 '^example\.slot-1 on build-2: restart done\.$'
+  expect_frame_line 9 1 "$(view_hdr ' — view: busy only')"
+  expect_frame 9 "$(fw_row build-2 0 1)"
+  expect_frame_count_of 9 "^${REV}" 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 3
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 2
+  expect_log_count '^probe:ssh_run ' 10
+}
+
+# h switches the pane to its host's block and back; the block is pinned. The
+# action keys have no slot there, and the view keys are not the pane's: `!`,
+# `b`, `s`, `/` and `c` change nothing — the `/` does not open the filter, or
+# the Esc after it would only close that — so the table Esc returns to is the
+# plain one, six rows, the cursor on build-2/slot-1. All of it off one round.
+case_fleet_watch_pane_h_shows_the_host_and_view_keys_do_nothing() {
+  local f
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=$'jjj\nhKh!bs/c\e-q' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 14
+  expect_frame_line 5 3 '^example\.slot-1 on build-2 — slot details$'
+  expect_text "build-2's block" "$SUM_OK
+build-2 — host details
+Host
+  host          build-2 (stub-host-1)
+  runnerctl     $(pane_ver)
+$PANE_HOST_ROWS
+
+$PANE_KEYS_HOST" "$(frame_from 6 2)"
+  expect_frame 7 '^build-2: the host block — K R S T P L O act on a slot; h goes back to the slot$'
+  for f in 8 9 10 11 12 13; do
+    expect_frame_line "$f" 1 "$(view_hdr '')"
+    expect_frame_line "$f" 3 '^example\.slot-1 on build-2 — slot details$'
+  done
+  expect_frame_line 14 1 "$(view_hdr '')"
+  expect_frame_count_of 14 "$V_ROW" 6
+  expect_frame 14 "$(fw_row build-2 0 1)"
+  expect_frame 14 "$FLEET_WATCH_LEGEND"
+  expect_no_out '\[y/n\]'
+  expect_no_out '^filter: '
+  expect_log_count '^probe:ssh_run ' 4
+}
+
+# The three ways a host is not simply answering. A host with no rows is one
+# error row, and Enter there is its block: the error, and `—` for everything
+# nobody has told this node. A host that STOPS answering keeps its payload as
+# it keeps its rows: the pane goes on showing the slot, with the age line the
+# table draws over the kept rows at the top of the Host block. And a slot that
+# is gone from its host's next answer closes the pane, saying so, with the
+# cursor on that host's first slot.
+case_fleet_watch_pane_for_a_host_that_is_not_answering() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=$'jjj\nKh\e-q' RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-unreachable" \
+    run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 8
+  expect_text "the block of a host that never answered" "gw-unreachable — host details
+  facts         none from that host yet — its 'status --json' has not answered
+Host
+  error         unreachable — ssh: connect to host gw-unreachable port 22: No route to host
+  host          gw-unreachable
+  runnerctl     —
+  cores         —
+  memory        —
+  disk          —
+  events        —
+
+$PANE_KEYS_DOWN" "$(frame_from 5 3)"
+  expect_frame 6 '^gw-unreachable: the host block — K R S T P L O act on a slot, and this host is showing none$'
+  expect_frame_line 7 3 '^gw-unreachable — host details$'
+  expect_frame 8 "^${REV}gw-unreachable +unreachable — "
+  expect_log_count '^probe:ssh_run ' 3
+  # stops answering with the pane up
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=$'jjj\n-hqq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_DOWN="build-2:2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 8
+  expect_frame_line 5 3 '^example\.slot-1 on build-2 — slot details$'
+  expect_frame_count_of 5 '^  (answer|error) ' 0
+  expect_frame_line 6 3 '^example\.slot-1 on build-2 — slot details$'
+  expect_frame 6 '^  job           test$'
+  expect_frame 6 '^  answer        no answer for 0s — last seen [0-9]{2}:[0-9]{2}:[0-9]{2} — unreachable — ssh: connect to host build-2 port 22: No route to host$'
+  expect_frame_line 7 3 '^build-2 — host details$'
+  expect_frame 7 '^  answer        no answer for 0s — '
+  expect_frame 7 '^  cores         16$'
+  expect_frame 8 "$(fw_row build-2 0 1)"
+  expect_log_count '^probe:ssh_run ' 7
+  # scaled away with the pane up
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=$'jjjjj\n-q' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_SCALED="build-2:2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 8
+  expect_frame_line 7 3 '^example\.slot-3 on build-2 — slot details$'
+  expect_frame 8 '^example\.slot-3 on build-2: no longer on that host — back to the table$'
+  expect_frame 8 "$(fw_row build-2 0 1)"
+  expect_frame_count_of 8 '^build-2 +2 +example\.slot-3 ' 0
+  expect_log_count '^probe:tty_read_char 5 q$' 1
+}
+
+# A job's text, through the REAL emitter and back. The workflow has a quote, a
+# backslash, an escape sequence and a bidi override in it; json_str on the
+# host writes `\"`, `\\` and `\u001b`, and the pane has to undo exactly that
+# before it draws — and only then take the controls out. Pinned as the bytes
+# on the row, which are neither the JSON's nor the raw value's: drawn as the
+# JSON has it the row would read `Build \"x\" \\ \u001b[31mred`, and unescaped
+# but not made safe it would carry a real Escape. The frame has no control
+# byte in it, and the payload this was read from is pinned separately, as the
+# escapes it is made of — so the two cannot agree and both be wrong.
+case_fleet_watch_pane_unescapes_then_neutralises_job_text() {
+  local wf=$'Build "x" \\ \e[31mred\xe2\x80\xae' ref=$'ma\e[2J\ain'
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_WORKFLOW="$wf" RUNNERCTL_STUB_RUN_REF_NAME="$ref" \
+    RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=$'\nqq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 3
+  expect_frame_line 2 3 '^example\.slot-1 on build-1 — slot details$'
+  expect_text "the workflow row" '  workflow      Build "x" \ [31mred' "$(grep -m1 '^  workflow ' <<<"${FRAMES[2]}"; true)"
+  expect_text "the ref row" '  ref           ma[2Jin' "$(grep -m1 '^  ref ' <<<"${FRAMES[2]}"; true)"
+  expect_frame_plain 2
+  expect_no_frame 2 $'\xe2\x80\xae'
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_WORKFLOW="$wf" RUNNERCTL_STUB_RUN_REF_NAME="$ref" run status --json
+  expect_rc 0
+  expect_out '"workflow":"Build \\"x\\" \\\\ \\u001b\[31mred'$'\xe2\x80\xae''",'
+  expect_out '"ref":"ma\\u001b\[2J\\u0007in",'
+}
+
+# The JSON string reader on its own: every escape json_str writes and the ones
+# another emitter may, one pass, left to right. `\\n` is a backslash and an n,
+# not a newline; a surrogate pair is one character and half of one is `?`;
+# U+0000 is dropped; what is not an escape is left as it is.
+case_json_unescape_pins_the_text() {
+  # shellcheck disable=SC2016
+  run_fn eval 'for s in "plain" "a\\\"b" "a\\\\nb" "a\\nb\\tc" "\\u001b[31m" "\\u00e6\\u2014" "\\ud83d\\ude00" "x\\ud83dy" \
+      "a\\u0000b" "\\uZZ12" "a\\/b" "tail\\"; do json_unescape "$s"; printf "%s -> %q\n" "$s" "$JSON_TEXT"; done'
+  expect_rc 0
+  expect_text "what each escape stands for" 'plain -> plain
+a\"b -> a\"b
+a\\nb -> a\\nb
+a\nb\tc -> $'"'"'a\nb\tc'"'"'
+\u001b[31m -> $'"'"'\E[31m'"'"'
+\u00e6\u2014 -> æ—
+\ud83d\ude00 -> 😀
+x\ud83dy -> x\?y
+a\u0000b -> ab
+\uZZ12 -> \?ZZ12
+a\/b -> a/b
+tail\ -> tail' "$OUT"
+}
+
+# The fleet pane's filler on payloads no stub host sends. `old` is a host from
+# before the run's facts, the leak count, the memory events and pressure, the
+# peak, the disks and the journal events: every one of those rows is `—`, and
+# nothing fails. `evil` is a host that lies: numbers written `08` (an octal
+# error to shell arithmetic, which would end the watch), a URL that is no run
+# page, a workflow with every kind of escape in it, a tab in a ref.
+case_fleet_watch_pane_reads_an_old_or_hostile_payload() {
+  local d="$TMP/ghr76.state"
+  local pre='"enabled":"enabled","memory_max":' post='"restart":"always","env_file":null,'
+  mkdir -p "$d"
+  {
+    echo '{"runnerctl":"0.9.0","host":{"name":"h1","cores":8,"mem_total":null,"mem_available":null},'
+    echo ' "slots":['
+    printf '%s\n' "  {\"idx\":0,\"unit\":\"actions.runner.example.old.service\",\"name\":\"old\",\"active\":\"active\",\"sub\":\"running\",${pre}null,\"memory_high\":null,\"memory_current\":1073741824,$post"'"since":1000000000,"restarts":0,"result":"success","job":{"repo":"my-app","name":"test","since":1000000000,"stalled":null},"idle_since":null,"jobs_completed":null,"working_on_access":"ok"},'
+    printf '%s\n' "  {\"idx\":1,\"unit\":\"u2\",\"name\":\"evil\",\"active\":\"active\",\"sub\":\"running\",${pre}08,\"memory_high\":0,\"memory_current\":09,\"memory_peak\":1e9,$post"'"since":08,"restarts":007,"result":"success","last_restart_reason":null,"profile":"ci","job":{"repo":"r","name":"n","since":08,"stalled":false,"workflow":"Build \"x\" \\n \u001b[31mred\u009b\u202e\ud83d\ude00","run_id":08,"run_attempt":1,"run_number":null,"ref":"a\tb","sha":null,"actor":null,"event":null,"url":"javascript:alert(1)"},"idle_since":null,"jobs_completed":null,"working_on_access":"no-journal","leaked_procs":2,"memory_events":{"high":1,"max":08,"oom_kill":0},"memory_pressure":{"full_avg10":1e9,"full_avg60":5.00,"full_total":1}}'
+    echo ']}'
+  } >"$d/0.json"
+  echo 0 >"$d/0.jrc"
+  echo 0 >"$d/0.rc"
+  # shellcheck disable=SC2016
+  GHR76_D="$d" run_fn eval 'now_epoch() { echo 1000000720; }
+    FLEET_HOSTS=(h1); FW_STATE="$GHR76_D" FW_HOST=h1 FW_PANE=slot
+    for FW_NAME in old evil; do fleet_watch_pane_build; printf "%s\n" "$PANE_OUT"; done
+    FW_NAME=gone; fleet_watch_pane_build || echo "rc=$? $FW_NOTICE"'
+  expect_rc 0
+  expect_text "an old host's pane, a hostile host's, and a slot that is not there" 'old on h1 — slot details
+Identity
+  host          h1
+  runner        old
+  unit          actions.runner.example.old.service
+  profile       —
+  enabled       enabled
+  runnerctl     0.9.0
+State
+  active        active/running
+  since         12m
+  restarts      0
+  result        success
+  last restart  —
+Job
+  repo          my-app
+  job           test
+  running for   12m
+  stalled       —
+  workflow      —
+  run           —
+  ref           —
+  commit        —
+  actor         —
+  event         —
+  url           —
+Memory
+  current       1.0G
+  peak          —
+  high          —
+  max           —
+  bar           no MemoryMax or MemoryHigh set — nothing to draw it against
+  pressure      —
+  events        —
+Leaks
+  leaked        —
+Host
+  cores         8
+  memory        —
+  disk          —
+  events        —
+evil on h1 — slot details
+Identity
+  host          h1
+  runner        evil
+  unit          u2
+  profile       ci
+  enabled       enabled
+  runnerctl     0.9.0
+State
+  active        active/running
+  since         —
+  restarts      —
+  result        success
+  last restart  —
+Job
+  repo          r
+  job           n
+  running for   —
+  stalled       no
+  workflow      Build "x" \n [31mred😀
+  run           attempt 1
+  ref           ab
+  commit        —
+  actor         —
+  event         —
+  url           not shown — what was reported is not a run page'"'"'s address
+  access        no-journal — only /proc could be read; idle time and job counts need journal read access (systemd-journal group) or root
+Memory
+  current       —
+  peak          —
+  high          0M
+  max           —
+  bar           —
+  pressure      full avg10 — · avg60 5.0%
+  events        high 1 · max — · oom_kill 0
+Leaks
+  leaked        2
+Host
+  cores         8
+  memory        —
+  disk          —
+  events        —
+rc=1 gone on h1: no longer on that host — back to the table' "$OUT"
+  expect_no_control_bytes
+  expect_no_out $'\xc2\x9b|\xe2\x80\xae'
+  rm -rf "$d"
+}
+
+t "watch: Enter opens the slot's pane, a tick refreshes it, q goes back"     case_watch_enter_opens_the_slot_pane_and_a_tick_refreshes_it
+t "watch: the pane keeps the cursor where it was and acts on its own slot"   case_watch_pane_keeps_the_cursor_and_acts_on_its_slot
+t "watch: h in the pane shows the host block alone"                          case_watch_pane_h_shows_the_host_block_alone
+t "watch: a job's text and a leaked process's comm are text in the pane"     case_watch_pane_draws_job_and_process_text_safely
+t "watch: a slot that goes away closes its pane with a notice"               case_watch_pane_closes_when_its_slot_goes_away
+t "watch: a pane taller than the terminal is windowed, scrolls and resizes"  case_watch_pane_is_windowed_and_scrolls
+t "fleet watch: Enter opens the slot's pane from the payload in hand"        case_fleet_watch_enter_opens_the_slot_pane_from_the_payload_in_hand
+t "fleet watch: the pane keeps the cursor and its action keys their pair"    case_fleet_watch_pane_keeps_the_cursor_and_acts_on_its_pair
+t "fleet watch: h shows the host's block, and no view key reaches the table" case_fleet_watch_pane_h_shows_the_host_and_view_keys_do_nothing
+t "fleet watch: the pane of a host that never answered, stopped, or scaled"  case_fleet_watch_pane_for_a_host_that_is_not_answering
+t "fleet watch: the pane unescapes a job's text, then makes it safe to draw" case_fleet_watch_pane_unescapes_then_neutralises_job_text
+t "json_unescape: what each escape stands for"                               case_json_unescape_pins_the_text
+t "fleet watch: an older host's payload is — per row, a hostile one harmless" case_fleet_watch_pane_reads_an_old_or_hostile_payload
 
 # --- Summary ------------------------------------------------------------------
 echo

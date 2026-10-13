@@ -113,7 +113,13 @@
 # row), R restarts the service (warned when a job is
 # in flight), S/T stop/start it, P reaps its `+N leaked` processes, L opens
 # `logs <slot> -n 50` in $PAGER, O prints the URL of the job's run on the
-# status line (GHR-78; printed, never opened). Privileged keys go through
+# status line (GHR-78; printed, never opened). Enter (GHR-76) replaces the
+# table with the selected slot in full — unit, sub-state, result and last
+# restart reason, the job's run, memory current / peak / high / max with a bar,
+# pressure and event counters, the leaked processes by pid and name, and the
+# host's cores, memory, disks and journal events; there q, Esc or Enter go back
+# (q does not quit in the pane — Ctrl-C does), h shows the host's block alone,
+# the action keys act on that slot, and ↑/↓ PgUp/PgDn scroll. Privileged keys go through
 # sudo like the commands do. Too narrow a terminal drops MAX, HIGH and ENVFILE
 # from the table, never WORKING-ON; --narrow (GHR-56, on `status` too) asks
 # for that narrow table outright. A terminal with columns to spare beyond the
@@ -234,7 +240,12 @@
 # restart, S stop, T start, P reap, each decided on facts read from that host
 # at the keypress and confirmed with a line naming the exact remote command,
 # and L pages that slot's last 50 journal lines. O prints the run URL of the
-# cursor's job, from the payload the last tick brought (GHR-78). S keeps a floor: it refuses
+# cursor's job, from the payload the last tick brought (GHR-78). Enter opens
+# the local watch's slot pane for the cursor's pair (GHR-76), read from that
+# same payload — no round trip, refreshed by the tick, `—` for anything an
+# older host does not report; on the row of a host that is not answering it
+# opens that host's block with the error in full, and h in a slot's pane shows
+# its host. S keeps a floor: it refuses
 # a stop that would leave fewer than --min-available K (default 1) slots
 # active across the watched hosts, so a cursor walked down the fleet pressing
 # S cannot take it to zero. `q` quits.
@@ -3400,6 +3411,376 @@ watch_run_action() {
   term_cursor hide
   WATCH_ACTION="" WATCH_PROMPT=""
 }
+
+# --- Slot detail pane (GHR-76) --------------------------------------------------
+# `status --json` carries a good deal per slot that the table has no room for:
+# the unit's full name, its sub-state, result and last restart reason, the
+# memory peak beside the current figure and both limits, every pressure and
+# event counter, the run a job belongs to (GHR-78), the processes behind a
+# `+N leaked`. Enter on a slot row replaces the table with all of it for that
+# one slot, and with the host's own facts under it; Esc, Enter or q goes back.
+#
+#   * ONE RENDERER, TWO FILLERS. pane_render draws from PN, an array of raw
+#     values in which empty means "not known". The local watch fills it from
+#     SLOT and HOST (pane_from_local), `fleet watch` from the `status --json`
+#     payload the last tick already brought (pane_from_json, further down). So
+#     the two panes cannot drift apart, and a host too old to report a field
+#     simply leaves it empty: every row prints `—` for an empty value.
+#   * EVERYTHING DRAWN GOES THROUGH pane_put, which runs the value through
+#     term_safe before it is painted. A workflow's name, a branch, an actor, a
+#     leaked process's comm, a mount point, the stderr of an ssh that failed —
+#     most of a pane is text somebody else chose, so the one function that
+#     appends a row is the one place it is neutralised; a row cannot be added
+#     that skips it. A run URL is additionally held to run_url_ok.
+#   * The pane has NO CURSOR LINE. It is drawn through viewport_draw with
+#     nothing selected, so a pane taller than the terminal is windowed like any
+#     frame (`↑ N more` / `↓ N more`) and ↑ ↓ j k, PgUp/PgDn and g/G move the
+#     window itself (pane_scroll) rather than a cursor. The table's own window
+#     position is put back on the way out.
+#   * The memory bar is ASCII — `#` in use now, `+` up to the peak, `-` free —
+#     so it survives --color never and a terminal that is not in UTF-8 mode. It
+#     is drawn against MemoryMax, or MemoryHigh where no max is set; with
+#     neither there is nothing to draw it against, and the row says so.
+#
+# In the pane q does NOT quit: it goes back to the table, like Esc and Enter
+# (and Q with it), and the pane's own legend says so; Ctrl-C quits from
+# anywhere. h switches between the slot and its host's block alone. The action
+# keys keep acting on the pane's slot, with the same confirm line. Every other
+# key does nothing there — a view key pressed in the pane must not change a
+# table nobody is looking at.
+declare -A PN=()
+PANE_OUT="" PANE_TOP_WAS=0
+PANE_LABEL_W=13 PANE_BAR_CELLS=40
+PANE_LEGEND_SLOT="q/Esc/Enter back  h host  jk scroll  K R S T P L O this slot  Ctrl-C quits"
+PANE_LEGEND_HOST="q/Esc/Enter back  h slot  jk scroll  Ctrl-C quits"
+PANE_LEGEND_DOWN="q/Esc/Enter back  jk scroll  Ctrl-C quits"
+PANE_NO_SLOT_KEYS="the host block — K R S T P L O act on a slot"
+
+# One row of the pane: LABEL, then VALUE made safe to draw and painted SGR
+# (`—` for an empty one). The only way a row gets into PANE_OUT.
+pane_put() { # LABEL VALUE [SGR]
+  local pad
+  term_safe "${2-}"
+  printf -v pad '%-*s' "$PANE_LABEL_W" "$1"
+  PANE_OUT+="${PANE_OUT:+$'\n'}  $pad ${3-}${TERM_SAFE:-—}${3:+$C_RESET}"
+}
+# A heading: the pane's title, or a section's name.
+pane_head() { # TEXT
+  term_safe "$1"
+  PANE_OUT+="${PANE_OUT:+$'\n'}${C_BOLD}${TERM_SAFE}${C_BOLD:+$C_RESET}"
+}
+# VALUE as a whole number arithmetic can take, into PANE_INT — empty for
+# anything else. Not just "digits": a remote's `08` is an octal error to
+# $((…)), and a watch must not die on what a host sent.
+PANE_INT=""
+pane_int() { # VALUE
+  PANE_INT=""
+  [[ ! "${1-}" =~ ^(0|[1-9][0-9]{0,17})$ ]] || PANE_INT="$1"
+}
+# Seconds since EPOCH, into PANE_INT; empty when EPOCH is not one or is ahead
+# of this node's clock.
+pane_age() { # EPOCH
+  local now
+  pane_int "${1-}"
+  [ -n "$PANE_INT" ] || return 0
+  now="$(now_epoch)"
+  if [ "$PANE_INT" -le "$now" ]; then PANE_INT=$((now - PANE_INT)); else PANE_INT=""; fi
+}
+# A duration for a row: fmt_dur's, or nothing (so the row prints `—` once).
+pane_dur() { # SECONDS
+  [[ "${1-}" =~ ^[0-9]+$ ]] || return 0
+  fmt_dur "$1"
+}
+# The bar: `[###+++++-----] 4% of max, peak 96%, high at 85%`. Nothing when the
+# current figure is unknown.
+pane_bar() { # CURRENT PEAK HIGH MAX
+  local cur="$1" peak="$2" high="$3" scale="$4" of=max used pk i bar="" out
+  [ -n "$cur" ] || return 0
+  if [ -z "$scale" ] || [ "$scale" -eq 0 ]; then scale="$high" of=high; fi
+  if [ -z "$scale" ] || [ "$scale" -eq 0 ]; then
+    echo "no MemoryMax or MemoryHigh set — nothing to draw it against"
+    return 0
+  fi
+  used=$((cur * PANE_BAR_CELLS / scale))
+  [ "$cur" -eq 0 ] || [ "$used" -gt 0 ] || used=1
+  [ "$used" -le "$PANE_BAR_CELLS" ] || used="$PANE_BAR_CELLS"
+  pk="$used"
+  if [ -n "$peak" ]; then
+    pk=$((peak * PANE_BAR_CELLS / scale))
+    [ "$pk" -le "$PANE_BAR_CELLS" ] || pk="$PANE_BAR_CELLS"
+    [ "$pk" -ge "$used" ] || pk="$used"
+  fi
+  for ((i = 0; i < PANE_BAR_CELLS; i++)); do
+    if [ "$i" -lt "$used" ]; then bar+="#"; elif [ "$i" -lt "$pk" ]; then bar+="+"; else bar+="-"; fi
+  done
+  out="[$bar] $(((cur * 100 + scale / 2) / scale))% of $of"
+  [ -z "$peak" ] || out+=", peak $(((peak * 100 + scale / 2) / scale))%"
+  if [ "$of" = max ] && [ -n "$high" ] && [ "$high" -gt 0 ]; then
+    out+=", high at $(((high * 100 + scale / 2) / scale))%"
+  fi
+  printf '%s\n' "$out"
+}
+# `a · b · c` from LABEL VALUE pairs, each empty value as `—`; nothing at all
+# when every value is empty, so the row is one `—` rather than three.
+pane_join() { # LABEL VALUE [LABEL VALUE]...
+  local out="" any=false
+  while [ $# -ge 2 ]; do
+    [ -z "$2" ] || any=true
+    out+="${out:+ · }$1 ${2:-—}"
+    shift 2
+  done
+  ! $any || printf '%s\n' "$out"
+}
+
+# The pane itself, into PANE_OUT, from PN. KIND is `slot` (the slot's
+# sections, then its host's) or `host` (the host block alone). What PN holds —
+# each a raw value, empty when unknown; a number has been through pane_int:
+#
+#   host name unit profile enabled version           Identity
+#   active sub since_age restarts result reason      State
+#   job (running | starting | idle | empty) job_repo job_name job_age
+#   job_stalled job_workflow job_run_id job_run_attempt job_run_number
+#   job_ref job_sha job_actor job_event job_url idle_age jobs_done access
+#   mem_cur mem_peak mem_high mem_max p10 p60 ev_high ev_max ev_oom
+#   leaked leak_list
+#   cores mem_total mem_avail                        Host
+#   disks        one line per filesystem, PCT AVAIL MOUNT ROLES separated by
+#                the unit separator (0x1f) — a tab would let `read` fold an
+#                empty AVAIL into the field after it
+#   events       ok | off | no-access, empty when the host does not say; with
+#                ok: hev_window hev_oom hev_cgroup_oom hev_disk_full
+#                hev_oom_proc hev_df_src
+#   answer_label / answer / stderr
+#                `fleet watch` only: why a host is not answering — its age
+#                line, or its error — and the rest of what ssh said, in full
+#   facts        `fleet watch` only: a line for a host that has sent no payload
+pane_render() { # slot|host TITLE
+  local v pct avail mnt roles line us=$'\x1f'
+  local -a ev=()
+  PANE_OUT=""
+  pane_head "$2"
+  [ -z "${PN[facts]:-}" ] || pane_put facts "${PN[facts]}" "$C_YELLOW"
+  if [ "$1" = slot ]; then
+    pane_head "Identity"
+    pane_put host "${PN[host]:-}"
+    pane_put runner "${PN[name]:-}"
+    pane_put unit "${PN[unit]:-}"
+    pane_put profile "${PN[profile]:-}"
+    pane_put enabled "${PN[enabled]:-}"
+    pane_put runnerctl "${PN[version]:-}"
+    pane_head "State"
+    v=""
+    if [ -n "${PN[active]:-}" ]; then
+      v="$(status_active_color "${PN[active]}" "${PN[restarts]:-0}" "${PN[result]:-success}")"
+      pane_put active "${PN[active]}/${PN[sub]:-?}" "$v"
+    else
+      pane_put active ""
+    fi
+    pane_put since "$(pane_dur "${PN[since_age]:-}")"
+    pane_put restarts "${PN[restarts]:-}"
+    pane_put result "${PN[result]:-}"
+    pane_put "last restart" "${PN[reason]:-}"
+    pane_head "Job"
+    case "${PN[job]:-}" in
+      running|starting)
+        v="${PN[job_name]:-}"
+        [ "${PN[job]}" != starting ] || v="(starting)"
+        pane_put repo "${PN[job_repo]:-}"
+        pane_put job "$v" "$C_GREEN"
+        pane_put "running for" "$(pane_dur "${PN[job_age]:-}")"
+        case "${PN[job_stalled]:-}" in
+          true)  pane_put stalled "STALLED — over the stall threshold" "$C_BOLD$C_RED" ;;
+          false) pane_put stalled "no" ;;
+          *)     pane_put stalled "" ;;
+        esac
+        pane_put workflow "${PN[job_workflow]:-}"
+        v="${PN[job_run_number]:+#${PN[job_run_number]}}"
+        [ -z "${PN[job_run_id]:-}" ] || v+="${v:+ · }id ${PN[job_run_id]}"
+        [ -z "${PN[job_run_attempt]:-}" ] || v+="${v:+ · }attempt ${PN[job_run_attempt]}"
+        pane_put run "$v"
+        pane_put ref "${PN[job_ref]:-}"
+        pane_put commit "${PN[job_sha]:-}"
+        pane_put actor "${PN[job_actor]:-}"
+        pane_put event "${PN[job_event]:-}"
+        # A string is printed as a link only when it is one this script would
+        # have built (GHR-78) — whichever host it came from.
+        v="${PN[job_url]:-}"
+        if [ -n "$v" ] && ! run_url_ok "$v"; then v="not shown — what was reported is not a run page's address"; fi
+        pane_put url "$v" ;;
+      idle)
+        pane_put job "idle" "$C_DIM"
+        pane_put "idle for" "$(pane_dur "${PN[idle_age]:-}")"
+        pane_put "jobs done" "${PN[jobs_done]:-}" ;;
+      *)
+        pane_put job "" ;;
+    esac
+    case "${PN[access]:-}" in
+      ''|ok) ;;
+      no-journal) pane_put access "no-journal — only /proc could be read; idle time and job counts need journal read access (systemd-journal group) or root" "$C_YELLOW" ;;
+      no-access)  pane_put access "no-access — neither the journal nor the slot's processes could be read; needs the systemd-journal group or root" "$C_YELLOW" ;;
+      *)          pane_put access "${PN[access]}" "$C_YELLOW" ;;
+    esac
+    pane_head "Memory"
+    pane_put current "$(hbytes "${PN[mem_cur]:-}")" "$(status_used_color "${PN[mem_cur]:-}" "${PN[mem_high]:-}")"
+    pane_put peak "$(hbytes "${PN[mem_peak]:-}")"
+    pane_put high "$(hbytes "${PN[mem_high]:-}")"
+    pane_put max "$(hbytes "${PN[mem_max]:-}")"
+    pane_put bar "$(pane_bar "${PN[mem_cur]:-}" "${PN[mem_peak]:-}" "${PN[mem_high]:-}" "${PN[mem_max]:-}")"
+    pane_put pressure "$(pane_join "full avg10" "${PN[p10]:+$(status_press_cell "${PN[p10]}")}" "avg60" "${PN[p60]:+$(status_press_cell "${PN[p60]}")}")" \
+      "$(status_press_color "${PN[p10]:-}")"
+    pane_put events "$(pane_join high "${PN[ev_high]:-}" max "${PN[ev_max]:-}" oom_kill "${PN[ev_oom]:-}")"
+    pane_head "Leaks"
+    v=""
+    [ -z "${PN[leaked]:-}" ] || [ "${PN[leaked]}" -eq 0 ] || v="$C_YELLOW"
+    pane_put leaked "${PN[leaked]:-}" "$v"
+    [ -z "${PN[leak_list]:-}" ] || pane_put processes "${PN[leak_list]}"
+  fi
+  pane_head "Host"
+  [ -z "${PN[answer]:-}" ] || pane_put "${PN[answer_label]:-error}" "${PN[answer]}" "$C_RED"
+  if [ -n "${PN[stderr]:-}" ]; then
+    while IFS= read -r line; do pane_put stderr "$line"; done <<<"${PN[stderr]}"
+  fi
+  if [ "$1" = host ]; then
+    pane_put host "${PN[host]:-}"
+    pane_put runnerctl "${PN[version]:-}"
+  fi
+  pane_put cores "${PN[cores]:-}"
+  v=""
+  if [ -n "${PN[mem_avail]:-}${PN[mem_total]:-}" ]; then
+    v="$(hbytes "${PN[mem_avail]:-}") available of $(hbytes "${PN[mem_total]:-}")"
+  fi
+  pane_put memory "$v"
+  if [ -n "${PN[disks]:-}" ]; then
+    while IFS="$us" read -r pct avail mnt roles; do
+      [ -n "$mnt" ] || continue
+      pane_put disk "$(disk_cell "${pct:-?}" "$avail" "$mnt" "$roles")" "$(disk_color "$pct")"
+    done <<<"${PN[disks]}"
+  else
+    pane_put disk ""
+  fi
+  case "${PN[events]:-}" in
+    ok)
+      v="$(pane_dur "${PN[hev_window]:-}")"
+      [ "${PN[hev_oom]:-0}" -eq 0 ] || ev+=("${PN[hev_oom]} OOM kill$([ "${PN[hev_oom]}" -eq 1 ] || echo s)${PN[hev_oom_proc]:+ (last: ${PN[hev_oom_proc]})}")
+      [ "${PN[hev_cgroup_oom]:-0}" -eq 0 ] || ev+=("${PN[hev_cgroup_oom]} at a cgroup limit")
+      [ "${PN[hev_disk_full]:-0}" -eq 0 ] || ev+=("${PN[hev_disk_full]} disk-full${PN[hev_df_src]:+ (last from ${PN[hev_df_src]})}")
+      if [ "${#ev[@]}" -gt 0 ]; then
+        pane_put events "last ${v:-?}: $(join_by ", " "${ev[@]}")" "$C_RED"
+      else
+        pane_put events "none in the last ${v:-?}" "$C_DIM"
+      fi ;;
+    off)       pane_put events "not searched (EVENTS_SEC=0)" ;;
+    no-access) pane_put events "the journal could not be read (systemd-journal group, or root)" "$C_YELLOW" ;;
+    *)         pane_put events "" ;;
+  esac
+}
+
+# PN from what collect_slot and collect_host just left in SLOT and HOST: the
+# local watch's filler. A systemd memory property that means "unset" is empty
+# here, as it is null in --json.
+pane_from_local() {
+  local cores="" total="" avail="" k v us=$'\x1f' pct free mnt roles
+  PN=()
+  read -r cores total avail < <(host_facts) || true
+  PN[host]="$(host_name)" PN[version]="$RUNNERCTL_VERSION"
+  pane_int "$cores"; PN[cores]="$PANE_INT"
+  pane_int "$total"; PN[mem_total]="$PANE_INT"
+  pane_int "$avail"; PN[mem_avail]="$PANE_INT"
+  PN[disks]=""
+  while IFS=$'\t' read -r pct free mnt _ _ _ _ roles; do
+    [ -n "$mnt" ] || continue
+    PN[disks]+="${PN[disks]:+$'\n'}$pct$us$free$us$mnt$us$roles"
+  done <<<"${HOST[disks]:-}"
+  PN[events]="${HOST[events]:-}"
+  if [ "${PN[events]}" = ok ]; then
+    PN[hev_window]="$EVENTS_SEC"
+    pane_int "${HOST[oom]:-}"; PN[hev_oom]="${PANE_INT:-0}"
+    pane_int "${HOST[cgroup_oom]:-}"; PN[hev_cgroup_oom]="${PANE_INT:-0}"
+    pane_int "${HOST[disk_full]:-}"; PN[hev_disk_full]="${PANE_INT:-0}"
+    PN[hev_oom_proc]="${HOST[last_oom_proc]:-}" PN[hev_df_src]="${HOST[last_disk_full_src]:-}"
+  fi
+  PN[name]="${SLOT[name]}" PN[unit]="${SLOT[unit]}" PN[profile]="${SLOT[profile]}"
+  PN[enabled]="${SLOT[enabled]}" PN[active]="${SLOT[active]}" PN[sub]="${SLOT[sub]}"
+  PN[result]="${SLOT[result]}" PN[reason]="${SLOT[last_restart_reason]}"
+  for k in since_age:since_age restarts:restarts mem_cur:memory_current mem_peak:memory_peak \
+           mem_high:memory_high mem_max:memory_max ev_high:mem_events_high ev_max:mem_events_max \
+           ev_oom:mem_events_oom_kill leaked:job_leaked jobs_done:job_done \
+           job_run_id:job_run_id job_run_attempt:job_run_attempt job_run_number:job_run_number; do
+    v="${SLOT[${k#*:}]:-}"
+    # systemd's "no limit" is 2^64-1, which is no number to draw a bar against.
+    [ "$v" != 18446744073709551615 ] || v=""
+    pane_int "$v"; PN[${k%%:*}]="$PANE_INT"
+  done
+  PN[p10]="${SLOT[mem_pressure_full_avg10]}" PN[p60]="${SLOT[mem_pressure_full_avg60]}"
+  PN[access]="${SLOT[job_access]}"
+  if [ -n "${PN[leaked]}" ] && [ "${PN[leaked]}" -gt 0 ]; then
+    PN[leak_list]="$(pid_comm_list "${SLOT[job_leaked_pids]}" "${SLOT[job_leaked_comms]}")"
+  fi
+  case "${SLOT[job_state]}" in
+    running|starting)
+      PN[job]="${SLOT[job_state]}"
+      PN[job_repo]="${SLOT[job_repo_full]:-${SLOT[job_repo]}}" PN[job_name]="${SLOT[job_name]}"
+      pane_age "${SLOT[job_since]}"; PN[job_age]="$PANE_INT"
+      PN[job_stalled]="${SLOT[job_stalled]}" PN[job_workflow]="${SLOT[job_workflow]}"
+      PN[job_ref]="${SLOT[job_ref]}" PN[job_sha]="${SLOT[job_sha]}" PN[job_actor]="${SLOT[job_actor]}"
+      PN[job_event]="${SLOT[job_event]}" PN[job_url]="${SLOT[job_url]}" ;;
+    idle|idle-fresh)
+      PN[job]=idle
+      pane_age "${SLOT[job_idle_since]}"; PN[idle_age]="$PANE_INT" ;;
+  esac
+}
+
+# The window of a pane that has no cursor line: the keys move VIEW_TOP, which
+# viewport_frame clamps to what there is and carries to the next frame. 0 when
+# KEY was one of them.
+#
+# The first step down is two lines and the last step up is too: a window one
+# line from the top would hide that single line behind a `↑ 1 more` marker,
+# and viewport_frame draws the line instead of the marker — so a step of one
+# from the top would change nothing on the screen.
+pane_scroll() { # KEY
+  case "$1" in
+    down|j) if [ "$VIEW_TOP" -le 0 ]; then VIEW_TOP=2; else VIEW_TOP=$((VIEW_TOP + 1)); fi ;;
+    up|k)   if [ "$VIEW_TOP" -le 2 ]; then VIEW_TOP=0; else VIEW_TOP=$((VIEW_TOP - 1)); fi ;;
+    pgdn)   viewport_step 0; VIEW_TOP=$((VIEW_TOP + VIEW_STEP)) ;;
+    pgup)   viewport_step 0; VIEW_TOP=$((VIEW_TOP - VIEW_STEP)); [ "$VIEW_TOP" -ge 0 ] || VIEW_TOP=0 ;;
+    g|home) VIEW_TOP=0 ;;
+    G|end)  VIEW_TOP="$VIEW_END" ;;
+    *)      return 1 ;;
+  esac
+}
+# Into a pane and out of it: the table's window position is kept aside, so the
+# table comes back scrolled to where it was.
+pane_enter() { PANE_TOP_WAS="$VIEW_TOP" VIEW_TOP=0; }
+pane_leave() { VIEW_TOP="$PANE_TOP_WAS"; }
+
+# The local watch's pane for UNIT (row IDX), into PANE_OUT. WATCH_PANE is
+# `slot`, `host` or empty (the table).
+WATCH_PANE=""
+watch_pane_build() { # UNIT IDX
+  collect_slot "$1" "$2"
+  collect_host
+  pane_from_local
+  if [ "$WATCH_PANE" = host ]; then
+    pane_render host "${PN[host]:-this host} — host details"
+  else
+    pane_render slot "${SLOT[name]} — slot details"
+  fi
+}
+# A key while the pane is up. See the block above for what each does.
+watch_pane_key() { # KEY
+  case "$1" in
+    esc|enter|q|Q) WATCH_PANE=""; pane_leave ;;
+    h) VIEW_TOP=0; if [ "$WATCH_PANE" = slot ]; then WATCH_PANE=host; else WATCH_PANE=slot; fi ;;
+    K|R|S|T|P|L|O)
+      if [ "$WATCH_PANE" = slot ]; then
+        watch_key_action "$1" "$WATCH_CURSOR"
+      else
+        WATCH_NOTICE="$PANE_NO_SLOT_KEYS; h goes back to the slot"
+      fi ;;
+    *) pane_scroll "$1" || true ;;
+  esac
+}
 # One key against the watch state. Returns 1 on `q` (quit). The cursor is
 # the unit's name in WATCH_CURSOR, so it stays on the same slot when the
 # pool is scaled and the row numbers shift; UNITS is the current order.
@@ -3416,6 +3797,9 @@ watch_handle_key() { # KEY UNITS...
     return 0
   fi
   WATCH_NOTICE=""
+  # GHR-76: with the pane up every key is the pane's — `q` goes back to the
+  # table rather than quitting, and no key moves a cursor nobody can see.
+  if [ -n "$WATCH_PANE" ]; then watch_pane_key "$key"; return 0; fi
   n="${#units[@]}"
   for i in "${!units[@]}"; do [ "${units[$i]}" != "$WATCH_CURSOR" ] || break; done
   case "$key" in
@@ -3437,6 +3821,8 @@ watch_handle_key() { # KEY UNITS...
       [ "$i" -ge 0 ] || i=0
       WATCH_CURSOR="${units[$i]}" ;;
     K|R|S|T|P|L|O) watch_key_action "$key" "$WATCH_CURSOR" ;;
+    # GHR-76: the cursor's slot in full, in place of the table.
+    enter) if [ -n "$WATCH_CURSOR" ]; then WATCH_PANE=slot; pane_enter; fi ;;
   esac
   return 0
 }
@@ -3454,7 +3840,7 @@ watch_handle_key() { # KEY UNITS...
 # a key read with the interval as its timeout: a key redraws at once, a
 # timeout is a tick. The journal memo counts ticks, not keys.
 cmd_watch() { # [--interval N] [--iterations N] [--color WHEN] [--stall-after N] [--narrow]
-  local interval=2 iterations="" tick=0 refreshed=-1 out header units=() status short cur tail
+  local interval=2 iterations="" tick=0 refreshed=-1 out header units=() status short cur tail idx i legend
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     view_opt "$@"
@@ -3489,7 +3875,8 @@ cmd_watch() { # [--interval N] [--iterations N] [--color WHEN] [--stall-after N]
       refreshed="$tick"
     fi
     header="$(paint "$C_BOLD" "runnerctl watch — ${HOSTNAME:-$(uname -n)} — $(date +%H:%M:%S) — every ${interval}s (Ctrl-C to quit)")"
-    watch_table
+    # GHR-76: with the pane up the table is not drawn, so it is not rendered.
+    [ -n "$WATCH_PANE" ] || watch_table
     if [ -n "$iterations" ]; then
       printf '\033[H\033[2J%s\n%s\n' "$header" "$WATCH_TABLE"
       pause "$interval"
@@ -3498,6 +3885,32 @@ cmd_watch() { # [--interval N] [--iterations N] [--color WHEN] [--stall-after N]
       continue
     fi
     mapfile -t units < <(discover)
+    if [ -n "$WATCH_PANE" ]; then
+      # GHR-76: the pane, rebuilt from fresh facts on every frame — a tick
+      # refreshes it exactly as it refreshes the table. A slot that went away
+      # while its pane was up (scaled down) has nothing to show: back to the
+      # table, saying so, with the cursor dropped to the top as below.
+      idx=-1
+      for i in "${!units[@]}"; do
+        if [ "${units[$i]}" = "$WATCH_CURSOR" ]; then idx="$i"; break; fi
+      done
+      if [ "$idx" -ge 0 ]; then
+        watch_pane_build "$WATCH_CURSOR" "$idx"
+        legend="$PANE_LEGEND_SLOT"
+        [ "$WATCH_PANE" = slot ] || legend="$PANE_LEGEND_HOST"
+        viewport_draw "$header" "$PANE_OUT" $'\n'"$(paint "$C_DIM" "$legend")"$'\n'"${WATCH_PROMPT:-$WATCH_NOTICE}" 0 0 0
+        if viewport_read_key "$interval"; then
+          watch_handle_key "$KEY" "${units[@]}" || break
+        else
+          tick=$((tick + 1))
+        fi
+        continue
+      fi
+      WATCH_NOTICE="$(short_name "$WATCH_CURSOR"): no longer on this host — back to the table"
+      WATCH_PANE="" WATCH_ACTION="" WATCH_PROMPT=""
+      pane_leave
+      watch_table
+    fi
     # The cursor follows its unit; a slot that went away drops it to the top.
     [[ " ${units[*]} " == *" $WATCH_CURSOR "* ]] || WATCH_CURSOR="${units[0]:-}"
     short="$(short_name "$WATCH_CURSOR")"
@@ -6303,6 +6716,190 @@ json_line_field() { # LINE KEY
   ! $JF_SET || printf '%s\n' "$JF"
 }
 
+# The contents of a JSON string as json_line_get hands them back — still
+# escaped — turned into the text they stand for, into JSON_TEXT (GHR-76). The
+# readers above never needed this: a state, a number or a URL has no escape in
+# it. A workflow called `Build "x"` does, and drawn as it arrives it reads
+# `Build \"x\"`.
+#
+# One pass, left to right, so an escaped backslash is consumed with the
+# character after it and `\\n` stays a backslash and an `n`. `\uXXXX` becomes
+# the character's UTF-8 bytes, a surrogate pair one character; a lone
+# surrogate becomes `?` and U+0000 nothing (a shell string cannot hold it).
+#
+# WHAT COMES OUT IS NOT SAFE TO DRAW. `\u001b` is an Escape again here, by
+# design: this is decoding, and term_safe is what makes text drawable. The
+# order is the whole point — unescape, THEN term_safe. The other way round the
+# control character is still spelled as six harmless characters when term_safe
+# looks, and is produced after it has finished.
+JSON_TEXT=""
+json_unescape() { # STRING
+  local s="${1-}" out="" c hex cp lo
+  JSON_TEXT="$s"
+  [[ "$s" == *\\* ]] || return 0
+  while [[ "$s" == *\\* ]]; do
+    out+="${s%%\\*}"
+    s="${s#*\\}"
+    c="${s:0:1}" s="${s:1}"
+    case "$c" in
+      n) out+=$'\n' ;;
+      r) out+=$'\r' ;;
+      t) out+=$'\t' ;;
+      b) out+=$'\b' ;;
+      f) out+=$'\f' ;;
+      u)
+        hex="${s:0:4}"
+        if [[ ! "$hex" =~ ^[0-9a-fA-F]{4}$ ]]; then out+="?"; continue; fi
+        s="${s:4}" cp=$((16#$hex))
+        if [ "$cp" -ge 55296 ] && [ "$cp" -le 56319 ] && [[ "${s:0:6}" =~ ^\\u([dD][c-fC-F][0-9a-fA-F]{2})$ ]]; then
+          lo=$((16#${BASH_REMATCH[1]}))
+          s="${s:6}" cp=$((65536 + (cp - 55296) * 1024 + lo - 56320))
+        fi
+        json_utf8 "$cp"; out+="$JSON_CHAR" ;;
+      *) out+="$c" ;;
+    esac
+  done
+  JSON_TEXT="$out$s"
+}
+# Code point CP as UTF-8 bytes, into JSON_CHAR — spelled out rather than left
+# to printf's \u, which writes whatever the caller's locale makes of it.
+JSON_CHAR=""
+json_utf8() { # CP
+  local cp="$1" esc
+  JSON_CHAR=""
+  if [ "$cp" -eq 0 ]; then return 0
+  elif [ "$cp" -ge 55296 ] && [ "$cp" -le 57343 ]; then JSON_CHAR="?"; return 0
+  elif [ "$cp" -lt 128 ]; then printf -v esc '\\x%02x' "$cp"
+  elif [ "$cp" -lt 2048 ]; then printf -v esc '\\x%02x\\x%02x' $((192 + cp / 64)) $((128 + cp % 64))
+  elif [ "$cp" -lt 65536 ]; then
+    printf -v esc '\\x%02x\\x%02x\\x%02x' $((224 + cp / 4096)) $((128 + cp / 64 % 64)) $((128 + cp % 64))
+  else
+    printf -v esc '\\x%02x\\x%02x\\x%02x\\x%02x' $((240 + cp / 262144)) $((128 + cp / 4096 % 64)) $((128 + cp / 64 % 64)) $((128 + cp % 64))
+  fi
+  printf -v JSON_CHAR '%b' "$esc"
+}
+
+# One string field of LINE as text, into PJ: json_line_get's, unescaped. Empty
+# for null or a key that is not there — an older host that does not report it.
+PJ=""
+pane_json() { # LINE KEY
+  PJ=""
+  json_line_get "$1" "$2"
+  $JF_SET || return 0
+  json_unescape "$JF"
+  PJ="$JSON_TEXT"
+}
+# The same for a field that has to be a number: into PJ, empty unless it is a
+# whole number arithmetic can take (pane_int).
+pane_json_int() { # LINE KEY
+  json_line_get "$1" "$2"
+  pane_int "$JF"
+  PJ="$PANE_INT"
+}
+
+# PN from a host's `status --json` payload: `fleet watch`'s filler (GHR-76).
+# HOSTLINE is the payload's first line (the one carrying the host object),
+# SLOTLINE the selected slot's; either may be empty, and every field read
+# tolerates a key that is not there — a host older than the field prints `—`
+# for it. A string is unescaped here and made safe where it is drawn
+# (pane_put); a number is held to pane_int here, because the renderer does
+# arithmetic on it and this is a string another host sent.
+pane_from_json() { # HOSTLINE SLOTLINE
+  local hl="$1" sl="$2" job=null rest piece obj roles k us=$'\x1f'
+  PN=([host]="" [name]="" [unit]="" [profile]="" [enabled]="" [version]="" [active]="" [sub]=""
+      [since_age]="" [restarts]="" [result]="" [reason]="" [job]="" [access]=""
+      [mem_cur]="" [mem_peak]="" [mem_high]="" [mem_max]="" [p10]="" [p60]=""
+      [ev_high]="" [ev_max]="" [ev_oom]="" [leaked]="" [leak_list]=""
+      [cores]="" [mem_total]="" [mem_avail]="" [disks]="" [events]="")
+  if [ -n "$hl" ]; then
+    pane_json "$hl" runnerctl; PN[version]="$PJ"
+    pane_json "$hl" name; PN[host_name]="$PJ"
+    pane_json_int "$hl" cores; PN[cores]="$PJ"
+    pane_json_int "$hl" mem_total; PN[mem_total]="$PJ"
+    pane_json_int "$hl" mem_available; PN[mem_avail]="$PJ"
+    # Each disk object starts at its "mount" key; what is cut off before the
+    # next one is that disk's.
+    rest="$hl"
+    while [[ "$rest" == *'{"mount":'* ]]; do
+      rest="${rest#*'{"mount":'}"
+      piece="\"mount\":${rest%%'{"mount":'*}"
+      roles=""
+      if [[ "$piece" =~ \"roles\":\[([^]]*)\] ]]; then
+        roles="${BASH_REMATCH[1]//\"/}"
+        json_unescape "$roles"; roles="$JSON_TEXT"
+      fi
+      pane_json_int "$piece" use_pct; k="$PJ"
+      pane_json_int "$piece" avail; k+="$us$PJ"
+      pane_json "$piece" mount
+      # One line per disk: a mount point is one line of text or it is not one.
+      PN[disks]+="${PN[disks]:+$'\n'}$k$us${PJ//$'\n'/ }$us${roles//$'\n'/ }"
+    done
+    if [[ "$hl" =~ \"events\":\{([^}]*)\} ]]; then
+      obj="${BASH_REMATCH[1]}"
+      PN[events]=ok
+      pane_json_int "$obj" window; PN[hev_window]="$PJ"
+      pane_json_int "$obj" oom_kills; PN[hev_oom]="${PJ:-0}"
+      pane_json_int "$obj" cgroup_oom_kills; PN[hev_cgroup_oom]="${PJ:-0}"
+      pane_json_int "$obj" disk_full; PN[hev_disk_full]="${PJ:-0}"
+      pane_json "$obj" last_oom_process; PN[hev_oom_proc]="$PJ"
+      pane_json "$obj" last_disk_full_source; PN[hev_df_src]="$PJ"
+    fi
+  fi
+  [ -n "$sl" ] || return 0
+  pane_json "$sl" name; PN[name]="$PJ"
+  pane_json "$sl" unit; PN[unit]="$PJ"
+  pane_json "$sl" profile; PN[profile]="$PJ"
+  pane_json "$sl" enabled; PN[enabled]="$PJ"
+  pane_json "$sl" active; PN[active]="$PJ"
+  pane_json "$sl" sub; PN[sub]="$PJ"
+  pane_json "$sl" result; PN[result]="$PJ"
+  pane_json "$sl" last_restart_reason; PN[reason]="$PJ"
+  pane_json "$sl" working_on_access; PN[access]="$PJ"
+  pane_json_int "$sl" restarts; PN[restarts]="$PJ"
+  pane_json_int "$sl" leaked_procs; PN[leaked]="$PJ"
+  pane_json_int "$sl" memory_current; PN[mem_cur]="$PJ"
+  pane_json_int "$sl" memory_peak; PN[mem_peak]="$PJ"
+  pane_json_int "$sl" memory_high; PN[mem_high]="$PJ"
+  pane_json_int "$sl" memory_max; PN[mem_max]="$PJ"
+  json_line_get "$sl" since; pane_age "$JF"; PN[since_age]="$PANE_INT"
+  if [[ "$sl" =~ \"memory_events\":\{([^}]*)\} ]]; then
+    obj="${BASH_REMATCH[1]}"
+    pane_json_int "$obj" high; PN[ev_high]="$PJ"
+    pane_json_int "$obj" max; PN[ev_max]="$PJ"
+    pane_json_int "$obj" oom_kill; PN[ev_oom]="$PJ"
+  fi
+  if [[ "$sl" =~ \"memory_pressure\":\{([^}]*)\} ]]; then
+    obj="${BASH_REMATCH[1]}"
+    json_line_get "$obj" full_avg10; [[ ! "$JF" =~ ^[0-9]{1,3}(\.[0-9]{1,4})?$ ]] || PN[p10]="$JF"
+    json_line_get "$obj" full_avg60; [[ ! "$JF" =~ ^[0-9]{1,3}(\.[0-9]{1,4})?$ ]] || PN[p60]="$JF"
+  fi
+  [[ ! "$sl" =~ \"job\":(.*),\"idle_since\": ]] || job="${BASH_REMATCH[1]}"
+  if [ "$job" = null ]; then
+    json_line_get "$sl" idle_since
+    if $JF_SET; then
+      PN[job]=idle
+      pane_age "$JF"; PN[idle_age]="$PANE_INT"
+      pane_json_int "$sl" jobs_completed; PN[jobs_done]="$PJ"
+    fi
+    return 0
+  fi
+  PN[job]=running
+  pane_json "$job" repo; PN[job_repo]="$PJ"
+  pane_json "$job" name; PN[job_name]="$PJ"
+  [ -n "$PJ" ] || PN[job]=starting
+  json_line_get "$job" since; pane_age "$JF"; PN[job_age]="$PANE_INT"
+  json_line_get "$job" stalled; PN[job_stalled]="$JF"
+  pane_json "$job" workflow; PN[job_workflow]="$PJ"
+  pane_json_int "$job" run_id; PN[job_run_id]="$PJ"
+  pane_json_int "$job" run_attempt; PN[job_run_attempt]="$PJ"
+  pane_json_int "$job" run_number; PN[job_run_number]="$PJ"
+  pane_json "$job" ref; PN[job_ref]="$PJ"
+  pane_json "$job" sha; PN[job_sha]="$PJ"
+  pane_json "$job" actor; PN[job_actor]="$PJ"
+  pane_json "$job" event; PN[job_event]="$PJ"
+  pane_json "$job" url; PN[job_url]="$PJ"
+}
+
 # The selected slot's facts, fresh from its host, into FF. 1 with FW_NOTICE
 # set when there is nothing to decide on: the host did not answer, or the slot
 # is no longer there. A remote runs in a subshell of its own here, as it would
@@ -6430,7 +7027,7 @@ fleet_watch_floor() { # HOST NAME ACTIVE-STATE
 # FW_ACTION (a confirm line naming the exact remote command, run on `y`). L
 # runs at once — reading logs changes nothing.
 fleet_watch_key_action() { # KEY
-  local host="$FW_HOST" name="$FW_NAME" lbl rc=0 runs
+  local host="$FW_HOST" name="$FW_NAME"
   FW_NOTICE="" FW_PROMPT="" FW_ACTION="" FW_ACT_HOST="$host" FW_ACT_NAME="$name"
   if [ "$FW_POS" -lt 0 ]; then FW_NOTICE="no slot to act on"; return 0; fi
   # What the cursor is ON, not the slot it remembers: a host that is not
@@ -6444,6 +7041,14 @@ fleet_watch_key_action() { # KEY
     FW_NOTICE="$host: not answering — no slot there to act on"
     return 0
   fi
+  fleet_watch_slot_action "$1" "$host" "$name"
+}
+# The key itself, on slot NAME of HOST — the pair, not a row: the detail pane
+# (GHR-76) acts on the slot it is showing, which a view may have filtered out
+# of the rows since it was opened.
+fleet_watch_slot_action() { # KEY HOST NAME
+  local host="$2" name="$3" lbl rc=0 runs
+  FW_NOTICE="" FW_PROMPT="" FW_ACTION="" FW_ACT_HOST="$host" FW_ACT_NAME="$name"
   lbl="$name on $host"
   if [ "$1" = L ]; then
     (ssh_run "$host" "$FLEET_RUNNERCTL" logs "$(printf %q "$name")" -n 50) >"$FW_TMP/logs" 2>"$FW_TMP/err" || rc=$?
@@ -6608,7 +7213,7 @@ FW_KIND=()
 declare -A FW_FACT=() FW_HOSTBAD=() FW_HOSTSUM=() FW_OPEN=()
 FLEET_WATCH_EMPTY="nothing matches — a shows all"
 FLEET_WATCH_VIEW_LEGEND="$WATCH_LEGEND  a all  ? keys"
-# Fourteen lines, so that with the header, the summary and the three lines
+# Seventeen lines, so that with the header, the summary and the three lines
 # under it the list fits a terminal of 24 rows; none is wider than 80 columns.
 FLEET_WATCH_HELP="fleet watch — keys
   ↑ ↓ j k   PgUp PgDn   g G Home End   move the cursor: a row, a page, the ends
@@ -6619,6 +7224,9 @@ FLEET_WATCH_HELP="fleet watch — keys
   a     all: clears ! b i, the text and the collapse
   s     order: config → longest job first → most memory first
   c     one line per host; on a host, c or Enter opens it and c closes it
+  Enter   the cursor's slot in full, in place of the table (on the row of a
+          host that is not answering: that host). There q Esc Enter go back, h
+          shows the host alone, ↑ ↓ PgUp PgDn scroll, K R S T P L O act on it
   K R S T P L   kill job, restart, stop, start, reap, logs: the cursor's slot
   O     print the run URL of the cursor's job — nothing is opened
   ?     this list
@@ -6847,10 +7455,125 @@ fleet_watch_view() { # FRAME
   for line in ${notes[@]+"${notes[@]}"}; do FW_VIEW+="$nl$line"; done
 }
 
+# --- Fleet watch detail pane (GHR-76) -------------------------------------------
+# The local watch's pane (see pane_render), for the cursor's (host, slot) pair.
+# What is particular to a fleet:
+#
+#   * IT READS WHAT THE TICK ALREADY BROUGHT. The pane is filled from the
+#     host's last `status --json` payload in FW_STATE — the one the summary and
+#     the views read — so opening it, scrolling it and leaving it ask no host
+#     anything, and it refreshes when a tick's answer lands, like the table.
+#     Not from a fresh read at the keypress, as the action keys make: a read
+#     holds the keyboard for up to FLEET_WATCH_TIMEOUT on a host that has
+#     stopped answering, which is exactly the host whose details are wanted,
+#     and the pane is a view of the row that was on screen, not a decision.
+#     An action key pressed IN the pane still decides on a fresh read, through
+#     fleet_watch_slot_action — the same function, the same confirm line.
+#   * A host that has stopped answering keeps its last payload, as it keeps its
+#     rows: the pane shows those facts, with the age line the table draws over
+#     the rows (`no answer for 45s — last seen …`) at the top of its Host
+#     block, and the rest of what ssh said under it.
+#   * A slot that is gone from its host's payload (scaled down) closes the
+#     pane with a notice; the cursor then lands where fleet_watch_place puts
+#     it. A host that has sent no payload yet gets a pane that says so.
+#   * WHERE Enter LEADS depends on the row, and the three cannot meet:
+#       a slot row          the slot's pane
+#       a folded host       opens the fold (GHR-75), as before
+#       a host's error row  that host's block alone, with the error in full
+#     A host line (Disk/OOM) and the age line over kept rows are not rows the
+#     cursor stops on, so a host's block is reached from any of its slots with
+#     h, which switches the pane between the slot and its host.
+#
+# FW_MODE=pane, with FW_PANE saying which (`slot` or `host`) and FW_PANE_FROM
+# what it was opened from (`slot` or `down`): a pane opened from an error row
+# has no slot to switch back to or to act on.
+FW_PANE="" FW_PANE_FROM=""
+
+# The pane for the cursor's pair, into PANE_OUT. 1, with FW_NOTICE set, when
+# the slot is no longer in its host's answer.
+fleet_watch_pane_build() {
+  local i at="" rc hl="" sl="" facts=false
+  for i in "${!FLEET_HOSTS[@]}"; do
+    if [ "${FLEET_HOSTS[$i]}" = "$FW_HOST" ]; then at="$i"; break; fi
+  done
+  if [ -n "$at" ] && [ -s "$FW_STATE/$at.json" ] && [ "$(cat "$FW_STATE/$at.jrc" 2>/dev/null || echo 255)" = 0 ]; then
+    facts=true
+    IFS= read -r hl <"$FW_STATE/$at.json" || true
+    [[ "$hl" == '{"runnerctl":'* ]] || hl=""
+    if [ "$FW_PANE" = slot ]; then
+      sl="$(grep -F -m1 ",\"name\":$(json_str "$FW_NAME"),\"active\":" "$FW_STATE/$at.json" || true)"
+      if [ -z "$sl" ]; then
+        FW_NOTICE="$FW_NAME on $FW_HOST: no longer on that host — back to the table"
+        return 1
+      fi
+    fi
+  fi
+  pane_from_json "$hl" "$sl"
+  # The alias this node dials, and the host's own name where the two differ.
+  PN[host]="$FW_HOST"
+  [ -z "${PN[host_name]:-}" ] || [ "${PN[host_name]}" = "$FW_HOST" ] || PN[host]+=" (${PN[host_name]})"
+  [ -n "${PN[name]}" ] || PN[name]="$FW_NAME"
+  $facts || PN[facts]="none from that host yet — its 'status --json' has not answered"
+  if [ -n "$at" ]; then
+    rc="$(cat "$FW_STATE/$at.rc" 2>/dev/null || echo late)"
+    if [ "$rc" != 0 ]; then
+      if [ "$(fleet_reachable "$rc")" = false ] && [ -s "$FW_STATE/$at.seen" ]; then
+        PN[answer_label]="answer"
+        PN[answer]="$(FLEET_DIR="$FW_STATE" fleet_stale_line "$at" "$rc")"
+      else
+        PN[answer_label]="error"
+        PN[answer]="$(fleet_error_text "$rc" "$FW_STATE/$at.err" "${FLEET_BUDGETS[$at]:-}")"
+      fi
+      # The table quotes the first line of what ssh said; here is the rest.
+      [ ! -s "$FW_STATE/$at.err" ] || PN[stderr]="$(tail -n +2 "$FW_STATE/$at.err" | head -n 20)"
+    fi
+  fi
+  if [ "$FW_PANE" = host ]; then
+    pane_render host "$FW_HOST — host details"
+  else
+    pane_render slot "$FW_NAME on $FW_HOST — slot details"
+  fi
+}
+
+# Enter, on the row the cursor is on. See the block above.
+fleet_watch_enter() {
+  [ "$FW_POS" -ge 0 ] || return 0
+  case "${FW_KIND[$FW_POS]:-}" in
+    host) fleet_watch_fold_key enter ;;
+    slot) FW_MODE=pane FW_PANE=slot FW_PANE_FROM=slot; pane_enter ;;
+    down) FW_MODE=pane FW_PANE=host FW_PANE_FROM=down; pane_enter ;;
+  esac
+}
+fleet_watch_pane_close() {
+  FW_MODE="" FW_PANE="" FW_PANE_FROM=""
+  pane_leave
+}
+# A key while the pane is up: back to the table, the host block, the action
+# keys on the pane's slot, the window. Nothing else — a view key pressed here
+# must not rearrange a table nobody is looking at.
+fleet_watch_pane_key() { # KEY
+  case "$1" in
+    esc|enter|q|Q) fleet_watch_pane_close ;;
+    h)
+      [ "$FW_PANE_FROM" = slot ] || return 0
+      VIEW_TOP=0
+      if [ "$FW_PANE" = slot ]; then FW_PANE=host; else FW_PANE=slot; fi ;;
+    K|R|S|T|P|L|O)
+      if [ "$FW_PANE" = slot ]; then
+        fleet_watch_slot_action "$1" "$FW_HOST" "$FW_NAME"
+      elif [ "$FW_PANE_FROM" = slot ]; then
+        FW_NOTICE="$FW_HOST: $PANE_NO_SLOT_KEYS; h goes back to the slot"
+      else
+        FW_NOTICE="$FW_HOST: $PANE_NO_SLOT_KEYS, and this host is showing none"
+      fi ;;
+    *) pane_scroll "$1" || true ;;
+  esac
+}
+
 # c: fold every host to one line; with the hosts folded, open or close the one
-# the cursor is on. Enter opens a folded host and does nothing anywhere else —
-# on a slot row it is left free (GHR-76's detail pane), and the two cannot
-# meet: a folded host has no slot row for the cursor to be on.
+# the cursor is on. Enter opens a folded host; on any other row it is
+# fleet_watch_enter's (GHR-76's detail pane), and the two cannot meet: a
+# folded host has no slot row for the cursor to be on.
 fleet_watch_fold_key() { # c|enter
   if [ "$1" = enter ]; then
     if $FW_COLLAPSE && [ "$FW_POS" -ge 0 ] && [ "${FW_KIND[$FW_POS]:-}" = host ]; then FW_OPEN[$FW_HOST]=1; fi
@@ -6924,6 +7647,9 @@ fleet_watch_handle_key() { # KEY
     return 0
   fi
   FW_NOTICE=""
+  # GHR-76: with the pane up every key is the pane's — `q` goes back to the
+  # table rather than quitting, and no key moves the cursor or changes a view.
+  if [ "$FW_MODE" = pane ]; then fleet_watch_pane_key "$1"; return 0; fi
   case "$1" in
     q|Q)    return 1 ;;
     down|j) [ "$FW_POS" -lt 0 ] || [ "$FW_POS" -ge $((n - 1)) ] || fleet_watch_select $((FW_POS + 1)) ;;
@@ -6935,7 +7661,8 @@ fleet_watch_handle_key() { # KEY
     i)   FW_FILTER=idle ;;
     a)   FW_FILTER=all FW_SEARCH="" FW_COLLAPSE=false FW_OPEN=() ;;
     s)   case "$FW_SORT" in config) FW_SORT=job ;; job) FW_SORT=mem ;; *) FW_SORT=config ;; esac ;;
-    c|enter) fleet_watch_fold_key "$1" ;;
+    c)     fleet_watch_fold_key c ;;
+    enter) fleet_watch_enter ;;
     /)   FW_MODE=search FW_SEARCH_WAS="$FW_SEARCH" ;;
     '?') FW_MODE=help ;;
   esac
@@ -7088,7 +7815,25 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
       fetch=tick
       continue
     fi
-    if $draw && ! $launched && [ "$FW_MODE" = help ]; then
+    # GHR-76: the pane is rebuilt from the payloads in hand on every draw, so a
+    # tick's answer refreshes it as it refreshes the table. A slot that is no
+    # longer in its host's answer closes it, and this draw is the table's.
+    if $draw && ! $launched && [ "$FW_MODE" = pane ]; then
+      if ! fleet_watch_pane_build; then
+        # Whatever was being confirmed was about a slot that is not there.
+        fleet_watch_pane_close
+        FW_ACTION="" FW_PROMPT=""
+      fi
+    fi
+    if $draw && ! $launched && [ "$FW_MODE" = pane ]; then
+      draw=false
+      legend="$PANE_LEGEND_SLOT"
+      if [ "$FW_PANE_FROM" = down ]; then legend="$PANE_LEGEND_DOWN"
+      elif [ "$FW_PANE" = host ]; then legend="$PANE_LEGEND_HOST"
+      fi
+      viewport_draw "$head"$'\n'"$summary" "$PANE_OUT" \
+        $'\n'"$(paint "$C_DIM" "$legend")"$'\n'"${FW_PROMPT:-$FW_NOTICE}" 0 0 0
+    elif $draw && ! $launched && [ "$FW_MODE" = help ]; then
       # GHR-75: the keys, where the table was, until a key. Chrome and all
       # through the viewport, so the terminal is left as any frame leaves it;
       # the fetches go on behind it and the next draw shows what they brought.
