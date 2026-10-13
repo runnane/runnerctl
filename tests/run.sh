@@ -5056,6 +5056,74 @@ case_host_events_parse() {
   expect_out $'^0\t0\t0\t\t\t\t$'
 }
 
+
+# --- The fleet host line (GHR-66) ---------------------------------------------
+# Each host's Disk: / events fragment (GHR-64) lands on one line of its own,
+# above that host's slots — the remote header it was cut from is folded away.
+# Line number of the first stdout line matching an ERE, 0 when none does.
+first_line() { grep -nE -m1 "$1" <<<"$OUT" | cut -d: -f1 || echo 0; }
+
+case_fleet_status_host_line_above_each_hosts_slots() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_FULL="build-2" run fleet status
+  expect_rc 0
+  expect_out_count '^build-1 +Disk: / 24% \(353\.9G free\)$' 1
+  expect_out_count '^build-2 +Disk: / 24% \(353\.9G free\), /var/lib/docker 96% \(37\.3G free\), /srv/build cache 88% \(223\.5G free\) — last 1h: 2 OOM kills, 1 disk-full$' 1
+  # each host line sits between the previous host's slots and its own
+  local h1 s1 h2 s2 last1
+  h1="$(first_line '^build-1 +Disk: ')"; s1="$(first_line '^build-1 +0 ')"
+  h2="$(first_line '^build-2 +Disk: ')"; s2="$(first_line '^build-2 +0 ')"
+  last1="$(first_line '^build-1 +2 ')"
+  NEXPECT=$((NEXPECT + 1))
+  { [ "$h1" -gt 0 ] && [ "$h1" -lt "$s1" ] && [ "$last1" -lt "$h2" ] && [ "$h2" -lt "$s2" ]; } \
+    || FAILS+=("host lines out of place: build-1 line $h1 slot0 $s1 slot2 $last1, build-2 line $h2 slot0 $s2")
+  # the slot rows are untouched and `fleet status` stays plain
+  expect_out_count '^build-[12] +[0-9]+ +example\.slot-' 6
+  expect_no_out "$ESC"
+  expect_no_out '^build-[12] runnerctl '
+}
+
+case_fleet_status_old_host_gets_no_host_line() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-oldver" run fleet status
+  expect_out_count '^build-1 +Disk: ' 1
+  # a pre-0.16.0 header has no fragment: no line, and its rows still render
+  # — not even its cores/RAM: only the 3 slot rows carry its name
+  expect_out_count '^build-oldver ' 3
+  expect_out_count '^build-oldver +[0-9]+ +example\.slot-' 3
+}
+
+case_fleet_watch_host_line_keeps_the_remote_colours() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_FULL="build-1" \
+    run fleet watch --iterations 1 --color always
+  expect_rc 0
+  expect_out_count "^build-1 +Disk: / 24% \(353\.9G free\), $ESC\[31m/var/lib/docker 96% \(37\.3G free\)$ESC\[0m, $ESC\[33m/srv/build cache 88% \(223\.5G free\)$ESC\[0m — $ESC\[31mlast 1h: 2 OOM kills, 1 disk-full$ESC\[0m\$" 1
+  expect_out_count '^build-2 +Disk: / 24% \(353\.9G free\)$' 1
+}
+
+# The cursor walks slot rows only: j from build-1's last slot goes to build-2's
+# first, over build-2's host line, and no frame highlights a host line.
+case_fleet_watch_cursor_skips_host_lines() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjkq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 5
+  expect_out_count '^build-[12] +Disk: ' 10
+  expect_no_out "^${REV}build-[12] +Disk: "
+  expect_out_count "^${REV}" 5
+  expect_out_count "$(fw_row build-1 0 1)" 1
+  expect_out_count "$(fw_row build-1 1 2)" 1
+  expect_out_count "$(fw_row build-1 2 3)" 2
+  expect_out_count "$(fw_row build-2 0 1)" 1
+}
+
+# A long host line is not a table row: the fleet watch measures its width
+# with watch_table_width, which must count slot rows only.
+case_fleet_watch_host_line_does_not_count_for_width() {
+  local long; long="build-1 Disk: /$(printf 'x%.0s' {1..300}) 24% (1G free)"
+  run_fn watch_table_width "$long"$'\n''build-1 0 example.slot-1 active' '[^ ]+ +'
+  expect_rc 0
+  expect_out '^31$'
+}
+
 t "status: header and one row per discovered slot"                 case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
 t "status: EnvironmentFiles value with embedded '=' survives"       case_status_envfile_value_with_embedded_equals
@@ -5355,6 +5423,11 @@ t "fleet watch: a too-wide frame narrows next tick and stays narrow"   case_flee
 t "fleet watch: widens again with room to spare; --narrow pins it"    case_fleet_watch_widens_again_and_narrow_pins_it
 t "fleet --narrow: a host too old for it renders full-width, no error" case_fleet_narrow_an_old_host_renders_full_width_not_an_error
 t "fleet watch: j/k walk (host, slot) pairs, clamp, and cost no fan-out" case_fleet_watch_cursor_walks_host_slot_pairs
+t "fleet status: a host line above each host's slots, plain"             case_fleet_status_host_line_above_each_hosts_slots
+t "fleet status: a host too old for the fragment gets no host line"       case_fleet_status_old_host_gets_no_host_line
+t "fleet watch: the host line keeps the remote's colours"                 case_fleet_watch_host_line_keeps_the_remote_colours
+t "fleet watch: the cursor skips host lines"                              case_fleet_watch_cursor_skips_host_lines
+t "fleet watch: a host line does not count toward the table width"       case_fleet_watch_host_line_does_not_count_for_width
 t "fleet watch: a host dropping out keeps the cursor, which comes back" case_fleet_watch_cursor_survives_a_host_dropping_out
 t "fleet watch: a slot scaled away drops the cursor to its host's first" case_fleet_watch_cursor_on_a_slot_that_scaled_away_stays_on_its_host
 t "fleet watch: S, y stops the pair on its own host; the frame shows it" case_fleet_watch_S_stops_the_selected_pair_on_its_own_host

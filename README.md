@@ -257,8 +257,9 @@ cgroup out of memory`) is not counted here — that is the slot's `MemoryMax`
 doing its job, and it shows on the slot's row. Needs the same journal access
 as `WORKING-ON`; without it nothing is shown, never a zero. Both ride on the
 header line rather than a new one, so `fleet status` and `fleet watch` read a
-host's table unchanged; on a fleet they are in `fleet status --json` and
-`fleet health`.
+host's table unchanged; on a fleet they appear as a host line above each host's
+slots (see `fleet status` below), in `fleet status --json` and in `fleet
+health`.
 
 `ACTIVE` folds in a restart count (`↻3`) when systemd has restarted the unit
 since it was last started by hand (`NRestarts`, which `systemctl
@@ -747,11 +748,18 @@ against every runner host in `FLEET_HOSTS`, over ssh:
 ```
 $ runnerctl fleet status
 HOST     IDX RUNNER          PROFILE  ACTIVE           SINCE  ENABLED  ...  WORKING-ON
+build-1  Disk: / 24% (353.9G free)
 build-1  0   org.build-1-a   ci       active/running   3d 4h  enabled  ...  my-app:test (12m)
 build-1  1   org.build-1-b   ci       active/running   2d 7h  enabled  ...  idle 2h31m (7 jobs)
+build-2  Disk: / 31% (320.2G free), /var/lib/docker 96% (37.3G free) — last 1h: 1 OOM kill
 build-2  0   org.build-2-a   ci       active/running   6d     enabled  ...  my-app:lint (2m)
 build-3  unreachable — ssh: connect to host build-3 port 22: No route to host
 ```
+
+Each host that answered gets a **host line** above its slots: the `Disk:` and
+`last 1h:` part of its own `status` header. `fleet watch` keeps the host's
+colours on it, and its cursor never stops on it. A host older than 0.16.0
+prints no such fragment and gets no host line.
 
 Set the inventory on the **central node only** — the runner hosts need no
 fleet config, just `runnerctl` installed and an ssh login:
@@ -849,8 +857,10 @@ place, with colour, over ssh connections that **stay open**:
 $ runnerctl fleet watch --interval 5
 runnerctl fleet watch — 3 host(s) — 14:02:11 — every 5s (q to quit)
 HOST     IDX RUNNER          PROFILE  ACTIVE           SINCE  ENABLED  ...  WORKING-ON
+build-1  Disk: / 24% (353.9G free)
 build-1  0   org.build-1-a   ci       active/running   3d 4h  enabled  ...  my-app:test (12m)
 build-1  1   org.build-1-b   ci       active/running   2d 7h  enabled  ...  idle 2h31m (7 jobs)
+build-2  Disk: / 31% (320.2G free), /var/lib/docker 96% (37.3G free) — last 1h: 1 OOM kill
 build-2  0   org.build-2-a   ci       active/running   6d     enabled  ...  my-app:lint (2m)
 build-3  unreachable — ssh: connect to host build-3 port 22: No route to host
 
