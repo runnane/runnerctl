@@ -394,7 +394,7 @@ case_status_table() {
   # not just shaped — this is what made the --color always diff case flake.
   # GHR-64: the stubbed root drive rides on the same line, and an empty
   # event window adds nothing to it.
-  expect_out '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: 16 cores, 64Gi RAM, 48Gi available — Disk: / 24% \(353\.9G free\)$'
+  expect_out '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: 16 cores, 64Gi RAM, 48Gi available — Disk: / \[docker,work\] 24% \(353\.9G free\)$'
   expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$'
   # slot-1 also carries MemoryPeak (GHR-8), so USED is current/peak; PRESS
   # is — until the stub answers cgroup_memory_facts (GHR-31).
@@ -1342,7 +1342,7 @@ case_watch_three_iterations_redraw_frames() {
   # every frame carries the version header too (GHR-32), with the same
   # pinned host_line() fragment as `status` on every redraw (GHR-34)
   expect_out_count '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: ' 3
-  expect_out_count '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: 16 cores, 64Gi RAM, 48Gi available — Disk: / 24% \(353\.9G free\)$' 3
+  expect_out_count '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: 16 cores, 64Gi RAM, 48Gi available — Disk: / \[docker,work\] 24% \(353\.9G free\)$' 3
   # GHR-64: the host journal search is memoised like the per-slot one —
   # one scan for three frames inside JOURNAL_CACHE_TTL.
   expect_log_count '^probe:journal_host_events ' 1
@@ -4970,7 +4970,7 @@ case_status_host_disks_and_events() {
   expect_rc 0
   # every fixed drive on the header line, a mount point with a space intact,
   # then the window's host-wide OOM kills (the cgroup one is not counted)
-  expect_out '^runnerctl [0-9.]+ — Host: 16 cores, 64Gi RAM, 48Gi available — Disk: / 24% \(353\.9G free\), /var/lib/docker 96% \(37\.3G free\), /srv/build cache 88% \(223\.5G free\) — last 1h: 2 OOM kills, 1 disk-full$'
+  expect_out '^runnerctl [0-9.]+ — Host: 16 cores, 64Gi RAM, 48Gi available — Disk: /var/lib/docker \[docker\] 96% \(37\.3G free\), /srv/runner work \[work\] 88% \(223\.5G free\) — last 1h: 2 OOM kills, 1 disk-full$'
   # the column header stays the third line — fleet status/watch index it
   [ "$(sed -n 3p <<<"$OUT")" = "$(grep -E '^IDX ' <<<"$OUT")" ] || FAILS+=("column header is not line 3")
   NEXPECT=$((NEXPECT + 1))
@@ -4982,14 +4982,40 @@ case_status_host_disks_and_events() {
 case_status_host_disks_color() {
   RUNNERCTL_STUB_DISKS=full RUNNERCTL_STUB_HOST_EVENTS=events run status --color always
   expect_rc 0
-  expect_out $'/ 24% \\(353\\.9G free\\), \e\\[31m/var/lib/docker 96% \\(37\\.3G free\\)\e\\[0m, \e\\[33m/srv/build cache 88% \\(223\\.5G free\\)\e\\[0m — \e\\[31mlast 1h: 2 OOM kills, 1 disk-full\e\\[0m$'
+  expect_out $'— Disk: \e\\[31m/var/lib/docker \\[docker\\] 96% \\(37\\.3G free\\)\e\\[0m, \e\\[33m/srv/runner work \\[work\\] 88% \\(223\\.5G free\\)\e\\[0m — \e\\[31mlast 1h: 2 OOM kills, 1 disk-full\e\\[0m$'
+  # GHR-67: a healthy partition is painted too — green, not left plain
+  run status --color always
+  expect_out $'— Disk: \e\\[32m/ \\[docker,work\\] 24% \\(353\\.9G free\\)\e\\[0m$'
+}
+
+# GHR-67: only what holds docker, the work folders and DISK_PATHS is watched.
+# A LABEL=PATH entry is named by its label and shares a filesystem's row with
+# whatever else is on it; a path that does not exist is skipped.
+case_status_disk_paths_labelled() {
+  local cfg="$TMP/disk-paths.config"
+  save_config "$cfg" <<<"DISK_PATHS='cache=/srv/cache /missing/x /var/tmp'"
+  RUNNERCTL_STUB_DISKS=full run_cfg "$cfg" status
+  expect_rc 0
+  expect_out '— Disk: /var/lib/docker \[docker\] 96% \(37\.3G free\), /srv/runner work \[work\] 88% \(223\.5G free\), / \[cache,/var/tmp\] 24% \(353\.9G free\)$'
+  expect_no_out '/missing'
+}
+
+case_status_disk_falls_back_to_root() {
+  local cfg="$TMP/disk-root.config"
+  save_config "$cfg" <<<"DISK_DOCKER_DIR=/missing/docker"
+  RUNNERCTL_STUB_NO_WORKDIR=1 run_cfg "$cfg" status
+  expect_rc 0
+  expect_out '— Disk: / \[root\] 24% \(353\.9G free\)$'
+  # with the work folders known, docker missing just drops its role
+  run_cfg "$cfg" status
+  expect_out '— Disk: / \[work\] 24% \(353\.9G free\)$'
 }
 
 case_status_host_events_no_access() {
   RUNNERCTL_STUB_HOST_EVENTS=no-access run status
   expect_rc 0
   # an unreadable journal says nothing on the header rather than "0 events"
-  expect_out '^runnerctl [0-9.]+ — Host: 16 cores, 64Gi RAM, 48Gi available — Disk: / 24% \(353\.9G free\)$'
+  expect_out '^runnerctl [0-9.]+ — Host: 16 cores, 64Gi RAM, 48Gi available — Disk: / \[docker,work\] 24% \(353\.9G free\)$'
 }
 
 case_status_host_events_off() {
@@ -4997,7 +5023,7 @@ case_status_host_events_off() {
   save_config "$cfg" <<<'EVENTS_SEC=0'
   RUNNERCTL_STUB_HOST_EVENTS=events run_cfg "$cfg" status
   expect_rc 0
-  expect_out '— Disk: / 24% \(353\.9G free\)$'
+  expect_out '— Disk: / \[docker,work\] 24% \(353\.9G free\)$'
   expect_no_log '^probe:journal_host_events '
 }
 
@@ -5006,7 +5032,7 @@ case_status_disk_ignore() {
   save_config "$cfg" <<<"DISK_IGNORE='^/var/lib/docker\$'"
   RUNNERCTL_STUB_DISKS=full run_cfg "$cfg" status
   expect_rc 0
-  expect_out '— Disk: / 24% \(353\.9G free\), /srv/build cache 88% \(223\.5G free\)$'
+  expect_out '— Disk: /srv/runner work \[work\] 88% \(223\.5G free\)$'
   expect_no_out '/var/lib/docker'
 }
 
@@ -5014,8 +5040,9 @@ case_status_json_host_disks_events() {
   if ! $HAVE_PYTHON3; then skip "python3 not installed — host.disks/events not checked"; expect_rc 0; return; fi
   RUNNERCTL_STUB_DISKS=full RUNNERCTL_STUB_HOST_EVENTS=events run status --json
   expect_rc 0
-  expect_json 'd["host"]["disks"][0] == {"mount": "/", "device": "/dev/nvme0n1p2", "fstype": "ext4", "size": 500000000000, "used": 120000000000, "avail": 380000000000, "use_pct": 24}'
-  expect_json '[x["mount"] for x in d["host"]["disks"]] == ["/", "/var/lib/docker", "/srv/build cache"]'
+  expect_json 'd["host"]["disks"][0] == {"mount": "/var/lib/docker", "device": "/dev/sdb1", "fstype": "xfs", "size": 1000000000000, "used": 960000000000, "avail": 40000000000, "use_pct": 96, "roles": ["docker"]}'
+  # three slots' work folders on one drive are one entry, one role
+  expect_json '[(x["mount"], x["roles"]) for x in d["host"]["disks"]] == [("/var/lib/docker", ["docker"]), ("/srv/runner work", ["work"])]'
   expect_json 'd["host"]["events"] == {"window": 3600, "oom_kills": 2, "cgroup_oom_kills": 1, "disk_full": 1, "last_oom": 1000000100, "last_oom_process": "cc1plus", "last_disk_full": 999999500, "last_disk_full_source": "dockerd"}'
 }
 
@@ -5024,15 +5051,15 @@ case_status_json_host_events_null() {
   RUNNERCTL_STUB_HOST_EVENTS=no-access run status --json
   expect_rc 0
   expect_json 'd["host"]["events"] is None'
-  expect_json 'len(d["host"]["disks"]) == 1'
+  expect_json '[x["roles"] for x in d["host"]["disks"]] == [["docker", "work"]]'
 }
 
 case_health_host_problems() {
   RUNNERCTL_STUB_DISKS=full RUNNERCTL_STUB_HOST_EVENTS=events run health --max-restarts 99
   expect_rc 1
-  expect_out '^host: /var/lib/docker is 96% full \(37\.3G free, DISK_CRIT_PCT=95\)$'
+  expect_out '^host: /var/lib/docker \[docker\] is 96% full \(37\.3G free, DISK_CRIT_PCT=95\)$'
   # 88 % is a warning on the header, not a health problem
-  expect_no_out 'build cache'
+  expect_no_out 'runner work'
   expect_out "^host: the kernel OOM-killed 2 process\(es\) host-wide in the last 1h \(last: cc1plus\) — "
   expect_out "^host: 1 'No space left on device' line\(s\) in the journal in the last 1h \(last from dockerd\)$"
   expect_out_count '^host: ' 3
@@ -5066,8 +5093,8 @@ first_line() { grep -nE -m1 "$1" <<<"$OUT" | cut -d: -f1 || echo 0; }
 case_fleet_status_host_line_above_each_hosts_slots() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_FULL="build-2" run fleet status
   expect_rc 0
-  expect_out_count '^build-1 +Disk: / 24% \(353\.9G free\)$' 1
-  expect_out_count '^build-2 +Disk: / 24% \(353\.9G free\), /var/lib/docker 96% \(37\.3G free\), /srv/build cache 88% \(223\.5G free\) — last 1h: 2 OOM kills, 1 disk-full$' 1
+  expect_out_count '^build-1 +Disk: / \[docker,work\] 24% \(353\.9G free\)$' 1
+  expect_out_count '^build-2 +Disk: /var/lib/docker \[docker\] 96% \(37\.3G free\), /srv/runner work \[work\] 88% \(223\.5G free\) — last 1h: 2 OOM kills, 1 disk-full$' 1
   # each host line sits between the previous host's slots and its own
   local h1 s1 h2 s2 last1
   h1="$(first_line '^build-1 +Disk: ')"; s1="$(first_line '^build-1 +0 ')"
@@ -5080,6 +5107,17 @@ case_fleet_status_host_line_above_each_hosts_slots() {
   expect_out_count '^build-[12] +[0-9]+ +example\.slot-' 6
   expect_no_out "$ESC"
   expect_no_out '^build-[12] runnerctl '
+}
+
+# `fleet status` asks for --color never and paints the host line itself
+# (GHR-67), cell by cell, from the percentages; the rows stay plain.
+case_fleet_status_host_line_painted_locally() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_FULL="build-2" run fleet status --color always
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 1
+  expect_out_count "^build-1 +Disk: $ESC\\[32m/ \\[docker,work\\] 24% \\(353\\.9G free\\)$ESC\\[0m\$" 1
+  expect_out_count "^build-2 +Disk: $ESC\\[31m/var/lib/docker \\[docker\\] 96% \\(37\\.3G free\\)$ESC\\[0m, $ESC\\[33m/srv/runner work \\[work\\] 88% \\(223\\.5G free\\)$ESC\\[0m — $ESC\\[31mlast 1h: 2 OOM kills, 1 disk-full$ESC\\[0m\$" 1
+  expect_no_out "^build-[12] +[0-9]+ .*$ESC"
 }
 
 case_fleet_status_old_host_gets_no_host_line() {
@@ -5095,8 +5133,8 @@ case_fleet_watch_host_line_keeps_the_remote_colours() {
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_FULL="build-1" \
     run fleet watch --iterations 1 --color always
   expect_rc 0
-  expect_out_count "^build-1 +Disk: / 24% \(353\.9G free\), $ESC\[31m/var/lib/docker 96% \(37\.3G free\)$ESC\[0m, $ESC\[33m/srv/build cache 88% \(223\.5G free\)$ESC\[0m — $ESC\[31mlast 1h: 2 OOM kills, 1 disk-full$ESC\[0m\$" 1
-  expect_out_count '^build-2 +Disk: / 24% \(353\.9G free\)$' 1
+  expect_out_count "^build-1 +Disk: $ESC\[31m/var/lib/docker \[docker\] 96% \(37\.3G free\)$ESC\[0m, $ESC\[33m/srv/runner work \[work\] 88% \(223\.5G free\)$ESC\[0m — $ESC\[31mlast 1h: 2 OOM kills, 1 disk-full$ESC\[0m\$" 1
+  expect_out_count "^build-2 +Disk: $ESC\\[32m/ \[docker,work\] 24% \(353\.9G free\)$ESC\\[0m\$" 1
 }
 
 # The cursor walks slot rows only: j from build-1's last slot goes to build-2's
@@ -5255,6 +5293,8 @@ t "status --color always: a drive past WARN/CRIT and the events painted" case_st
 t "status: an unreadable journal adds no event count"                    case_status_host_events_no_access
 t "status: EVENTS_SEC=0 turns the journal search off"                    case_status_host_events_off
 t "status: DISK_IGNORE leaves a mount out"                               case_status_disk_ignore
+t "status: DISK_PATHS labels, shares a row, skips a missing path"      case_status_disk_paths_labelled
+t "status: / [root] when no watched path resolves"                       case_status_disk_falls_back_to_root
 t "status --json: host.disks and host.events"                            case_status_json_host_disks_events
 t "status --json: host.events null when the journal is unreadable"       case_status_json_host_events_null
 t "health: a full drive, a host OOM kill and a disk-full line"           case_health_host_problems
@@ -5424,6 +5464,7 @@ t "fleet watch: widens again with room to spare; --narrow pins it"    case_fleet
 t "fleet --narrow: a host too old for it renders full-width, no error" case_fleet_narrow_an_old_host_renders_full_width_not_an_error
 t "fleet watch: j/k walk (host, slot) pairs, clamp, and cost no fan-out" case_fleet_watch_cursor_walks_host_slot_pairs
 t "fleet status: a host line above each host's slots, plain"             case_fleet_status_host_line_above_each_hosts_slots
+t "fleet status --color always: the host line is painted locally"        case_fleet_status_host_line_painted_locally
 t "fleet status: a host too old for the fragment gets no host line"       case_fleet_status_old_host_gets_no_host_line
 t "fleet watch: the host line keeps the remote's colours"                 case_fleet_watch_host_line_keeps_the_remote_colours
 t "fleet watch: the cursor skips host lines"                              case_fleet_watch_cursor_skips_host_lines

@@ -54,13 +54,20 @@
 #PRESSURE_WARN_PCT="10"
 #PRESSURE_CRIT_PCT="50"
 
-# Disk usage of every fixed drive (a /dev block device, one row per device)
-# on the status header, in percent: yellow from WARN, red and a `health`
-# problem from CRIT. DISK_IGNORE is an ERE over mount points to leave out,
-# e.g. '^/boot/efi$'.
+# Disk usage of the filesystems that hold Docker's data root, every slot's
+# work folder and DISK_PATHS, once per filesystem, labelled with what is on
+# it, in percent: green below WARN, yellow from WARN, red and a `health`
+# problem from CRIT. /boot and the like only appear if one of those paths
+# lives there. DISK_IGNORE is an ERE over mount points to leave out.
 #DISK_WARN_PCT="85"
 #DISK_CRIT_PCT="95"
 #DISK_IGNORE=""
+#
+# Docker's data root — set it when daemon.json moves "data-root".
+#DISK_DOCKER_DIR="/var/lib/docker"
+#
+# More directories to watch, space-separated, PATH or LABEL=PATH.
+#DISK_PATHS="cache=/srv/build-cache"
 
 # Seconds of journal status/health search for host-wide kernel OOM kills and
 # "No space left on device" lines. Either one in the window is a `health`
