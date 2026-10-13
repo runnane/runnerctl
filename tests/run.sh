@@ -9269,6 +9269,138 @@ t "fleet watch: a host's frame lines and age line relay only its SGR"        cas
 t "fleet watch: action notices and L's journal relay only a host's SGR"      case_fleet_watch_notices_relay_only_sgr_from_a_host
 t "fleet watch: facts, confirm lines and the pane relay only a host's SGR"   case_fleet_watch_key_reads_relay_only_sgr_from_a_host
 
+# --- GHR-104: a number a host wrote, before it reaches arithmetic ----------------
+# The helper itself: what shell arithmetic can take. 0 is a number; a leading
+# zero is an octal error and is not; 18 places is the most a 64-bit value takes
+# without wrapping, 19 is unknown rather than cut short; a sign, a fraction, an
+# exponent, a space and nothing are not numbers. pane_int is the same rule.
+case_num_int_says_what_arithmetic_can_take() {
+  # shellcheck disable=SC2016
+  run_fn eval 'for v in 0 5 10 123456789012345678 08 09 007 00 1234567890123456789 99999999999999999999 -5 +5 1.5 1e9 "5 " " 5" 0x10 abc ""; do
+      num_int "$v"; pane_int "$v"; printf "[%s] -> [%s] [%s]\n" "$v" "$NUM_INT" "$PANE_INT"; done'
+  expect_rc 0
+  expect_text "the verdict on each value" '[0] -> [0] [0]
+[5] -> [5] [5]
+[10] -> [10] [10]
+[123456789012345678] -> [123456789012345678] [123456789012345678]
+[08] -> [] []
+[09] -> [] []
+[007] -> [] []
+[00] -> [] []
+[1234567890123456789] -> [] []
+[99999999999999999999] -> [] []
+[-5] -> [] []
+[+5] -> [] []
+[1.5] -> [] []
+[1e9] -> [] []
+[5 ] -> [] []
+[ 5] -> [] []
+[0x10] -> [] []
+[abc] -> [] []
+[] -> [] []' "$OUT"
+}
+
+# The read every action key makes of a host. A job's `since` the host wrote as
+# `08` is an octal error to $((…)) and ended the watch at the keypress; each
+# value that is no number arithmetic can take leaves the runtime out of the
+# confirm line, as a missing one does, and the call RETURNS (it is called plain,
+# under set -e, so an exit is the case's own exit status). 0 is a legitimate
+# `since`, and one ahead of this node's clock is unknown, not a negative age.
+case_fleet_watch_facts_reads_a_since_no_arithmetic_can_take() {
+  local d="$TMP/ghr104.state"
+  mkdir -p "$d/tmp"
+  # shellcheck disable=SC2016
+  GHR104_D="$d" run_snippet "$STUB" 'FW_TMP="$GHR104_D/tmp" FLEET_RUNNERCTL=runnerctl
+    now_epoch() { echo 1000000720; }
+    ssh_run() { printf "%s\n" "$GHR104_LINE"; }
+    for v in 1000000000 0 08 09 007 99999999999999999999 -5 1e9 2000000000 null; do
+      GHR104_LINE="  {\"idx\":0,\"unit\":\"u\",\"name\":\"s1\",\"active\":\"active\",\"sub\":\"running\",\"job\":{\"repo\":\"r\",\"name\":\"n\",\"since\":$v,\"stalled\":false},\"idle_since\":null,\"working_on_access\":\"ok\"}"
+      fleet_watch_facts h1 s1
+      printf "since %s -> [%s]\n" "$v" "${FF[job_cell]}"
+    done
+    echo done'
+  expect_rc 0
+  expect_text "the job cell for each since" 'since 1000000000 -> [r:n (12m)]
+since 0 -> [r:n (11574d 1h)]
+since 08 -> [r:n]
+since 09 -> [r:n]
+since 007 -> [r:n]
+since 99999999999999999999 -> [r:n]
+since -5 -> [r:n]
+since 1e9 -> [r:n]
+since 2000000000 -> [r:n]
+since null -> [r:n]
+done' "$OUT"
+  expect_text "stderr" "" "$ERR"
+  rm -rf "$d"
+}
+
+# The classifiers read the same payloads for the summary and the views, and
+# test (not compute) their numbers: `[ 99999999999999999999 -gt 0 ]` prints an
+# error into the frame, so a number no arithmetic can take is unknown here too.
+# A zero is a number: it is what a healthy slot reports, and 0 memory is 0.
+case_fleet_classifiers_hold_a_hosts_numbers_to_what_a_test_can_take() {
+  local f="$TMP/ghr104.slots" tail=',"idle_since":null,"jobs_completed":null,"working_on_access":"ok"'
+  local up='"active":"active","sub":"running","enabled":"enabled"'
+  local big=99999999999999999999
+  {
+    echo "  {\"idx\":0,\"unit\":\"u\",\"name\":\"weird\",$up,\"memory_high\":$big,\"memory_current\":09,\"job\":{\"repo\":\"r\",\"name\":\"n\",\"since\":08,\"stalled\":false}$tail,\"leaked_procs\":$big,\"memory_pressure\":null}"
+    echo "  {\"idx\":1,\"unit\":\"u\",\"name\":\"over\",$up,\"memory_high\":$big,\"memory_current\":5,\"job\":null$tail,\"leaked_procs\":08,\"memory_pressure\":null}"
+    echo "  {\"idx\":2,\"unit\":\"u\",\"name\":\"zero\",$up,\"memory_high\":0,\"memory_current\":0,\"job\":{\"repo\":\"r\",\"name\":\"n\",\"since\":0,\"stalled\":false}$tail,\"leaked_procs\":0,\"memory_pressure\":null}"
+    echo "  {\"idx\":3,\"unit\":\"u\",\"name\":\"high\",$up,\"memory_high\":100,\"memory_current\":100,\"job\":null$tail,\"leaked_procs\":2,\"memory_pressure\":null}"
+  } >"$f"
+  # shellcheck disable=SC2016
+  GHR104_F="$f" run_fn eval 'while IFS= read -r l; do fleet_slot_classify "$l"; echo "$SC_NAME state=$SC_STATE leaking=$SC_LEAKING problem=$SC_PROBLEM since=$SC_SINCE mem=$SC_MEM"; done <"$GHR104_F"
+    for h in "{\"runnerctl\":\"1\",\"host\":{\"disks\":[{\"use_pct\":08}],\"events\":{\"oom_kills\":'"$big"',\"disk_full\":09}}}" \
+             "{\"runnerctl\":\"1\",\"host\":{\"disks\":[{\"use_pct\":'"$big"'}],\"events\":{\"oom_kills\":0,\"disk_full\":0}}}" \
+             "{\"runnerctl\":\"1\",\"host\":{\"disks\":[{\"use_pct\":95}],\"events\":{\"oom_kills\":0,\"disk_full\":3}}}"; do
+      fleet_host_classify "$h"; echo "host disk=[$HC_DISK] events=$HC_EVENTS"; done'
+  expect_rc 0
+  expect_text "the classification of each line" 'weird state=busy leaking=false problem=false since= mem=
+over state=idle leaking=false problem=false since= mem=5
+zero state=busy leaking=false problem=false since=0 mem=0
+high state=idle leaking=true problem=true since= mem=100
+host disk=[] events=false
+host disk=[] events=false
+host disk=[crit] events=true' "$OUT"
+  expect_text "stderr" "" "$ERR"
+  rm -f "$f"
+}
+
+# `fleet health` adds up the "ok: N slot(s) healthy" each host printed. A host
+# that wrote `08` (an octal error to the addition, which ends the command) or a
+# number too long to add is not counted, and the report says so the way it does
+# for an older remote: `N host(s) healthy`, never a total that is short. A 0 is
+# a count, and adds.
+case_fleet_health_adds_only_counts_arithmetic_can_take() {
+  local d="$TMP/ghr104.health"
+  mkdir -p "$d"
+  # shellcheck disable=SC2016
+  GHR104_D="$d" run_snippet "$STUB" 'FLEET_DIR="$GHR104_D" FLEET_HOSTS=(h1 h2)
+    fleet_rc() { echo 0; }
+    for pair in "3 0" "2 08" "2 99999999999999999999" "07 2"; do
+      set -- $pair
+      echo "ok: $1 slot(s) healthy" >"$FLEET_DIR/0.out"; echo "ok: $2 slot(s) healthy" >"$FLEET_DIR/1.out"
+      fleet_health_report false; echo "rc=$?"
+    done'
+  expect_rc 0
+  expect_text "the report for each pair of counts" 'ok: 3 slot(s) healthy across 2 host(s)
+rc=0
+ok: 2 host(s) healthy
+rc=0
+ok: 2 host(s) healthy
+rc=0
+ok: 2 host(s) healthy
+rc=0' "$OUT"
+  expect_text "stderr" "" "$ERR"
+  rm -rf "$d"
+}
+
+t "num_int: what shell arithmetic can take, and pane_int is the same rule"      case_num_int_says_what_arithmetic_can_take
+t "fleet watch: a job's since no arithmetic can take is left out, not fatal"    case_fleet_watch_facts_reads_a_since_no_arithmetic_can_take
+t "fleet: the classifiers hold a host's numbers to what a test can take"        case_fleet_classifiers_hold_a_hosts_numbers_to_what_a_test_can_take
+t "fleet health: only counts arithmetic can take are added"                     case_fleet_health_adds_only_counts_arithmetic_can_take
+
 # --- Summary ------------------------------------------------------------------
 echo
 echo "sim: $npass ok, $nxfail xfail (${XFAIL_KEYS# }), $nfail failed"

@@ -1656,6 +1656,20 @@ join_short() {
   echo "${out:-none}"
 }
 
+# --- Numbers from another host (GHR-104) --------------------------------------
+# VALUE as a whole number shell arithmetic can take, into NUM_INT — empty for
+# anything else. Not just "digits": `08` is an octal error to $((…)) and ((…))
+# (which ends a script under set -e), and a digit string past 18 places wraps
+# silently there and makes `[ … -gt … ]` print an error into a frame. 0 is a
+# number; a sign, a fraction, an exponent and an over-long string are not, and
+# the last is unknown rather than truncated. Every number a remote host wrote
+# is read through this before it reaches arithmetic or a numeric test.
+NUM_INT=""
+num_int() { # VALUE
+  NUM_INT=""
+  [[ ! "${1-}" =~ ^(0|[1-9][0-9]{0,17})$ ]] || NUM_INT="$1"
+}
+
 # --- Durations ----------------------------------------------------------------
 # Seconds -> 12s / 41m / 3h12m / 3d 4h (a zero remainder is dropped: 6d, 2h).
 # Anything that is not a non-negative integer (empty, "n/a", a negative from
@@ -3590,12 +3604,11 @@ pane_head() { # TEXT
   PANE_OUT+="${PANE_OUT:+$'\n'}${C_BOLD}${TERM_SAFE}${C_BOLD:+$C_RESET}"
 }
 # VALUE as a whole number arithmetic can take, into PANE_INT — empty for
-# anything else. Not just "digits": a remote's `08` is an octal error to
-# $((…)), and a watch must not die on what a host sent.
+# anything else. The rule is num_int's (GHR-104), kept in one place.
 PANE_INT=""
 pane_int() { # VALUE
-  PANE_INT=""
-  [[ ! "${1-}" =~ ^(0|[1-9][0-9]{0,17})$ ]] || PANE_INT="$1"
+  num_int "${1-}"
+  PANE_INT="$NUM_INT"
 }
 # Seconds since EPOCH, into PANE_INT; empty when EPOCH is not one or is ahead
 # of this node's clock.
@@ -5453,17 +5466,20 @@ fleet_slot_classify() { # SLOT-LINE
     if [ "$JF" = true ]; then SC_STATE=stalled SC_PROBLEM=true; else SC_STATE=busy; fi
   fi
   if [ "$job" != null ]; then
+    # GHR-104: each number below is the host's; a test on one that is no
+    # number prints an error into the frame, so it is read through num_int.
     json_line_get "$job" since
-    [[ ! "$JF" =~ ^[0-9]+$ ]] || SC_SINCE="$JF"
+    num_int "$JF"; SC_SINCE="$NUM_INT"
     json_line_get "$job" repo; SC_JOB="$JF"
     json_line_get "$job" name; SC_JOB="${SC_JOB:+$SC_JOB:}$JF"
   fi
   json_line_get "$1" leaked_procs
-  if [[ "$JF" =~ ^[0-9]+$ ]] && [ "$JF" -gt 0 ]; then SC_LEAKING=true SC_PROBLEM=true; fi
+  num_int "$JF"
+  if [ -n "$NUM_INT" ] && [ "$NUM_INT" -gt 0 ]; then SC_LEAKING=true SC_PROBLEM=true; fi
   json_line_get "$1" memory_current
-  [[ ! "$JF" =~ ^[0-9]+$ ]] || SC_MEM="$JF"
-  json_line_get "$1" memory_high; high="$JF"
-  if [ -n "$SC_MEM" ] && [[ "$high" =~ ^[0-9]+$ ]] && [ "$high" -gt 0 ] && [ "$SC_MEM" -ge "$high" ]; then
+  num_int "$JF"; SC_MEM="$NUM_INT"
+  json_line_get "$1" memory_high; num_int "$JF"; high="$NUM_INT"
+  if [ -n "$SC_MEM" ] && [ -n "$high" ] && [ "$high" -gt 0 ] && [ "$SC_MEM" -ge "$high" ]; then
     SC_PROBLEM=true
   fi
   # A percentage with decimals, which only awk compares — asked for a slot
@@ -5479,18 +5495,20 @@ fleet_slot_classify() { # SLOT-LINE
 # disk-full line in its window.
 HC_VER="" HC_DISK="" HC_EVENTS=false
 fleet_host_classify() { # HOST-LINE
-  local line="$1" lvl n
+  local line="$1" lvl n m
   HC_DISK="" HC_EVENTS=false
   json_line_get "$line" runnerctl; HC_VER="$JF"
   while [[ "$line" =~ \"use_pct\":([0-9]+) ]]; do
-    lvl="$(disk_level "${BASH_REMATCH[1]}")"
-    line="${line#*"${BASH_REMATCH[0]}"}"
+    m="${BASH_REMATCH[0]}"
+    num_int "${BASH_REMATCH[1]}"
+    lvl="$(disk_level "$NUM_INT")"
+    line="${line#*"$m"}"
     case "$lvl" in crit) HC_DISK=crit ;; warn) [ -n "$HC_DISK" ] || HC_DISK=warn ;; esac
   done
   # What is left of the line is past the disks: the events object.
-  json_line_get "$line" oom_kills; n="$JF"
-  json_line_get "$line" disk_full
-  if { [[ "$n" =~ ^[0-9]+$ ]] && [ "$n" -gt 0 ]; } || { [[ "$JF" =~ ^[0-9]+$ ]] && [ "$JF" -gt 0 ]; }; then
+  json_line_get "$line" oom_kills; num_int "$JF"; n="$NUM_INT"
+  json_line_get "$line" disk_full; num_int "$JF"
+  if { [ -n "$n" ] && [ "$n" -gt 0 ]; } || { [ -n "$NUM_INT" ] && [ "$NUM_INT" -gt 0 ]; }; then
     HC_EVENTS=true
   fi
 }
@@ -6399,7 +6417,7 @@ cmd_fleet_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart
 # output is reused verbatim with the host name prefixed, so the single-host
 # format people already read stays intact.
 fleet_health_report() { # QUIET
-  local quiet="$1" i host rc line slots total=0 counted=true hosts_ok=0
+  local quiet="$1" i host rc line total=0 counted=true hosts_ok=0
   local -a problems=()
   for i in "${!FLEET_HOSTS[@]}"; do
     host="${FLEET_HOSTS[$i]}"
@@ -6411,8 +6429,11 @@ fleet_health_report() { # QUIET
         # stop counting if any host words it differently (an older remote,
         # say) rather than reporting a total that is quietly short.
         line="$(head -1 "$FLEET_DIR/$i.out" 2>/dev/null || true)"
-        if [[ "$line" =~ ^ok:\ ([0-9]+)\ slot ]]; then
-          slots="${BASH_REMATCH[1]}"; total=$((total + slots))
+        # GHR-104: the count is the host's, and reaches $((…)).
+        num_int ""
+        [[ ! "$line" =~ ^ok:\ ([0-9]+)\ slot ]] || num_int "${BASH_REMATCH[1]}"
+        if [ -n "$NUM_INT" ]; then
+          total=$((total + NUM_INT))
         else
           counted=false
         fi
@@ -7094,7 +7115,10 @@ fleet_watch_facts() { # HOST NAME
       FF[job_cell]="(starting)"
     else
       FF[job_cell]="${repo:+$repo:}$name"
-      [[ ! "$since" =~ ^[0-9]+$ ]] || FF[job_cell]+=" ($(fmt_dur $(($(now_epoch) - since))))"
+      # GHR-104: `since` is the host's number; one that is no number
+      # arithmetic can take (`08`) leaves the runtime out, as a missing one does.
+      pane_age "$since"
+      [ -z "$PANE_INT" ] || FF[job_cell]+=" ($(fmt_dur "$PANE_INT"))"
       [ "$stalled" != true ] || FF[job_cell]+=" STALLED"
     fi
     # GHR-78: text a job supplied, about to be drawn in a confirm line here.
