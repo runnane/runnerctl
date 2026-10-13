@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.19.0](https://github.com/runnane/runnerctl/compare/v0.18.0...v0.19.0) (2026-10-13)
+
+
+### Features
+
+* fleet status/watch print a fleet summary line — hosts answering, slots by state, capacity left (GHR-72) ([#79](https://github.com/runnane/runnerctl/issues/79)) ([f3f9f1c](https://github.com/runnane/runnerctl/commit/f3f9f1cd8907a2979ab1dc5af075331296bcabe3))
+* fleet upgrade takes --host, a --canary, --serial and --stop-on-failure, and reads each host's version back before calling it upgraded (GHR-82) ([#84](https://github.com/runnane/runnerctl/issues/84)) ([d0b5eca](https://github.com/runnane/runnerctl/commit/d0b5ecabcf87817b76a1cebce592a0c7e38a0ca4))
+* fleet watch fetches each host in the background — a slow host holds up neither the frame nor the keys, and one that stops answering keeps its rows with their age (GHR-74) ([#83](https://github.com/runnane/runnerctl/issues/83)) ([7ea1134](https://github.com/runnane/runnerctl/commit/7ea11346dfe537d4dcf5a994fdfe61ea1010d0d3))
+* watch and fleet watch fit the frame to the terminal's height — a window that follows the cursor, PgUp/PgDn and g/G, redraw on resize (GHR-73) ([#82](https://github.com/runnane/runnerctl/issues/82)) ([80c6434](https://github.com/runnane/runnerctl/commit/80c6434d11f514d38c1c8faa3d4d52031532334f))
+
+
+### Bug Fixes
+
+* fleet mutating commands get their own time budget, and a timeout says the host may still be running (GHR-81) ([#81](https://github.com/runnane/runnerctl/issues/81)) ([13961e1](https://github.com/runnane/runnerctl/commit/13961e127038dde53a82a3d4ef6a5aa3ebdfc8cf))
+
 ## [0.18.0](https://github.com/runnane/runnerctl/compare/v0.17.0...v0.18.0) (2026-10-13)
 
 
