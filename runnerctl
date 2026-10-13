@@ -1139,10 +1139,18 @@ JOB_REF="" JOB_SHA="" JOB_ACTOR="" JOB_EVENT="" JOB_URL=""
 # cannot be told from half a character, and a terminal not in UTF-8 mode acts
 # on it. Well-formed text beyond ASCII — `ærlig`, an emoji in a workflow name
 # — is kept untouched.
+#
+# KEEP-ESC (any second argument) leaves ESC alone and applies every other
+# rule: relay_safe's last step, over a line whose only ESCs are the SGRs it
+# decided to keep. One set of rules, so the two cannot drift apart.
 TERM_SAFE=""
-term_safe() { # TEXT
+term_safe() { # TEXT [KEEP-ESC]
   local LC_ALL=C s="${1-}"
-  s="${s//[$'\001'-$'\037'$'\177']/}"
+  if [ -n "${2:-}" ]; then
+    s="${s//[$'\001'-$'\032'$'\034'-$'\037'$'\177']/}"
+  else
+    s="${s//[$'\001'-$'\037'$'\177']/}"
+  fi
   s="${s//$'\xc2'[$'\x80'-$'\x9f']/}"
   s="${s//$'\xe2\x80'[$'\x8e'$'\x8f'$'\xa8'-$'\xae']/}"
   s="${s//$'\xe2\x81'[$'\xa6'-$'\xa9']/}"
@@ -1163,6 +1171,118 @@ utf8_or_ascii() { # TEXT
   t="${t//[$'\xe0'-$'\xef'][$'\x80'-$'\xbf'][$'\x80'-$'\xbf']/}"
   t="${t//[$'\xc2'-$'\xdf'][$'\x80'-$'\xbf']/}"
   [[ "$t" != *[$'\x80'-$'\xff']* ]] || UTF8_TEXT="${s//[$'\x80'-$'\xff']/?}"
+}
+
+# --- Text another host sent (GHR-101) -----------------------------------------
+# term_safe is for a value. `fleet` relays whole LINES another host drew — its
+# table, what it said on stderr, the last line of an action, its journal — and
+# those are painted on purpose: `fleet watch` asks every host for --color
+# always, because only the host knows a cell is STALLED. So the central node
+# can neither print them as they came (a host on a runnerctl older than GHR-78
+# draws a job's name raw, and a login banner or a wrapper script on a host
+# reaches this terminal) nor put them through term_safe, which would take the
+# colours off and leave each one's `[31m` behind as text.
+#
+# A LINE made safe to relay, into RELAY_SAFE. One kind of sequence is kept,
+# and only in the shape this script paints with:
+#
+#   kept     SGR: ESC [, at most 32 digits and `;`, then `m` — strip_sgr's own
+#            shape, so a width measured off a relayed line is what is drawn —
+#            and only when EVERY parameter is one of the attributes and
+#            foreground colours a table uses (relay_sgr_ok). Not conceal (8),
+#            blink, a background or a 38/48 colour: those can hide the text
+#            or repaint around it, which is what keeping colours must not
+#            buy. A `:` sub-parameter is not accepted at all.
+#   removed  every other sequence, WHOLE, so none leaves its tail on screen: a
+#            CSI to its final byte (`ESC [ 2 J`, and an SGR that failed the
+#            test above), an OSC, DCS, SOS, PM or APC string to BEL or ESC \
+#            (or to the next ESC, which ends one on a terminal too), any
+#            other escape with its intermediate and final bytes, and the
+#            8-bit C1 spellings of CSI and of the strings. A sequence with no
+#            end on the line is removed to the end of the line.
+#   then     term_safe's rules for everything else — the ESC of a kept SGR
+#            excepted — C0, DEL, C1, bidi, malformed UTF-8 as `?`.
+#
+# A line that leaves an attribute on (its last kept SGR is not a reset) gets
+# ESC [ 0 m appended, so it cannot paint the next row's HOST cell or the frame
+# under it.
+#
+# PLAIN (any second argument) keeps no SGR either: the whole-sequence removal
+# without the colours, for text from another host that is never painted.
+#
+# Cost: a line with no byte outside printable ASCII is returned as it came; one
+# with no ESC and no C1 introducer is term_safe's substitutions alone. Only a
+# line carrying a sequence is walked, one sequence per step, never per byte.
+RELAY_SAFE=""
+RELAY_SGR_RE='^\[([0-9;]{0,32})m'
+RELAY_CSI_RE='^[0-?]*[ -/]*[@-~]?'
+RELAY_STR_RE=$'^[^\a\e]*(\a|\e\\\\)?'
+RELAY_ESC_RE='^[ -/]*[0-~]'
+relay_safe() { # TEXT [PLAIN]
+  local LC_ALL=C s="${1-}" out="" head c1 c n m sgr=false last=""
+  if [[ "$s" != *[$'\001'-$'\037'$'\177'-$'\377']* ]]; then RELAY_SAFE="$s"; return 0; fi
+  if [[ "$s" != *$'\e'* && "$s" != *$'\xc2'[$'\x90\x98\x9b\x9d\x9e\x9f']* ]]; then
+    term_safe "$s"; RELAY_SAFE="$TERM_SAFE"; return 0
+  fi
+  while :; do
+    # Up to the first ESC or C1 introducer, whichever comes first. A split,
+    # not a pattern match, so no ESC can hide inside what is taken as text.
+    head="${s%%$'\e'*}"
+    c1="${s%%$'\xc2'[$'\x90\x98\x9b\x9d\x9e\x9f']*}"
+    [ "${#c1}" -ge "${#head}" ] || head="$c1"
+    [ "${#head}" -lt "${#s}" ] || break
+    out+="$head" s="${s:${#head}}" n=0
+    if [[ "$s" == $'\e'* ]]; then
+      s="${s:1}"
+      if [ -z "${2:-}" ] && [[ "$s" =~ $RELAY_SGR_RE ]]; then
+        m="${BASH_REMATCH[0]}" c="${BASH_REMATCH[1]}"
+        if relay_sgr_ok "$c"; then
+          out+=$'\e'"$m" s="${s:${#m}}" sgr=true last="$c"
+          continue
+        fi
+      fi
+      case "$s" in
+        \[*)       s="${s:1}"; [[ "$s" =~ $RELAY_CSI_RE ]]; n="${#BASH_REMATCH[0]}" ;;
+        [\]PX^_]*) s="${s:1}"; [[ "$s" =~ $RELAY_STR_RE ]]; n="${#BASH_REMATCH[0]}" ;;
+        *)         if [[ "$s" =~ $RELAY_ESC_RE ]]; then n="${#BASH_REMATCH[0]}"; fi ;;
+      esac
+    else
+      c="${s:1:1}" s="${s:2}"
+      if [ "$c" = $'\x9b' ]; then [[ "$s" =~ $RELAY_CSI_RE ]]; else [[ "$s" =~ $RELAY_STR_RE ]]; fi
+      n="${#BASH_REMATCH[0]}"
+    fi
+    s="${s:n}"
+  done
+  term_safe "$out$s" keep-esc
+  out="$TERM_SAFE"
+  if $sgr && [[ ! "${last##*;}" =~ ^0*$ ]]; then out+=$'\e[0m'; fi
+  RELAY_SAFE="$out"
+}
+# Whether every parameter of an SGR (the digits and `;` between ESC [ and m) is
+# one relay_safe keeps: reset, bold, dim, italic, underline, reverse, their
+# offs, and the sixteen foreground colours with the default. An empty
+# parameter is 0.
+relay_sgr_ok() { # PARAMS
+  local p="$1;" v
+  while [ -n "$p" ]; do
+    v="${p%%;*}" p="${p#*;}"
+    case "$v" in
+      ''|0|1|2|3|4|7|22|23|24|27|3[0-7]|39|9[0-7]) ;;
+      *) return 1 ;;
+    esac
+  done
+}
+# FILE rewritten in place, every line through relay_safe — where a remote's
+# answer lands, before anything reads it. A last line with no newline gains
+# one; nothing that reads these files can tell.
+relay_file() { # FILE
+  local line out=""
+  [ -s "$1" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    relay_safe "$line"
+    out+="$RELAY_SAFE"$'\n'
+  done <"$1"
+  printf '%s' "$out" >"$1"
 }
 # TEXT cut to N characters for a cell, the last one `…` when something went.
 clip() { # TEXT N
@@ -4859,7 +4979,19 @@ fleet_fanout_one() { # INDEX REMOTE-ARGS...
   # recorded, so every failure would read as the missing-file fallback
   # and a timeout would be indistinguishable from an unreachable host.
   FLEET_CALL_TIMEOUT="${FLEET_BUDGETS[$i]:-}" ssh_run "$host" "${args[@]}" >"$FLEET_DIR/$i.out" 2>"$FLEET_DIR/$i.err" || hrc=$?
+  # GHR-101: the one place a fan-out's answer lands, so every reader after it
+  # — the table, the reports, the error rows — has relayable text and none
+  # has the raw bytes to get wrong. A `--json` payload is data for a program,
+  # passed on unparsed: fleet_payload_ok decides whether it is passed at all.
+  relay_file "$FLEET_DIR/$i.err"
+  fleet_args_json "${args[@]}" || relay_file "$FLEET_DIR/$i.out"
   echo "$hrc" >"$FLEET_DIR/$i.rc"
+}
+# Whether a remote command line asks for `--json`.
+fleet_args_json() { # ARGS...
+  local a
+  for a in "$@"; do [ "$a" != --json ] || return 0; done
+  return 1
 }
 
 fleet_rc() { # INDEX
@@ -4947,8 +5079,16 @@ fleet_error_text() { # RC ERRFILE [BUDGET [MUTATING]]
 # A host's payload is only nested verbatim when it actually looks like the
 # object it claims to be. rc 0 with something else on stdout would otherwise
 # produce invalid fleet JSON, and a consumer would blame the fleet tool.
+#
+# GHR-101: nor when it carries a raw control byte other than a newline or a
+# tab. JSON has none inside a string and json_str escapes every one, so such a
+# payload is not this script's JSON — and `fleet status --json` is read on a
+# terminal as often as by a program, where an ESC in it would act.
 fleet_payload_ok() { # INDEX
-  [ -s "$FLEET_DIR/$1.out" ] && [ "$(head -c 1 "$FLEET_DIR/$1.out")" = "{" ]
+  [ -s "$FLEET_DIR/$1.out" ] && [ "$(head -c 1 "$FLEET_DIR/$1.out")" = "{" ] && ! fleet_payload_ctl "$1"
+}
+fleet_payload_ctl() { # INDEX
+  LC_ALL=C grep -aq $'[\001-\010\013-\037\177]' "$FLEET_DIR/$1.out"
 }
 
 # `fleet status --json`: each host's own payload nested UNCHANGED inside an
@@ -4967,7 +5107,9 @@ fleet_status_json() {
     # A host that exited 0 with something other than an object gets an error
     # of its own rather than a bare null status: exit 0, reachable, no error
     # and no payload is the one combination a consumer cannot interpret.
-    if [ "$rc" = 0 ] && ! $ok; then
+    if [ "$rc" = 0 ] && ! $ok && [ -s "$FLEET_DIR/$i.out" ] && fleet_payload_ctl "$i"; then
+      err="exit 0 but stdout carries raw control bytes, which no runnerctl JSON does — check FLEET_RUNNERCTL and the remote login's output"
+    elif [ "$rc" = 0 ] && ! $ok; then
       err="exit 0 but no JSON object on stdout — check FLEET_RUNNERCTL and the remote login's output"
     else
       err="$(fleet_error_text "$rc" "$FLEET_DIR/$i.err")"
@@ -6442,6 +6584,14 @@ fleet_watch_fetch_one() { # INDEX
     for a in "${FW_TABLE_ARGS[@]}"; do [ "$a" = "$FLEET_OPTIONAL_ARG" ] || args+=("$a"); done
     FLEET_CALL_TIMEOUT="${FLEET_BUDGETS[$i]:-}" ssh_run "$host" "$FLEET_RUNNERCTL" "${args[@]}" >"$d/out" 2>"$d/err" || hrc=$?
   fi
+  # GHR-101: filtered here, in the job, before the answer is published — so
+  # the flat files fleet_watch_collect moves it into, and every frame, view,
+  # pane and age line drawn from them on every redraw after, only ever hold
+  # relayable text, and the filtering is paid once per answer, off the loop.
+  # The --json payload below is parsed, never drawn as it came (see
+  # fleet_fanout_one).
+  relay_file "$d/out"
+  relay_file "$d/err"
   echo "$hrc" >"$d/rc"
   # GHR-72's summary pass, to a host whose table call exited 0 and no other:
   # one that is down is dialled once per tick, not twice.
@@ -6912,6 +7062,7 @@ fleet_watch_facts() { # HOST NAME
   local rc=0 line job
   FF=()
   (FLEET_CALL_TIMEOUT="$FLEET_WATCH_TIMEOUT" ssh_run "$1" "$FLEET_RUNNERCTL" status --json) >"$FW_TMP/facts" 2>"$FW_TMP/err" || rc=$?
+  relay_file "$FW_TMP/err"
   if [ "$rc" != 0 ]; then
     FW_NOTICE="$2 on $1: could not read its current state — $(fleet_error_text "$rc" "$FW_TMP/err" "$FLEET_WATCH_TIMEOUT")"
     return 1
@@ -6923,8 +7074,12 @@ fleet_watch_facts() { # HOST NAME
     FW_NOTICE="$2 on $1: no longer on that host — nothing run"
     return 1
   fi
-  FF[active]="$(json_line_field "$line" active)"
-  FF[sub]="$(json_line_field "$line" sub)"
+  # GHR-101: the two words the confirm lines quote as the host sent them
+  # (`stuck stopping (deactivating/stop-sigterm)`, `not active (failed)`).
+  # json_line_field does not decode, so an escape is text already; a raw
+  # control byte in a hostile payload is not, and goes whole here.
+  relay_safe "$(json_line_field "$line" active)" plain; FF[active]="$RELAY_SAFE"
+  relay_safe "$(json_line_field "$line" sub)" plain; FF[sub]="$RELAY_SAFE"
   FF[access]="$(json_line_field "$line" working_on_access)"
   FF[leaked]="$(json_line_field "$line" leaked_procs)"
   FF[job]="" FF[job_cell]=""
@@ -7052,6 +7207,11 @@ fleet_watch_slot_action() { # KEY HOST NAME
   lbl="$name on $host"
   if [ "$1" = L ]; then
     (ssh_run "$host" "$FLEET_RUNNERCTL" logs "$(printf %q "$name")" -n 50) >"$FW_TMP/logs" 2>"$FW_TMP/err" || rc=$?
+    # GHR-101: a journal line is whatever a job printed, and the pager may be
+    # `less -R` (or LESS=-R), which passes control bytes through: the lines
+    # are relayed like a table's, SGR kept for a pager that draws it.
+    relay_file "$FW_TMP/logs"
+    relay_file "$FW_TMP/err"
     if [ "$rc" != 0 ]; then
       FW_NOTICE="$lbl: logs — $(fleet_error_text "$rc" "$FW_TMP/err")"
       return 0
@@ -7135,6 +7295,9 @@ fleet_watch_run_action() {
   budget="$(fleet_mutate_budget "$FW_ACTION" 1)"
   printf '\nrunning on %s: %s %s %s\n' "$FW_ACT_HOST" "$FLEET_RUNNERCTL" "$FW_ACTION" "$FW_ACT_NAME"
   (FLEET_CALL_TIMEOUT="$budget" ssh_run "$FW_ACT_HOST" "$FLEET_RUNNERCTL" "$FW_ACTION" "$(printf %q "$FW_ACT_NAME")") >"$FW_TMP/out" 2>"$FW_TMP/err" || rc=$?
+  # GHR-101: either one becomes the next frame's notice.
+  relay_file "$FW_TMP/out"
+  relay_file "$FW_TMP/err"
   if [ "$rc" = 0 ]; then
     last="$(grep . "$FW_TMP/out" | tail -1 || true)"
     FW_NOTICE="$FW_ACT_NAME on $FW_ACT_HOST: ${last:-$FW_ACTION done}"
@@ -7526,6 +7689,11 @@ fleet_watch_pane_build() {
       fi
       # The table quotes the first line of what ssh said; here is the rest.
       [ ! -s "$FW_STATE/$at.err" ] || PN[stderr]="$(tail -n +2 "$FW_STATE/$at.err" | head -n 20)"
+      # GHR-101: relayed text, whose only escapes are SGRs. The pane paints
+      # its own rows, and pane_put's term_safe would leave each SGR's `[31m`
+      # behind as text, so the colours come off here, whole.
+      strip_sgr "${PN[answer]}"; PN[answer]="$SGR_STRIPPED"
+      strip_sgr "${PN[stderr]:-}"; PN[stderr]="$SGR_STRIPPED"
     fi
   fi
   if [ "$FW_PANE" = host ]; then

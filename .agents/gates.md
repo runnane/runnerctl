@@ -234,6 +234,19 @@ Traps:
   stall threshold of their own, `RUNNERCTL_STUB_FLEET_FULL` full disks and
   journal events.
 
+- **A host named `*hostile*` sends hostile bytes (GHR-101).** The stub answers
+  for it as for any host, then appends `STUB_HOSTILE` — a screen clear, a
+  window-title OSC and one SGR-painted word — to every non-empty line it
+  writes, stdout and stderr, `--json` included; it composes with the other
+  names (`hostile-unreachable`, `hostile-weird`). What a relay keeps of it is
+  `HOSTILE_KEPT` in `tests/run.sh`, and `relay_want` derives a hostile host's
+  expected lines from build-1's (same-width names). A frame's own prefix is
+  `ESC [ H ESC [ 2 J`, so assert the rest is gone with
+  `expect_no_hostile_rest`, never a bare `expect_no_out 2J`. The relay itself
+  runs where an answer lands (`fleet_fanout_one`, `fleet_watch_fetch_one`,
+  the watch's key reads), so a mutation that removes one `relay_file` call
+  turns red every case reading through that intake point, each at its own
+  assertion.
 - **A detail pane (GHR-76) is asserted by frame, not by `expect_out`.** A pane
   frame has no cursor row, so with colour off it carries no escape sequence
   of its own: `expect_frame_plain N` holds the whole frame to "no control
