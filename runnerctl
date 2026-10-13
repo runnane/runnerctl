@@ -1090,8 +1090,9 @@ ms_to_secs() { # MILLISECONDS
 #   JOB_LEAKED / JOB_LEAKED_PIDS / JOB_LEAKED_COMMS
 #               while idle with a readable cgroup: how many processes a
 #               finished job left in it, their pids (space-separated) and
-#               their comms (comma-separated); JOB_LEAKED empty when the
-#               slot is busy or the cgroup cannot be read (GHR-29)
+#               their comms, each made safe to draw and joined on COMM_SEP
+#               (GHR-100); JOB_LEAKED empty when the slot is busy or the
+#               cgroup cannot be read (GHR-29)
 #   JOB_REPO_FULL / JOB_WORKFLOW / JOB_RUN_ID / JOB_RUN_ATTEMPT / JOB_RUN_NUMBER
 #   / JOB_REF / JOB_SHA / JOB_ACTOR / JOB_EVENT / JOB_URL
 #               the run the job belongs to (GHR-78), from the same environment
@@ -1371,6 +1372,20 @@ run_url_ok() { # URL
   [[ "$1" =~ ^https?://[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(:[0-9]{1,5})?/[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}/actions/runs/[0-9]{1,15}(/attempts/[0-9]{1,15})?$ ]]
 }
 
+# GHR-100: a comm is whatever its process set it to — any 15 bytes, an escape
+# sequence or a comma among them — and the comm lists exist only to be
+# printed (reap's and kill's lines, the watch's P and K confirm lines, health's
+# leaked line, the pane). So each comm is made safe to draw where it is
+# collected, with relay_safe's whole-sequence removal (`?` when nothing is
+# left), and the list is joined on COMM_SEP, a control character: no comm
+# that went through relay_safe can contain one, so pid_comm_list's split
+# cannot pair a pid with another process's name. The pids are not touched —
+# they are what `kill` and `reap` signal.
+COMM_SEP=$'\x1f' COMM_SAFE=""
+comm_safe() { # COMM, into COMM_SAFE
+  relay_safe "${1-}" plain
+  COMM_SAFE="${RELAY_SAFE:-?}"
+}
 # The JOB_LEAKED_* facts from one proc_leaked walk of CGROUP, per the
 # contract above. Only called on an idle slot.
 job_leak_check() { # CGROUP
@@ -1382,7 +1397,8 @@ job_leak_check() { # CGROUP
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     JOB_LEAKED=$((JOB_LEAKED + 1))
     JOB_LEAKED_PIDS+="${JOB_LEAKED_PIDS:+ }$pid"
-    JOB_LEAKED_COMMS+="${JOB_LEAKED_COMMS:+, }${comm:-?}"
+    comm_safe "$comm"
+    JOB_LEAKED_COMMS+="${JOB_LEAKED_COMMS:+$COMM_SEP}$COMM_SAFE"
   done < <(proc_leaked "$1")
 }
 # GHR-36: the job-side processes of the cgroup, for `kill`. Same shape as
@@ -1398,7 +1414,8 @@ job_tree_check() { # CGROUP
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     JOB_TREE=$((JOB_TREE + 1))
     JOB_TREE_PIDS+="${JOB_TREE_PIDS:+ }$pid"
-    JOB_TREE_COMMS+="${JOB_TREE_COMMS:+, }${comm:-?}"
+    comm_safe "$comm"
+    JOB_TREE_COMMS+="${JOB_TREE_COMMS:+$COMM_SEP}$COMM_SAFE"
   done < <(proc_job_tree "$1")
 }
 # JOB_STALLED from the running job's age (seconds), per the contract above.
@@ -1481,20 +1498,25 @@ job_facts() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
 # decides whether the row fits.
 #
 # Everything a job supplied is drawn through term_safe — the repository and
-# the job's name too, which reached this cell raw before.
+# the job's name too, which reached this cell raw before. Since GHR-100 that is
+# relay_safe's PLAIN form, which applies term_safe's rules after removing an
+# escape sequence WHOLE: term_safe alone leaves `ESC [ 2 J`'s `[2J` behind as
+# text, and a sequence's tail is not the value's text. The same for every
+# line that quotes this cell (the --if-stalled and --when-idle lines, reap's
+# busy line, the watch's confirm lines and notices).
 JOB_CELL_PART=40
 job_cell() { # [ROOM]
   local repo name wf ref rest long
   case "$JOB_STATE" in
     none)         echo "—" ;;
     running)
-      term_safe "$JOB_REPO"; repo="$TERM_SAFE"
-      term_safe "$JOB_NAME"; name="${TERM_SAFE:-?}"
+      relay_safe "$JOB_REPO" plain; repo="$RELAY_SAFE"
+      relay_safe "$JOB_NAME" plain; name="${RELAY_SAFE:-?}"
       rest="${JOB_RUNTIME:+ ($JOB_RUNTIME)}"
       [ "$JOB_STALLED" != true ] || rest+=" STALLED"
       if [ "${1:-0}" -gt 0 ] && [ -n "$JOB_WORKFLOW$JOB_REF" ]; then
-        term_safe "$JOB_WORKFLOW"; wf="$(clip "$TERM_SAFE" "$JOB_CELL_PART")"
-        term_safe "$JOB_REF"; ref="$(clip "$TERM_SAFE" "$JOB_CELL_PART")"
+        relay_safe "$JOB_WORKFLOW" plain; wf="$(clip "$RELAY_SAFE" "$JOB_CELL_PART")"
+        relay_safe "$JOB_REF" plain; ref="$(clip "$RELAY_SAFE" "$JOB_CELL_PART")"
         long="${repo:+$repo:}${wf:+$wf / }$name${ref:+ @$ref}$rest"
         if [ "${#long}" -le "$1" ]; then printf '%s\n' "$long"; return 0; fi
       fi
@@ -1634,7 +1656,7 @@ idle_gate() { # UNIT VERB HANDLED REMAINING
 # A (no access) slot dies, as --when-idle does: the question cannot be
 # answered, and acting on a guess would kill a healthy job.
 stalled_gate() { # UNIT VERB-ING
-  local short
+  local short repo name
   short="$(short_name "$1")"
   slot_job_facts "$1"
   case "$JOB_STATE" in
@@ -1642,7 +1664,11 @@ stalled_gate() { # UNIT VERB-ING
     none)      echo "$short: not running — skipped"; return 1 ;;
   esac
   if [ "$JOB_STALLED" = true ]; then
-    echo "$short: stalled — $(job_desc "${JOB_REPO:+$JOB_REPO:}${JOB_NAME:-?}${JOB_RUNTIME:+ ($JOB_RUNTIME)}"), longer than $(fmt_dur "$STALL_SEC") — $2"
+    # GHR-100: the repository and the job's name are a job's text, drawn
+    # through relay_safe as job_cell draws them.
+    relay_safe "$JOB_REPO" plain; repo="$RELAY_SAFE"
+    relay_safe "$JOB_NAME" plain; name="$RELAY_SAFE"
+    echo "$short: stalled — $(job_desc "${repo:+$repo:}${name:-?}${JOB_RUNTIME:+ ($JOB_RUNTIME)}"), longer than $(fmt_dur "$STALL_SEC") — $2"
     return 0
   fi
   echo "$short: not stalled ($(job_cell)) — skipped"
@@ -2661,19 +2687,30 @@ host_header_suffix() {
 }
 
 # The `health` problems the host facts carry, one per line. Reads HOST.
+#
+# GHR-100: the OOM-killed process's name and the disk-full line's syslog
+# identifier are text a process chose. Measured with systemd 262, `journalctl
+# -o short-unix` (no --all) does not hand back a control byte for either — an
+# unprintable identifier falls back to the process's comm, printed with `\033`
+# as text, and an unprintable message becomes `[N blob data]`. The kernel's
+# OOM line was not measured (that needs an OOM kill). Neither is a promise
+# about every journalctl a host runs, so both are drawn through relay_safe
+# anyway; HOST and --json keep them as they were read.
 host_problems() {
-  local pct avail mnt roles
+  local pct avail mnt roles proc src
   while IFS=$'\t' read -r pct avail mnt _ _ _ _ roles; do
     [ -n "$mnt" ] || continue
     [ "$(disk_level "$pct")" = crit ] || continue
     echo "host: $mnt${roles:+ [$roles]} is $pct% full ($(hbytes "$avail") free, DISK_CRIT_PCT=$DISK_CRIT_PCT)"
   done <<<"${HOST[disks]}"
   [ "${HOST[events]}" = ok ] || return 0
+  relay_safe "${HOST[last_oom_proc]}" plain; proc="$RELAY_SAFE"
+  relay_safe "${HOST[last_disk_full_src]}" plain; src="$RELAY_SAFE"
   if [ "${HOST[oom]}" -gt 0 ]; then
-    echo "host: the kernel OOM-killed ${HOST[oom]} process(es) host-wide in the last $(fmt_dur "$EVENTS_SEC")${HOST[last_oom_proc]:+ (last: ${HOST[last_oom_proc]})} — 'journalctl -k -g \"Out of memory\"' shows them"
+    echo "host: the kernel OOM-killed ${HOST[oom]} process(es) host-wide in the last $(fmt_dur "$EVENTS_SEC")${proc:+ (last: $proc)} — 'journalctl -k -g \"Out of memory\"' shows them"
   fi
   if [ "${HOST[disk_full]}" -gt 0 ]; then
-    echo "host: ${HOST[disk_full]} 'No space left on device' line(s) in the journal in the last $(fmt_dur "$EVENTS_SEC")${HOST[last_disk_full_src]:+ (last from ${HOST[last_disk_full_src]})}"
+    echo "host: ${HOST[disk_full]} 'No space left on device' line(s) in the journal in the last $(fmt_dur "$EVENTS_SEC")${src:+ (last from $src)}"
   fi
 }
 
@@ -4147,10 +4184,12 @@ cmd_reap() { # [--dry-run] [target ...] (default: all)
 }
 
 # `pid/comm, pid/comm` from a PIDS + COMMS pair, for reap's and kill's lines.
+# COMMS is joined on COMM_SEP (GHR-100), which no collected comm can contain:
+# a comm with a comma or a space in it is one name, next to its own pid.
 pid_comm_list() { # PIDS COMMS
   local out="" pids comms i
   read -ra pids <<<"$1"
-  IFS=',' read -ra comms <<<"${2// /}"
+  IFS="$COMM_SEP" read -ra comms <<<"$2"
   for i in "${!pids[@]}"; do out+="${out:+, }${pids[$i]}/${comms[$i]:-?}"; done
   echo "$out"
 }
@@ -4460,8 +4499,11 @@ cmd_compose_reap() { # [--apply] [--standalone] [--project NAME] [--max-age-hour
       fi
     fi
     [ "$seen" -gt 0 ] || seen="${vol_last[$p]}"
+    # GHR-100: a project is a label any job with docker can set to any bytes;
+    # drawn through relay_safe, matched and removed by its raw value and ids.
+    relay_safe "$p" plain
     printf '%s %s reason=%s idle=%sm containers=%s networks=%s volumes=%s\n' \
-      "$action" "$p" "$reason" "$(( (now - seen) / 60 ))" \
+      "$action" "$RELAY_SAFE" "$reason" "$(( (now - seen) / 60 ))" \
       "$(wc -w <<<"${containers[$p]:-}")" "$(wc -w <<<"${networks[$p]:-}")" "$(wc -w <<<"${volumes[$p]:-}")"
     if [ "$action" != reap ]; then kept=$((kept + 1)); continue; fi
     reaped=$((reaped + 1))
@@ -4731,7 +4773,7 @@ cmd_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart-stall
     esac
   done
   require_runners
-  local u short n=0 problems=() nrestarts reason line
+  local u short n=0 problems=() nrestarts reason line repo name
   while read -r u; do
     [ -n "$u" ] || continue
     collect_slot "$u" "$n"
@@ -4753,7 +4795,11 @@ cmd_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart-stall
       problems+=("$line")
     fi
     if [ "${SLOT[job_stalled]}" = true ]; then
-      line="$short: stalled — job ${SLOT[job_repo]:+${SLOT[job_repo]}:}${SLOT[job_name]:-?} running ${SLOT[job_runtime]}, longer than $(fmt_dur "$STALL_SEC") (--stall-after $STALL_SEC)"
+      # GHR-100: a job's text, drawn through relay_safe on the host that read
+      # it — this line is what cron mails and what `fleet health` relays.
+      relay_safe "${SLOT[job_repo]}" plain; repo="$RELAY_SAFE"
+      relay_safe "${SLOT[job_name]}" plain; name="$RELAY_SAFE"
+      line="$short: stalled — job ${repo:+$repo:}${name:-?} running ${SLOT[job_runtime]}, longer than $(fmt_dur "$STALL_SEC") (--stall-after $STALL_SEC)"
       ! pressure_at_least "${SLOT[mem_pressure_full_avg10]}" "$PRESSURE_WARN_PCT" || line+=" — under memory pressure $(status_press_cell "${SLOT[mem_pressure_full_avg10]}"), throttled rather than hung"
       # GHR-30: the only privileged call health ever makes, and only here.
       if $restart_stalled; then
@@ -4762,7 +4808,7 @@ cmd_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart-stall
       problems+=("$line")
     fi
     if [[ "${SLOT[job_leaked]}" =~ ^[0-9]+$ ]] && [ "${SLOT[job_leaked]}" -gt 0 ]; then
-      problems+=("$short: ${SLOT[job_leaked]} leaked process(es) left by finished jobs (${SLOT[job_leaked_comms]}) — runnerctl reap ${SLOT[idx]}")
+      problems+=("$short: ${SLOT[job_leaked]} leaked process(es) left by finished jobs (${SLOT[job_leaked_comms]//"$COMM_SEP"/, }) — runnerctl reap ${SLOT[idx]}")
     fi
     if pressure_at_least "${SLOT[mem_pressure_full_avg10]}" "$PRESSURE_CRIT_PCT"; then
       problems+=("$short: under full memory pressure $(status_press_cell "${SLOT[mem_pressure_full_avg10]}") (avg10, PRESSURE_CRIT_PCT=$PRESSURE_CRIT_PCT) — throttled at MemoryHigh (${SLOT[mem_events_high]:-?} times so far), see USED vs HIGH")
