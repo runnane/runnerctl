@@ -3598,7 +3598,8 @@ watch_run_action() {
 #     the two panes cannot drift apart, and a host too old to report a field
 #     simply leaves it empty: every row prints `—` for an empty value.
 #   * EVERYTHING DRAWN GOES THROUGH pane_put, which runs the value through
-#     term_safe before it is painted. A workflow's name, a branch, an actor, a
+#     relay_safe's PLAIN form (an escape sequence removed whole, GHR-108)
+#     before it is painted. A workflow's name, a branch, an actor, a
 #     leaked process's comm, a mount point, the stderr of an ssh that failed —
 #     most of a pane is text somebody else chose, so the one function that
 #     appends a row is the one place it is neutralised; a row cannot be added
@@ -3631,14 +3632,14 @@ PANE_NO_SLOT_KEYS="the host block — K R S T P L O act on a slot"
 # (`—` for an empty one). The only way a row gets into PANE_OUT.
 pane_put() { # LABEL VALUE [SGR]
   local pad
-  term_safe "${2-}"
+  relay_safe "${2-}" plain
   printf -v pad '%-*s' "$PANE_LABEL_W" "$1"
-  PANE_OUT+="${PANE_OUT:+$'\n'}  $pad ${3-}${TERM_SAFE:-—}${3:+$C_RESET}"
+  PANE_OUT+="${PANE_OUT:+$'\n'}  $pad ${3-}${RELAY_SAFE:-—}${3:+$C_RESET}"
 }
 # A heading: the pane's title, or a section's name.
 pane_head() { # TEXT
-  term_safe "$1"
-  PANE_OUT+="${PANE_OUT:+$'\n'}${C_BOLD}${TERM_SAFE}${C_BOLD:+$C_RESET}"
+  relay_safe "$1" plain
+  PANE_OUT+="${PANE_OUT:+$'\n'}${C_BOLD}${RELAY_SAFE}${C_BOLD:+$C_RESET}"
 }
 # VALUE as a whole number arithmetic can take, into PANE_INT — empty for
 # anything else. The rule is num_int's (GHR-104), kept in one place.
@@ -7170,7 +7171,8 @@ fleet_watch_facts() { # HOST NAME
     # GHR-78: text a job supplied, about to be drawn in a confirm line here.
     # json_str on the host already escaped every control character; what it
     # passes through verbatim (a bidi override) is taken out on this side.
-    term_safe "${FF[job_cell]}"; FF[job_cell]="$TERM_SAFE"
+    # GHR-108: whole sequences removed, as the table's WORKING-ON cell does.
+    relay_safe "${FF[job_cell]}" plain; FF[job_cell]="$RELAY_SAFE"
   fi
 }
 
@@ -7760,8 +7762,8 @@ fleet_watch_pane_build() {
       # The table quotes the first line of what ssh said; here is the rest.
       [ ! -s "$FW_STATE/$at.err" ] || PN[stderr]="$(tail -n +2 "$FW_STATE/$at.err" | head -n 20)"
       # GHR-101: relayed text, whose only escapes are SGRs. The pane paints
-      # its own rows, and pane_put's term_safe would leave each SGR's `[31m`
-      # behind as text, so the colours come off here, whole.
+      # its own rows, and the colours of a relayed line are not wanted in a
+      # row, so they come off here, whole (pane_put would remove them whole too).
       strip_sgr "${PN[answer]}"; PN[answer]="$SGR_STRIPPED"
       strip_sgr "${PN[stderr]:-}"; PN[stderr]="$SGR_STRIPPED"
     fi

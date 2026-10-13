@@ -8064,6 +8064,9 @@ case_run_facts_hostile_text_is_neutralised_where_drawn() {
   expect_no_out "$ESC\\]"
   # `fleet watch`: the remote drew its row without the override, and the
   # confirm line this node builds from the remote's JSON is without it too
+  # (a raw sequence in the payload is pinned in
+  # case_ghr108_fleet_watch_job_cell_removes_a_sequence_whole: a real host
+  # writes it as \u001b, which is text here)
   RUNNERCTL_STUB_RUN_REPOSITORY=$'example/my\xe2\x80\xae-app' RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Knq' \
     RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
   expect_rc 0
@@ -8592,12 +8595,20 @@ case_watch_pane_draws_job_and_process_text_safely() {
   # Q in the pane is q in the pane: back to the table, which the q then quits
   expect_frame_count 3
   expect_frame 3 "$LEGEND"
-  expect_frame 2 '^  repo          example/my\]0;x-app$'
-  expect_frame 2 '^  workflow      CI$'
-  expect_frame 2 '^  ref           ma\[2J\[31min$'
+  # GHR-108: each sequence is removed whole, as in the table's cell
+  expect_frame 2 '^  repo          example/my-app$'
+  expect_frame 2 '^  workflow      C$'
+  expect_frame 2 '^  ref           main$'
   expect_frame 2 '^  url           —$'
   expect_frame_plain 2
   expect_no_frame 2 $'\xc2\x9b|\xe2\x80\xae'
+  # a value made of nothing but sequences is empty, and an empty row is `—`
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_REF_NAME=$'\e[2J\e[31m' RUNNERCTL_STUB_RUN_REPOSITORY="$repo" RUNNERCTL_STUB_RUN_WORKFLOW="$wf" \
+    RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=$'\nqq' run watch --color never
+  expect_rc 0
+  frames
+  expect_frame 2 '^  ref           —$'
+  expect_frame 2 '^  repo          example/my-app$'
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 RUNNERCTL_STUB_LEAK_COMM=$'no\e[31mde\a' \
     RUNNERCTL_STUB_KEYS=$'j\nqq' run watch --color never
   expect_rc 0
@@ -8903,14 +8914,30 @@ case_fleet_watch_pane_unescapes_then_neutralises_job_text() {
   frames
   expect_frame_count 3
   expect_frame_line 2 3 '^example\.slot-1 on build-1 — slot details$'
-  expect_text "the workflow row" '  workflow      Build "x" \ [31mred' "$(grep -m1 '^  workflow ' <<<"${FRAMES[2]}"; true)"
-  expect_text "the ref row" '  ref           ma[2Jin' "$(grep -m1 '^  ref ' <<<"${FRAMES[2]}"; true)"
+  expect_text "the workflow row" '  workflow      Build "x" \ red' "$(grep -m1 '^  workflow ' <<<"${FRAMES[2]}"; true)"
+  expect_text "the ref row" '  ref           main' "$(grep -m1 '^  ref ' <<<"${FRAMES[2]}"; true)"
   expect_frame_plain 2
   expect_no_frame 2 $'\xe2\x80\xae'
   RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_WORKFLOW="$wf" RUNNERCTL_STUB_RUN_REF_NAME="$ref" run status --json
   expect_rc 0
   expect_out '"workflow":"Build \\"x\\" \\\\ \\u001b\[31mred'$'\xe2\x80\xae''",'
   expect_out '"ref":"ma\\u001b\[2J\\u0007in",'
+}
+
+# GHR-108: the pane's two draw functions on their own. A heading (the title
+# carries a slot name and a host name) and a row each remove an escape sequence
+# whole; a row whose whole value is sequences is `—`, as an empty one is.
+case_ghr108_pane_head_and_put_remove_sequences_whole() {
+  # shellcheck disable=SC2016
+  GHR108_T=$'my\e[2J-slot on h\e]0;x\a1' GHR108_V=$'ma\e[2J\e[31min' GHR108_E=$'\e[2J\e]0;x\a' \
+    run_fn eval 'C_BOLD="" C_RESET=""; PANE_OUT=""
+      pane_head "$GHR108_T"; pane_put label "$GHR108_V"; pane_put empty "$GHR108_E"; pane_put none ""
+      printf "%s\n" "$PANE_OUT"'
+  expect_rc 0
+  expect_text "the heading and the rows" 'my-slot on h1
+  label         main
+  empty         —
+  none          —' "$OUT"
 }
 
 # The JSON string reader on its own: every escape json_str writes and the ones
@@ -9021,7 +9048,7 @@ Job
   job           n
   running for   —
   stalled       no
-  workflow      Build "x" \n [31mred😀
+  workflow      Build "x" \n red😀
   run           attempt 1
   ref           ab
   commit        —
@@ -9061,6 +9088,7 @@ t "fleet watch: the pane keeps the cursor and its action keys their pair"    cas
 t "fleet watch: h shows the host's block, and no view key reaches the table" case_fleet_watch_pane_h_shows_the_host_and_view_keys_do_nothing
 t "fleet watch: the pane of a host that never answered, stopped, or scaled"  case_fleet_watch_pane_for_a_host_that_is_not_answering
 t "fleet watch: the pane unescapes a job's text, then makes it safe to draw" case_fleet_watch_pane_unescapes_then_neutralises_job_text
+t "GHR-108: the pane's heading and rows remove a sequence whole; all-sequence is —" case_ghr108_pane_head_and_put_remove_sequences_whole
 t "json_unescape: what each escape stands for"                               case_json_unescape_pins_the_text
 t "fleet watch: an older host's payload is — per row, a hostile one harmless" case_fleet_watch_pane_reads_an_old_or_hostile_payload
 
@@ -9339,6 +9367,25 @@ done' "$OUT"
   rm -rf "$d"
 }
 
+# GHR-108: the job cell the action keys quote in their confirm lines, from a
+# payload carrying RAW sequences (a real host writes them as \u001b, which is
+# text here; a hostile or broken one may not). term_safe alone left the tail of
+# each (`[2J`, `]0;x`) in the cell; the value's own characters are all that stay.
+case_ghr108_fleet_watch_job_cell_removes_a_sequence_whole() {
+  local d="$TMP/ghr108.state"
+  mkdir -p "$d/tmp"
+  # shellcheck disable=SC2016
+  GHR108_D="$d" GHR108_REPO=$'my\e[2J-app' GHR108_NAME=$'te\e]0;x\ast' run_snippet "$STUB" 'FW_TMP="$GHR108_D/tmp" FLEET_RUNNERCTL=runnerctl
+    now_epoch() { echo 1000000720; }
+    ssh_run() { printf "  {\"idx\":0,\"unit\":\"u\",\"name\":\"s1\",\"active\":\"active\",\"sub\":\"running\",\"job\":{\"repo\":\"%s\",\"name\":\"%s\",\"since\":1000000000,\"stalled\":true},\"idle_since\":null,\"working_on_access\":\"ok\"}\n" "$GHR108_REPO" "$GHR108_NAME"; }
+    fleet_watch_facts h1 s1
+    printf "[%s]\n" "${FF[job_cell]}"'
+  expect_rc 0
+  expect_text "the job cell" '[my-app:test (12m) STALLED]' "$OUT"
+  expect_text "stderr" "" "$ERR"
+  rm -rf "$d"
+}
+
 # The classifiers read the same payloads for the summary and the views, and
 # test (not compute) their numbers: `[ 99999999999999999999 -gt 0 ]` prints an
 # error into the frame, so a number no arithmetic can take is unknown here too.
@@ -9402,6 +9449,7 @@ rc=0' "$OUT"
 
 t "num_int: what shell arithmetic can take, and pane_int is the same rule"      case_num_int_says_what_arithmetic_can_take
 t "fleet watch: a job's since no arithmetic can take is left out, not fatal"    case_fleet_watch_facts_reads_a_since_no_arithmetic_can_take
+t "GHR-108: fleet watch's job cell removes a raw sequence whole, as the table does" case_ghr108_fleet_watch_job_cell_removes_a_sequence_whole
 t "fleet: the classifiers hold a host's numbers to what a test can take"        case_fleet_classifiers_hold_a_hosts_numbers_to_what_a_test_can_take
 t "fleet health: only counts arithmetic can take are added"                     case_fleet_health_adds_only_counts_arithmetic_can_take
 
