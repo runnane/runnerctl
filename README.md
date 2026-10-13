@@ -806,9 +806,12 @@ FLEET_HOSTS=(build-1 build-2 build-3)   # ssh aliases, or user@host
 ```
 
 `runnerctl config-example` prints the whole block, including `FLEET_PARALLEL`
-(how many hosts at once, default 8), `FLEET_TIMEOUT` (per-host seconds,
-default 30), `FLEET_SSH_OPTS` and `FLEET_RUNNERCTL` (where the remote command
-lives, if it is not on the ssh user's `PATH`).
+(how many hosts at once, default 8), `FLEET_TIMEOUT` (per-host seconds for a
+read-only call, default 30), `FLEET_MUTATE_TIMEOUT` (per-host seconds for a
+call that changes things, default 900 — see [the mutating
+fan-out](#changing-things-the-mutating-fan-out)), `FLEET_SSH_OPTS` and
+`FLEET_RUNNERCTL` (where the remote command lives, if it is not on the ssh
+user's `PATH`).
 
 **"Installed" means installed on the PATH a *non-interactive* ssh gets**, which
 is not the PATH you see when you log in. `ssh host runnerctl` runs no login
@@ -842,7 +845,8 @@ outcomes are deliberately kept apart, because they call for different actions:
 | row | meaning |
 | --- | --- |
 | `unreachable — …` | ssh could not reach the host. Nothing is known about it. |
-| `timed out after Ns` | it did not answer inside `FLEET_TIMEOUT`. Nothing is known about it. |
+| `timed out after Ns` | a read-only call did not answer inside `FLEET_TIMEOUT`. Nothing is known about it. |
+| `timed out after Ns — the command may still be running on that host; …` | a call that **changes things** ran out of its own, larger budget. This is *not* "nothing is known": only the local ssh was stopped, and the host carries on until it next writes output — so it may be part-way through, or about to finish. Read `runnerctl fleet status` before re-running anything. |
 | `remote exit N — …` | the host answered fine and its `runnerctl` exited non-zero. On a host with no runner units that is its own perfectly good message, not a fleet fault. |
 | `remote exit 127 — …` | nothing named `runnerctl` on that host's non-interactive ssh `PATH` — see the PATH note above. Set `FLEET_RUNNERCTL`, or install it system-wide. |
 | `remote exit 126 — …` | runnerctl **is** there and the ssh login cannot execute it. Installs from 0.9.0 and 0.10.0 landed `0700`/`0711`; `sudo chmod 755` the path the row names, or re-run the installer (0.10.1 widens it). |
@@ -995,7 +999,11 @@ keeps the cursor on its error row (keys there act on nothing) and remembers the
 slot, so it is back on that slot when the host answers again; a slot that goes
 away drops the cursor to that host's first slot. `L` is not a stream: the host's
 `logs <slot> -n 50` runs to completion under `FLEET_TIMEOUT` and the result is
-paged locally. Every remote action needs what the same command needs run by
+paged locally. The keys that change something (`K` `R` `S` `T` `P`) run under
+`FLEET_MUTATE_TIMEOUT` instead, and the watch waits for them: a restart that
+sits out a wedged job's `TimeoutStopSec` holds the frame for those minutes
+rather than reporting `failed` about an action that then completes behind it.
+Every remote action needs what the same command needs run by
 hand over ssh: passwordless sudo on that host, `L` included (`logs` reads the
 journal through it). The facts read is a plain `status --json` and needs none.
 
@@ -1103,7 +1111,26 @@ build-2: restart done.
 fleet restart: 2 host(s) ok, 0 failed
 ```
 
-These differ from the read-only commands in three ways, all deliberate.
+These differ from the read-only commands in four ways, all deliberate.
+
+**Their own time budget.** `FLEET_TIMEOUT` (30 s) is sized for a status read;
+these are slow by design, so each host gets `FLEET_MUTATE_TIMEOUT` instead
+(default 900 s — raise it for hosts with many slots, since a plain `restart`
+of slots whose jobs ignore SIGTERM sits out `TimeoutStopSec` for each in
+turn). `--when-idle` and `drain` wait on top of that, for up to `--timeout`
+**per slot**, so their budget is *slots on that host × the wait +
+`FLEET_MUTATE_TIMEOUT`*: the host is first asked how many slots it has (one
+read-only `status --json`), and three slots under the default 1800 s wait get
+6300 s. The wait is the `--timeout` you pass, else the **central node's**
+`WAIT_TIMEOUT` — a host whose own config raises `WAIT_TIMEOUT` waits longer
+than the central node can know, so pass `--timeout` explicitly there.
+`fleet upgrade` and `fleet health --restart-stalled` are on the same budget.
+
+If a host does run out of it, the row says `timed out after Ns — the command
+may still be running on that host; 'runnerctl fleet status' shows where it got
+to`, and it means that: the timeout stops the local ssh, not the remote
+`runnerctl`. The fan-out then moves on to the next host, so check before
+re-running.
 
 **One host at a time.** `FLEET_PARALLEL` is ignored for mutating commands.
 Combined with the per-host `--when-idle` (one slot at a time *within* a host),
