@@ -24,6 +24,21 @@ or the static tarball from github.com/koalaman/shellcheck/releases). Point the
 `SHELLCHECK` make variable at a non-PATH binary:
 `make lint SHELLCHECK=/path/to/shellcheck`.
 
+**Pinned version: shellcheck 0.11.0.** Lint at `-S style` is version-sensitive
+(a new release can add or drop findings), so local and CI must agree. CI
+installs the official static linux x86_64 tarball for v0.11.0 in
+`.github/workflows/ci.yml`, verified against a SHA-256 written in the workflow
+before it is unpacked (a mismatch fails the job); the runner is pinned to
+`ubuntu-24.04` rather than `ubuntu-latest`. The checksum is of the bytes
+downloaded on 2026-10-13 (trust on first use). To move to a newer shellcheck,
+change the version and checksum together in the workflow, and bump the version
+named here. Dependabot does not watch this pin: it only covers actions.
+
+CI actions are pinned to full commit SHAs with the release as a trailing
+comment (`uses: owner/repo@<sha> # vX.Y.Z`), never a floating tag. Dependabot
+(`.github/dependabot.yml`, `github-actions`, weekly, `ci:` commit prefix)
+opens the bump PRs; review the diff there rather than editing a SHA by hand.
+
 Runs at `-S style` over `runnerctl`, `tests/run.sh` and `tests/stub.config`
 (the stub has no shebang because it is sourced, so the set is linted with
 `-s bash`), so info-level findings fail the gate. Fix the code rather than

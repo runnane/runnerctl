@@ -9,11 +9,28 @@ permissions:
 
 jobs:
   gates:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - name: Install shellcheck
-        run: sudo apt-get update -q && sudo apt-get install -y -q shellcheck
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      # shellcheck is pinned to the same release the gates document
+      # (.agents/gates.md): the official static linux x86_64 tarball, checked
+      # against a SHA-256 recorded here before it is unpacked. A mismatch
+      # fails the step (sha256sum -c exits non-zero under bash -e) and the
+      # binary never reaches PATH. Bump version and checksum together.
+      - name: Install shellcheck v0.11.0
+        shell: bash
+        env:
+          SHELLCHECK_VERSION: v0.11.0
+          SHELLCHECK_SHA256: b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6
+        run: |
+          set -euo pipefail
+          tarball="$RUNNER_TEMP/shellcheck.tar.gz"
+          curl -fsSL -o "$tarball" "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.gz"
+          echo "${SHELLCHECK_SHA256}  ${tarball}" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/shellcheck-bin"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/shellcheck-bin" --strip-components=1 "shellcheck-${SHELLCHECK_VERSION}/shellcheck"
+          echo "$RUNNER_TEMP/shellcheck-bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/shellcheck-bin/shellcheck" --version
       - run: make gates
         shell: bash
 
@@ -38,24 +55,24 @@ jobs:
   release:
     needs: gates
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
       pull-requests: write
     steps:
-      - uses: actions/create-github-app-token@v2
+      - uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
         id: app-token
         if: ${{ vars.RELEASE_APP_ID != '' }}
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
         id: release
         with:
           token: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         if: ${{ steps.release.outputs.release_created }}
       - name: Attach runnerctl to the release
         if: ${{ steps.release.outputs.release_created }}
