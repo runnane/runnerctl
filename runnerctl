@@ -357,12 +357,21 @@ COMPOSE_REAP_STANDALONE="0"
 # and a `health` problem from CRIT (GHR-31).
 PRESSURE_WARN_PCT="10"
 PRESSURE_CRIT_PCT="50"
-# Disk usage of the host's fixed drives in percent (GHR-64): yellow on the
-# status header from WARN, red and a `health` problem from CRIT. DISK_IGNORE
-# is an ERE over mount points left out of all three surfaces (empty = none).
+# Disk usage in percent of the filesystems that hold Docker's data root, the
+# runners' work folders and DISK_PATHS (GHR-64, GHR-67): green on the status
+# header below WARN, yellow from WARN, red and a `health` problem from CRIT.
+# DISK_IGNORE is an ERE over mount points left out of all three surfaces
+# (empty = none).
 DISK_WARN_PCT="85"
 DISK_CRIT_PCT="95"
 DISK_IGNORE=""
+# Docker's data root (`docker info`'s DockerRootDir). A setting rather than a
+# question to the daemon: a hung dockerd would hang every `status`.
+DISK_DOCKER_DIR="/var/lib/docker"
+# More directories whose filesystem to watch, space-separated, each PATH or
+# LABEL=PATH — e.g. "cache=/srv/build-cache". The label names it on the
+# header; a bare PATH is labelled with itself.
+DISK_PATHS=""
 # How far back status/health look in the journal for host-wide OOM kills and
 # "No space left on device" lines, in seconds (GHR-64). 0 turns it off.
 EVENTS_SEC="3600"
@@ -1943,27 +1952,91 @@ host_name() {
 # per-slot memory_events.oom_kill (GHR-31) only sees a slot's own cgroup
 # limit. These two hooks are the host's half, read once per status/health.
 
-# One line per fixed drive: "DEVICE FSTYPE SIZE USED AVAIL PCT MOUNT", sizes
-# in bytes, PCT without the %. Fixed = a /dev block device that is not a loop
-# device (snaps, images) or read-only media; one row per device, the first
-# mount df lists, so bind mounts and btrfs subvolumes are not counted twice.
-# MOUNT is last so a mount point with a space in it survives `read`. Behind
-# a function so a test config can pin it.
-host_disks() {
-  df -B1 --output=source,fstype,size,used,avail,pcent,target 2>/dev/null \
-    | awk 'NR > 1 && $1 ~ /^\/dev\// && $1 !~ /^\/dev\/loop/ \
-             && $2 !~ /^(squashfs|iso9660|udf)$/ && !seen[$1]++ { sub(/%/, "", $6); print }' || true
+# Which filesystems are watched (GHR-67): the ones that hold something a build
+# pool fills — Docker's data root, every slot's work folder, and DISK_PATHS —
+# not every block device, which put /boot and /efi next to them. One
+# "ROLE<TAB>PATH" line each, in that order. A slot's work folder is its unit's
+# WorkingDirectory plus the runner's own workFolder (runner_work_folder, the
+# same reading compose-reap does).
+disk_watch_paths() {
+  local u wd p
+  printf 'docker\t%s\n' "$DISK_DOCKER_DIR"
+  while read -r u; do
+    [ -n "$u" ] || continue
+    wd="$(prop "$u" WorkingDirectory)"
+    [ -n "$wd" ] || continue
+    printf 'work\t%s\n' "$(runner_work_folder "$wd")"
+  done < <(discover)
+  for p in $DISK_PATHS; do
+    case "$p" in
+      *=*) printf '%s\t%s\n' "${p%%=*}" "${p#*=}" ;;
+      *)   printf '%s\t%s\n' "$p" "$p" ;;
+    esac
+  done
 }
 
-# Each fixed drive as "PCT<TAB>AVAIL<TAB>MOUNT<TAB>DEVICE<TAB>FSTYPE<TAB>SIZE<TAB>USED",
-# DISK_IGNORE applied — the one reader the header, --json and health share.
+# For each PATH that exists, the filesystem holding it as
+# "PATH<TAB>DEVICE FSTYPE SIZE USED AVAIL PCT MOUNT" — sizes in bytes, PCT
+# without the %, MOUNT last so a mount point with a space in it survives
+# `read`. A path that does not exist (no Docker on this host) prints nothing.
+# Behind a function so a test config can pin it.
+host_df() { # PATH...
+  local p
+  for p in "$@"; do
+    [ -e "$p" ] || continue
+    df -B1 --output=source,fstype,size,used,avail,pcent,target -- "$p" 2>/dev/null \
+      | awk -v p="$p" 'NR == 2 { sub(/%/, "", $6); printf "%s\t%s\n", p, $0 }' || true
+  done
+}
+
+# Each watched filesystem as
+#   PCT<TAB>AVAIL<TAB>MOUNT<TAB>DEVICE<TAB>FSTYPE<TAB>SIZE<TAB>USED<TAB>ROLES
+# once per filesystem — a /dev device once however many paths and mounts
+# (bind mounts, btrfs subvolumes) reach it, anything else once per mount
+# point — with the roles of every path on it, comma-joined and deduplicated,
+# in the order disk_watch_paths found them. `/` stands in when no path
+# resolves at all (no Docker, no slots). DISK_IGNORE applied — the one reader
+# the header, --json and health share.
 host_disk_rows() {
-  local dev fs size used avail pct mnt
-  while read -r dev fs size used avail pct mnt; do
-    [ -n "$mnt" ] || continue
-    [ -z "$DISK_IGNORE" ] || ! [[ "$mnt" =~ $DISK_IGNORE ]] || continue
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$pct" "$avail" "$mnt" "$dev" "$fs" "$size" "$used"
-  done < <(host_disks)
+  local -a roles=() paths=() order=()
+  local -A row=() role_of=() seen_role=()
+  local role p line dev fs size used avail pct mnt key rk i
+  while IFS=$'\t' read -r role p; do
+    [ -n "$p" ] || continue
+    roles+=("$role"); paths+=("$p")
+  done < <(disk_watch_paths)
+  if [ "${#paths[@]}" -gt 0 ]; then
+    while IFS=$'\t' read -r p line; do
+      [ -n "$line" ] || continue
+      read -r dev fs size used avail pct mnt <<<"$line"
+      [ -n "$mnt" ] || continue
+      [ -z "$DISK_IGNORE" ] || ! [[ "$mnt" =~ $DISK_IGNORE ]] || continue
+      case "$dev" in /dev/*) key="$dev" ;; *) key="mnt:$mnt" ;; esac
+      if [ -z "${row[$key]+x}" ]; then
+        row[$key]="$pct"$'\t'"$avail"$'\t'"$mnt"$'\t'"$dev"$'\t'"$fs"$'\t'"$size"$'\t'"$used"
+        order+=("$key")
+      fi
+      for i in "${!paths[@]}"; do
+        [ "${paths[$i]}" = "$p" ] || continue
+        rk="$key"$'\t'"${roles[$i]}"
+        [ -z "${seen_role[$rk]:-}" ] || continue
+        seen_role[$rk]=1
+        role_of[$key]+="${role_of[$key]:+,}${roles[$i]}"
+      done
+    done < <(host_df "${paths[@]}")
+  fi
+  if [ "${#order[@]}" -eq 0 ]; then
+    while IFS=$'\t' read -r p line; do
+      read -r dev fs size used avail pct mnt <<<"$line"
+      [ -n "$mnt" ] || continue
+      [ -z "$DISK_IGNORE" ] || ! [[ "$mnt" =~ $DISK_IGNORE ]] || continue
+      key="$dev"; row[$key]="$pct"$'\t'"$avail"$'\t'"$mnt"$'\t'"$dev"$'\t'"$fs"$'\t'"$size"$'\t'"$used"
+      order+=("$key"); role_of[$key]=root
+    done < <(host_df /)
+  fi
+  for key in ${order[@]+"${order[@]}"}; do
+    printf '%s\t%s\n' "${row[$key]}" "${role_of[$key]}"
+  done
 }
 
 # The journal lines that are host trouble, since epoch SINCE, as
@@ -2054,6 +2127,19 @@ disk_level() { # PCT
   fi
 }
 
+# The colour a partition at PCT is painted (GHR-67): every partition gets
+# one, so a healthy disk reads as checked-and-fine rather than as unpainted.
+disk_color() { # PCT
+  case "$(disk_level "$1")" in
+    crit) echo "$C_RED" ;; warn) echo "$C_YELLOW" ;; *) echo "$C_GREEN" ;;
+  esac
+}
+
+# One partition as the header names it: "/srv [docker,work] 88% (223.5G free)".
+disk_cell() { # PCT AVAIL MOUNT ROLES
+  printf '%s%s %s%% (%s free)\n' "$3" "${4:+ [$4]}" "$1" "$(hbytes "$2")"
+}
+
 # ARGS joined by SEP.
 join_by() { # SEP ARGS...
   local sep="$1" out="" a; shift
@@ -2061,17 +2147,15 @@ join_by() { # SEP ARGS...
   printf '%s\n' "$out"
 }
 
-# The header's " — Disk: / 24% (354.0G free), /data 91% (45.0G free)" and,
-# when the window holds any, " — last 1h: 2 OOM kills, 1 disk-full", painted
-# per mount. Empty when there is nothing to say. Reads HOST.
+# The header's " — Disk: / [work] 24% (354.0G free), /var/lib/docker [docker]
+# 91% (45.0G free)" and, when the window holds any, " — last 1h: 2 OOM kills,
+# 1 disk-full", each partition painted green, yellow or red. Empty when there
+# is nothing to say. Reads HOST.
 host_header_suffix() {
-  local out="" pct avail mnt cells=() color
-  while IFS=$'\t' read -r pct avail mnt _; do
+  local out="" pct avail mnt roles cells=()
+  while IFS=$'\t' read -r pct avail mnt _ _ _ _ roles; do
     [ -n "$mnt" ] || continue
-    case "$(disk_level "$pct")" in
-      crit) color="$C_RED" ;; warn) color="$C_YELLOW" ;; *) color="" ;;
-    esac
-    cells+=("$(paint "$color" "$mnt $pct% ($(hbytes "$avail") free)")")
+    cells+=("$(paint "$(disk_color "$pct")" "$(disk_cell "$pct" "$avail" "$mnt" "$roles")")")
   done <<<"${HOST[disks]}"
   if [ "${#cells[@]}" -gt 0 ]; then
     out+=" — Disk: $(join_by ", " "${cells[@]}")"
@@ -2089,11 +2173,11 @@ host_header_suffix() {
 
 # The `health` problems the host facts carry, one per line. Reads HOST.
 host_problems() {
-  local pct avail mnt
-  while IFS=$'\t' read -r pct avail mnt _; do
+  local pct avail mnt roles
+  while IFS=$'\t' read -r pct avail mnt _ _ _ _ roles; do
     [ -n "$mnt" ] || continue
     [ "$(disk_level "$pct")" = crit ] || continue
-    echo "host: $mnt is $pct% full ($(hbytes "$avail") free, DISK_CRIT_PCT=$DISK_CRIT_PCT)"
+    echo "host: $mnt${roles:+ [$roles]} is $pct% full ($(hbytes "$avail") free, DISK_CRIT_PCT=$DISK_CRIT_PCT)"
   done <<<"${HOST[disks]}"
   [ "${HOST[events]}" = ok ] || return 0
   if [ "${HOST[oom]}" -gt 0 ]; then
@@ -2106,10 +2190,15 @@ host_problems() {
 
 # --json's "disks":[...] array. Reads HOST.
 host_disks_json() {
-  local pct avail mnt dev fs size used sep="" out="["
-  while IFS=$'\t' read -r pct avail mnt dev fs size used; do
+  local pct avail mnt dev fs size used roles r rsep jroles sep="" out="["
+  while IFS=$'\t' read -r pct avail mnt dev fs size used roles; do
     [ -n "$mnt" ] || continue
-    out+="$sep{\"mount\":$(json_str "$mnt"),\"device\":$(json_str "$dev"),\"fstype\":$(json_strn "$fs"),\"size\":$(json_num "$size"),\"used\":$(json_num "$used"),\"avail\":$(json_num "$avail"),\"use_pct\":$(json_num "$pct")}"
+    jroles="[" rsep=""
+    while IFS= read -r -d, r; do
+      jroles+="$rsep$(json_str "$r")"; rsep=","
+    done <<<"${roles:+$roles,}"
+    jroles+="]"
+    out+="$sep{\"mount\":$(json_str "$mnt"),\"device\":$(json_str "$dev"),\"fstype\":$(json_strn "$fs"),\"size\":$(json_num "$size"),\"used\":$(json_num "$used"),\"avail\":$(json_num "$avail"),\"use_pct\":$(json_num "$pct"),\"roles\":$jroles}"
     sep=","
   done <<<"${HOST[disks]}"
   printf '%s]\n' "$out"
@@ -3830,7 +3919,36 @@ fleet_host_info() { # RAW-HEADER-LINE
   local rest="${1#* — Host: }"
   [ "$rest" != "$1" ] || return 0
   [[ "$rest" == *" — "* ]] || return 0
-  printf '%s\n' "${rest#* — }"
+  rest="${rest#* — }"
+  # `fleet status` asks for --color never and paints here (GHR-67): the host
+  # line is repainted from its own percentages, against THIS node's
+  # thresholds. Under `fleet watch` the remote already painted it.
+  if ! $FLEET_REMOTE_COLOR && [ -n "$C_RESET" ]; then
+    rest="$(fleet_host_info_paint "$rest")"
+  fi
+  printf '%s\n' "$rest"
+}
+# A plain host line, painted: each "MOUNT [ROLES] PCT% (FREE free)" cell by
+# disk_color and the "last …:" events red, as host_header_suffix does it.
+fleet_host_info_paint() { # PLAIN-INFO
+  local info="$1" disks="" events="" out="" cell
+  local -a cells=()
+  case "$info" in
+    "Disk: "*)
+      disks="${info#Disk: }"
+      if [[ "$disks" == *" — "* ]]; then events="${disks#* — }"; disks="${disks%% — *}"; fi ;;
+    *) events="$info" ;;
+  esac
+  if [ -n "$disks" ]; then
+    while IFS= read -r cell; do
+      [ -n "$cell" ] || continue
+      if [[ "$cell" =~ \ ([0-9]+)%\ \( ]]; then cell="$(paint "$(disk_color "${BASH_REMATCH[1]}")" "$cell")"; fi
+      cells+=("$cell")
+    done <<<"${disks//, /$'\n'}"
+    out="Disk: $(join_by ", " "${cells[@]}")"
+  fi
+  [ -z "$events" ] || out+="${out:+ — }$(paint "$C_RED" "$events")"
+  printf '%s\n' "$out"
 }
 # A host line as it appears in the assembled frame: the HOST cell, then
 # `Disk: ` or `last <window>: ` — never a slot (no IDX) and never a host that
@@ -5657,13 +5775,20 @@ cmd_config_example() {
 #PRESSURE_WARN_PCT="10"
 #PRESSURE_CRIT_PCT="50"
 
-# Disk usage of every fixed drive (a /dev block device, one row per device)
-# on the status header, in percent: yellow from WARN, red and a `health`
-# problem from CRIT. DISK_IGNORE is an ERE over mount points to leave out,
-# e.g. '^/boot/efi$'.
+# Disk usage of the filesystems that hold Docker's data root, every slot's
+# work folder and DISK_PATHS, once per filesystem, labelled with what is on
+# it, in percent: green below WARN, yellow from WARN, red and a `health`
+# problem from CRIT. /boot and the like only appear if one of those paths
+# lives there. DISK_IGNORE is an ERE over mount points to leave out.
 #DISK_WARN_PCT="85"
 #DISK_CRIT_PCT="95"
 #DISK_IGNORE=""
+#
+# Docker's data root — set it when daemon.json moves "data-root".
+#DISK_DOCKER_DIR="/var/lib/docker"
+#
+# More directories to watch, space-separated, PATH or LABEL=PATH.
+#DISK_PATHS="cache=/srv/build-cache"
 
 # Seconds of journal status/health search for host-wide kernel OOM kills and
 # "No space left on device" lines. Either one in the window is a `health`

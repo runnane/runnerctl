@@ -229,7 +229,7 @@ an idle slot, how long it has been idle and how many jobs it has finished
 since it started:
 
 ```
-runnerctl 0.7.0 — Host: 16 cores, 62Gi RAM, 48Gi available — Disk: / 24% (353.9G free), /var/lib/docker 96% (37.3G free) — last 1h: 1 OOM kill
+runnerctl 0.7.0 — Host: 16 cores, 62Gi RAM, 48Gi available — Disk: /var/lib/docker [docker] 96% (37.3G free), /srv/runners [work] 41% (602.4G free) — last 1h: 1 OOM kill
 
 IDX RUNNER                 PROFILE  ACTIVE                              SINCE    ENABLED   MAX    HIGH   USED        PRESS  RESTART  ENVFILE WORKING-ON
 0   org.host-1             ci       active/running                     3d 4h    enabled   26.0G  25.0G  3.1G/24.9G  0.4%   always   —       my-app:test (12m)
@@ -242,12 +242,19 @@ host only picks up a new one when `upgrade` runs, so on a fleet that is
 otherwise only visible through a second command — then the host's cores and
 memory.
 
-`Disk:` lists every fixed drive — each mounted `/dev` block device, once per
-device (bind mounts and btrfs subvolumes are not repeated; loop devices,
-network mounts and tmpfs are left out) — with its use and free space, yellow
-from `DISK_WARN_PCT` (config, default 85) and red from `DISK_CRIT_PCT`
-(default 95). `DISK_IGNORE` (an ERE over mount points, e.g. `'^/boot/efi$'`)
-leaves a mount out of the header, `--json` and `health`.
+`Disk:` lists the filesystems a build pool fills, not every disk: the one
+holding Docker's data root (`DISK_DOCKER_DIR`, default `/var/lib/docker`),
+the ones holding each slot's work folder (its unit's `WorkingDirectory` plus
+the runner's `workFolder`, default `_work`), and any directory in
+`DISK_PATHS` (space-separated, `PATH` or `LABEL=PATH`, e.g.
+`DISK_PATHS="cache=/srv/build-cache"`). Each filesystem appears once, named by
+its mount point and labelled with what is on it (`/ [docker,work]` when
+everything shares the root disk). `/boot`, `/efi` and the like only appear
+if one of those paths lives on them, and `/` stands in as `/ [root]` when
+none of them exists. Every partition is coloured: green below
+`DISK_WARN_PCT` (config, default 85), yellow from it, and red from
+`DISK_CRIT_PCT` (default 95). `DISK_IGNORE` (an ERE over mount points) leaves
+a mount out of the header, `--json` and `health`.
 
 `last 1h:` appears only when the journal holds host trouble in the last
 `EVENTS_SEC` seconds (default 3600, `0` turns the search off): kernel OOM
@@ -501,7 +508,7 @@ memory values); no `jq` needed to produce it, and the table and the JSON are
 rendered from one collector, so they cannot disagree on a value:
 
 ```json
-{"runnerctl":"0.7.0","host":{"name":"build-1","cores":16,"mem_total":64424509440,"mem_available":51539607552,"disks":[{"mount":"/","device":"/dev/nvme0n1p2","fstype":"ext4","size":500000000000,"used":120000000000,"avail":380000000000,"use_pct":24}],"events":{"window":3600,"oom_kills":0,"cgroup_oom_kills":1,"disk_full":0,"last_oom":null,"last_oom_process":null,"last_disk_full":null,"last_disk_full_source":null}},
+{"runnerctl":"0.7.0","host":{"name":"build-1","cores":16,"mem_total":64424509440,"mem_available":51539607552,"disks":[{"mount":"/","device":"/dev/nvme0n1p2","fstype":"ext4","size":500000000000,"used":120000000000,"avail":380000000000,"use_pct":24,"roles":["docker","work"]}],"events":{"window":3600,"oom_kills":0,"cgroup_oom_kills":1,"disk_full":0,"last_oom":null,"last_oom_process":null,"last_disk_full":null,"last_disk_full_source":null}},
  "slots":[
   {"idx":0,"unit":"actions.runner.org.host-1.service","name":"org.host-1",
    "active":"active","sub":"running","enabled":"enabled",
@@ -543,8 +550,9 @@ percentages and total stall microseconds; the `PRESS` column is
 carries `name` (the host's own `hostname`, null when it cannot be read),
 `cores`
 (`nproc`), `mem_total` / `mem_available` (bytes, from `/proc/meminfo`),
-`disks` (one object per fixed drive — `mount`, `device`, `fstype`, `size`,
-`used`, `avail` in bytes and `use_pct` — the drives the header's `Disk:`
+`disks` (one object per watched filesystem — `mount`, `device`, `fstype`,
+`size`, `used`, `avail` in bytes, `use_pct` and `roles`, e.g.
+`["docker","work"]` — the filesystems the header's `Disk:`
 lists) and `events` (the last `EVENTS_SEC` of journal: `window` in seconds,
 `oom_kills` host-wide and `cgroup_oom_kills` per-cgroup, `disk_full` lines,
 and the epoch second, process and syslog identifier of the last of each;
@@ -574,7 +582,7 @@ closes that: exit 0 with `ok: N slot(s) healthy` when every enabled slot is
 times (default 5) or more since its last manual start, no job has been
 running for `--stall-after` seconds (default `STALL_SEC`, 1 h) or more, no
 idle slot has leaked processes, no slot is under full memory pressure
-of `PRESSURE_CRIT_PCT` (50 %) or more, no fixed drive is at `DISK_CRIT_PCT`
+of `PRESSURE_CRIT_PCT` (50 %) or more, no watched filesystem is at `DISK_CRIT_PCT`
 (95 %) or more, and the journal holds no host-wide OOM kill and no `No space
 left on device` line in the last `EVENTS_SEC` (1 h); otherwise one line per
 problem on stdout and exit 1:
@@ -585,7 +593,7 @@ example.slot-1: 7 restarts since last start (oom-kill)
 example.slot-3: stalled — job my-app:build running 1h33m, longer than 1h (--stall-after 3600)
 example.slot-4: 2 leaked process(es) left by finished jobs (node, esbuild) — runnerctl reap 3
 example.slot-5: under full memory pressure 63.2% (avg10, PRESSURE_CRIT_PCT=50) — throttled at MemoryHigh (4 times so far), see USED vs HIGH
-host: /var/lib/docker is 96% full (37.3G free, DISK_CRIT_PCT=95)
+host: /var/lib/docker [docker] is 96% full (37.3G free, DISK_CRIT_PCT=95)
 host: the kernel OOM-killed 2 process(es) host-wide in the last 1h (last: cc1plus) — 'journalctl -k -g "Out of memory"' shows them
 host: 1 'No space left on device' line(s) in the journal in the last 1h (last from dockerd)
 ```
@@ -748,17 +756,20 @@ against every runner host in `FLEET_HOSTS`, over ssh:
 ```
 $ runnerctl fleet status
 HOST     IDX RUNNER          PROFILE  ACTIVE           SINCE  ENABLED  ...  WORKING-ON
-build-1  Disk: / 24% (353.9G free)
+build-1  Disk: / [docker,work] 24% (353.9G free)
 build-1  0   org.build-1-a   ci       active/running   3d 4h  enabled  ...  my-app:test (12m)
 build-1  1   org.build-1-b   ci       active/running   2d 7h  enabled  ...  idle 2h31m (7 jobs)
-build-2  Disk: / 31% (320.2G free), /var/lib/docker 96% (37.3G free) — last 1h: 1 OOM kill
+build-2  Disk: /var/lib/docker [docker] 96% (37.3G free), /srv/runners [work] 41% (602.4G free) — last 1h: 1 OOM kill
 build-2  0   org.build-2-a   ci       active/running   6d     enabled  ...  my-app:lint (2m)
 build-3  unreachable — ssh: connect to host build-3 port 22: No route to host
 ```
 
 Each host that answered gets a **host line** above its slots: the `Disk:` and
-`last 1h:` part of its own `status` header. `fleet watch` keeps the host's
-colours on it, and its cursor never stops on it. A host older than 0.16.0
+`last 1h:` part of its own `status` header. Each partition on it is green,
+yellow or red: `fleet watch` keeps the colours the host painted, and `fleet
+status` (which asks hosts for plain output) paints the line itself from the
+percentages, against this node's `DISK_WARN_PCT` / `DISK_CRIT_PCT`. The
+`fleet watch` cursor never stops on a host line. A host older than 0.16.0
 prints no such fragment and gets no host line.
 
 Set the inventory on the **central node only** — the runner hosts need no
@@ -857,10 +868,10 @@ place, with colour, over ssh connections that **stay open**:
 $ runnerctl fleet watch --interval 5
 runnerctl fleet watch — 3 host(s) — 14:02:11 — every 5s (q to quit)
 HOST     IDX RUNNER          PROFILE  ACTIVE           SINCE  ENABLED  ...  WORKING-ON
-build-1  Disk: / 24% (353.9G free)
+build-1  Disk: / [docker,work] 24% (353.9G free)
 build-1  0   org.build-1-a   ci       active/running   3d 4h  enabled  ...  my-app:test (12m)
 build-1  1   org.build-1-b   ci       active/running   2d 7h  enabled  ...  idle 2h31m (7 jobs)
-build-2  Disk: / 31% (320.2G free), /var/lib/docker 96% (37.3G free) — last 1h: 1 OOM kill
+build-2  Disk: /var/lib/docker [docker] 96% (37.3G free), /srv/runners [work] 41% (602.4G free) — last 1h: 1 OOM kill
 build-2  0   org.build-2-a   ci       active/running   6d     enabled  ...  my-app:lint (2m)
 build-3  unreachable — ssh: connect to host build-3 port 22: No route to host
 
