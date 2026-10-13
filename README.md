@@ -830,7 +830,9 @@ FLEET_HOSTS=(build-1 build-2 build-3)   # ssh aliases, or user@host
 
 `runnerctl config-example` prints the whole block, including `FLEET_PARALLEL`
 (how many hosts at once, default 8), `FLEET_TIMEOUT` (per-host seconds for a
-read-only call, default 30), `FLEET_MUTATE_TIMEOUT` (per-host seconds for a
+read-only call, default 30), `FLEET_WATCH_TIMEOUT` (per-host seconds for a
+read made by [`fleet watch`](#a-live-fleet-view-fleet-watch), default 10),
+`FLEET_MUTATE_TIMEOUT` (per-host seconds for a
 call that changes things, default 900 — see [the mutating
 fan-out](#changing-things-the-mutating-fan-out)), `FLEET_SSH_OPTS` and
 `FLEET_RUNNERCTL` (where the remote command lives, if it is not on the ssh
@@ -868,7 +870,7 @@ outcomes are deliberately kept apart, because they call for different actions:
 | row | meaning |
 | --- | --- |
 | `unreachable — …` | ssh could not reach the host. Nothing is known about it. |
-| `timed out after Ns` | a read-only call did not answer inside `FLEET_TIMEOUT`. Nothing is known about it. |
+| `timed out after Ns` | a read-only call did not answer inside `FLEET_TIMEOUT` (`FLEET_WATCH_TIMEOUT` under `fleet watch`). Nothing is known about it. |
 | `timed out after Ns — the command may still be running on that host; …` | a call that **changes things** ran out of its own, larger budget. This is *not* "nothing is known": only the local ssh was stopped, and the host carries on until it next writes output — so it may be part-way through, or about to finish. Read `runnerctl fleet status` before re-running anything. |
 | `remote exit N — …` | the host answered fine and its `runnerctl` exited non-zero. On a host with no runner units that is its own perfectly good message, not a fleet fault. |
 | `remote exit 127 — …` | nothing named `runnerctl` on that host's non-interactive ssh `PATH` — see the PATH note above. Set `FLEET_RUNNERCTL`, or install it system-wide. |
@@ -927,7 +929,8 @@ build-1  0   org.build-1-a   ci       active/running   3d 4h  enabled  ...  my-a
 build-1  1   org.build-1-b   ci       active/running   2d 7h  enabled  ...  idle 2h31m (7 jobs)
 build-2  Disk: /var/lib/docker [docker] 96% (37.3G free), /srv/runners [work] 41% (602.4G free) — last 1h: 1 OOM kill
 build-2  0   org.build-2-a   ci       active/running   6d     enabled  ...  my-app:lint (2m)
-build-3  unreachable — ssh: connect to host build-3 port 22: No route to host
+build-3  no answer for 45s — last seen 14:01:26 — unreachable — ssh: connect to host build-3 port 22: No route to host
+build-3  0   org.build-3-a   ci       active/running   1d 2h  enabled  ...  my-app:build (4m)
 
 ↑↓/jk select  K kill job  R restart  S stop  T start  P reap  L logs  q quit
 ```
@@ -955,9 +958,39 @@ Two differences from `fleet status`, each worth knowing:
   round trip to every host, and a tick that has not finished before the next one
   starts is not a faster view, it is a queue.
 
+**One slow host does not slow the view.** Each host is fetched in the
+background, on its own, and a frame is drawn from whatever each host *last*
+returned — so a host that accepts the connection and then stalls holds up
+neither the other hosts' rows nor the keyboard: the cursor, `q` and a pending
+`y` are read the whole time. What you see for a host depends on what it last
+did:
+
+| the host | in the frame |
+| --- | --- |
+| answered this tick | its rows |
+| has not answered yet (the first seconds of a watch) | `waiting for its first answer` |
+| stopped answering — unreachable, timed out, or its call from an earlier tick is still running when the next one comes due | its **last rows, dimmed**, under `no answer for 45s — last seen 14:01:26 — <why>` |
+| never answered, and its call failed | the error row (`unreachable — …`, `timed out after 10s`) |
+| answered, and its `runnerctl` exited non-zero | `remote exit N — …`: that is the host's own account of itself, so no old rows are shown under it |
+
+The age counts from the last time that host returned a table, and is brought up
+to date at least once per tick. **Kept rows are for reading only**: a host shown
+that way is not answering as far as the summary line and `S`'s capacity floor
+are concerned, and neither counts a single slot for it. Its rows can still be
+selected — a key on one reads the host's state at that moment, as every action
+key does, and says so if the host cannot be read.
+
+Every read the watch makes of a host has `FLEET_WATCH_TIMEOUT` seconds (default
+10) rather than `FLEET_TIMEOUT`'s 30: each tick's calls, the read an action key
+makes before it decides, and the floor's. A host is never asked twice at once —
+one still out when a tick comes due is skipped for that tick — and
+`FLEET_PARALLEL` still caps how many are in flight. A one-shot `fleet status`
+is not affected by any of this.
+
 The [fleet summary](#several-hosts-from-one-place-fleet-status) sits directly
 under the header rather than at the bottom, so it stays on screen however long
-the table is. It is refreshed with the table, once per tick.
+the table is. It is refreshed with the table, whenever a host's answer comes
+in.
 
 **A fleet taller than the terminal** — six hosts of four slots is past thirty
 lines — is cut to the terminal's height [the way the local `watch`
@@ -992,8 +1025,9 @@ flag. `runnerctl upgrade` on that host gives it the narrow table too.
 
 `--host H` (repeatable) narrows the watch to named hosts, validated against
 `FLEET_HOSTS` exactly as it is for the mutating commands. A host that does not
-answer stays a **row** in every frame — a watch that died when one of six hosts
-rebooted would take the five that are fine off the screen with it.
+answer stays **on screen** in every frame, as its last rows or as a row of its
+own — a watch that died when one of six hosts rebooted would take the five that
+are fine off the screen with it.
 
 **Action keys.** The local `watch`'s keys work here too, against the slot the
 cursor is on — and on a fleet that is a *(host, slot)* pair, because every host
@@ -1031,9 +1065,10 @@ as nothing available, and the confirm line says how many it left out. `R` and
 same split as the fleet commands below.
 
 The cursor survives the frame changing under it. A host that stops answering
-keeps the cursor on its error row (keys there act on nothing) and remembers the
-slot, so it is back on that slot when the host answers again; a slot that goes
-away drops the cursor to that host's first slot. `L` is not a stream: the host's
+keeps its rows, so the cursor stays on the slot it was on (the age line above
+them is never a stop); a host with no rows to keep is one row, where keys act
+on nothing, and the cursor is back on its slot when the host answers. A slot
+that goes away drops the cursor to that host's first slot. `L` is not a stream: the host's
 `logs <slot> -n 50` runs to completion under `FLEET_TIMEOUT` and the result is
 paged locally. The keys that change something (`K` `R` `S` `T` `P`) run under
 `FLEET_MUTATE_TIMEOUT` instead, and the watch waits for them: a restart that

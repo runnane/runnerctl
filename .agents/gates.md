@@ -146,6 +146,31 @@ Traps:
   frames before the tick's. A `%` in `RUNNERCTL_STUB_KEYS` is a real SIGWINCH
   sent from inside the key read. With the height unknown (the default, 0)
   nothing is fitted and every older case draws what it always drew.
+- **`fleet watch` fetches each host in a background job (GHR-74), and the
+  stub models the loop's poll step rather than sleeping through it.** While a
+  fetch is out the loop's key read has `FW_POLL` (0.2) as its timeout; the
+  stub's `tty_read_char` first waits — really, briefly — until every fetch
+  has landed or belongs to a host the case made hang, then: a step in which
+  something landed times out and consumes NO scripted key (so one frame per
+  tick, as before), and only a step with nothing but hung hosts out reads
+  `RUNNERCTL_STUB_KEYS`. A key logged `probe:tty_read_char 0.2 <char>` was
+  therefore handled while a host was outstanding. The knobs:
+  `RUNNERCTL_STUB_FLEET_HANG="host[:from-poll]"` (the table call blocks until
+  its process is killed, 30 s at most; never use it with `--iterations`, which
+  waits for the round), `RUNNERCTL_STUB_CLOCK=1` (every whole-second `pause`
+  moves `now_epoch`, and a `-` read during a poll step jumps to the next tick,
+  so an age can be pinned — set `TZ=UTC` for the `last seen` time), and a
+  fourth field on `RUNNERCTL_STUB_FLEET_DELAY` (`host:secs:pattern:from-poll`).
+  `RUNNERCTL_STUB_FLEET_DOWN` fails table calls only: a host that must also
+  fail the reads an action key makes needs the delay's fourth field.
+- **A case that signals the script inherits the gate's signal dispositions.**
+  The stub's `!` key is Ctrl-C, a real SIGINT — but a gate started in the
+  background (`make gates &`, or under a wrapper that does that) runs every
+  case with SIGINT ignored, and bash cannot trap a signal that was ignored
+  when it started. The `!` case passed under a plain `make sim` and sat out
+  its `RUN_TIMEOUT` under a backgrounded one. The stub now reads `SigIgn` and
+  sends SIGTERM there instead (logged `probe:sigterm`, not `probe:sigint`), so
+  check which of the two a log shows before claiming the SIGINT path ran.
 - The `status --json` case (GHR-16) asserts the parsed JSON through
   `python3` (`expect_json`): where python3 is absent the case keeps its
   exit-code, shape and read-only assertions, prints a `skip` notice for the
