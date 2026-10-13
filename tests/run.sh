@@ -5296,7 +5296,7 @@ case_scale_save_writes_the_profile_it_scaled_with() {
 # --- compose-reap: compose stacks whose job is gone -----------------------------
 # The fixture in tests/stub.config holds one project per verdict path; these
 # pin each verdict, the removal order and scope, and the two refusals.
-CR_DRY='^compose-reap: mode=dry-run projects=12 reap=5 keep=7 removed=0 failed=0 slots=3 standalone=0 images-removed=0 non-compose-running=4$'
+CR_DRY='^compose-reap: mode=dry-run projects=12 reap=5 keep=7 removed=0 failed=0 slots=3 standalone=0 images-removed=0 non-compose-running=4 skipped=0$'
 
 case_compose_reap_dry_run_judges_every_project() {
   RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_WORKER=1 run compose-reap
@@ -5389,7 +5389,7 @@ case_compose_reap_refuses_bad_input() {
 case_compose_reap_empty_daemon() {
   run compose-reap --apply
   expect_rc 0
-  expect_out '^compose-reap: mode=apply projects=0 reap=0 keep=0 removed=0 failed=0 slots=3 standalone=0 images-removed=0 non-compose-running=0$'
+  expect_out '^compose-reap: mode=apply projects=0 reap=0 keep=0 removed=0 failed=0 slots=3 standalone=0 images-removed=0 non-compose-running=0 skipped=0$'
 }
 
 case_compose_reap_timer_refuses_a_user_writable_runnerctl() {
@@ -5442,14 +5442,15 @@ case_compose_reap_real_helpers() {
   run_fn root_exec_problem "$d/self"
   expect_out "^$d/self is owned by uid $(id -u), not root\$"
 
-  # compose_containers against a fake docker: ids from `ps`, then one inspect
-  # with the project, keep-label and working-dir template fields in order.
+  # compose_containers against a fake docker BINARY (the sim's model is a
+  # function): ids from `ps`, then one inspect whose template asks for docker's
+  # fields first and every label last, through json (GHR-109).
   mkdir -p "$d/bin"
   cat >"$d/bin/docker" <<'FAKE'
 #!/usr/bin/env bash
 case "$1" in
   ps)      echo c1 ;;
-  inspect) printf '%s\n' "$*" >"${0%/*}/../inspect.args"; echo 'proj-9000|c1|2001-09-09T01:46:40Z|2001-09-09T01:46:41Z|true|/w' ;;
+  inspect) printf '%s\n' "$*" >"${0%/*}/../inspect.args"; echo 'c1|2001-09-09T01:46:40Z|2001-09-09T01:46:41Z|"true"|"/w"|"proj-9000"' ;;
 esac
 FAKE
   chmod 755 "$d/bin/docker"
@@ -5457,11 +5458,173 @@ FAKE
   PATH="$d/bin:$PATH"
   run_fn compose_containers
   PATH="$saved"
-  expect_out '^proj-9000\|c1\|2001-09-09T01:46:40Z\|2001-09-09T01:46:41Z\|true\|/w$'
-  _expect
-  grep -q 'runnerctl.keep' "$d/inspect.args" || FAILS+=("inspect template does not ask for the keep label")
-  grep -q 'com.docker.compose.project.working_dir' "$d/inspect.args" || FAILS+=("inspect template does not ask for the working dir")
+  expect_out '^c1\|2001-09-09T01:46:40Z\|2001-09-09T01:46:41Z\|"true"\|"/w"\|"proj-9000"$'
+  expect_text "compose_containers' template" \
+    'inspect -f {{.Id}}|{{.Created}}|{{.State.StartedAt}}|{{json (index .Config.Labels "runnerctl.keep")}}|{{json (index .Config.Labels "com.docker.compose.project.working_dir")}}|{{json (index .Config.Labels "com.docker.compose.project")}} c1' \
+    "$(cat "$d/inspect.args")"
   rm -rf "$d"
+}
+
+# --- GHR-109: no label decides what compose-reap removes ------------------------
+# The stub models `docker` itself (tests/stub.config), so these run the real
+# templates and the real compose_record. A label is any bytes a job with docker
+# chose; before GHR-109 the reader split `PROJECT|ID|CREATED…` on `|`, so a
+# label `x|<id>` made --apply remove <id>. G109_VICTIM is an id of docker's
+# form that no fixture object has: it is what a label would smuggle.
+G109_VICTIM="$(printf 'deadbeef%.0s' 1 2 3 4 5 6 7 8)"
+G109_OLD='2000-01-01T00:00:00Z'
+
+case_ghr109_pipe_in_a_label_chooses_no_id() {
+  # The issue's probe, exactly: `--project x` names no project now — the
+  # label is `x|victim-id` whole — so nothing is judged and nothing removed.
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_STALE='x|victim-id' run compose-reap --apply --project x
+  expect_rc 0
+  expect_out ' projects=0 reap=0 keep=0 removed=0 failed=0 '
+  expect_no_log '^docker rm'
+  # The whole label selects the project, which is reaped by ITS ids.
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_STALE='x|victim-id' run compose-reap --apply --project 'x|victim-id'
+  expect_rc 0
+  expect_out '^reap x\|victim-id reason=age idle=240m containers=1 networks=1 volumes=1$'
+  expect_log_order '^docker rm container c-stale$' '^docker rm network n-stale$' '^docker rm volume v-stale$'
+  expect_log_count '^docker rm ' 3
+  expect_no_log 'victim'
+  # The label names ANOTHER project that is being reaped (harness-123456),
+  # then an id of docker's form, then a time that parses even with the rest
+  # of an old-shape record after it (compose_epoch's fallback reads the first
+  # three words). No id check, no unreadable-time guard and no volume-only
+  # rule could catch that for any of the three kinds; only the record's order
+  # does. The whole run, every other verdict as ever.
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_WORKER=1 RUNNERCTL_STUB_COMPOSE_STALE="harness-123456|$G109_VICTIM|2000-01-01 00:00:00 +0000 UTC" run compose-reap --apply
+  expect_rc 0
+  expect_log_order '^docker rm container c-stale$' '^docker rm network n-stale$' '^docker rm volume v-stale$'
+  expect_log_count '^docker rm ' 8
+  expect_no_log "$G109_VICTIM"
+  expect_out ' removed=8 failed=0 .* skipped=0$'
+}
+
+case_ghr109_newline_in_a_label_is_one_record() {
+  # Shaped to forge a whole record of the NEW form, were the label not JSON:
+  # `x"`, a newline, then the victim's id, two old times, two labels, a name.
+  local forged="x\"
+$G109_VICTIM|$G109_OLD|$G109_OLD|null|null|\"victim"
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_WORKER=1 RUNNERCTL_STUB_COMPOSE_STALE="$forged" run compose-reap --apply
+  expect_rc 0
+  expect_text "the forged label's verdict" \
+    'skip "x\"\n'"$G109_VICTIM|$G109_OLD|$G109_OLD"'|null|null|\"victim" reason=unparseable:container-label,network-label,volume-label containers=0 networks=0 volumes=0 unparseable=3' \
+    "$(grep -m1 '^skip ' <<<"$OUT" || true)"
+  expect_no_log "$G109_VICTIM|victim|stale"
+  expect_log_count '^docker rm ' 5
+  expect_out ' removed=5 failed=0 .* skipped=1$'
+  expect_no_control_bytes
+  # The issue's form of it: a record of the OLD shape after the newline.
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_STALE="x
+victim|victim-id|$G109_OLD" run compose-reap --apply
+  expect_rc 0
+  expect_out '^skip "x\\nvictim\|victim-id\|2000-01-01T00:00:00Z" reason=unparseable:'
+  expect_no_log 'victim|stale'
+}
+
+case_ghr109_an_unparseable_object_skips_its_project() {
+  # A container whose id is not docker's form: the record is refused, and its
+  # network and volume — readable — stay with it.
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_WORKER=1 RUNNERCTL_STUB_COMPOSE_BAD_ID=container run compose-reap --apply
+  expect_rc 0
+  expect_out '^skip stale reason=unparseable:container-id containers=0 networks=1 volumes=1 unparseable=1$'
+  expect_no_log 'victim'
+  expect_no_log '^docker rm (network n-stale|volume v-stale)$'
+  expect_log '^docker rm container c-pidgone$'
+  expect_log_count '^docker rm ' 5
+  expect_out ' projects=12 reap=4 keep=7 removed=5 failed=0 .* skipped=1$'
+  # The same for a network's id and a volume's Name.
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_BAD_ID=network run compose-reap --apply --project stale
+  expect_out '^skip stale reason=unparseable:network-id containers=1 networks=0 volumes=1 unparseable=1$'
+  expect_no_log '^docker rm'
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_BAD_ID=volume run compose-reap --apply --project stale
+  expect_out '^skip stale reason=unparseable:volume-id containers=1 networks=1 volumes=0 unparseable=1$'
+  expect_no_log '^docker rm'
+  # A clean project label with another label docker had to escape.
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_STALE_WD="/w
+$G109_VICTIM" run compose-reap --apply --project stale
+  expect_out '^skip stale reason=unparseable:container-label containers=0 networks=1 volumes=1 unparseable=1$'
+  expect_no_log '^docker rm'
+  # A dry run says the same and removes nothing either way.
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_WORKER=1 RUNNERCTL_STUB_COMPOSE_BAD_ID=container run compose-reap
+  expect_out '^skip stale reason=unparseable:container-id '
+  expect_out '^compose-reap: mode=dry-run projects=12 reap=4 keep=7 .* skipped=1$'
+  expect_no_log '^docker rm'
+}
+
+case_ghr109_a_label_cannot_make_a_fresh_stack_old() {
+  # Under the old split this label put the victim in ID and an old time in
+  # CREATED and STARTED: `young` (1 h) read as 26 years idle and went, by the
+  # victim's id. The times are docker's own fields now.
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_YOUNG="young|$G109_VICTIM|$G109_OLD|$G109_OLD" run compose-reap --apply
+  expect_rc 0
+  expect_out "^keep young\\|$G109_VICTIM\\|2000-01-01T00:00:00Z\\|2000-01-01T00:00:00Z reason=young idle=60m containers=1 "
+  expect_no_log "$G109_VICTIM|c-young"
+  # A time docker printed that does not parse is unknown, never epoch 0 —
+  # which the age guard would read as the oldest stack there is.
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_CREATED='not a time' run compose-reap --apply --project young
+  expect_rc 0
+  expect_out '^skip young reason=unparseable:container-created containers=0 networks=0 volumes=0 unparseable=1$'
+  expect_no_log '^docker rm'
+}
+
+case_ghr109_a_skipped_project_is_drawn_safely() {
+  # DEL and a C1 CSI are not escaped by docker's json; the line is still
+  # refused, and its name drawn through relay_safe — the CSI gone whole.
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_STALE=$'st\x7f\xc2\x9b2Jale' run compose-reap --apply
+  expect_rc 0
+  expect_text "the stale project's skip" \
+    'skip stale reason=unparseable:container-label,network-label,volume-label containers=0 networks=0 volumes=0 unparseable=3' \
+    "$(grep -m1 '^skip ' <<<"$OUT" || true)"
+  expect_no_control_bytes
+  expect_no_log 'stale'
+}
+
+case_ghr109_standalone_reads_one_record_per_container() {
+  # The image text is a job's: with a newline in it, the old split read the
+  # rest as a container of its own. Now the record is refused, not guessed.
+  RUNNERCTL_STUB_STANDALONE=1 RUNNERCTL_STUB_STANDALONE_IMAGE="verify:1
+$G109_VICTIM|/x|sha256:$G109_VICTIM|x|$G109_OLD|$G109_OLD|" run compose-reap --standalone --apply
+  expect_rc 0
+  expect_out_count '^skip container record reason=unparseable:label$' 1
+  expect_no_log "$G109_VICTIM|s-old"
+  expect_log '^docker rm container s-shared$'
+  expect_out ' removed=1 failed=0 slots=3 standalone=5 images-removed=0 .* skipped=1$'
+  # An image text drawn through relay_safe: a CSI gone whole.
+  RUNNERCTL_STUB_STANDALONE=1 RUNNERCTL_STUB_STANDALONE_IMAGE=$'verify\xc2\x9b2J:1' run compose-reap --standalone --apply
+  expect_out_count '^skip container record reason=unparseable:label$' 1
+  expect_no_log 's-old'
+}
+
+case_ghr109_compose_record_shapes() {
+  # compose_record itself, over lines no fixture sends.
+  local h lines; h="$(printf 'ab%.0s' {1..32})"
+  lines="$(printf '%s\n' \
+    "container:$h|2001-09-09T01:46:40Z|0001-01-01T00:00:00Z|null|\"/w|x\"|\"p|q\"" \
+    "container:$h|t|t|\"true\"|null|null" \
+    "network:$h|2026-08-26 22:12:51.64 +0200 CEST|\"p\"" \
+    "volume:\"v_1.x\"|t|\"p\"" \
+    "volume:\"-v\"|t|\"p\"" \
+    "network:${h:0:12}|t|\"p\"" \
+    "container:$h|t|t|null|\"a\\\"b\"|\"p\"" \
+    "network:$h|t|\"p\\u001b\"" \
+    "network:$h|t|p" \
+    "network:$h|t|\"p\" trailing")"
+  # shellcheck disable=SC2016  # the child expands these
+  G109_LINES="$lines" run_fn eval 'while IFS= read -r l; do compose_record "${l%%:*}" "${l#*:}"; printf "%s<%s><%s><%s><%s><%s><%s>\n" "${CR_BAD:-ok}" "$CR_PROJECT" "$CR_ID" "$CR_CREATED" "$CR_STARTED" "$CR_KEEP" "$CR_WD"; done <<<"$G109_LINES"'
+  expect_rc 0
+  expect_text "compose_record's verdicts" "ok<p|q><$h><2001-09-09T01:46:40Z><0001-01-01T00:00:00Z><></w|x>
+ok<><$h><t><t><true><>
+ok<p><$h><2026-08-26 22:12:51.64 +0200 CEST><><><>
+ok<p><v_1.x><t><><><>
+id<p><><><><><>
+id<p><><><><><>
+label<p><><><><><>
+label<\"p\\u001b\"><><><><><>
+unreadable<><><><><><>
+unreadable<><><><><><>" "$OUT"
 }
 
 # --- compose-reap --standalone: containers with no compose label ----------------
@@ -5543,17 +5706,21 @@ case_compose_reap_standalone_real_hook() {
 case "$*" in
   "ps -aq --no-trunc") printf 'aaa\nbbb\nccc\n' ;;
   "ps -aq --no-trunc --filter label=com.docker.compose.project") echo bbb ;;
-  inspect*) printf '%s\n' "$*" >"${0%/*}/../inspect.args"; echo 'aaa|/x|sha-a|x:1|t|t|' ; echo 'ccc|/y|sha-c|y:1|t|t|' ;;
+  inspect*) printf '%s\n' "$*" >"${0%/*}/../inspect.args"; echo 'aaa|sha-a|t|t|"/x"|"x:1"|' ; echo 'ccc|sha-c|t|t|"/y"|"y:1"|null' ;;
 esac
 FAKE
   chmod 755 "$d/bin/docker"
   PATH="$d/bin:$PATH"
   run_fn compose_standalone
   PATH="$saved"
-  expect_out '^aaa\|/x\|sha-a\|x:1\|t\|t\|$'
+  expect_out '^aaa\|sha-a\|t\|t\|"/x"\|"x:1"\|$'
   _expect
   grep -q ' aaa ccc$' "$d/inspect.args" || FAILS+=("inspect was not asked for exactly the non-compose ids (aaa ccc): $(cat "$d/inspect.args")")
-  grep -q '{{with .Config.Labels}}' "$d/inspect.args" || FAILS+=("keep label read is not nil-guarded")
+  # GHR-109: docker's fields first, the job's text last and through json; the
+  # keep label nil-guarded.
+  expect_text "compose_standalone's template" \
+    'inspect -f {{.Id}}|{{.Image}}|{{.Created}}|{{.State.StartedAt}}|{{json .Name}}|{{json .Config.Image}}|{{with .Config.Labels}}{{json (index . "runnerctl.keep")}}{{end}} aaa ccc' \
+    "$(cat "$d/inspect.args")"
   rm -rf "$d"
 }
 
@@ -9603,18 +9770,21 @@ case_ghr100_host_events_text_is_drawn_safely() {
   expect_no_control_bytes
 }
 
-# compose-reap: a project is a label any job with docker can set. Drawn safe;
-# matched and removed by its raw value and its objects' ids.
+# compose-reap: a project is a label any job with docker can set. Drawn safe.
+# GHR-109: a label docker has to escape (this one's ESC) no longer reaches a
+# verdict at all — the project is skipped whole, shown as docker escaped it,
+# and nothing is removed, by its raw value or any other.
 case_ghr100_compose_reap_project_label_is_drawn_safely() {
   RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_STALE=$'st\e[2Jale' run compose-reap
   expect_rc 0
-  expect_text "the stale project's verdict" 'reap stale reason=age idle=240m containers=1 networks=1 volumes=1' \
-    "$(ghr100_line '^reap stale ')"
+  expect_text "the stale project's verdict" \
+    'skip "st\u001b[2Jale" reason=unparseable:container-label,network-label,volume-label containers=0 networks=0 volumes=0 unparseable=3' \
+    "$(ghr100_line '^skip ')"
   expect_no_control_bytes
   RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_STALE=$'st\e[2Jale' run compose-reap --apply --project $'st\e[2Jale'
   expect_rc 0
-  expect_out_count '^reap stale reason=age ' 1
-  expect_log_order '^docker rm container c-stale$' '^docker rm network n-stale$' '^docker rm volume v-stale$'
+  expect_out ' projects=0 reap=0 keep=0 removed=0 '
+  expect_no_log '^docker rm'
   expect_no_control_bytes
 }
 
@@ -9667,8 +9837,17 @@ t "GHR-100: --json keeps the raw repository and name, escaped"                ca
 t "GHR-100: a comm with a comma or a space stays next to its own pid"        case_ghr100_comm_with_a_comma_keeps_its_pid
 t "GHR-100: a hostile comm leaves the signalled pids exactly as read"         case_ghr100_hostile_comm_leaves_the_signalled_pids_alone
 t "GHR-100: the journal's process name and identifier are drawn safely"      case_ghr100_host_events_text_is_drawn_safely
-t "GHR-100: compose-reap draws a project label safely, acts on the raw one"  case_ghr100_compose_reap_project_label_is_drawn_safely
+t "GHR-100: compose-reap draws a project label safely, removes nothing for it" case_ghr100_compose_reap_project_label_is_drawn_safely
 t "GHR-100: the real collectors, and the real proc_leaked, make comms safe"  case_ghr100_real_collectors_make_comms_safe
+
+# --- GHR-109: no label decides what compose-reap removes ----------------------
+t "GHR-109: a | in a label chooses no id --apply removes"              case_ghr109_pipe_in_a_label_chooses_no_id
+t "GHR-109: a newline in a label leaves one record, and it is skipped" case_ghr109_newline_in_a_label_is_one_record
+t "GHR-109: an unparseable object skips its whole project"             case_ghr109_an_unparseable_object_skips_its_project
+t "GHR-109: a label cannot make a fresh stack old"                     case_ghr109_a_label_cannot_make_a_fresh_stack_old
+t "GHR-109: a skipped project's name is drawn safely"                  case_ghr109_a_skipped_project_is_drawn_safely
+t "GHR-109: --standalone reads one record per container"               case_ghr109_standalone_reads_one_record_per_container
+t "GHR-109: compose_record holds a line to its shape"                  case_ghr109_compose_record_shapes
 
 # --- Summary ------------------------------------------------------------------
 echo

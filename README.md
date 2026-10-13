@@ -406,7 +406,7 @@ $ sudo runnerctl compose-reap
 reap ci-harness-48211 reason=gone:pid:48211 idle=849m containers=2 networks=2 volumes=2
 keep ci-harness-51007 reason=live:pid:51007 idle=4m containers=3 networks=2 volumes=2
 keep pg-scratch reason=volume-only idle=781m containers=0 networks=0 volumes=1
-compose-reap: mode=dry-run projects=3 reap=1 keep=2 removed=0 failed=0 slots=4 standalone=0 images-removed=0 non-compose-running=0
+compose-reap: mode=dry-run projects=3 reap=1 keep=2 removed=0 failed=0 slots=4 standalone=0 images-removed=0 non-compose-running=0 skipped=0
 ```
 
 It is a dry run unless `--apply`, and `--apply` refuses on a host with no
@@ -416,6 +416,15 @@ networks, then its named volumes — by id, never a prune, because on a shared
 daemon a prune reaches other jobs. A project that is only volumes is never
 reaped. Running containers without a compose label are counted in the
 summary (`non-compose-running`) and, by default, never touched.
+
+A label is text any job with Docker access chose, so it is never trusted to
+shape what is read: ids and timestamps come from Docker's own fields, and the
+labels come back JSON-encoded. A project with any object whose record does not
+parse — a label Docker had to escape (a quote, a backslash, a newline, a
+control byte), an id that is not Docker's form, a timestamp that does not
+read — is not reaped at all that run: it is printed as
+`skip <project> reason=unparseable:<kind>-<why>` and counted in the summary's
+`skipped`.
 
 #### Containers with no compose label: `--standalone`
 

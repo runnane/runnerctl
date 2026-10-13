@@ -4308,6 +4308,8 @@ cmd_kill() { # [--dry-run] [--if-stalled] [--stall-after N] [target ...]
 # project, then a summary, so a timer's journal shows the leak rate.
 # Running containers with no compose label are outside its reach: counted in
 # the summary (`non-compose-running=N`) so they are visible, never touched.
+# A project with an object whose record does not parse (GHR-109, below) is
+# `skip`ped whole and counted in `skipped=N`.
 #
 # The docker reads and removals go through the compose_* hooks below so a
 # config can stub them without replacing the logic.
@@ -4323,26 +4325,112 @@ compose_epoch() { # DOCKER-TIMESTAMP
   date -d "$a $b $c" +%s 2>/dev/null || echo 0
 }
 
-# PROJECT|ID|CREATED|STARTED|KEEP|WORKING-DIR, one line per compose container.
+# GHR-109: what docker answers is read so that no label can move a field.
+# A label is any bytes a job with docker access chose — `|`, a newline, a
+# quote, a control byte — so a record that SPLITS on a separator lets the
+# label pick the id the root timer removes (`x|<id>` did exactly that) and
+# the timestamp the age guard reads. So each record is:
+#
+#   docker's own fields first   the id (64 hex digits, `{{.Id}}`) or a volume's
+#                               `{{json .Name}}`, then the timestamps — none of
+#                               which a label can reach;
+#   every label last, as JSON   `{{json (index … "label")}}`, docker's own
+#                               encoder: a `"`, a `\`, a newline or any C0 byte
+#                               comes back escaped, so a line is always ONE
+#                               record. An absent label is `null` (a container
+#                               or network) or `""` (a volume).
+#
+# compose_record then holds the whole line to one exact shape. A label docker
+# had to escape, a control byte (DEL and C1 are not escaped), an id that is not
+# docker's form or a timestamp that does not parse makes the record
+# unparseable: its project is skipped whole and said so, never guessed at.
+# A label with `|` in it parses: `|` is no longer a separator, only text.
+
+# ID|CREATED|STARTED|KEEP|WORKING-DIR|PROJECT, one line per compose container.
 compose_containers() {
   local ids
   mapfile -t ids < <(docker ps -aq --filter "label=com.docker.compose.project" 2>/dev/null)
   [ "${#ids[@]}" -gt 0 ] || return 0
-  docker inspect -f "{{index .Config.Labels \"com.docker.compose.project\"}}|{{.Id}}|{{.Created}}|{{.State.StartedAt}}|{{index .Config.Labels \"$COMPOSE_REAP_KEEP_LABEL\"}}|{{index .Config.Labels \"com.docker.compose.project.working_dir\"}}" "${ids[@]}" 2>/dev/null
+  docker inspect -f "{{.Id}}|{{.Created}}|{{.State.StartedAt}}|{{json (index .Config.Labels \"$COMPOSE_REAP_KEEP_LABEL\")}}|{{json (index .Config.Labels \"com.docker.compose.project.working_dir\")}}|{{json (index .Config.Labels \"com.docker.compose.project\")}}" "${ids[@]}" 2>/dev/null
 }
 
-# PROJECT|ID|CREATED, one line per compose network, and per compose volume.
+# ID|CREATED|PROJECT per compose network; NAME|CREATED|PROJECT per volume.
 compose_networks() {
   local ids
   mapfile -t ids < <(docker network ls -q --filter "label=com.docker.compose.project" 2>/dev/null)
   [ "${#ids[@]}" -gt 0 ] || return 0
-  docker network inspect -f '{{index .Labels "com.docker.compose.project"}}|{{.Id}}|{{.Created}}' "${ids[@]}" 2>/dev/null
+  docker network inspect -f '{{.Id}}|{{.Created}}|{{json (index .Labels "com.docker.compose.project")}}' "${ids[@]}" 2>/dev/null
 }
 compose_volumes() {
   local ids
   mapfile -t ids < <(docker volume ls -q --filter "label=com.docker.compose.project" 2>/dev/null)
   [ "${#ids[@]}" -gt 0 ] || return 0
-  docker volume inspect -f '{{index .Labels "com.docker.compose.project"}}|{{.Name}}|{{.CreatedAt}}' "${ids[@]}" 2>/dev/null
+  docker volume inspect -f '{{json .Name}}|{{.CreatedAt}}|{{json (index .Labels "com.docker.compose.project")}}' "${ids[@]}" 2>/dev/null
+}
+
+# The shapes compose_record holds a line to. A timestamp is RFC 3339 or Go's
+# time.String() (an older daemon's network); a label is a JSON string that
+# needed no escape, or null.
+COMPOSE_HEX_RE='[0-9a-f]{64}'
+COMPOSE_TS_RE='[0-9A-Za-z:.+ -]+'
+COMPOSE_LBL_RE='"[^"\\]*"|null'
+COMPOSE_VOL_RE='"[A-Za-z0-9][A-Za-z0-9_.-]+"'
+COMPOSE_CONTAINER_RE="^($COMPOSE_HEX_RE)[|]($COMPOSE_TS_RE)[|]($COMPOSE_TS_RE)[|]($COMPOSE_LBL_RE)[|]($COMPOSE_LBL_RE)[|]($COMPOSE_LBL_RE)\$"
+COMPOSE_NETWORK_RE="^($COMPOSE_HEX_RE)[|]($COMPOSE_TS_RE)[|]($COMPOSE_LBL_RE)\$"
+COMPOSE_VOLUME_RE="^($COMPOSE_VOL_RE)[|]($COMPOSE_TS_RE)[|]($COMPOSE_LBL_RE)\$"
+# The project label: the line's last field, a JSON string with or without
+# escapes. Found even when the rest of the line is wrong, so a bad record can
+# still take its project with it.
+COMPOSE_TAIL_RE='[|]("([^"\\]|\\.)*"|null)$'
+COMPOSE_CTRL_RE=$'[\001-\037\177]|\xc2[\x80-\x9f]'
+
+# A label token as compose_record found it, into COMPOSE_LABEL: null is empty.
+compose_label() { # TOKEN
+  case "$1" in
+    null) COMPOSE_LABEL="" ;;
+    *)    COMPOSE_LABEL="${1:1:${#1}-2}" ;;
+  esac
+}
+
+# One line of compose_containers / _networks / _volumes into CR_*:
+#   CR_PROJECT  the project label; docker's escaped JSON text, quotes and all,
+#               when docker had to escape it (it is shown as written, and no
+#               clean label can collide with it: those carry no `"`)
+#   CR_ID CR_CREATED CR_STARTED CR_KEEP CR_WD   the record, when it parsed
+#   CR_BAD      empty, or why it did not: label, id, format; `unreadable` when
+#               not even the project could be found
+compose_record() { # container|network|volume LINE
+  local LC_ALL=C l="$2" re first
+  CR_PROJECT="" CR_ID="" CR_CREATED="" CR_STARTED="" CR_KEEP="" CR_WD="" CR_BAD=""
+  if ! [[ "$l" =~ $COMPOSE_TAIL_RE ]]; then CR_BAD=unreadable; return 0; fi
+  case "${BASH_REMATCH[1]}" in
+    *\\*) CR_PROJECT="${BASH_REMATCH[1]}" CR_BAD=label; return 0 ;;
+  esac
+  compose_label "${BASH_REMATCH[1]}"; CR_PROJECT="$COMPOSE_LABEL"
+  if [[ "$l" =~ $COMPOSE_CTRL_RE ]]; then CR_BAD=label; return 0; fi
+  case "$1" in
+    container) re="$COMPOSE_CONTAINER_RE" ;;
+    network)   re="$COMPOSE_NETWORK_RE" ;;
+    *)         re="$COMPOSE_VOLUME_RE" ;;
+  esac
+  if ! [[ "$l" =~ $re ]]; then
+    first="${l%%|*}"
+    if [[ "$l" == *\\* ]]; then CR_BAD=label
+    elif [ "$1" = volume ] && ! [[ "$first" =~ ^$COMPOSE_VOL_RE$ ]]; then CR_BAD=id
+    elif [ "$1" != volume ] && ! [[ "$first" =~ ^$COMPOSE_HEX_RE$ ]]; then CR_BAD=id
+    else CR_BAD=format
+    fi
+    return 0
+  fi
+  CR_ID="${BASH_REMATCH[1]}" CR_CREATED="${BASH_REMATCH[2]}"
+  case "$1" in
+    container)
+      CR_STARTED="${BASH_REMATCH[3]}"
+      compose_label "${BASH_REMATCH[4]}"; CR_KEEP="$COMPOSE_LABEL"
+      compose_label "${BASH_REMATCH[5]}"; CR_WD="$COMPOSE_LABEL"
+      ;;
+    volume) CR_ID="${CR_ID:1:${#CR_ID}-2}" ;;
+  esac
 }
 
 # "RUNNING COMPOSE-RUNNING": all running containers, and those with the label.
@@ -4355,15 +4443,37 @@ compose_running_counts() {
 
 docker_available() { command -v docker >/dev/null 2>&1; }
 
-# ID|NAME|IMAGE-ID|IMAGE|CREATED|STARTED|KEEP, one line per container WITHOUT a
-# compose label, in any state. `with` guards a container whose Labels is nil.
+# ID|IMAGE-ID|CREATED|STARTED|NAME|IMAGE|KEEP, one line per container WITHOUT
+# a compose label, in any state — docker's fields first, then what a job chose
+# as JSON, as compose_containers does (GHR-109): the keep label is a label,
+# and the image is the text the job asked for. `with` guards a container whose
+# Labels is nil, so KEEP may also be empty.
 compose_standalone() {
   local all composed ids
   all="$(docker ps -aq --no-trunc 2>/dev/null | sort)"
   composed="$(docker ps -aq --no-trunc --filter "label=com.docker.compose.project" 2>/dev/null | sort)"
   mapfile -t ids < <(comm -23 <(printf '%s\n' "$all") <(printf '%s\n' "$composed") | grep -v '^$' || true)
   [ "${#ids[@]}" -gt 0 ] || return 0
-  docker inspect -f "{{.Id}}|{{.Name}}|{{.Image}}|{{.Config.Image}}|{{.Created}}|{{.State.StartedAt}}|{{with .Config.Labels}}{{index . \"$COMPOSE_REAP_KEEP_LABEL\"}}{{end}}" "${ids[@]}" 2>/dev/null
+  docker inspect -f "{{.Id}}|{{.Image}}|{{.Created}}|{{.State.StartedAt}}|{{json .Name}}|{{json .Config.Image}}|{{with .Config.Labels}}{{json (index . \"$COMPOSE_REAP_KEEP_LABEL\")}}{{end}}" "${ids[@]}" 2>/dev/null
+}
+# A container's name as docker validates it, behind its `/`.
+COMPOSE_STANDALONE_RE="^($COMPOSE_HEX_RE)[|](sha256:$COMPOSE_HEX_RE)[|]($COMPOSE_TS_RE)[|]($COMPOSE_TS_RE)[|]\"/([A-Za-z0-9][A-Za-z0-9_.-]*)\"[|](\"[^\"\\\\]*\")[|]($COMPOSE_LBL_RE)?\$"
+
+# One line of compose_standalone into CR_ID CR_IMG CR_CREATED CR_STARTED
+# CR_NAME CR_IMAGE CR_KEEP, or CR_BAD (label, id, format) with nothing else:
+# there is no project to skip, so the container alone is.
+compose_standalone_record() { # LINE
+  local LC_ALL=C l="$1"
+  CR_ID="" CR_IMG="" CR_CREATED="" CR_STARTED="" CR_NAME="" CR_IMAGE="" CR_KEEP="" CR_BAD=""
+  if [[ "$l" =~ $COMPOSE_CTRL_RE || "$l" == *\\* ]]; then CR_BAD=label; return 0; fi
+  if ! [[ "$l" =~ $COMPOSE_STANDALONE_RE ]]; then
+    if [[ "${l%%|*}" =~ ^$COMPOSE_HEX_RE$ ]]; then CR_BAD=format; else CR_BAD=id; fi
+    return 0
+  fi
+  CR_ID="${BASH_REMATCH[1]}" CR_IMG="${BASH_REMATCH[2]}" CR_CREATED="${BASH_REMATCH[3]}"
+  CR_STARTED="${BASH_REMATCH[4]}" CR_NAME="${BASH_REMATCH[5]}"
+  compose_label "${BASH_REMATCH[6]}"; CR_IMAGE="$COMPOSE_LABEL"
+  if [ -n "${BASH_REMATCH[7]}" ]; then compose_label "${BASH_REMATCH[7]}"; CR_KEEP="$COMPOSE_LABEL"; fi
 }
 
 # True when any container, in any state, still uses IMAGE-ID.
@@ -4438,39 +4548,73 @@ cmd_compose_reap() { # [--apply] [--standalone] [--project NAME] [--max-age-hour
     die "no '$UNIT_GLOB' units on this host — refusing compose-reap --apply (this is not a runner host, and the age guard would take its own stacks)"
   fi
 
-  # Inventory, grouped by project.
+  # Inventory, grouped by project. GHR-109: each line is held to its shape by
+  # compose_record; one object that fails takes its whole project out of this
+  # run (`unparseable`), because a stack is reaped together or not at all.
   local -A containers=() networks=() volumes=() last=() net_last=() vol_last=() workdir=() keep=()
-  local projects=() project id created started k t
+  local -A unparseable=() n_unparseable=()
+  local projects=() project id k t line kind n_skipped=0
   compose_add_project() {
     [ -n "$1" ] || return 1
     [ -z "$only" ] || [ "$1" = "$only" ] || return 1
     [ -n "${last[$1]+x}" ] || { projects+=("$1"); last[$1]=0; net_last[$1]=0; vol_last[$1]=0; }
   }
-  while IFS='|' read -r project id created started k wd; do
-    compose_add_project "$project" || continue
-    containers[$project]+="$id "
-    t="$(compose_epoch "$created")"; start="$(compose_epoch "$started")"
-    [ "$start" -le "$t" ] || t="$start"
-    [ "$t" -le "${last[$project]}" ] || last[$project]="$t"
-    [ "$k" != "true" ] || keep[$project]=1
-    [ -z "$wd" ] || workdir[$project]="$wd"
-  done < <(compose_containers)
-  while IFS='|' read -r project id created; do
-    compose_add_project "$project" || continue
-    networks[$project]+="$id "
-    t="$(compose_epoch "$created")"
-    [ "$t" -le "${net_last[$project]}" ] || net_last[$project]="$t"
-  done < <(compose_networks)
-  while IFS='|' read -r project id created; do
-    compose_add_project "$project" || continue
-    volumes[$project]+="$id "
-    t="$(compose_epoch "$created")"
-    [ "$t" -le "${vol_last[$project]}" ] || vol_last[$project]="$t"
-  done < <(compose_volumes)
+  # KIND WHY: the record in CR_* is not used, and its project is not reaped.
+  compose_unparseable() {
+    case " ${unparseable[$CR_PROJECT]:-} " in
+      *" $1-$2 "*) ;;
+      *) unparseable[$CR_PROJECT]+="$1-$2 " ;;
+    esac
+    n_unparseable[$CR_PROJECT]=$(( ${n_unparseable[$CR_PROJECT]:-0} + 1 ))
+  }
+  for kind in container network volume; do
+    while IFS= read -r line || [ -n "$line" ]; do
+      compose_record "$kind" "$line"
+      if [ -z "$CR_PROJECT" ]; then
+        # No project to put it under: said, counted, never acted on.
+        [ -z "$CR_BAD" ] || { echo "skip $kind record reason=unparseable:$CR_BAD"; n_skipped=$((n_skipped + 1)); }
+        continue
+      fi
+      project="$CR_PROJECT"
+      compose_add_project "$project" || continue
+      if [ -n "$CR_BAD" ]; then compose_unparseable "$kind" "$CR_BAD"; continue; fi
+      t="$(compose_epoch "$CR_CREATED")"
+      # An unreadable time is 0, which the age guard would read as ancient.
+      if [ "$t" -le 0 ]; then compose_unparseable "$kind" created; continue; fi
+      case "$kind" in
+        container)
+          containers[$project]+="$CR_ID "
+          start="$(compose_epoch "$CR_STARTED")"
+          [ "$start" -le "$t" ] || t="$start"
+          [ "$t" -le "${last[$project]}" ] || last[$project]="$t"
+          [ "$CR_KEEP" != "true" ] || keep[$project]=1
+          [ -z "$CR_WD" ] || workdir[$project]="$CR_WD"
+          ;;
+        network)
+          networks[$project]+="$CR_ID "
+          [ "$t" -le "${net_last[$project]}" ] || net_last[$project]="$t"
+          ;;
+        volume)
+          volumes[$project]+="$CR_ID "
+          [ "$t" -le "${vol_last[$project]}" ] || vol_last[$project]="$t"
+          ;;
+      esac
+    done < <(case "$kind" in container) compose_containers ;; network) compose_networks ;; volume) compose_volumes ;; esac)
+  done
 
-  local mode=dry-run reaped=0 kept=0 n_removed=0 n_failed=0 p seen action reason alive dead ok bad kind n
+  local mode=dry-run reaped=0 kept=0 n_removed=0 n_failed=0 p seen action reason alive dead ok bad n why
   $apply && mode=apply
   for p in ${projects[@]+"${projects[@]}"}; do
+    if [ -n "${unparseable[$p]+x}" ]; then
+      why="${unparseable[$p]% }"
+      relay_safe "$p" plain
+      printf 'skip %s reason=unparseable:%s containers=%s networks=%s volumes=%s unparseable=%s\n' \
+        "$RELAY_SAFE" "${why// /,}" \
+        "$(wc -w <<<"${containers[$p]:-}")" "$(wc -w <<<"${networks[$p]:-}")" "$(wc -w <<<"${volumes[$p]:-}")" \
+        "${n_unparseable[$p]}"
+      n_skipped=$((n_skipped + 1))
+      continue
+    fi
     seen="${last[$p]}"
     [ "$seen" -gt 0 ] || seen="${net_last[$p]}"
     alive="" dead=""
@@ -4531,12 +4675,20 @@ cmd_compose_reap() { # [--apply] [--standalone] [--project NAME] [--max-age-hour
   local n_standalone=0 n_images=0 cid name img image
   local -A freed_images=()
   if $standalone; then
-    while IFS='|' read -r cid name img image created started k; do
-      [ -n "$cid" ] || continue
-      name="${name#/}"
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ -n "$line" ] || continue
+      compose_standalone_record "$line"
+      # GHR-109: no project to take with it, so the container alone is skipped.
+      if [ -z "$CR_BAD" ] && [ "$(compose_epoch "$CR_CREATED")" -le 0 ]; then CR_BAD=created; fi
+      if [ -n "$CR_BAD" ]; then
+        echo "skip container record reason=unparseable:$CR_BAD"
+        n_skipped=$((n_skipped + 1))
+        continue
+      fi
+      cid="$CR_ID" name="$CR_NAME" img="$CR_IMG" image="$CR_IMAGE" k="$CR_KEEP"
       [ -z "$only" ] || [ "$name" = "$only" ] || continue
       n_standalone=$((n_standalone + 1))
-      seen="$(compose_epoch "$created")"; t="$(compose_epoch "$started")"
+      seen="$(compose_epoch "$CR_CREATED")"; t="$(compose_epoch "$CR_STARTED")"
       [ "$t" -le "$seen" ] || seen="$t"
       alive=""
       for start in "${slot_start[@]}"; do
@@ -4548,6 +4700,9 @@ cmd_compose_reap() { # [--apply] [--standalone] [--project NAME] [--max-age-hour
       elif [ $((now - seen)) -ge $((max_age * 3600)) ]; then action=reap reason=age
       else action=keep reason=young
       fi
+      # The name is docker-validated; the image is the text a job asked for.
+      relay_safe "$image" plain
+      image="$RELAY_SAFE"
       printf '%s container %s reason=%s idle=%sm image=%s\n' "$action" "$name" "$reason" "$(( (now - seen) / 60 ))" "$image"
       if [ "$action" != reap ]; then kept=$((kept + 1)); continue; fi
       reaped=$((reaped + 1))
@@ -4571,7 +4726,7 @@ cmd_compose_reap() { # [--apply] [--standalone] [--project NAME] [--max-age-hour
 
   local running composed
   read -r running composed <<<"$(compose_running_counts)"
-  echo "compose-reap: mode=$mode projects=${#projects[@]} reap=$reaped keep=$kept removed=$n_removed failed=$n_failed slots=${#slot_start[@]} standalone=$n_standalone images-removed=$n_images non-compose-running=$(( ${running:-0} - ${composed:-0} ))"
+  echo "compose-reap: mode=$mode projects=${#projects[@]} reap=$reaped keep=$kept removed=$n_removed failed=$n_failed slots=${#slot_start[@]} standalone=$n_standalone images-removed=$n_images non-compose-running=$(( ${running:-0} - ${composed:-0} )) skipped=$n_skipped"
   [ "$n_failed" -eq 0 ]
 }
 
