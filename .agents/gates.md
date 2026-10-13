@@ -204,25 +204,32 @@ is green (`release-please-config.json`, `.release-please-manifest.json`):
 
 Two things the automation cannot do for you:
 
-- The release PR is authored by `github-actions[bot]` (the action runs with
-  the default `GITHUB_TOKEN`; there is no `RELEASE_PLEASE_TOKEN` secret). Its
+- Who authors the release PR decides whether its gates start on their own.
+  With the default `GITHUB_TOKEN` it is `github-actions[bot]`, and its
   `pull_request` runs are **not** suppressed — every refresh of the release
-  branch creates one — but the repository's Actions approval policy decides
-  whether they run: under *Require approval for first-time contributors*
-  (`approval_policy: first_time_contributors`) GitHub treats the bot as a
-  first-time contributor on every PR, so each run sat `action_required`
-  behind a "1 workflow awaiting approval" banner (GHR-35, three runs in one
-  evening). The policy is now *first-time contributors who are new to
-  GitHub* (`first_time_contributors_new_to_github`, set 2026-09-13 with
-  `gh api -X PUT repos/runnane/runnerctl/actions/permissions/fork-pr-contributor-approval
-  -f approval_policy=first_time_contributors_new_to_github`), which still
-  gates brand-new accounts opening fork PRs and lets the bot's runs start;
-  read the current value with `gh api` on the same path. Whatever the
-  release PR's checks show, the bumped script is gated by the `push` run on
-  `main` after the merge, which needs no approval and where a red `gates`
-  blocks the tag (`release` needs `gates`). If a bot-authored PR still trips
-  the policy, a `RELEASE_PLEASE_TOKEN` repository secret (PAT, contents +
-  pull-requests write) makes the PR yours and its runs ordinary.
+  branch creates one — but each is created `action_required` behind a
+  "1 workflow awaiting approval" banner and runs only once someone clicks
+  approve. The fork-PR approval policy does **not** release them: GHR-35
+  moved it from `first_time_contributors` to
+  `first_time_contributors_new_to_github` on 2026-09-13 on that theory, and
+  runs created on 09-14, 09-24 and through October were still held (GHR-69;
+  every green release-PR run in that window is `run_attempt: 2`, triggered by
+  the human who approved it). Read the stuck ones with
+  `gh api 'repos/runnane/runnerctl/actions/runs?status=action_required'`.
+
+  The fix is the PR's identity, not a setting. The `release` job mints an
+  installation token with `actions/create-github-app-token` when the
+  repository variable `RELEASE_APP_ID` is set, using the secret
+  `RELEASE_APP_PRIVATE_KEY`, and hands it to release-please; the PR is then
+  authored by that app and its runs are ordinary. The app must be installed
+  on this repository with **Contents** and **Pull requests** read and write —
+  without Contents it cannot push the release branch or create the tag, and
+  the job fails on `main` rather than falling back. The fallback to
+  `GITHUB_TOKEN` applies only when the variable is absent.
+
+  Whatever the release PR's checks show, the bumped script is also gated by
+  the `push` run on `main` after the merge, which needs no approval and where
+  a red `gates` blocks the tag (`release` needs `gates`).
 - The repository setting *Settings → Actions → General → Workflow permissions
   → Allow GitHub Actions to create and approve pull requests* must be on, or
   the action fails with `GitHub Actions is not permitted to create or approve
