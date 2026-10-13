@@ -142,10 +142,19 @@
 # is a fixed-length hash whatever the host is called.
 #FLEET_SSH_OPTS=(-o ControlMaster=auto -o ControlPath=~/.ssh/cm-%C -o ControlPersist=60)
 
-# Most hosts contacted at once, and the per-host seconds budget. The timeout
-# is what stops one wedged host holding up the whole fan-out.
+# Most hosts contacted at once, and the per-host seconds budget of a read-only
+# call (status, health, a watch tick). The timeout is what stops one wedged
+# host holding up the whole fan-out.
 #FLEET_PARALLEL="8"
 #FLEET_TIMEOUT="30"
+
+# The per-host seconds budget of a call that CHANGES things (restart, stop,
+# apply, upgrade, a watch action key, ...). Those are slow by design — a slot
+# whose job ignores SIGTERM sits out its unit's TimeoutStopSec, one slot after
+# another — so raise this on hosts with many slots. A --when-idle or drain
+# wait is added on top automatically: --timeout (else WAIT_TIMEOUT above) per
+# slot on the host.
+#FLEET_MUTATE_TIMEOUT="900"
 
 # The remote command, for hosts where runnerctl is not on the ssh user's PATH.
 #FLEET_RUNNERCTL="runnerctl"

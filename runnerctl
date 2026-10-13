@@ -387,9 +387,16 @@ FLEET_HOSTS=()
 # Extra ssh options, appended AFTER the built-in ones so a site can override
 # any of them (e.g. adding ControlMaster/ControlPersist for a polling loop).
 FLEET_SSH_OPTS=()
-# Most hosts contacted at once, and the per-host seconds budget.
+# Most hosts contacted at once, and the per-host seconds budget of a READ-ONLY
+# call (status, health, a watch tick).
 FLEET_PARALLEL="8"
 FLEET_TIMEOUT="30"
+# The per-host seconds budget of a MUTATING call (GHR-81). Separate because
+# FLEET_TIMEOUT is sized for a status read, and the commands that change
+# things are slow by design: a restart of a slot whose job ignores SIGTERM
+# sits out the unit's TimeoutStopSec, one slot after another. A --when-idle
+# wait is added on top of this, per slot — see fleet_mutate_budget.
+FLEET_MUTATE_TIMEOUT="900"
 # The remote command. Fleet mode requires runnerctl installed on each host
 # (see the fleet section of the README for why); point this at an absolute
 # path where it is not on the ssh user's PATH.
@@ -484,6 +491,7 @@ load_config() {
   # produce N identical errors after N connections have been made.
   [[ "$FLEET_PARALLEL" =~ ^[1-9][0-9]*$ ]] || die "FLEET_PARALLEL '$FLEET_PARALLEL' set in $CONFIG_FILE is invalid — want a whole number of hosts, 1 or more"
   [[ "$FLEET_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "FLEET_TIMEOUT '$FLEET_TIMEOUT' set in $CONFIG_FILE is invalid — want a whole number of seconds, 1 or more"
+  [[ "$FLEET_MUTATE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "FLEET_MUTATE_TIMEOUT '$FLEET_MUTATE_TIMEOUT' set in $CONFIG_FILE is invalid — want a whole number of seconds, 1 or more"
   [ -n "$FLEET_RUNNERCTL" ] || die "FLEET_RUNNERCTL set in $CONFIG_FILE is empty — want the remote command name or an absolute path"
   # Provisioning settings (GHR-45). Checked here so a typo fails before a
   # download, a useradd or a registration — not half way through slot 3.
@@ -3630,9 +3638,17 @@ cmd_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart-stall
 # through FLEET_SSH_OPTS, appended LAST so it overrides both what is set here
 # and the watch's own sockets. Host key policy is deliberately left to the
 # caller's ssh config rather than decided here.
+#
+# The budget (GHR-81) is FLEET_TIMEOUT unless the caller names another for
+# this one call in FLEET_CALL_TIMEOUT — which every MUTATING caller does, from
+# fleet_mutate_budget. A variable rather than an argument so the signature the
+# stub shadows stays HOST COMMAND..., and set per call rather than once per
+# command because a budget walk interleaves status reads (short) with the
+# slot actions (long) and must not lend the reads the long budget.
+FLEET_CALL_TIMEOUT=""
 ssh_run() { # HOST COMMAND...
   local host="$1"; shift
-  timeout "$FLEET_TIMEOUT" ssh \
+  timeout "${FLEET_CALL_TIMEOUT:-$FLEET_TIMEOUT}" ssh \
     -o BatchMode=yes \
     -o ConnectTimeout=10 \
     ${FLEET_SSH_CONTROL_OPTS+"${FLEET_SSH_CONTROL_OPTS[@]}"} \
@@ -3734,6 +3750,10 @@ fleet_cleanup() {
 # per host before the first frame.
 FLEET_OPTIONAL_ARG=""
 FLEET_OPTIONAL_REJECTED=" "
+# Per-host budgets for the fan-out in flight, indexed like FLEET_HOSTS (GHR-81).
+# Empty for a read-only fan-out, which leaves every host on FLEET_TIMEOUT; a
+# mutating command fills it from fleet_mutate_budget before it fans out.
+FLEET_BUDGETS=()
 fleet_fanout() { # REMOTE-ARGS...
   local i host running=0
   local -a retry=()
@@ -3783,7 +3803,7 @@ fleet_fanout_one() { # INDEX REMOTE-ARGS...
   # non-zero ssh_run kills this subshell before the status can be
   # recorded, so every failure would read as the missing-file fallback
   # and a timeout would be indistinguishable from an unreachable host.
-  ssh_run "$host" "${args[@]}" >"$FLEET_DIR/$i.out" 2>"$FLEET_DIR/$i.err" || hrc=$?
+  FLEET_CALL_TIMEOUT="${FLEET_BUDGETS[$i]:-}" ssh_run "$host" "${args[@]}" >"$FLEET_DIR/$i.out" 2>"$FLEET_DIR/$i.err" || hrc=$?
   echo "$hrc" >"$FLEET_DIR/$i.rc"
 }
 
@@ -3800,8 +3820,19 @@ fleet_reachable() { # RC
   case "$1" in 124|255) echo false ;; *) echo true ;; esac
 }
 
-fleet_error_text() { # RC ERRFILE
-  local rc="$1" err="" hint=""
+# What a timed-out MUTATING call adds to `timed out after Ns` (GHR-81).
+# `timeout` kills the local ssh, not the remote runnerctl, which carries on
+# until it next writes to its closed stdout — so the host may be part-way
+# through or about to finish, and "nothing is known about it" is the one thing
+# an operator must not read into the row.
+FLEET_TIMEOUT_STILL_RUNNING="the command may still be running on that host; 'runnerctl fleet status' shows where it got to"
+
+# BUDGET is the seconds the call was given, for the timed-out wording; empty
+# means FLEET_TIMEOUT, the read-only budget. MUTATING (any non-empty word)
+# says the call was changing things on the host, which adds the sentence above.
+fleet_error_text() { # RC ERRFILE [BUDGET [MUTATING]]
+  local rc="$1" err="" hint="" budget="${3:-$FLEET_TIMEOUT}" still=""
+  [ -z "${4:-}" ] || still=" — $FLEET_TIMEOUT_STILL_RUNNING"
   [ ! -s "$2" ] || err="$(head -1 "$2")"
   # An accurate error that leaves the reader to work out the fix is half a
   # message. Name the remedy where it is read.
@@ -3847,7 +3878,7 @@ fleet_error_text() { # RC ERRFILE
   esac
   case "$rc" in
     0)   echo "" ;;
-    124) echo "timed out after ${FLEET_TIMEOUT}s${err:+ — $err}" ;;
+    124) echo "timed out after ${budget}s$still${err:+ — $err}" ;;
     255) echo "unreachable${err:+ — $err}" ;;
     *)   echo "remote exit $rc${err:+ — $err}$hint" ;;
   esac
@@ -4403,10 +4434,17 @@ fleet_budget_walk() { # SUBCOMMAND MODE BUDGET [REMOTE-ARGS...]
         waited=$((waited + POLL_SEC))
       done
     fi
-    local rc1=0
-    ssh_run "$host" "$FLEET_RUNNERCTL" "$sub" "$idx" "$@" >/dev/null 2>&1 || rc1=$?
+    # One slot per call, so the budget is one slot's worth (GHR-81) — and for
+    # this call only: the fleet_slots re-reads above stay on FLEET_TIMEOUT.
+    local rc1=0 budget1
+    budget1="$(fleet_mutate_budget "$sub" 1 "$@")"
+    FLEET_CALL_TIMEOUT="$budget1" ssh_run "$host" "$FLEET_RUNNERCTL" "$sub" "$idx" "$@" >/dev/null 2>&1 || rc1=$?
     if [ "$rc1" = 0 ]; then
       acted=$((acted + 1)); echo "$host slot $idx: $sub ok"
+    elif [ "$rc1" = 124 ]; then
+      # Not "(exit 124)": the slot is not known to have failed, only not known
+      # to have finished, and the walk is about to move on past it.
+      nbad=$((nbad + 1)); echo "$host slot $idx: $sub FAILED ($(fleet_error_text 124 /dev/null "$budget1" mutating))"
     else
       nbad=$((nbad + 1)); echo "$host slot $idx: $sub FAILED (exit $rc1)"
     fi
@@ -4423,6 +4461,68 @@ fleet_budget_walk() { # SUBCOMMAND MODE BUDGET [REMOTE-ARGS...]
   [ "$nbad" -eq 0 ] || return 1
   $stopped_at_floor && return 2
   return 0
+}
+
+# Seconds one MUTATING remote call may take (GHR-81): SUBCOMMAND with
+# REMOTE-ARGS, against a host — or a walk's single slot — of SLOTS slots.
+#
+# FLEET_MUTATE_TIMEOUT covers the action itself. Under --when-idle (and
+# `drain`, which is `stop --when-idle`) the remote also WAITS, by design and
+# for up to its --timeout PER SLOT — idle_gate hands every slot the full
+# WAIT_TIMEOUT, one slot after another — so the wait is added once per slot.
+# The wait is read off the forwarded --timeout, else this node's
+# WAIT_TIMEOUT: a host whose own config raises WAIT_TIMEOUT is waiting longer
+# than this can know, and wants an explicit --timeout on the fleet command.
+fleet_waits_for_idle() { # SUBCOMMAND [REMOTE-ARGS...]
+  local a
+  [ "$1" != drain ] || return 0
+  for a in "${@:2}"; do [ "$a" != --when-idle ] || return 0; done
+  return 1
+}
+fleet_mutate_budget() { # SUBCOMMAND SLOTS [REMOTE-ARGS...]
+  local sub="$1" slots="$2" wait="$WAIT_TIMEOUT" prev="" a
+  shift 2
+  if ! fleet_waits_for_idle "$sub" "$@"; then
+    echo "$FLEET_MUTATE_TIMEOUT"; return 0
+  fi
+  for a in "$@"; do
+    case "$a" in --timeout=*) prev=--timeout; a="${a#*=}" ;; esac
+    # A --timeout the remote will refuse is not this function's to report;
+    # the host says so in a second, well inside any budget.
+    if [ "$prev" = --timeout ] && [[ "$a" =~ ^[0-9]+$ ]]; then wait="$a"; fi
+    prev="$a"
+  done
+  echo $((slots * wait + FLEET_MUTATE_TIMEOUT))
+}
+
+# Fill FLEET_BUDGETS for a mutating fan-out of SUBCOMMAND with REMOTE-ARGS.
+#
+# A command that waits for idle slots needs each host's SLOT COUNT, because
+# its worst case is that many waits end to end — so those, and only those,
+# pay one read-only `status --json` round first (at FLEET_PARALLEL and on
+# FLEET_TIMEOUT, like any other read). Counted the way fleet_slots counts:
+# render_status_json emits one line per slot. A host that does not answer
+# the read is budgeted as ONE slot rather than skipped: it is still asked to
+# do the work, and if it turns out to have been reachable and slow, the
+# timed-out wording says the truth about it.
+fleet_set_budgets() { # SUBCOMMAND [REMOTE-ARGS...]
+  local i n
+  local -a nslots=()
+  if fleet_waits_for_idle "$@"; then
+    fleet_fanout "$FLEET_RUNNERCTL" status --json
+    for i in "${!FLEET_HOSTS[@]}"; do
+      n=0
+      [ "$(fleet_rc "$i")" != 0 ] || n="$(grep -c '"idx":' "$FLEET_DIR/$i.out" || true)"
+      nslots[i]="$n"
+    done
+    fleet_cleanup
+  fi
+  FLEET_BUDGETS=()
+  for i in "${!FLEET_HOSTS[@]}"; do
+    n="${nslots[$i]:-1}"
+    [ "$n" -ge 1 ] || n=1
+    FLEET_BUDGETS[i]="$(fleet_mutate_budget "$1" "$n" "${@:2}")"
+  done
 }
 
 cmd_fleet_run() { # SUBCOMMAND [--host H]... [--all-hosts] [REMOTE-ARGS...]
@@ -4480,6 +4580,10 @@ cmd_fleet_run() { # SUBCOMMAND [--host H]... [--all-hosts] [REMOTE-ARGS...]
   # within a host), serial hosts bound the blast radius to a single host at
   # any moment. It is slow on a large fleet, and that is the right trade for
   # something that can take CI capacity down.
+  #
+  # The budgets are set BEFORE going serial (GHR-81): the slot-count read a
+  # waiting command needs is read-only, and has no reason to queue.
+  fleet_set_budgets "$sub" ${fwd[@]+"${fwd[@]}"}
   FLEET_PARALLEL=1
   fleet_fanout "$FLEET_RUNNERCTL" "$sub" ${fwd[@]+"${fwd[@]}"}
   fleet_run_report "$sub" || rc=$?
@@ -4502,7 +4606,7 @@ fleet_run_report() { # SUBCOMMAND
       [ -n "$line" ] || continue
       printf '%s: %s\n' "$host" "$line"
     done <"$FLEET_DIR/$i.out"
-    [ "$rc" = 0 ] || printf '%s: %s\n' "$host" "$(fleet_error_text "$rc" "$FLEET_DIR/$i.err")"
+    [ "$rc" = 0 ] || printf '%s: %s\n' "$host" "$(fleet_error_text "$rc" "$FLEET_DIR/$i.err" "${FLEET_BUDGETS[$i]:-}" mutating)"
   done
   echo "fleet $sub: $ok host(s) ok, $bad failed"
   [ "$bad" -eq 0 ]
@@ -4537,6 +4641,13 @@ cmd_fleet_upgrade() { # [--check] [--ref REF]
     esac
   done
   require_fleet
+  # GHR-81: the remote downloads with `curl --max-time 30` (fetch_script), so
+  # under FLEET_TIMEOUT — the same 30 s — a slow download and the fan-out's
+  # own timeout raced each other. --check downloads too, so it gets the same
+  # budget; only a real upgrade is reported as possibly still running.
+  local i
+  FLEET_BUDGETS=()
+  for i in "${!FLEET_HOSTS[@]}"; do FLEET_BUDGETS[i]="$(fleet_mutate_budget upgrade 1)"; done
   fleet_fanout "$FLEET_RUNNERCTL" upgrade ${fwd[@]+"${fwd[@]}"}
   fleet_upgrade_report "$check" || rc=$?
   fleet_cleanup
@@ -4563,7 +4674,8 @@ fleet_upgrade_field() { # INDEX KEY
 # remote is the only thing that knows whether it actually wrote the file, and
 # re-deriving that locally would be a second implementation to keep in step.
 fleet_upgrade_report() { # CHECK
-  local check="$1" i host rc cur avail state vers
+  local check="$1" i host rc cur avail state vers mutating=mutating
+  ! $check || mutating=""
   local level=0 changed=0 bad=0
   # Three parallel arrays rather than one delimited string per row: a state
   # word carrying the delimiter would otherwise split a row in half, and the
@@ -4575,7 +4687,7 @@ fleet_upgrade_report() { # CHECK
     if [ "$rc" != 0 ]; then
       bad=$((bad + 1))
       r_host+=("$host"); r_vers+=("—")
-      r_state+=("$(fleet_error_text "$rc" "$FLEET_DIR/$i.err")")
+      r_state+=("$(fleet_error_text "$rc" "$FLEET_DIR/$i.err" "${FLEET_BUDGETS[$i]:-}" "$mutating")")
       continue
     fi
     cur="$(fleet_upgrade_field "$i" installed)"
@@ -4628,8 +4740,11 @@ fleet_upgrade_report() { # CHECK
 # DID NOT ANSWER IS A PROBLEM, never a silent pass — a monitor that goes
 # green because a host dropped out of the fan-out is worse than no monitor,
 # and that is the single assertion this command exists to make true.
+# Non-empty when `fleet health` was asked to --restart-stalled (GHR-81). A
+# global rather than an argument: fleet_health_report's signature is QUIET.
+FLEET_HEALTH_MUTATING=""
 cmd_fleet_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart-stalled]
-  local quiet=false rc=0
+  local quiet=false rc=0 i
   local -a fwd=()
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
@@ -4650,11 +4765,18 @@ cmd_fleet_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart
         [[ "$2" =~ ^[0-9]+$ ]] || die "--stall-after value '$2' is invalid — want a whole number of seconds"
         fwd+=(--stall-after "$2"); shift 2 ;;
       --restart-stalled)
+        # GHR-81: the one health call that changes things — and the slots it
+        # restarts are wedged ones, the slowest restart there is.
+        FLEET_HEALTH_MUTATING=mutating
         fwd+=(--restart-stalled); shift ;;
       *) die "unknown option: $1" ;;
     esac
   done
   require_fleet
+  FLEET_BUDGETS=()
+  if [ -n "$FLEET_HEALTH_MUTATING" ]; then
+    for i in "${!FLEET_HOSTS[@]}"; do FLEET_BUDGETS[i]="$(fleet_mutate_budget restart 1)"; done
+  fi
   fleet_fanout "$FLEET_RUNNERCTL" health ${fwd[@]+"${fwd[@]}"}
   fleet_health_report "$quiet" || rc=$?
   fleet_cleanup
@@ -4696,11 +4818,11 @@ fleet_health_report() { # QUIET
         # exit 0 with the failure invisible: the exact hole this command
         # exists to close.
         if [ "${#problems[@]}" -eq "$before" ]; then
-          problems+=("$host: $(fleet_error_text "$rc" "$FLEET_DIR/$i.err")")
+          problems+=("$host: $(fleet_error_text "$rc" "$FLEET_DIR/$i.err" "${FLEET_BUDGETS[$i]:-}" "$FLEET_HEALTH_MUTATING")")
         fi
         ;;
       *)
-        problems+=("$host: $(fleet_error_text "$rc" "$FLEET_DIR/$i.err")")
+        problems+=("$host: $(fleet_error_text "$rc" "$FLEET_DIR/$i.err" "${FLEET_BUDGETS[$i]:-}" "$FLEET_HEALTH_MUTATING")")
         ;;
     esac
   done
@@ -5071,15 +5193,21 @@ fleet_watch_key_action() { # KEY
 # The slot name was read off the host's own frame, and ssh hands its argv to
 # the remote shell as one string: %q keeps a systemd-escaped name (`\x2d`)
 # or anything else odd a single argument there. A plain name is unchanged.
+#
+# GHR-81: on the mutating budget, not FLEET_TIMEOUT. The watch is held for as
+# long as the action takes either way — a restart that sits out a wedged
+# job's TimeoutStopSec is minutes — but giving up at 30 s only made the frame
+# say `failed` about an action that then completed behind it.
 fleet_watch_run_action() {
-  local rc=0 last
+  local rc=0 last budget
+  budget="$(fleet_mutate_budget "$FW_ACTION" 1)"
   printf '\nrunning on %s: %s %s %s\n' "$FW_ACT_HOST" "$FLEET_RUNNERCTL" "$FW_ACTION" "$FW_ACT_NAME"
-  (ssh_run "$FW_ACT_HOST" "$FLEET_RUNNERCTL" "$FW_ACTION" "$(printf %q "$FW_ACT_NAME")") >"$FW_TMP/out" 2>"$FW_TMP/err" || rc=$?
+  (FLEET_CALL_TIMEOUT="$budget" ssh_run "$FW_ACT_HOST" "$FLEET_RUNNERCTL" "$FW_ACTION" "$(printf %q "$FW_ACT_NAME")") >"$FW_TMP/out" 2>"$FW_TMP/err" || rc=$?
   if [ "$rc" = 0 ]; then
     last="$(grep . "$FW_TMP/out" | tail -1 || true)"
     FW_NOTICE="$FW_ACT_NAME on $FW_ACT_HOST: ${last:-$FW_ACTION done}"
   else
-    FW_NOTICE="$FW_ACT_NAME on $FW_ACT_HOST: $FW_ACTION failed — $(fleet_error_text "$rc" "$FW_TMP/err")"
+    FW_NOTICE="$FW_ACT_NAME on $FW_ACT_HOST: $FW_ACTION failed — $(fleet_error_text "$rc" "$FW_TMP/err" "$budget" mutating)"
   fi
   FW_ACTION="" FW_PROMPT="" FW_REFRESH=true
 }
@@ -6032,10 +6160,19 @@ cmd_config_example() {
 # is a fixed-length hash whatever the host is called.
 #FLEET_SSH_OPTS=(-o ControlMaster=auto -o ControlPath=~/.ssh/cm-%C -o ControlPersist=60)
 
-# Most hosts contacted at once, and the per-host seconds budget. The timeout
-# is what stops one wedged host holding up the whole fan-out.
+# Most hosts contacted at once, and the per-host seconds budget of a read-only
+# call (status, health, a watch tick). The timeout is what stops one wedged
+# host holding up the whole fan-out.
 #FLEET_PARALLEL="8"
 #FLEET_TIMEOUT="30"
+
+# The per-host seconds budget of a call that CHANGES things (restart, stop,
+# apply, upgrade, a watch action key, ...). Those are slow by design — a slot
+# whose job ignores SIGTERM sits out its unit's TimeoutStopSec, one slot after
+# another — so raise this on hosts with many slots. A --when-idle or drain
+# wait is added on top automatically: --timeout (else WAIT_TIMEOUT above) per
+# slot on the host.
+#FLEET_MUTATE_TIMEOUT="900"
 
 # The remote command, for hosts where runnerctl is not on the ssh user's PATH.
 #FLEET_RUNNERCTL="runnerctl"

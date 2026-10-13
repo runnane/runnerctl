@@ -2935,7 +2935,9 @@ case_fleet_upgrade_failed_host_is_a_row_not_an_abort() {
   expect_rc 1
   expect_out '^build-2-oldver +0\.0\.1 -> 9\.9\.9 +upgraded$'
   expect_out '^gw-unreachable +— +unreachable — '
-  expect_out '^slow-timeout +— +timed out after 30s$'
+  # GHR-81: an upgrade is a mutating call — its own budget, and a timeout that
+  # says the host may have carried on rather than "nothing is known"
+  expect_out "^slow-timeout +— +timed out after 900s — the command may still be running on that host; 'runnerctl fleet status' shows where it got to\$"
   expect_out '^3 host\(s\): 0 already level, 1 upgraded, 2 unreachable or unclear$'
 }
 
@@ -3046,11 +3048,237 @@ case_fleet_capacity_removal_allowed_when_scoped_or_acknowledged() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet drain --host build-1
   expect_rc 0
   expect_out '^build-1: drain done\.$'
-  expect_log_count '^probe:ssh_run ' 1
+  # GHR-81: a drain waits per slot, so each targeted host is first asked how
+  # many it has — one read, and still exactly one drain
+  expect_log_count '^probe:ssh_run .* -- runnerctl drain$' 1
+  expect_log_count '^probe:ssh_run ' 2
+  expect_no_log '^probe:ssh_run build-2 '
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet drain --all-hosts
   expect_rc 0
   expect_out '^fleet drain: 2 host\(s\) ok, 0 failed$'
-  expect_log_count '^probe:ssh_run ' 2
+  expect_log_count '^probe:ssh_run .* -- runnerctl drain$' 2
+}
+
+# --- GHR-81: a mutating call has its own, much larger budget -------------------
+# FLEET_TIMEOUT (30 s) is sized for a status read, and it used to govern every
+# remote call. The stub models how long a call takes (RUNNERCTL_STUB_FLEET_DELAY)
+# against the budget the caller gave it, so nothing here sleeps.
+#
+# The delay is the SAME 45 s on every call to the host in both halves — the
+# slot-count read a drain makes first times out on it as well, and the drain
+# is then budgeted for one slot — so the only thing that separates the half
+# that succeeds from the half that times out is which budget the call was on.
+case_fleet_drain_outlasts_the_read_only_budget() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_DELAY="build-1:45" \
+    run fleet drain --host build-1
+  expect_rc 0
+  expect_out '^build-1: drain done\.$'
+  expect_out '^fleet drain: 1 host\(s\) ok, 0 failed$'
+  # no wait involved: FLEET_MUTATE_TIMEOUT on its own covers it too
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_DELAY="build-1:45" \
+    run fleet restart --host build-1
+  expect_rc 0
+  expect_out '^build-1: restart done\.$'
+  expect_no_log 'status --json'
+  # the negative control: the read-only budget has NOT grown, and a read that
+  # ran out says nothing about a command still running
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_DELAY="build-1:45" \
+    run fleet status
+  expect_rc 1
+  expect_out '^build-1 +timed out after 30s$'
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_DELAY="build-1:45" \
+    run fleet health
+  expect_rc 1
+  expect_out '^build-1: timed out after 30s$'
+}
+
+# When a mutating call does run out, the row must not read as "nothing is
+# known": `timeout` kills the local ssh, and the remote carries on. The budget
+# in the message is the one the call was actually given, and it is exactly
+# FLEET_MUTATE_TIMEOUT — one second less and the call completes.
+case_fleet_mutating_timeout_says_it_may_still_be_running() {
+  local cfg="$TMP/ghr81.config"
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_DELAY="build-1:900:restart" \
+    run fleet restart
+  expect_rc 1
+  expect_out "^build-1: timed out after 900s — the command may still be running on that host; 'runnerctl fleet status' shows where it got to\$"
+  expect_out '^build-2: restart done\.$'
+  expect_out '^fleet restart: 1 host\(s\) ok, 1 failed$'
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_DELAY="build-1:899:restart" \
+    run fleet restart
+  expect_rc 0
+  expect_out '^fleet restart: 2 host\(s\) ok, 0 failed$'
+  # the knob is a config setting like any other, validated before dialling
+  save_config "$cfg" <<<'FLEET_MUTATE_TIMEOUT=120'
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_FLEET_DELAY="build-1:119:restart" \
+    run_cfg "$cfg" fleet restart
+  expect_rc 0
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_FLEET_DELAY="build-1:120:restart" \
+    run_cfg "$cfg" fleet restart
+  expect_rc 1
+  expect_out '^build-1: timed out after 120s — the command may still be running on that host; '
+  save_config "$cfg" <<<'FLEET_MUTATE_TIMEOUT=0'
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$cfg" fleet restart
+  expect_rc 1
+  expect_err "FLEET_MUTATE_TIMEOUT '0' set in .* is invalid — want a whole number of seconds, 1 or more"
+  expect_no_log '^probe:ssh_run '
+  rm -f "$cfg"
+}
+
+# --when-idle waits up to --timeout PER SLOT, one slot after another, so the
+# budget is the host's slot count times the wait, plus the action's own
+# budget. The stub's hosts have three slots: 3 x 60 + 900 = 1080.
+case_fleet_when_idle_budget_is_the_wait_per_slot_plus_the_action() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_FLEET_DELAY="build-1:1079:restart" \
+    run fleet restart --when-idle --timeout 60
+  expect_rc 0
+  expect_out '^build-1: restart done\.$'
+  # the slot count is read first, read-only, and only because of the wait
+  expect_log_order '^probe:ssh_run build-1 -- runnerctl status --json$' \
+                   '^probe:ssh_run build-1 -- runnerctl restart --when-idle --timeout 60$'
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_FLEET_DELAY="build-1:1080:restart" \
+    run fleet restart --when-idle --timeout=60
+  expect_rc 1
+  expect_out '^build-1: timed out after 1080s — the command may still be running on that host; '
+  # no --timeout: this node's WAIT_TIMEOUT (1800), and drain implies the wait
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_FLEET_DELAY="build-1:6299:drain" \
+    run fleet drain --host build-1
+  expect_rc 0
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_FLEET_DELAY="build-1:6300:drain" \
+    run fleet drain --host build-1
+  expect_rc 1
+  expect_out '^build-1: timed out after 6300s — the command may still be running on that host; '
+  # a host that does not answer the slot-count read is still asked to do the
+  # work, budgeted as one slot: 1 x 60 + 900
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_FLEET_DELAY="build-1:45:status build-1:959:restart" \
+    run fleet restart --when-idle --timeout 60
+  expect_rc 0
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_FLEET_DELAY="build-1:45:status build-1:960:restart" \
+    run fleet restart --when-idle --timeout 60
+  expect_rc 1
+  expect_out '^build-1: timed out after 960s — '
+}
+
+# The arithmetic on its own, through the real function.
+case_fleet_mutate_budget_arithmetic() {
+  run_fn fleet_mutate_budget restart 3
+  expect_out '^900$'
+  # --timeout without --when-idle bounds nothing on the remote, so adds nothing
+  run_fn fleet_mutate_budget restart 3 --timeout 60
+  expect_out '^900$'
+  run_fn fleet_mutate_budget restart 3 --when-idle --timeout 60
+  expect_out '^1080$'
+  run_fn fleet_mutate_budget stop 2 --timeout=10 --when-idle
+  expect_out '^920$'
+  run_fn fleet_mutate_budget drain 3
+  expect_out '^6300$'
+  # a --timeout the remote will refuse falls back to WAIT_TIMEOUT
+  run_fn fleet_mutate_budget restart 1 --when-idle --timeout nope
+  expect_out '^2700$'
+  expect_rc 0
+}
+
+# The budget walk makes one remote call per SLOT, so each gets one slot's
+# budget — and the status re-reads between them stay on FLEET_TIMEOUT.
+case_fleet_budget_walk_gives_each_slot_the_mutating_budget() {
+  RUNNERCTL_STUB_FLEET_SLOTS=2 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    RUNNERCTL_STUB_FLEET_DELAY="build-1:45:restart" run fleet restart --max-unavailable 1
+  expect_rc 0
+  expect_out '^build-1 slot 0: restart ok$'
+  expect_out '^fleet restart: 4 slot\(s\) done, 0 failed$'
+  # under --when-idle a slot's budget is its wait plus the action: 60 + 900
+  RUNNERCTL_STUB_FLEET_SLOTS=2 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    RUNNERCTL_STUB_FLEET_DELAY="build-1:959:restart" run fleet restart --max-unavailable 1 --when-idle --timeout 60
+  expect_rc 0
+  expect_out '^fleet restart: 4 slot\(s\) done, 0 failed$'
+  RUNNERCTL_STUB_FLEET_SLOTS=2 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    RUNNERCTL_STUB_FLEET_DELAY="build-1:960:restart" run fleet restart --max-unavailable 1 --when-idle --timeout 60
+  expect_rc 1
+  # not "(exit 124)": the slot is not known to have failed
+  expect_out_count "^build-1 slot [01]: restart FAILED \\(timed out after 960s — the command may still be running on that host; 'runnerctl fleet status' shows where it got to\\)\$" 2
+  expect_out '^build-2 slot 1: restart ok$'
+  expect_out '^fleet restart: 2 slot\(s\) done, 2 failed$'
+  # the negative control: a re-read that takes 45 s is still a host that did
+  # not answer — the slot budget is lent to the slot action and nothing else
+  RUNNERCTL_STUB_FLEET_SLOTS=2 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    RUNNERCTL_STUB_FLEET_DELAY="build-1:45:status" run fleet restart --max-unavailable 1
+  expect_out '^warning: 1 host\(s\) did not answer — the budget is being held over the 2 slot\(s\) that did$'
+  expect_no_log '^probe:ssh_run build-1 -- runnerctl restart'
+  # ...and that has to hold for a re-read made AFTER a slot action, which the
+  # run above cannot show: its slow host is out before anything is acted on.
+  # Here build-2 never answers a read in time, so the floor is held over
+  # build-1's two slots alone: one drained, one left. Were the re-reads on
+  # the long budget, build-2's would answer, its two slots would count as
+  # available, and build-1 would be drained dry.
+  #
+  # What this does NOT separate, measured: the walk naming the slot budget
+  # for its one call from the fan-out naming its own budget for every read.
+  # Either alone keeps the re-reads short — a walk that left its slot budget
+  # set stayed green here, because fleet_fanout_one overrode it — so this
+  # goes red only when the fan-out itself lends a read the long budget.
+  RUNNERCTL_STUB_FLEET_SLOTS=2 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    RUNNERCTL_STUB_FLEET_DELAY="build-2:45:status" run fleet drain --min-available 1
+  expect_rc 2
+  expect_out '^fleet drain: 1 slot\(s\) done, 0 failed, 1 left running at the floor$'
+  expect_out '^left running to hold --min-available 1: build-1/1$'
+}
+
+# `fleet watch`'s action keys, `fleet upgrade` and `fleet health
+# --restart-stalled` are the other mutating callers of ssh_run.
+case_fleet_other_mutating_callers_are_on_the_mutating_budget() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jRy-q' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    RUNNERCTL_STUB_FLEET_DELAY="build-1:45:restart" run fleet watch --color never
+  expect_rc 0
+  expect_out '^example\.slot-2 on build-1: restart done\.$'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jRy-q' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    RUNNERCTL_STUB_FLEET_DELAY="build-1:900:restart" run fleet watch --color never
+  expect_rc 0
+  expect_out "^example\\.slot-2 on build-1: restart failed — timed out after 900s — the command may still be running on that host; 'runnerctl fleet status' shows where it got to\$"
+  # upgrade: the remote's own download is allowed 30 s, which used to be the
+  # whole budget around it
+  RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" RUNNERCTL_STUB_FLEET_DELAY="build-2-oldver:45:upgrade" \
+    run fleet upgrade
+  expect_rc 0
+  expect_out '^build-2-oldver +0\.0\.1 -> 9\.9\.9 +upgraded$'
+  # --check downloads too, so it is on the same budget — but it changes
+  # nothing, so its timeout does not claim a command is still running
+  RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" RUNNERCTL_STUB_FLEET_DELAY="build-2-oldver:45:upgrade" \
+    run fleet upgrade --check
+  expect_out '^build-2-oldver +0\.0\.1 -> 9\.9\.9 '
+  RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" RUNNERCTL_STUB_FLEET_DELAY="build-2-oldver:900:upgrade" \
+    run fleet upgrade --check
+  expect_rc 1
+  expect_out '^build-2-oldver +— +timed out after 900s$'
+  # health: read-only until it is asked to restart what it finds
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_FLEET_DELAY="build-1:45:health" \
+    run fleet health --restart-stalled
+  expect_rc 0
+  expect_no_out 'timed out'
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_FLEET_DELAY="build-1:900:health" \
+    run fleet health --restart-stalled
+  expect_rc 1
+  expect_out "^build-1: timed out after 900s — the command may still be running on that host; 'runnerctl fleet status' shows where it got to\$"
+}
+
+# Every case above goes through the stub's ssh_run, which MODELS `timeout`.
+# This one runs the real ssh_run against a fake `ssh` that takes two seconds,
+# so what is pinned is the real wrapper: it cuts a call off at FLEET_TIMEOUT,
+# and at FLEET_CALL_TIMEOUT instead when the caller named one.
+case_fleet_real_ssh_run_times_out_on_the_budget_of_the_call() {
+  local d saved="$PATH"
+  d="$(mktemp -d "$TMP/ghr81.XXXXXX")"
+  mkdir "$d/bin"
+  printf '#!/bin/sh\nsleep 2\necho "answered: $*"\n' >"$d/bin/ssh"
+  chmod +x "$d/bin/ssh"
+  PATH="$d/bin:$PATH"
+  run_fn eval 'FLEET_TIMEOUT=1; ssh_run host-a runnerctl status'
+  expect_rc 124
+  expect_no_out 'answered'
+  run_fn eval 'FLEET_TIMEOUT=1; FLEET_CALL_TIMEOUT=30 ssh_run host-a runnerctl restart'
+  PATH="$saved"
+  expect_rc 0
+  expect_out '^answered: -o BatchMode=yes -o ConnectTimeout=10 -- host-a runnerctl restart$'
+  rm -rf "$d"
 }
 
 # The most likely failure of a mutating fan-out, and the one BatchMode=yes
@@ -5645,6 +5873,13 @@ t "fleet --host: targets exactly those hosts, repeatable"              case_flee
 t "fleet --host: an unknown host dies before anything is dialled"      case_fleet_host_unknown_dies_before_dialling
 t "fleet stop/drain/disable: refused fleet-wide without explicit scope" case_fleet_capacity_removal_refused_without_explicit_scope
 t "fleet drain: allowed with --host or --all-hosts"                    case_fleet_capacity_removal_allowed_when_scoped_or_acknowledged
+t "fleet drain: outlasts FLEET_TIMEOUT; status still times out (GHR-81)" case_fleet_drain_outlasts_the_read_only_budget
+t "fleet <mutating>: a timeout says the host may still be running it"  case_fleet_mutating_timeout_says_it_may_still_be_running
+t "fleet --when-idle: budget is the wait per slot plus the action"     case_fleet_when_idle_budget_is_the_wait_per_slot_plus_the_action
+t "fleet <mutating>: the budget arithmetic"                            case_fleet_mutate_budget_arithmetic
+t "fleet budget walk: each slot call is on the mutating budget"        case_fleet_budget_walk_gives_each_slot_the_mutating_budget
+t "fleet watch keys, upgrade, health --restart-stalled: same budget"   case_fleet_other_mutating_callers_are_on_the_mutating_budget
+t "fleet ssh_run: the real timeout wrapper honours the call's budget"  case_fleet_real_ssh_run_times_out_on_the_budget_of_the_call
 t "fleet <mutating>: a sudo failure is a named row with the remedy"    case_fleet_sudo_failure_is_a_named_row_with_the_remedy
 t "fleet env-init/logs: excluded, each saying why"                     case_fleet_excluded_commands_say_why
 # --- GHR-44: capacity budgets -------------------------------------------------
