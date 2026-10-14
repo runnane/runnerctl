@@ -6796,6 +6796,149 @@ case_scale_save_writes_the_profile_it_scaled_with() {
   expect_cfg "$cfg" "^  # Saved by \`runnerctl scale --save\` on [0-9]{4}-[0-9]{2}-[0-9]{2}\."
 }
 
+# --- GHR-135: --save writes the config through write_as --------------------------
+# save_profile's cp -p + tee (an existing config) and mkdir + tee + chown + chmod
+# (a new one) are several calls on names in the config's directory, so under
+# sudo (RUNNERCTL_STUB_AS_ROOT=1) they follow GHR-117's rule. A whole `apply
+# --save` run needs the stub's run_priv for the systemd calls and GHR-117's for
+# the case's own names, so this config routes each call by whether it names
+# the case directory: the drop-ins and daemon-reload stay the stub's (logged,
+# mirrored, never run), and the config write is made for real as this user.
+ghr135_config() { # CONFIG-PATH OVERRIDES   (further config body on stdin)
+  {
+    echo ". $PWD/$STUB"
+    cat <<'CFG'
+eval "ghr135_stub_run_priv() $(declare -f run_priv | tail -n +2)"
+CFG
+    echo ". $2"
+    cat <<'CFG'
+eval "ghr135_case_run_priv() $(declare -f run_priv | tail -n +2)"
+run_priv() { case "$*" in *"$GHR117_DIR"*) ghr135_case_run_priv "$@" ;; *) ghr135_stub_run_priv "$@" ;; esac; }
+CFG
+    cat
+  } >"$1"
+}
+
+# A root call (no runuser) on a name in the case directory.
+ghr135_root_call() { printf '^(cp|chmod|chown|mv|tee|rm|mkdir) .*%s' "$(ere_quote "$1")"; }
+
+case_ghr135_save_in_a_user_s_directory_is_written_as_that_user() {
+  local d="$TMP/ghr135u" ov="$TMP/ghr135u.sh" u me c cq
+  rm -rf "$d"; mkdir -p "$d/home/cfg"
+  ghr117_overrides "$ov" "$d"
+  u="$(id -u)"; me="$(getent passwd "$u" | cut -d: -f1)"
+  c="$d/home/cfg/config"; cq="$(ere_quote "$c")"
+  ghr135_config "$c" "$ov" </dev/null
+  cp "$c" "$d/before"
+  local tbl="$d/home $u 755
+$d/home/cfg $u 755
+$d/home/cfg/config $u 644
+$d/home/cfg/config.bak $u 644
+$d/home/new $u 755"
+  # An existing config: the .bak copy and the rewrite, both as the owner.
+  GHR117_TABLE="$tbl" RUNNERCTL_STUB_AS_ROOT=1 run_cfg "$c" apply --profile ci --high infinity --save
+  expect_rc 0
+  expect_out "^Saved profile 'ci' to $cq \\(previous version: $cq\\.bak\\)\\.$"
+  expect_log_order \
+    "^tee $(ere_quote "$DROPIN_DIR/$U1.d/10-runnerctl.conf")\$" \
+    "^runuser -u $me -- cp -p $cq $cq\\.bak\$" \
+    "^runuser -u $me -- tee $cq\$"
+  expect_no_log "$(ghr135_root_call "$d")"
+  expect_no_log 'chown'
+  expect_cfg "$c" "^  MEM_HIGH='infinity'$"
+  expect_same_file "$c.bak" "$d/before"
+  # A config that does not exist yet, in a directory yet to be made: mkdir,
+  # tee and chmod as the owner, no chown — the file is theirs, at 644.
+  local n="$d/home/new/cfg/config" nq
+  nq="$(ere_quote "$n")"
+  GHR117_TABLE="$tbl" RUNNERCTL_STUB_AS_ROOT=1 run_snippet "$n" \
+    "$(printf '. %q; PROFILE=ci; load_profile; MEM_HIGH=infinity; save_profile apply' "$ov")"
+  expect_rc 0
+  expect_out "^Created $nq with profile 'ci'\\.$"
+  expect_text "calls of a new config's save in a user's directory" \
+    "$(printf '%s\n' "runuser -u $me -- mkdir -p $d/home/new/cfg" "runuser -u $me -- tee $n" "runuser -u $me -- chmod 644 $n")" \
+    "$(cat "$LOG")"
+  expect_cfg "$n" "^  MEM_HIGH='infinity'$"
+  expect_mode "$n" 644
+}
+
+case_ghr135_save_refuses_a_directory_others_can_write() {
+  local d="$TMP/ghr135r" ov="$TMP/ghr135r.sh" u r c h
+  rm -rf "$d"; mkdir -p "$d/shared" "$d/home/cfg"
+  ghr117_overrides "$ov" "$d"
+  u="$(id -u)"; r="$(ere_quote "$d")"
+  c="$d/shared/config"; h="$d/home/cfg/config"
+  ghr135_config "$c" "$ov" </dev/null; cp "$c" "$d/shared.before"
+  ghr135_config "$h" "$ov" </dev/null; cp "$h" "$d/home.before"
+  # (a) world-writable, root's: refused before the first drop-in, let alone
+  # the config — nothing is logged and nothing on the host changed.
+  GHR117_TABLE="$d/shared 0 777" RUNNERCTL_STUB_AS_ROOT=1 run_cfg "$c" apply --profile ci --high infinity --save
+  expect_rc 1
+  expect_err "^runnerctl: refusing to save $r/shared/config as root: $r/shared is group- or world-writable \\(mode 777\\) — whoever can write $r/shared could swap a name in it between root's calls \\(GHR-117\\)\\."
+  expect_text "calls logged by a refused apply --save (world-writable)" "" "$(grep -vE '^probe:' "$LOG"; true)"
+  expect_no_path "$DROPIN_DIR/$U1.d/10-runnerctl.conf"
+  expect_same_file "$c" "$d/shared.before"
+  expect_no_path "$c.bak"
+  # (b) scale asks first too.
+  GHR117_TABLE="$d/shared 0 777" RUNNERCTL_STUB_AS_ROOT=1 run_cfg "$c" scale 2 --profile ci --high infinity --save
+  expect_rc 1
+  expect_err "^runnerctl: refusing to save $r/shared/config as root: $r/shared is group- or world-writable"
+  expect_text "calls logged by a refused scale --save" "" "$(grep -vE '^probe:' "$LOG"; true)"
+  expect_same_file "$c" "$d/shared.before"
+  # (c) a root-owned config in a user's directory — the shape a home config
+  # under sudo has: the user could swap it or its .bak between root's calls.
+  GHR117_TABLE="$d/home $u 755
+$d/home/cfg $u 755
+$h 0 644" RUNNERCTL_STUB_AS_ROOT=1 run_cfg "$h" apply --profile ci --high infinity --save
+  expect_rc 1
+  expect_err "^runnerctl: refusing to save $r/home/cfg/config as root: $r/home/cfg/config is owned by uid 0, not by uid $u who owns $r/home/cfg — "
+  expect_text "calls logged by a refused apply --save (foreign config)" "" "$(grep -vE '^probe:' "$LOG"; true)"
+  expect_same_file "$h" "$d/home.before"
+  expect_no_path "$h.bak"
+  # (d) a .bak someone else planted counts as a name the write touches.
+  : >"$h.bak"
+  GHR117_TABLE="$d/home $u 755
+$d/home/cfg $u 755
+$h $u 644
+$h.bak 4242 644" RUNNERCTL_STUB_AS_ROOT=1 run_cfg "$h" apply --profile ci --high infinity --save
+  expect_rc 1
+  expect_err "as root: $r/home/cfg/config\\.bak is owned by uid 4242, not by uid $u who owns $r/home/cfg — "
+  expect_text "calls logged by a refused apply --save (foreign .bak)" "" "$(grep -vE '^probe:' "$LOG"; true)"
+  expect_same_file "$h" "$d/home.before"
+}
+
+case_ghr135_save_in_a_root_owned_directory_is_root_s_write_as_before() {
+  local d="$TMP/ghr135t" ov="$TMP/ghr135t.sh" c n
+  rm -rf "$d"; mkdir -p "$d/sys"
+  ghr117_overrides "$ov" "$d"
+  c="$d/sys/config"; n="$d/sys/new/config"
+  ghr135_config "$c" "$ov" </dev/null
+  # Under sudo, a chain root's alone (unlisted paths are root's, 755): root's
+  # own two calls, as today.
+  RUNNERCTL_STUB_AS_ROOT=1 run_cfg "$c" apply --profile ci --high infinity --save
+  expect_rc 0
+  expect_text "root's calls for a trusted config" \
+    "$(printf '%s\n' "cp -p $c $c.bak" "tee $c")" \
+    "$(grep -F "$d" "$LOG"; true)"
+  expect_no_log '^runuser '
+  expect_cfg "$c" "^  MEM_HIGH='infinity'$"
+  # A new one: mkdir, tee, chmod 644, and — as for a root process today, which
+  # needs no sudo to write — no chown.
+  RUNNERCTL_STUB_AS_ROOT=1 run_snippet "$n" \
+    "$(printf '. %q; PROFILE=ci; load_profile; MEM_HIGH=infinity; save_profile apply' "$ov")"
+  expect_rc 0
+  expect_text "root's calls for a new trusted config" \
+    "$(printf '%s\n' "mkdir -p $d/sys/new" "tee $n" "chmod 644 $n")" \
+    "$(cat "$LOG")"
+  expect_mode "$n" 644
+  # Not root, and the directory writable: this process's own write, unjudged
+  # and unlogged — the path every GHR-58 --save case is on.
+  GHR117_TABLE="$d/sys 4242 777" run_cfg "$c" apply --profile ci --high 29G --save
+  expect_rc 0
+  expect_text "calls logged by an unprivileged save" "" "$(grep -F "$d" "$LOG"; true)"
+  expect_cfg "$c" "^  MEM_HIGH='29G'$"
+}
+
 # --- compose-reap: compose stacks whose job is gone -----------------------------
 # The fixture in tests/stub.config holds one project per verdict path; these
 # pin each verdict, the removal order and scope, and the two refusals.
@@ -10075,6 +10218,10 @@ t "GHR-117: a user's own copy under sudo is written as that user"        case_gh
 t "GHR-117: a directory others can write is refused before any call"     case_ghr117_refuses_a_directory_others_can_write
 t "GHR-117: a root-owned target is root's write, as before"              case_ghr117_a_root_owned_target_is_root_s_write_as_before
 t "GHR-117: the real chain owner over /tmp"                              case_ghr117_real_chain_owner
+# GHR-135: apply/scale --save write the config through write_as
+t "GHR-135: --save in a user's directory is written as that user"       case_ghr135_save_in_a_user_s_directory_is_written_as_that_user
+t "GHR-135: --save refuses a directory others can write, before a call" case_ghr135_save_refuses_a_directory_others_can_write
+t "GHR-135: --save in a root-owned directory is root's write, as before" case_ghr135_save_in_a_root_owned_directory_is_root_s_write_as_before
 
 # --- GHR-48: the real discover(), not the stub's stand-in -------------------
 t "discover: no matching units is empty and exit 0, not a failure"     case_discover_no_matching_units_is_empty_not_a_failure

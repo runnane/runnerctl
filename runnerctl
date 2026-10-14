@@ -2808,6 +2808,13 @@ render_profile_block() { # COMMAND
   echo "}"
 }
 
+# How --save writes FILE (GHR-135): write_as on its directory, naming the file
+# and its .bak. apply and scale ask before their first drop-in, so a refusal
+# leaves the host as it was; save_profile asks again when it writes.
+save_write_as() { # FILE
+  write_as "$(dirname "$1")" "save $1" "$1" "$1.bak"
+}
+
 save_profile() { # COMMAND
   local cmd="$1" f="$CONFIG_FILE" tmpd blk cand head_line start end existed=false
   tmpd="$(mktemp -d)"; blk="$tmpd/block"; cand="$tmpd/config"
@@ -2887,8 +2894,18 @@ save_profile() { # COMMAND
     die "--save: the saved profile_$PROFILE does not re-render the drop-in just applied — $f left unchanged. The drop-ins on disk are correct; nothing else was touched."
   fi
 
-  local priv=()
-  ! needs_priv "$f" || priv=(run_priv)
+  local priv=() newroot=false
+  ! needs_priv "$f" || { priv=(run_priv); newroot=true; }
+  # GHR-135: cp + tee, or mkdir + tee + chown + chmod, are several calls on
+  # names in the config's directory, so they are root's only in a directory
+  # nobody else can write — the rule migrate's config write follows (GHR-117,
+  # write_as): root's calls, every call as the one user who owns the
+  # directory (no chown: the new file is theirs, 644), or a refusal before
+  # the first call. $cand is in this process's own mktemp directory and is
+  # opened by this shell, on stdin, so the user's tee never opens it.
+  save_write_as "$f"
+  [ "${#WRITE_AS[@]}" -eq 0 ] || priv=("${WRITE_AS[@]}")
+  [ -z "$WRITE_USER" ] || newroot=false
   if $existed; then
     # tee onto the existing file keeps its inode, owner and mode — the ones
     # load_config already accepted when it sourced it this run.
@@ -2897,7 +2914,7 @@ save_profile() { # COMMAND
   else
     "${priv[@]}" mkdir -p "$(dirname "$f")"
     "${priv[@]}" tee "$f" <"$cand" >/dev/null
-    [ "${#priv[@]}" -eq 0 ] || run_priv chown root:root "$f"
+    ! $newroot || run_priv chown root:root "$f"
     "${priv[@]}" chmod 644 "$f"
   fi
   if [ -r "$f" ] && ! cmp -s "$cand" "$f"; then
@@ -3943,6 +3960,7 @@ cmd_apply() {
     die "--when-idle only applies to the restart: use 'apply --restart --when-idle' (apply alone just writes drop-ins)"
   fi
   require_runners; guard_env_file
+  ! $do_save || save_write_as "$CONFIG_FILE"
   local units=() u t short_list=""
   if [ "${#TARGETS[@]}" -gt 0 ]; then
     for t in "${TARGETS[@]}"; do
@@ -3993,6 +4011,7 @@ cmd_scale() {
   load_profile; parse_opts "$@"
   [ "${#TARGETS[@]}" -eq 0 ] || die "unexpected argument: ${TARGETS[*]}"
   require_runners; guard_env_file
+  ! $do_save || save_write_as "$CONFIG_FILE"
   mapfile -t units < <(discover)
   local total=${#units[@]}
   { [ "$n" -ge 1 ] && [ "$n" -le "$total" ]; } || die "N must be 1..$total"
