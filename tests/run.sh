@@ -5664,6 +5664,249 @@ case_provision_replace_never_writes_through_a_runner_tree() {
   expect_no_root_exec_in_runner_dirs "$d/rr"
 }
 
+# --- GHR-121: the runner root must be root's -----------------------------------
+# provision and deprovision do their root file work inside --runner-root, and
+# `mkdir -p` keeps an existing directory as it finds it, so a root the runner
+# user (or anyone) can write let them swap a slot under root's calls. The check
+# reads metadata only and runs before the first privileged call.
+#
+# No sim directory is root-owned and the sim does not run as root, so these
+# cases run the REAL check (RUNNERCTL_STUB_ROOT_REAL=1 — the stub otherwise
+# answers "fine") and fake only `stat`'s uid and mode, per path, from
+# GHR121_TABLE ("PATH UID MODE" per line; a path not listed is root's, 755), as
+# GHR-89's cases do. `readlink -m`, `-L` and `-e` are the real ones, on real
+# fixture directories. The real helper is also run unfaked over real
+# directories by case_ghr121_real_runner_root_check.
+ghr121_config() { # PATH CASE-DIR
+  {
+    echo ". $PWD/$STUB"
+    printf 'GHR121_DIR=%q\n' "$2"
+    cat <<'CFG'
+eval "root_exec_problem() $(declare -f real_root_exec_problem | tail -n +2)"
+stat() {
+  if [ "${1:-}" = -c ] && { [ "${2:-}" = %u ] || [ "${2:-}" = %a ]; }; then
+    local p u m
+    while read -r p u m; do
+      [ "$p" = "$3" ] || continue
+      if [ "$2" = %u ]; then echo "$u"; else echo "$m"; fi
+      return 0
+    done <<<"${GHR121_TABLE:-}"
+    # after `mkdir -p` has run, the root is group-writable (the late check)
+    if [ -e "$GHR121_DIR/flip" ] && [ "$3" = "$GHR121_DIR/rr" ]; then
+      if [ "$2" = %u ]; then echo 0; else echo 775; fi
+      return 0
+    fi
+    if [ "$2" = %u ]; then echo 0; else echo 755; fi
+    return 0
+  fi
+  command stat "$@"
+}
+eval "stub_prop() $(declare -f prop | tail -n +2)"
+prop() {
+  if [ "$2" = WorkingDirectory ]; then local s="${1#actions.runner.}"; s="${s%.service}"; echo "$GHR121_DIR/rr/${s#*.}"
+  else stub_prop "$@"; fi
+}
+eval "stub_run_priv() $(declare -f run_priv | tail -n +2)"
+run_priv() {
+  local rc=0
+  stub_run_priv "$@" || rc=$?
+  if [ "$1" = mkdir ] && [ "${GHR121_FLIP:-0}" = 1 ]; then : >"$GHR121_DIR/flip"; fi
+  if [ "$1" = runuser ] && [ "${5:-}" = rm ] && [ "${GHR121_RM_FAIL:-0}" = 1 ]; then rc=1; fi
+  return "$rc"
+}
+CFG
+  } >"$1"
+}
+
+# Calls that change the host: none may be logged by a refused run, and the log
+# as a whole is empty because the check is the first thing that happens.
+GHR121_CHANGES='^(useradd|groupadd|mkdir|mktemp|tar|chown|mv|rm|runuser|systemctl|tee|chmod)( |$)'
+
+case_ghr121_refuses_an_untrusted_runner_root() {
+  local d="$TMP/ghr121" cfg="$TMP/ghr121.config" r
+  rm -rf "$d"; mkdir -p "$d/rr" "$d/open/rr"
+  ln -s "$d/rr" "$d/linkrr"; ln -s "$d/open" "$d/via"
+  ghr121_config "$cfg" "$d"
+  r="$(ere_quote "$d")"
+  local -a prov=(provision 1 --url "$PROV_URL" --name-prefix slot --token "$PROV_TOKEN" --runner-root)
+
+  # (a) group-writable: the issue's first acceptance case.
+  GHR121_TABLE="$d/rr 0 775" RUNNERCTL_STUB_ROOT_REAL=1 RUNNERCTL_STUB_NO_UNITS=1 run_cfg "$cfg" "${prov[@]}" "$d/rr"
+  expect_rc 1
+  expect_err "the runner root $r/rr is not trusted: $r/rr is group- or world-writable \\(mode 775\\)"
+  expect_err "fix: chown root:root $r/rr; chmod 755 $r/rr"
+  expect_err 'Nothing was changed\.$'
+  expect_text "privileged calls logged before the refusal" "" "$(cat "$LOG")"
+  expect_no_log "$GHR121_CHANGES"
+  # (b) owned by a non-root user: the second.
+  GHR121_TABLE="$d/rr 1000 755" RUNNERCTL_STUB_ROOT_REAL=1 RUNNERCTL_STUB_NO_UNITS=1 run_cfg "$cfg" "${prov[@]}" "$d/rr"
+  expect_rc 1
+  expect_err "$r/rr is owned by uid 1000, not root"
+  expect_err "fix: chown root:root $r/rr; chmod 755 $r/rr"
+  expect_text "privileged calls logged before the refusal (owner)" "" "$(cat "$LOG")"
+  # (c) a parent two levels up is world-writable, not sticky.
+  GHR121_TABLE="$TMP 0 777" RUNNERCTL_STUB_ROOT_REAL=1 RUNNERCTL_STUB_NO_UNITS=1 run_cfg "$cfg" "${prov[@]}" "$d/rr"
+  expect_rc 1
+  expect_err "$(ere_quote "$TMP") is group- or world-writable \\(mode 777\\)"
+  expect_err "chmod 755 $(ere_quote "$TMP")"
+  expect_text "privileged calls logged before the refusal (parent)" "" "$(cat "$LOG")"
+  # (d) a sticky world-writable parent, /tmp's own mode: still refused.
+  GHR121_TABLE="$d 0 1777" RUNNERCTL_STUB_ROOT_REAL=1 RUNNERCTL_STUB_NO_UNITS=1 run_cfg "$cfg" "${prov[@]}" "$d/rr"
+  expect_rc 1
+  expect_err "$r is group- or world-writable \\(mode 1777\\)"
+  expect_text "privileged calls logged before the refusal (sticky)" "" "$(cat "$LOG")"
+  # (e) the root is itself a symlink, to a directory that would pass.
+  RUNNERCTL_STUB_ROOT_REAL=1 RUNNERCTL_STUB_NO_UNITS=1 run_cfg "$cfg" "${prov[@]}" "$d/linkrr"
+  expect_rc 1
+  expect_err "$r/linkrr is a symlink — the runner root must be a real directory"
+  expect_text "privileged calls logged before the refusal (symlink root)" "" "$(cat "$LOG")"
+  # (f) a symlinked parent is followed, and what it points at is checked.
+  GHR121_TABLE="$d/open 0 777" RUNNERCTL_STUB_ROOT_REAL=1 RUNNERCTL_STUB_NO_UNITS=1 run_cfg "$cfg" "${prov[@]}" "$d/via/rr"
+  expect_rc 1
+  expect_err "$r/open is group- or world-writable \\(mode 777\\)"
+  expect_text "privileged calls logged before the refusal (symlinked parent)" "" "$(cat "$LOG")"
+  # (g) a dry run reports the same refusal, and was read-only anyway.
+  GHR121_TABLE="$d/rr 0 775" RUNNERCTL_STUB_ROOT_REAL=1 RUNNERCTL_STUB_NO_UNITS=1 run_cfg "$cfg" "${prov[@]}" "$d/rr" --dry-run
+  expect_rc 1
+  expect_err "$r/rr is group- or world-writable \\(mode 775\\)"
+  expect_no_out '^\(dry run'
+  expect_text "privileged calls logged by a refused dry run" "" "$(cat "$LOG")"
+}
+
+# deprovision under a parent root does not own (a classic svc.sh runner lives
+# in its user's home): not refused — the directory is removed as the unit's
+# user, so whoever can swap the path can only make the rm hit what they could
+# delete anyway. Only a unit with no non-root user to remove it as is refused.
+case_ghr121_deprovision_removes_as_the_user_under_an_untrusted_parent() {
+  local d="$TMP/ghr121dp" cfg="$TMP/ghr121dp.config" r
+  rm -rf "$d"; mkdir -p "$d/rr"
+  ghr121_config "$cfg" "$d"
+  r="$(ere_quote "$d")"
+  # group-writable parent: removed as github-runner, never by root's rm.
+  GHR121_TABLE="$d/rr 0 775" RUNNERCTL_STUB_ROOT_REAL=1 run_cfg "$cfg" deprovision 1 --token "$DEPROV_TOKEN" --yes
+  expect_rc 0
+  expect_out "^\\[example\\.slot-2\\] removing $r/rr/slot-2 as github-runner, not root: $r/rr is not root-owned or others can write it\$"
+  expect_log "^runuser -u github-runner -- rm -rf -- $r/rr/slot-2\$"
+  expect_no_log "^rm -rf -- $r/rr/slot-2"
+  # the unit file and the drop-in are still root's.
+  expect_log '^rm -f -- .*/actions\.runner\.example\.slot-2\.service$'
+  expect_log '^rm -f .*/actions\.runner\.example\.slot-2\.service\.d/'
+  # --local-only, and a parent owned by the runner user.
+  GHR121_TABLE="$d/rr 1000 755" RUNNERCTL_STUB_ROOT_REAL=1 run_cfg "$cfg" deprovision 1 --local-only --yes
+  expect_rc 0
+  expect_out "removing $r/rr/slot-2 as github-runner, not root: $r/rr is not root-owned or others can write it"
+  expect_log "^runuser -u github-runner -- rm -rf -- $r/rr/slot-2\$"
+  expect_no_log "^rm -rf -- "
+  # a dry run shows the user's removal.
+  GHR121_TABLE="$d/rr 0 775" RUNNERCTL_STUB_ROOT_REAL=1 run_cfg "$cfg" deprovision 1 --local-only --dry-run
+  expect_rc 0
+  expect_out "^would run:   runuser -u github-runner -- rm -rf -- $r/rr/slot-2   \\(parent not root-owned\\)\$"
+  expect_no_out '^would run:   rm -rf -- '
+  expect_no_log "$GHR121_CHANGES"
+  # a trusted parent: root's rm, no runuser rm.
+  RUNNERCTL_STUB_ROOT_REAL=1 run_cfg "$cfg" deprovision 1 --local-only --yes
+  expect_rc 0
+  expect_log "^rm -rf -- $r/rr/slot-2\$"
+  expect_no_log '^runuser -u [^ ]+ -- rm '
+  expect_no_out 'not root:'
+  # a failing user-level rm is the [FAILED] path, naming the user, no retry as root.
+  GHR121_TABLE="$d/rr 0 775" GHR121_RM_FAIL=1 RUNNERCTL_STUB_ROOT_REAL=1 run_cfg "$cfg" deprovision 1 --local-only --yes
+  expect_rc 1
+  expect_out "^  \\[FAILED\\] rm -rf $r/rr/slot-2 as github-runner"
+  expect_no_log "^rm -rf -- $r/rr/slot-2"
+  # no non-root user to remove it as: refused, nothing logged.
+  GHR121_TABLE="$d/rr 0 775" RUNNERCTL_STUB_UNIT_USER=root RUNNERCTL_STUB_ROOT_REAL=1 run_cfg "$cfg" deprovision 1 --local-only --yes
+  expect_rc 1
+  expect_err "example\\.slot-2: $r/rr/slot-2 sits under $r/rr, which root does not own or others can write, and its unit gives no non-root user to remove it as \\(User='root'\\)\\. Remove it by hand\\. Nothing was changed\\."
+  expect_no_err 'chown'
+  expect_text "privileged calls logged by a refused root-user deprovision" "" "$(cat "$LOG")"
+  GHR121_TABLE="$d/rr 0 775" RUNNERCTL_STUB_UNIT_USER=root RUNNERCTL_STUB_ROOT_REAL=1 run_cfg "$cfg" deprovision 1 --local-only --dry-run
+  expect_rc 1
+  expect_text "privileged calls logged by a refused root-user dry run" "" "$(cat "$LOG")"
+}
+
+case_ghr121_a_root_that_is_root_s_still_provisions() {
+  local d="$TMP/ghr121ok" cfg="$TMP/ghr121ok.config" r
+  rm -rf "$d"; mkdir -p "$d/rr"
+  ghr121_config "$cfg" "$d"
+  r="$(ere_quote "$d")"
+  # A root that does not exist yet: its parents pass, mkdir -p makes it, the
+  # late check finds it (here: still absent under the stub, which creates
+  # nothing) fine.
+  RUNNERCTL_STUB_ROOT_REAL=1 RUNNERCTL_STUB_NO_UNITS=1 run_cfg "$cfg" provision 1 --url "$PROV_URL" \
+    --name-prefix slot --token "$PROV_TOKEN" --runner-root "$d/fresh"
+  expect_rc 0
+  expect_log "^mkdir -p $r/fresh\$"
+  expect_out '^Provisioned 1 runner\(s\): slot-1$'
+  # An existing root that is root's, 755 — and a 750 one.
+  RUNNERCTL_STUB_ROOT_REAL=1 RUNNERCTL_STUB_NO_UNITS=1 run_cfg "$cfg" provision 1 --url "$PROV_URL" \
+    --name-prefix slot --token "$PROV_TOKEN" --runner-root "$d/rr"
+  expect_rc 0
+  expect_out '^Provisioned 1 runner\(s\): slot-1$'
+  GHR121_TABLE="$d/rr 0 750" RUNNERCTL_STUB_ROOT_REAL=1 RUNNERCTL_STUB_NO_UNITS=1 run_cfg "$cfg" provision 1 --url "$PROV_URL" \
+    --name-prefix slot --token "$PROV_TOKEN" --runner-root "$d/rr"
+  expect_rc 0
+  # A dry run reports nothing wrong either.
+  RUNNERCTL_STUB_ROOT_REAL=1 RUNNERCTL_STUB_NO_UNITS=1 run_cfg "$cfg" provision 1 --url "$PROV_URL" \
+    --name-prefix slot --token "$PROV_TOKEN" --runner-root "$d/rr" --dry-run
+  expect_rc 0
+  expect_out '^\(dry run — nothing downloaded, nothing changed\)$'
+  # deprovision from a good root removes the slot.
+  RUNNERCTL_STUB_ROOT_REAL=1 run_cfg "$cfg" deprovision 1 --local-only --yes
+  expect_rc 0
+  expect_log "^rm -rf -- $r/rr/slot-2\$"
+  expect_no_log '^runuser -u [^ ]+ -- rm '
+}
+
+# The root is checked again once mkdir -p has run: what it made or kept is the
+# directory the file work goes into. Nothing is unpacked into a bad one.
+case_ghr121_checks_the_root_again_after_mkdir() {
+  local d="$TMP/ghr121late" cfg="$TMP/ghr121late.config" r
+  rm -rf "$d"; mkdir -p "$d/rr"
+  ghr121_config "$cfg" "$d"
+  r="$(ere_quote "$d")"
+  GHR121_FLIP=1 RUNNERCTL_STUB_ROOT_REAL=1 RUNNERCTL_STUB_NO_UNITS=1 run_cfg "$cfg" provision 1 --url "$PROV_URL" \
+    --name-prefix slot --token "$PROV_TOKEN" --runner-root "$d/rr"
+  expect_rc 1
+  expect_err "$r/rr is group- or world-writable \\(mode 775\\).*No runner was unpacked\\.\$"
+  expect_log "^mkdir -p $r/rr\$"
+  expect_no_log '^(mktemp|tar|chown|mv|rm|runuser) '
+  expect_no_log '^fetch: '
+}
+
+# The helper itself, over real directories and the real stat — nothing faked.
+# /tmp is the classic: sticky and world-writable, so a root under it is refused;
+# the default root's parents (/, /opt) are root's on a stock host.
+case_ghr121_real_runner_root_check() {
+  local d="$TMP/ghr121real"
+  rm -rf "$d"; mkdir -p "$d/rr"; ln -s "$d/rr" "$d/link"
+  run_fn runner_root_problem /tmp/ghr121-no-such-root
+  expect_rc 0
+  expect_out '^the runner root /tmp/ghr121-no-such-root is not trusted: /tmp is group- or world-writable \(mode 1777\)'
+  expect_out 'fix: chown root:root /tmp; chmod 755 /tmp,'
+  run_fn runner_root_problem "$d/link"
+  expect_out "^$(ere_quote "$d")/link is a symlink — the runner root must be a real directory"
+  if [ "$(id -u)" -ne 0 ]; then
+    run_fn runner_root_problem "$d/rr"
+    # (walking down from /, the first directory that is not root's is named —
+    # here /tmp, or $TMP's own owner: the claim is that it is refused, not where)
+    expect_out "^the runner root $(ere_quote "$d")/rr is not trusted: /[^ ]* (is owned by uid $(id -u), not root|is group- or world-writable)"
+    run_fn root_exec_problem "$d/rr"
+    expect_out "^$(ere_quote "$d")/rr is owned by uid $(id -u), not root"
+  else
+    skip "GHR-121: the sim runs as root, so a fixture directory is root-owned"
+  fi
+  # A stock host's /usr: root-owned, 755, and the missing root under it passes.
+  if [ "$(stat -c '%u %a' /usr)" = "0 755" ]; then
+    run_fn runner_root_problem /usr/ghr121-no-such-root/rr
+    expect_text "a missing root under a root-owned 755 parent" "" "$OUT"
+    run_fn dir_chain_problem /usr/ghr121-no-such-root
+    expect_text "the chain under /usr" "" "$OUT"
+  else
+    skip "GHR-121: /usr is not root:root 755 here"
+  fi
+}
+
 # The audit itself (GHR-110, narrowed by GHR-116): each shape of a root call
 # into a runner directory is reported, and a real provision's log is not.
 case_runner_dir_audit_catches_root_writes() {
@@ -8865,6 +9108,11 @@ t "GHR-110: deprovision removes a unit svc.sh installed, by name"       case_dep
 t "GHR-110: provision/deprovision run nothing in a runner dir as root"  case_provision_deprovision_run_nothing_as_root_in_runner_dirs
 t "GHR-116: provision --replace never writes through a runner's tree"   case_provision_replace_never_writes_through_a_runner_tree
 t "GHR-116: the runner-dir audit reports each root write into one"      case_runner_dir_audit_catches_root_writes
+t "GHR-121: an untrusted runner root is refused before any root call"   case_ghr121_refuses_an_untrusted_runner_root
+t "GHR-121: a root that is root's still provisions and deprovisions"    case_ghr121_a_root_that_is_root_s_still_provisions
+t "GHR-121: deprovision under an untrusted parent removes as the user"  case_ghr121_deprovision_removes_as_the_user_under_an_untrusted_parent
+t "GHR-121: the root is checked again once mkdir -p has run"            case_ghr121_checks_the_root_again_after_mkdir
+t "GHR-121: the real check over real directories (/tmp, symlink, owner)" case_ghr121_real_runner_root_check
 
 # --- GHR-48: the real discover(), not the stub's stand-in -------------------
 t "discover: no matching units is empty and exit 0, not a failure"     case_discover_no_matching_units_is_empty_not_a_failure

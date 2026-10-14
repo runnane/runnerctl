@@ -5645,6 +5645,72 @@ root_exec_problem() { # PATH
   esac
 }
 
+# Why the directory chain of PATH may not hold root's file work (GHR-121), or
+# nothing when it may: "<dir>\037<what is wrong>" for the first directory from
+# / downwards that root_exec_problem refuses (owner not uid 0, group- or
+# world-writable — a sticky /tmp is mode 1777 and refused). Components that do
+# not exist yet are skipped, since `mkdir -p` as root creates them root-owned;
+# a symlink component must be root's own (its target is walked separately, by
+# runner_root_problem). Reads metadata only, so it needs no privilege.
+dir_chain_problem() { # PATH
+  local path="$1" p="" part owner problem
+  local -a parts
+  problem="$(root_exec_problem /)"
+  [ -z "$problem" ] || { printf '/\037%s' "$problem"; return 0; }
+  IFS=/ read -ra parts <<<"${path#/}"
+  for part in "${parts[@]}"; do
+    [ -n "$part" ] || continue
+    p+="/$part"
+    if [ -L "$p" ]; then
+      owner="$(stat -c %u "$p" 2>/dev/null || echo '?')"
+      [ "$owner" = 0 ] || { printf '%s\037%s' "$p" "$p is a symlink owned by uid $owner, not root"; return 0; }
+      continue
+    fi
+    [ -e "$p" ] || break
+    problem="$(root_exec_problem "$p")"
+    [ -z "$problem" ] || { printf '%s\037%s' "$p" "$problem"; return 0; }
+  done
+}
+
+# Why DIR may not be the runner root, or nothing when it may (GHR-121).
+# provision and deprovision do all of a slot's file work as root inside the
+# runner root (mktemp, unpack, chown -R, the two renames, rm -rf), and every
+# protection in that work assumes nobody but root can write there: whoever can
+# swaps a slot's directory entry between root's calls. `mkdir -p` keeps an
+# existing directory as it finds it, so the check is made here, on metadata,
+# before the first privileged call — DIR itself and every parent up to /.
+# The same per-directory rule as the sudo checks (root_exec_problem). The root
+# itself may not be a symlink; a symlinked parent is followed and its target's
+# chain checked as well as the link's own directory chain.
+runner_root_problem() { # DIR
+  local dir="$1" r bad msg
+  r="$(runner_root_chain_problem "$dir")"
+  [ -n "$r" ] || return 0
+  bad="${r%%$'\037'*}"; msg="${r#*$'\037'}"
+  if [ "$bad" = "$dir" ] && [[ "$msg" == *"is a symlink" ]]; then
+    echo "$msg — the runner root must be a real directory (fix: use the directory it points at, root-owned and mode 755)"
+    return 0
+  fi
+  echo "the runner root $dir is not trusted: $msg — root does all of a slot's file work inside it, so whoever can write there can swap a slot under root's calls (fix: chown root:root $bad; chmod 755 $bad, or use a --runner-root under directories only root can write)"
+}
+
+# The first thing wrong with DIR's chain as "<dir>\037<what>", or nothing: the
+# part of runner_root_problem that deprovision (GHR-121) also uses, to say
+# which directory it will not trust root to remove a slot from.
+runner_root_chain_problem() { # DIR
+  local dir="$1" r canon
+  if [ -L "$dir" ]; then
+    printf '%s\037%s is a symlink' "$dir" "$dir"
+    return 0
+  fi
+  r="$(dir_chain_problem "$dir")"
+  if [ -z "$r" ]; then
+    canon="$(readlink -m -- "$dir" 2>/dev/null || echo "$dir")"
+    [ "$canon" = "$dir" ] || r="$(dir_chain_problem "$canon")"
+  fi
+  printf '%s' "$r"
+}
+
 cmd_compose_reap_timer() { # install|status|remove
   local sub="${1:-status}" self problem
   shift || true
@@ -10472,6 +10538,11 @@ cmd_provision() {
     u_="$(runner_unit_name "$url" "$prefix-$s_")" || exit 1
     slot_unit[$s_]="$u_"
   done
+  # GHR-121: before anything is touched, a dry run included. A root that does
+  # not exist yet is fine here — its existing parents are checked, and the
+  # root itself again once `mkdir -p` has made it.
+  local root_problem; root_problem="$(runner_root_problem "$root")"
+  [ -z "$root_problem" ] || die "$root_problem. Nothing was changed."
 
   # Resolve the release before touching the host, so a bad version or an
   # unreachable API fails with nothing half-created.
@@ -10532,6 +10603,9 @@ cmd_provision() {
 
   ensure_runner_user "$user" "$group" false
   run_priv mkdir -p "$root"
+  # What mkdir -p made (or kept) is the directory the file work runs in.
+  root_problem="$(runner_root_problem "$root")"
+  [ -z "$root_problem" ] || die "$root_problem. No runner was unpacked."
 
   echo "Downloading $asset…"
   # Its own name, not cmd_install's DOWNLOAD_TMP: that one is a file and this
@@ -10708,7 +10782,7 @@ cmd_deprovision() {
     seen+="$u "
     units+=("$u")
   done
-  local dirs=() users=() dir user short i
+  local dirs=() users=() unsafe=() dir user short i problem
   for u in "${units[@]}"; do
     short="$(short_name "$u")"
     # The unit (svc.sh's or provision's) has WorkingDirectory=<the runner's
@@ -10723,6 +10797,21 @@ cmd_deprovision() {
     [[ "$u" =~ ^[A-Za-z0-9@._:-]+\.service$ ]] || die "$short: '$u' is not a unit name runnerctl will remove a file for. Nothing was changed."
     if ! $local_only && { ! valid_user_name "$user" || runner_user_is_root "$user"; }; then
       die "$short: its unit runs the runner as '$user' — runnerctl never runs a runner's own scripts (config.sh remove) as root. Pass --local-only and remove it under Settings -> Actions -> Runners. Nothing was changed."
+    fi
+    # GHR-121: root's rm -rf of DIR is only as safe as the directory it sits
+    # in. A classic svc.sh runner lives under its user's home, so an untrusted
+    # parent is normal and is not refused: the removal then runs as the unit's
+    # user, so whoever can swap the path can only make it hit what they could
+    # delete anyway. Decided here, once, before the first privileged call (a
+    # dry run included); only a unit with no non-root user to remove it as is
+    # refused. The unit file and drop-in under SYSTEMD_DIR stay root's.
+    problem="$(runner_root_chain_problem "$(dirname "$dir")")"
+    if [ -z "$problem" ]; then
+      unsafe+=("")
+    elif valid_user_name "$user" && ! runner_user_is_root "$user"; then
+      unsafe+=("${problem%%$'\037'*}")
+    else
+      die "$short: $dir sits under ${problem%%$'\037'*}, which root does not own or others can write, and its unit gives no non-root user to remove it as (User='$user'). Remove it by hand. Nothing was changed."
     fi
     dirs+=("$dir"); users+=("$user")
   done
@@ -10772,7 +10861,11 @@ cmd_deprovision() {
       echo "would run:   rm -f -- $SYSTEMD_DIR/$u"
       $local_only || echo "would run:   cd $dir && rm -f .service   (as ${users[$i]})"
       $local_only || echo "would run:   cd $dir && ACTIONS_RUNNER_INPUT_TOKEN=*** ./config.sh remove   (as ${users[$i]})"
-      echo "would run:   rm -rf -- $dir"
+      if [ -n "${unsafe[$i]}" ]; then
+        echo "would run:   runuser -u ${users[$i]} -- rm -rf -- $dir   (parent not root-owned)"
+      else
+        echo "would run:   rm -rf -- $dir"
+      fi
       echo "would run:   rm -f $SYSTEMD_DIR/$u.d/$DROPIN_NAME"
     done
     echo "would run:   systemctl daemon-reload"
@@ -10824,9 +10917,16 @@ cmd_deprovision() {
         echo "runnerctl: warning: $short: config.sh remove failed — GitHub may already have forgotten this runner. Cleaning up locally anyway." >&2
       fi
     fi
-    echo "[$short] removing $dir"
-    if ! run_priv rm -rf -- "$dir"; then
-      failed+=("$short"); echo "  [FAILED] rm -rf $dir"; continue
+    if [ -n "${unsafe[$i]}" ]; then
+      echo "[$short] removing $dir as $user, not root: ${unsafe[$i]} is not root-owned or others can write it"
+      if ! run_priv runuser -u "$user" -- rm -rf -- "$dir"; then
+        failed+=("$short"); echo "  [FAILED] rm -rf $dir as $user — files $user cannot remove are left in place"; continue
+      fi
+    else
+      echo "[$short] removing $dir"
+      if ! run_priv rm -rf -- "$dir"; then
+        failed+=("$short"); echo "  [FAILED] rm -rf $dir"; continue
+      fi
     fi
     # runnerctl's own drop-in outlives the unit just removed.
     run_priv rm -f "$SYSTEMD_DIR/$u.d/$DROPIN_NAME" || true
