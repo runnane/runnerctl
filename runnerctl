@@ -619,8 +619,9 @@ need_val() { [ $# -ge 2 ] || die "$1 needs a value"; }
 #
 # verb, targets, the few flags that change what it did, who ran it — the sudo
 # caller, else the login — and, for a call that came through `fleet`, the
-# operator and central node it says it came from, then `ok`, `failed (exit N)`
-# or a count the command keeps itself. `history` reads them back.
+# operator and central node it says it came from, then `ok`, `failed (exit N)`,
+# `interrupted (SIGINT)` / `interrupted (SIGTERM)` (GHR-119) or a count the
+# command keeps itself. `history` reads them back.
 #
 # What goes in is chosen, never copied: no argv, so a token handed to
 # `provision` or `deprovision` has no way in. Each part is a value the command
@@ -640,7 +641,7 @@ need_val() { [ $# -ge 2 ] || die "$1 needs a value"; }
 # commands a timer or cron runs (`health --restart-stalled`, `compose-reap
 # --apply`, `--if-stalled`) arm only when they act, so a quiet hour writes
 # nothing.
-AUDIT_VERB="" AUDIT_PID="" AUDIT_RESULT="" AUDIT_NOTE="" AUDIT_AS=""
+AUDIT_VERB="" AUDIT_PID="" AUDIT_RESULT="" AUDIT_NOTE="" AUDIT_AS="" AUDIT_SIGNAL=""
 AUDIT_TARGETS=() AUDIT_FLAGS=()
 AUDIT_ORIGIN="" AUDIT_ORIGIN_BAD=false
 # One word of a login or an operator name, and a host name: letters, digits
@@ -698,9 +699,10 @@ audit_clean() { # TEXT [MAX]
 audit_begin() { # VERB [TARGET|--FLAG ...]
   local a
   if [ -z "$AUDIT_VERB" ] || [ "$AUDIT_PID" != "$BASHPID" ]; then
-    AUDIT_VERB="$1" AUDIT_PID="$BASHPID" AUDIT_RESULT="" AUDIT_NOTE=""
+    AUDIT_VERB="$1" AUDIT_PID="$BASHPID" AUDIT_RESULT="" AUDIT_NOTE="" AUDIT_SIGNAL=""
     AUDIT_TARGETS=() AUDIT_FLAGS=()
     builtin trap exit_run EXIT
+    audit_sig_arm
   fi
   shift
   for a in "$@"; do
@@ -748,7 +750,9 @@ audit_message() { # OUTCOME
 audit_finish() { # RC
   local rc="$1" outcome msg
   [ -n "$AUDIT_VERB" ] && [ "$AUDIT_PID" = "$BASHPID" ] || return 0
-  if [ -n "$AUDIT_RESULT" ]; then
+  if [ -n "$AUDIT_SIGNAL" ]; then
+    outcome="interrupted ($AUDIT_SIGNAL)"
+  elif [ -n "$AUDIT_RESULT" ]; then
     outcome="$AUDIT_RESULT"
   elif [ "$rc" = 0 ]; then
     outcome=ok
@@ -757,7 +761,10 @@ audit_finish() { # RC
   fi
   [ -z "$AUDIT_NOTE" ] || outcome+=" ($AUDIT_NOTE)"
   msg="$(audit_message "$outcome" 2>/dev/null)" || msg=""
+  # Finished: a second call in this process — the EXIT trap after the
+  # signal handler wrote the record (GHR-119) — writes nothing.
   AUDIT_VERB=""
+  audit_sig_disarm
   [ -z "$msg" ] || audit_logger "$msg" >/dev/null 2>&1 || true
   return 0
 }
@@ -791,6 +798,22 @@ trap() {
     builtin trap exit_run EXIT
     return 0
   fi
+  # GHR-119: INT and TERM are the record's while one is armed, so a command's
+  # own handler for them (`watch`, `fleet watch`) is kept by sig_own and
+  # chained to, never replaced. Every other signal is the builtin's.
+  if [ $# -ge 2 ] && [[ "$1" != -?* ]]; then
+    local cmd="$1" s rest=()
+    shift
+    for s in "$@"; do
+      case "$s" in
+        INT|SIGINT)   sig_own INT "$cmd" ;;
+        TERM|SIGTERM) sig_own TERM "$cmd" ;;
+        *)            rest+=("$s") ;;
+      esac
+    done
+    [ "${#rest[@]}" -eq 0 ] || builtin trap -- "$cmd" "${rest[@]}"
+    return 0
+  fi
   builtin trap -- "$@"
 }
 exit_run() {
@@ -800,6 +823,77 @@ exit_run() {
   if [ "$EXIT_PID" = "$BASHPID" ] && [ -n "$EXIT_CMD" ] && [ "$EXIT_CMD" != - ]; then
     eval "$EXIT_CMD"
   fi
+}
+
+# --- An interrupted command's record (GHR-119) ----------------------------------
+# A command ended by Ctrl-C or a SIGTERM still runs its EXIT trap, but `$?`
+# there is the status of whatever finished before the signal — so without a
+# handler of its own the record says `ok` for a command the operator stopped.
+# While a record is armed, and only then, INT and TERM run audit_signal: it
+# writes the record as `interrupted (SIGINT)` and then lets the signal do
+# exactly what it would have done without it —
+#
+#   * no handler of the command's own: the disposition goes back to the
+#     default and the same signal is raised again at THIS process ($BASHPID —
+#     the local watch arms its actions' records in a subshell, where $$ would
+#     be the watch). So the process still dies BY the signal: a parent sees
+#     WIFSIGNALED, a shell 128+N, and a calling shell's own Ctrl-C handling is
+#     what it was. A handler that recorded and then exited 130 would not be;
+#   * a handler of the command's own (`watch` and `fleet watch` trap INT and
+#     TERM to exit 0): that handler, run as it would have been.
+#
+# The EXIT trap then runs as it always did, and finds the record finished.
+# Before a record is armed nothing is trapped, so a signal there is handled
+# as it always was. One cost of a trapped signal is bash's, not ours: bash
+# runs a trap once the foreground command it is waiting for has ended, so a
+# TERM sent to runnerctl's pid alone — not its process group, as a terminal's
+# Ctrl-C, systemd and `timeout` do — waits for the step in progress (a
+# download, a sleep in a --when-idle wait) before the process ends.
+AUDIT_SIG_PID=""
+# The command's own INT / TERM handlers (`-` none), for the process that set
+# them: a subshell inherits these but not the traps.
+SIG_OWN_PID="" SIG_OWN_INT=- SIG_OWN_TERM=-
+sig_own() { # INT|TERM CMD
+  if [ "$SIG_OWN_PID" != "$BASHPID" ]; then SIG_OWN_PID="$BASHPID" SIG_OWN_INT=- SIG_OWN_TERM=-; fi
+  case "$1" in INT) SIG_OWN_INT="$2" ;; TERM) SIG_OWN_TERM="$2" ;; esac
+  # With a record armed here the trap stays audit_signal, which chains to it.
+  [ "$AUDIT_SIG_PID" = "$BASHPID" ] || builtin trap -- "$2" "$1"
+}
+# This process's own handler for SIG into SIG_OWNER (`-` none).
+sig_owner() { # INT|TERM
+  SIG_OWNER=-
+  [ "$SIG_OWN_PID" = "$BASHPID" ] || return 0
+  case "$1" in INT) SIG_OWNER="$SIG_OWN_INT" ;; TERM) SIG_OWNER="$SIG_OWN_TERM" ;; esac
+}
+audit_sig_arm() {
+  [ "$AUDIT_SIG_PID" != "$BASHPID" ] || return 0
+  AUDIT_SIG_PID="$BASHPID"
+  builtin trap 'audit_signal INT' INT
+  builtin trap 'audit_signal TERM' TERM
+}
+# Back to what the command itself asked for, when its record is finished.
+audit_sig_disarm() {
+  local s
+  [ "$AUDIT_SIG_PID" = "$BASHPID" ] || return 0
+  AUDIT_SIG_PID=""
+  for s in INT TERM; do
+    sig_owner "$s"
+    builtin trap -- "$SIG_OWNER" "$s"
+  done
+}
+audit_signal() { # INT|TERM
+  local owner
+  sig_owner "$1"; owner="$SIG_OWNER"
+  # A command that ignores the signal goes on: nothing was interrupted.
+  [ -n "$owner" ] || return 0
+  AUDIT_SIGNAL="SIG$1"
+  audit_finish 0
+  if [ "$owner" != - ]; then
+    eval "$owner"
+    return 0
+  fi
+  builtin trap - "$1"
+  kill -s "$1" "$BASHPID"
 }
 
 # --- The central node's record (GHR-88) -----------------------------------------

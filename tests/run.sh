@@ -12884,6 +12884,228 @@ t "GHR-88: history reads the records back"                                 case_
 t "GHR-88: the real history reader over journalctl"                        case_ghr88_the_real_history_reader
 t "GHR-88: fleet history merges the hosts' records by time"                case_ghr88_fleet_history_merges_by_time
 
+# --- GHR-119: the record of an interrupted command -----------------------------
+# run_signalled runs a command until the stub's RUNNERCTL_STUB_BLOCK call hangs
+# (a foreground `sleep 30` in run_priv), sends it SIG, and reads how it ended
+# from a real waitpid — WIFSIGNALED, which a shell's `$?` cannot tell from an
+# `exit 130`. The parent is perl, because it can say that and bash cannot, and
+# because it sets INT and TERM back to the default first: a gate started in the
+# background runs every case with SIGINT ignored (GHR-75), the child would
+# inherit that, and bash cannot trap a signal ignored at its start. The child
+# leads a process group of its own (setsid), so `group` is what a terminal's
+# Ctrl-C, systemd and `timeout` do, and `pid` signals runnerctl alone. A
+# process that has not died 10 s after the signal is `survived`, and whatever
+# is left of its group (the stub's sleep, under `pid`) is killed either way.
+HAVE_PERL=false
+perl -MPOSIX -e 1 >/dev/null 2>&1 && HAVE_PERL=true
+SIGNALLED=""
+# shellcheck disable=SC2016  # perl's own variables
+GHR119_PERL='use strict; use POSIX qw(:sys_wait_h setsid);
+my ($sig, $whom, $flag, $out, $err, @cmd) = @ARGV;
+$SIG{INT} = $SIG{TERM} = "DEFAULT";
+sub nap { select undef, undef, undef, $_[0] }
+my $pid = fork() // die "fork: $!";
+if (!$pid) {
+  setsid();
+  open STDIN, "<", "/dev/null"; open STDOUT, ">", $out; open STDERR, ">", $err;
+  exec @cmd or exit 127;
+}
+my $t = 0;
+until (-e $flag) {
+  if (waitpid($pid, WNOHANG) == $pid) { print "never-blocked (exit ", $? >> 8, ")\n"; exit 0 }
+  if (++$t > 200) { kill "KILL", -$pid; waitpid($pid, 0); print "never-blocked\n"; exit 0 }
+  nap 0.05;
+}
+# the stub has written the flag; wait for its sleep to be the running step
+my $kids = "/proc/$pid/task/$pid/children";
+for (1 .. 40) { last if -r $kids && -s $kids; nap 0.05 }
+kill $sig, ($whom eq "group" ? -$pid : $pid);
+$t = 0;
+until (waitpid($pid, WNOHANG) == $pid) {
+  if (++$t > 200) { kill "KILL", -$pid; waitpid($pid, 0); print "survived\n"; exit 0 }
+  nap 0.05;
+}
+my $st = $?;
+kill "KILL", -$pid;
+print WIFSIGNALED($st) ? "signal " . WTERMSIG($st) : "exit " . WEXITSTATUS($st), "\n";'
+run_signalled() { # INT|TERM group|pid BLOCK-ERE ARGS...
+  local sig="$1" whom="$2" block="$3" how
+  shift 3
+  : >"$LOG"; rm -rf "$WRITES"; mkdir -p "$WRITES"
+  RC=0 SIGNALLED=""
+  how="$(RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" RUNNERCTL_STUB_BLOCK="$block" \
+         perl -e "$GHR119_PERL" "$sig" "$whom" "$WRITES/.blocked" "$TMP/sig.out" "$TMP/err" "$RUNNERCTL" "$@")" || how="perl failed"
+  OUT="$(cat "$TMP/sig.out" 2>/dev/null; true)"
+  ERR="$(cat "$TMP/err" 2>/dev/null; true)"
+  case "$how" in
+    "signal "*) SIGNALLED="${how#signal }"; RC=$((128 + SIGNALLED)) ;;
+    "exit "*)   RC="${how#exit }" ;;
+    survived)   RC=-1 SIGNALLED=survived ;;
+    *)          RC=-1; ERRS+=("run_signalled: $how") ;;
+  esac
+}
+# The process died of signal N (a waitpid's WIFSIGNALED / WTERMSIG) — not an
+# exit, whatever its status.
+expect_signalled() { # N
+  _expect
+  case "$SIGNALLED" in
+    "$1")     ;;
+    survived) FAILS+=("want death by signal $1: the process was still alive 10 s after the signal") ;;
+    '')       FAILS+=("want death by signal $1: the process exited (status $RC)") ;;
+    *)        FAILS+=("want death by signal $1: it died of signal $SIGNALLED") ;;
+  esac
+}
+GHR119_REC="$TMP/ghr119-records"
+
+# Acceptance: a command interrupted while its record is armed records
+# `interrupted (SIG…)` — once — and still dies BY the signal, for TERM and for
+# a terminal's Ctrl-C. env-init arms after its `test -f` and before its mkdir.
+case_ghr119_an_interrupted_command_records_it_and_dies_by_the_signal() {
+  if ! $HAVE_PERL; then
+    skip "GHR-119: no perl, so no waitpid to tell death by signal from an exit"
+    # shellcheck disable=SC2016  # run_fn's child expands it
+    run_fn eval 'audit_logger() { :; }; audit_begin env-init; AUDIT_SIGNAL=SIGTERM; audit_message "interrupted ($AUDIT_SIGNAL)"'
+    expect_out '— interrupted \(SIGTERM\)$'
+    return 0
+  fi
+  run_signalled TERM group '^mkdir -p /etc/runnerctl$' env-init --profile deploy
+  expect_rc 143
+  expect_signalled 15
+  expect_one_record "env-init /etc/runnerctl/deploy\\.env \\(--profile deploy\\) by $ME — interrupted \\(SIGTERM\\)"
+  expect_log_order '^probe:blocked mkdir -p /etc/runnerctl$' '^probe:audit '
+  expect_no_log '^tee '
+  expect_no_out '^Scaffolded'
+  run_signalled INT group '^mkdir -p /etc/runnerctl$' env-init --profile deploy
+  expect_rc 130
+  expect_signalled 2
+  expect_one_record "env-init /etc/runnerctl/deploy\\.env \\(--profile deploy\\) by $ME — interrupted \\(SIGINT\\)"
+  expect_no_log '^tee '
+  # the same command left alone: its record says ok, so the word above is the signal's
+  run env-init --profile deploy
+  expect_rc 0
+  expect_one_record "env-init /etc/runnerctl/deploy\\.env \\(--profile deploy\\) by $ME — ok"
+}
+
+# Acceptance, the negative control: interrupted before it armed a record, a
+# command records nothing — and the signal is handled exactly as before: a
+# TERM to runnerctl's pid alone ends it at once, in the middle of the step it
+# is waiting on, because nothing is trapped yet.
+case_ghr119_interrupted_before_arming_records_nothing() {
+  if ! $HAVE_PERL; then
+    skip "GHR-119: no perl, so no waitpid to tell death by signal from an exit"
+    run env-init --profile deploy
+    expect_one_record "env-init /etc/runnerctl/deploy\\.env \\(--profile deploy\\) by $ME — ok"
+    return 0
+  fi
+  run_signalled TERM pid '^test -f /etc/runnerctl/deploy\.env$' env-init --profile deploy
+  expect_rc 143
+  expect_signalled 15
+  expect_log '^probe:blocked test -f /etc/runnerctl/deploy\.env$'
+  expect_no_log '^probe:audit'
+  expect_no_log '^mkdir '
+  run_signalled INT group '^test -f /etc/runnerctl/deploy\.env$' env-init --profile deploy
+  expect_rc 130
+  expect_signalled 2
+  expect_log '^probe:blocked test -f '
+  expect_no_log '^probe:audit'
+}
+
+# Composition with a command's own INT / TERM handler — `watch` and `fleet
+# watch` trap both to exit 0 and arm their actions' records in subshells.
+# Driven through the script's own functions, the record to a file. TERM only:
+# run_fn's bash inherits the gate's dispositions, and a gate started in the
+# background starts it with SIGINT ignored, which no trap can change (GHR-75)
+# — INT is pinned through run_signalled, which resets it first.
+case_ghr119_composes_with_a_commands_own_handler() {
+  # A record armed in a subshell under the owner, as watch's action is: the
+  # subshell records and dies of the signal ($BASHPID, not the watch's $$),
+  # the owner carries on, and its own handler still exits 0.
+  rm -f "$GHR119_REC"
+  # shellcheck disable=SC2016  # run_fn's child expands these
+  GHR119_REC="$GHR119_REC" run_fn eval 'audit_logger() { printf "%s\n" "$1" >>"$GHR119_REC"; }
+    trap '"'"'echo "owner ran"; exit 0'"'"' INT TERM
+    ( audit_begin restart slot-x; kill -TERM "$BASHPID"; echo "subshell went on" ) || echo "subshell rc=$?"
+    echo "owner went on"
+    kill -TERM "$BASHPID"
+    echo "owner survived its own handler"'
+  expect_rc 0
+  expect_text "subshell under an owner" 'subshell rc=143
+owner went on
+owner ran' "$OUT"
+  expect_text "its record" "restart slot-x by $ME — interrupted (SIGTERM)" "$(cat "$GHR119_REC" 2>/dev/null; true)"
+  # A record armed in the owner's own process — after the owner's trap, and
+  # before it: recorded once, then the owner's handler is what ends it.
+  rm -f "$GHR119_REC"
+  # shellcheck disable=SC2016
+  GHR119_REC="$GHR119_REC" run_fn eval 'audit_logger() { printf "%s\n" "$1" >>"$GHR119_REC"; }
+    trap '"'"'echo "owner ran"; exit 0'"'"' INT TERM
+    audit_begin restart slot-x
+    kill -TERM "$BASHPID"
+    echo "went on"'
+  expect_rc 0
+  expect_text "owner first" 'owner ran' "$OUT"
+  expect_text "its record" "restart slot-x by $ME — interrupted (SIGTERM)" "$(cat "$GHR119_REC" 2>/dev/null; true)"
+  rm -f "$GHR119_REC"
+  # shellcheck disable=SC2016
+  GHR119_REC="$GHR119_REC" run_fn eval 'audit_logger() { printf "%s\n" "$1" >>"$GHR119_REC"; }
+    audit_begin restart slot-x
+    trap '"'"'echo "owner ran"; exit 3'"'"' TERM
+    kill -TERM "$BASHPID"
+    echo "went on"'
+  expect_rc 3
+  expect_text "record first" 'owner ran' "$OUT"
+  expect_text "its record" "restart slot-x by $ME — interrupted (SIGTERM)" "$(cat "$GHR119_REC" 2>/dev/null; true)"
+  # A finished record hands INT and TERM back: to the owner's handler, or to
+  # nothing at all — and the record stays the one `ok`.
+  rm -f "$GHR119_REC"
+  # shellcheck disable=SC2016
+  GHR119_REC="$GHR119_REC" run_fn eval 'audit_logger() { printf "%s\n" "$1" >>"$GHR119_REC"; }
+    trap '"'"'echo "owner ran"; exit 7'"'"' TERM
+    audit_begin restart slot-x
+    audit_finish 0
+    builtin trap -p TERM
+    kill -TERM "$BASHPID"
+    echo "went on"'
+  expect_rc 7
+  expect_text "handed back to the owner" "trap -- 'echo \"owner ran\"; exit 7' SIGTERM
+owner ran" "$OUT"
+  expect_text "its record" "restart slot-x by $ME — ok" "$(cat "$GHR119_REC" 2>/dev/null; true)"
+  rm -f "$GHR119_REC"
+  # shellcheck disable=SC2016
+  GHR119_REC="$GHR119_REC" run_fn eval 'audit_logger() { printf "%s\n" "$1" >>"$GHR119_REC"; }
+    audit_begin restart slot-x
+    armed="$(builtin trap -p TERM)"; printf "armed: %s\n" "$armed"
+    audit_finish 0
+    builtin trap -p TERM
+    kill -TERM "$BASHPID"
+    echo "went on"'
+  expect_rc 143
+  expect_text "armed, then handed back to nothing" "armed: trap -- 'audit_signal TERM' SIGTERM" "$OUT"
+  expect_text "its record" "restart slot-x by $ME — ok" "$(cat "$GHR119_REC" 2>/dev/null; true)"
+}
+
+# The new outcome is read back as written by history and fleet history.
+case_ghr119_history_shows_an_interrupted_record() {
+  printf '%s\n' \
+    '2026-10-14T09:00:01.000100+00:00 build-1 runnerctl[101]: drain example.slot-2 by deploy — interrupted (SIGINT)' \
+    '2026-10-14T09:00:05.000300+00:00 build-1 runnerctl[102]: upgrade to 0.22.0 by deploy via fleet from alice@central-1 — interrupted (SIGTERM)' \
+    >"$GHR88_HIST.ghr119"
+  RUNNERCTL_STUB_HISTORY="$GHR88_HIST.ghr119" run history
+  expect_rc 0
+  expect_text "history" '2026-10-14T09:00:01.000100Z drain example.slot-2 by deploy — interrupted (SIGINT)
+2026-10-14T09:00:05.000300Z upgrade to 0.22.0 by deploy via fleet from alice@central-1 — interrupted (SIGTERM)' "$OUT"
+  cp "$GHR88_HIST.ghr119" "$GHR88_HIST.ghr119.build-1"
+  RUNNERCTL_STUB_HISTORY="$GHR88_HIST.ghr119" RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet history
+  expect_rc 0
+  expect_text "fleet history" '2026-10-14T09:00:01.000100Z build-1 drain example.slot-2 by deploy — interrupted (SIGINT)
+2026-10-14T09:00:05.000300Z build-1 upgrade to 0.22.0 by deploy via fleet from alice@central-1 — interrupted (SIGTERM)' "$OUT"
+}
+
+t "GHR-119: an interrupted command records it and dies by the signal"      case_ghr119_an_interrupted_command_records_it_and_dies_by_the_signal
+t "GHR-119: interrupted before arming, nothing is recorded or trapped"     case_ghr119_interrupted_before_arming_records_nothing
+t "GHR-119: the record composes with a command's own INT/TERM handler"     case_ghr119_composes_with_a_commands_own_handler
+t "GHR-119: history and fleet history show an interrupted record"          case_ghr119_history_shows_an_interrupted_record
+
 # --- GHR-80: fleet JSON for a UI — the envelope, the stream, health --json ----
 # `fleet status --json` gains `generated_at`, `runnerctl`, `summary` and, per
 # host, `duration_ms`, `stale` and `last_seen` — each AFTER every key that was

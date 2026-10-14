@@ -1028,7 +1028,8 @@ The verb; the slots it acted on (`all` when it was given none); the few flags
 that change what it did (`--when-idle`, `--profile NAME`, `--restart`,
 `--if-stalled`, …); who ran it — the sudo caller, else the login; for a call
 that came through `fleet`, the operator and central node it says it came
-from; and how it ended — `ok`, `failed (exit N)`, or a count the command
+from; and how it ended — `ok`, `failed (exit N)`, `interrupted (SIGINT)` /
+`interrupted (SIGTERM)`, or a count the command
 keeps (`health --restart-stalled`: `restarted 2, 1 failed`; `compose-reap
 --apply`: `ok (removed=8 failed=0 images-removed=0)`).
 
@@ -1048,6 +1049,15 @@ keeps (`health --restart-stalled`: `restarted 2, 1 failed`; `compose-reap
   (`health --restart-stalled`, `compose-reap --apply`, `--if-stalled`) record
   only when they act, naming the slots they took, so a quiet hour writes
   nothing.
+- **Interrupted:** a command stopped by Ctrl-C or a SIGTERM after that point
+  is recorded as `interrupted (SIGINT)` or `interrupted (SIGTERM)`, and still
+  ends the way it would have without the record — killed by that signal, or,
+  under `watch` and `fleet watch`, through their own Ctrl-C handling. Stopped
+  before that point, it records nothing. While a record is armed bash runs
+  the signal's handler only once the step in progress has ended, so a
+  SIGTERM sent to runnerctl's process alone (rather than its process group,
+  as Ctrl-C, systemd and `timeout` signal it) waits for that step — a
+  download, or one sleep of a `--when-idle` wait.
 - **Never a secret.** The line is built from chosen parts, never the command
   line, so a token or PAT handed to `provision` or `deprovision` — as a flag
   or in the environment — has no way in. Every part is cleaned of control
