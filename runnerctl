@@ -4405,7 +4405,23 @@ page() {
   read -ra pager <<<"${PAGER:-less}"
   if command -v "${pager[0]}" >/dev/null 2>&1; then "${pager[@]}"; else cat; fi
 }
-WATCH_LEGEND="↑↓/jk select  K kill job  R restart  S stop  T start  P reap  L logs  q quit"
+# GHR-105: one line for both watches (fleet watch's is GHR-98's). It names `?`
+# and not Enter, O or h: the list behind `?` holds every key, and 80 columns
+# hold no more than this. fleet watch builds its legends from the same head.
+WATCH_LEGEND_HEAD="↑↓/jk select  K kill  R restart  S stop  T start  P reap  L logs"
+WATCH_LEGEND="$WATCH_LEGEND_HEAD  ? keys  q quit"
+# GHR-105: the keys the local watch reads, where the table was, until a key.
+# Nine lines, so with the header and the foot it fits 24 rows; none is
+# wider than 80 columns.
+WATCH_HELP="watch — keys
+  ↑ ↓ j k   PgUp PgDn   g G Home End   move the cursor: a row, a page, the ends
+  Enter   the cursor's slot in full, in place of the table. There q Esc Enter
+          go back, h shows the host alone, ↑ ↓ PgUp PgDn scroll, K R S T P L O
+          act on the slot
+  K R S T P L   kill job, restart, stop, start, reap, logs; each asks to confirm
+  O     print the run URL of the cursor's job — nothing is opened
+  q ?   quit, this list; any key closes it (and is spent doing so)"
+WATCH_HELP_ON=false
 
 # The cursor row: reverse video over the whole line, re-applied after every
 # reset a painted cell ends with, so a coloured cell does not cut it short.
@@ -5198,6 +5214,8 @@ watch_handle_key() { # KEY UNITS...
     return 0
   fi
   WATCH_NOTICE=""
+  # GHR-105: any key closes the list, and is spent doing it.
+  if $WATCH_HELP_ON; then WATCH_HELP_ON=false; return 0; fi
   # GHR-76: with the pane up every key is the pane's — `q` goes back to the
   # table rather than quitting, and no key moves a cursor nobody can see.
   if [ -n "$WATCH_PANE" ]; then watch_pane_key "$key"; return 0; fi
@@ -5224,6 +5242,7 @@ watch_handle_key() { # KEY UNITS...
     K|R|S|T|P|L|O) watch_key_action "$key" "$WATCH_CURSOR" ;;
     # GHR-76: the cursor's slot in full, in place of the table.
     enter) if [ -n "$WATCH_CURSOR" ]; then WATCH_PANE=slot; pane_enter; fi ;;
+    '?')   WATCH_HELP_ON=true ;;
   esac
   return 0
 }
@@ -5290,6 +5309,15 @@ cmd_watch() { # [--interval N] [--iterations N] [--color WHEN] [--stall-after N]
       continue
     fi
     mapfile -t units < <(discover)
+    if $WATCH_HELP_ON; then
+      viewport_draw "$header" "$WATCH_HELP" $'\n'"$(paint "$C_DIM" "any key closes this list")"$'\n' 0 0 0
+      if viewport_read_key "$interval"; then
+        watch_handle_key "$KEY" "${units[@]}" || break
+      else
+        tick=$((tick + 1))
+      fi
+      continue
+    fi
     if [ -n "$WATCH_PANE" ]; then
       # GHR-76: the pane, rebuilt from fresh facts on every frame — a tick
       # refreshes it exactly as it refreshes the table. A slot that went away
@@ -11189,11 +11217,11 @@ FW_VIEW="" FW_VIEW_NAME="" FW_FACTS_OK=false
 FW_KIND=()
 declare -A FW_FACT=() FW_HOSTBAD=() FW_HOSTSUM=() FW_OPEN=()
 FLEET_WATCH_EMPTY="nothing matches — a shows all"
-# GHR-98: fleet watch's own legend, since only it has the `?` overlay. It names
+# GHR-98: fleet watch's legend (GHR-105: its head is the local watch's). Names
 # `?` in the frame a reader sees first, and is 80 columns exactly (the
 # host-scoped keys are in the overlay, not here: no room). With a view on it
 # also names `a`, ahead of `? keys`, which it says once.
-FLEET_WATCH_LEGEND_HEAD="↑↓/jk select  K kill  R restart  S stop  T start  P reap  L logs"
+FLEET_WATCH_LEGEND_HEAD="$WATCH_LEGEND_HEAD"
 FLEET_WATCH_LEGEND="$FLEET_WATCH_LEGEND_HEAD  ? keys  q quit"
 FLEET_WATCH_VIEW_LEGEND="$FLEET_WATCH_LEGEND_HEAD  a all  ? keys  q quit"
 # Seventeen lines, so that with the header, the summary and the three lines

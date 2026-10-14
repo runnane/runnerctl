@@ -2026,7 +2026,7 @@ case_status_used_color_thresholds() {
 # The cursor row is reverse video (ESC[7m … ESC[0m) whatever --color says;
 # each frame ends with the legend and a status line (notice or confirm).
 REV="$ESC\[7m"
-LEGEND='^↑↓/jk select  K kill job  R restart  S stop  T start  P reap  L logs  q quit$'
+LEGEND='^↑↓/jk select  K kill  R restart  S stop  T start  P reap  L logs  \? keys  q quit$'
 SLOT1_UNIT='actions\.runner\.example\.slot-1\.service'
 SLOT2_UNIT='actions\.runner\.example\.slot-2\.service'
 SLOT3_UNIT='actions\.runner\.example\.slot-3\.service'
@@ -8383,7 +8383,7 @@ w_row() { echo "^$1 +example\.slot-$2 "; }
 # follows it.
 case_watch_unknown_height_draws_the_frame_of_before() {
   local table want sep=$'\033[H\033[2J' legend="${LEGEND#^}" hdr
-  legend="${legend%\$}"
+  legend="${legend%\$}" legend="${legend//\\?/?}"
   hdr="runnerctl watch — ${HOSTNAME:-$(uname -n)} — TIME — every 1s (Ctrl-C to quit)"
   run status
   expect_rc 0
@@ -8398,6 +8398,40 @@ case_watch_unknown_height_draws_the_frame_of_before() {
   # width, which only a known height needs, was asked for by watch_table alone
   expect_cfg "$LOG.lines" '^2$'
   expect_cfg "$LOG.cols" '^2$'
+}
+
+# GHR-105: the local watch's legend is the fleet's default one and says `? keys`
+# in 80 columns, measured as the script measures a line.
+case_watch_legend_names_the_keys_overlay_in_80_columns() {
+  run_snippet "$STUB" "viewport_rows \"\$WATCH_LEGEND\" 80; echo \"\$VIEW_ROWS \${#SGR_STRIPPED}\""
+  expect_rc 0
+  expect_text "the legend: one row, 80 columns at most" "1 80" "$OUT"
+  run_snippet "$STUB" "viewport_rows \"\${WATCH_LEGEND}x\" 80; echo \"\$VIEW_ROWS\""
+  expect_text "the same legend one column longer wraps (the measure bites)" "2" "$OUT"
+  run_snippet "$STUB" "printf \"%s\\n\" \"\$WATCH_LEGEND\""
+  expect_out_count '\? keys' 1
+}
+
+# GHR-105: `?` puts the list of keys where the table was, naming Enter and O;
+# any key closes it, and is spent doing so (the second `?` shows the table
+# again, and the `q` after it is what quits).
+case_watch_question_mark_lists_every_key() {
+  local k
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='??q' run watch --interval 60
+  expect_rc 0
+  frames
+  expect_frame_count 3
+  expect_frame 1 "$LEGEND"
+  expect_frame_line 2 2 '^watch — keys$'
+  expect_frame 2 '^any key closes this list$'
+  expect_frame_count_of 2 '^IDX |example\.slot-' 0
+  for k in 'Enter' 'K R S T P L' 'O' 'q \?' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
+    expect_frame 2 "^  $k   +[a-z]"
+  done
+  expect_frame 2 '^  O     print the run URL of the cursor.s job — nothing is opened$'
+  expect_frame 3 "$LEGEND"
+  expect_frame_count_of 3 'watch — keys' 0
+  expect_frame_lines 2 13
 }
 
 case_fleet_watch_unknown_height_draws_the_frame_of_before() {
@@ -10203,6 +10237,8 @@ t "fleet watch: a failed remote action is a notice, the watch goes on"  case_fle
 t "watch: unknown height (0) is the frame of before, byte for byte"       case_watch_unknown_height_draws_the_frame_of_before
 t "fleet watch: unknown height (0) is the frame of before, byte for byte" case_fleet_watch_unknown_height_draws_the_frame_of_before
 t "fleet watch: the legend names ? and fits 80 columns"                  case_fleet_watch_legend_names_the_keys_overlay_in_80_columns
+t "watch: the legend names ? and fits 80 columns"                        case_watch_legend_names_the_keys_overlay_in_80_columns
+t "watch: ? lists every key, naming Enter and O; a key closes the list"  case_watch_question_mark_lists_every_key
 t "watch: a tall frame is cut to the height, chrome and cursor row kept"   case_watch_tall_frame_is_cut_to_the_terminal_height
 t "watch: the window scrolls with the cursor; PgUp/PgDn, g/G, Home/End"   case_watch_window_scrolls_with_the_cursor
 t "watch, fleet watch: the last row brings the notes under the table in"  case_watch_last_row_shows_the_notes_under_the_table

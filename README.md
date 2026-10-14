@@ -610,6 +610,7 @@ and the result becomes the status line under the legend:
 | `L` | show `logs <slot> -n 50` in `$PAGER` (`less`; `q` returns to the table). No confirm — it changes nothing | `journalctl -u <unit> -n 50` |
 | `O` | print the URL of the running job's run on the status line — `https://github.com/<owner>/<repo>/actions/runs/<id>/attempts/<n>` — to copy or click. It is printed, never opened: the node you watch from is usually a terminal with no browser. Says so when no job is running, or when the job's environment could not be read (between steps, a container job, no access to the slot's processes) | nothing |
 | `Enter` | show the selected slot in full, in place of the table — [below](#the-slot-in-full-enter) | nothing |
+| `?` | list every key `watch` reads, in place of the table, as [`fleet watch`](#a-live-fleet-view-fleet-watch)'s `?` does; any key closes the list, and is spent doing so. The legend under the table names it: `? keys` | nothing |
 | `PgUp` / `PgDn` | move the cursor a page (a window less one row, so the row you left is still on screen) | |
 | `g` / `G`, `Home` / `End` | the first / last slot | |
 | `q` | quit | |
@@ -1388,7 +1389,7 @@ build-2  0   org.build-2-a   ci       active/running   6d     enabled  ...  my-a
 build-3  no answer for 45s — last seen 14:01:26 — unreachable — ssh: connect to host build-3 port 22: No route to host
 build-3  0   org.build-3-a   ci       active/running   1d 2h  enabled  ...  my-app:build (4m)
 
-↑↓/jk select  K kill job  R restart  S stop  T start  P reap  L logs  q quit
+↑↓/jk select  K kill  R restart  S stop  T start  P reap  L logs  ? keys  q quit
 ```
 
 **Do not build this out of `watch(1)`.** `watch runnerctl fleet status` works
