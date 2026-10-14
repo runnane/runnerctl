@@ -47,7 +47,7 @@
 #                                [--if-stalled] [--stall-after N] \
 #                                [<unit|slot-index|name> ...]
 #   runnerctl drain [--timeout N] [<unit|slot-index|name> ...]
-#   runnerctl enable|disable <unit|slot-index|name>
+#   runnerctl enable|disable <unit|slot-index|name> [<unit|slot-index|name> ...]
 #   runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
 #                  [--since WHEN] [-g PATTERN]
 #   runnerctl remove-limits [<unit|slot-index|name> ...]
@@ -4117,12 +4117,23 @@ cmd_ctl() { # start|stop|restart [--when-idle] [--timeout N] [--if-stalled] [--s
   fi
 }
 
-cmd_toggle() { # enable|disable <target>
+cmd_toggle() { # enable|disable <target> [target ...]
   local action="$1"; shift || true
   [ $# -ge 1 ] || die "$action needs a <unit|slot-index|name>"
-  local u; u="$(resolve "$1")"
-  audit_begin "$action" "$(short_name "$u")"
-  run_priv systemctl "$action" --now "$u"
+  local units=() u t
+  # Resolve every target before acting on any (GHR-134): a bad later target
+  # changes nothing. Resolve on its own line: a die inside "$(...)" only exits
+  # the subshell.
+  for t in "$@"; do
+    case "$t" in -*) die "unknown option: $t" ;; esac
+    u="$(resolve "$t")"
+    units+=("$u")
+  done
+  audit_begin "$action"
+  audit_slots "${#units[@]}" "${units[@]}"
+  for u in "${units[@]}"; do
+    run_priv systemctl "$action" --now "$u"
+  done
   echo "$action done."
 }
 
