@@ -1502,10 +1502,18 @@ journal_job_args() { # UNIT [INVOCATION-ID]
   return 0
 }
 
+# Two calls, because one cannot tell "no access" from "no match" (GHR-65):
+# `journalctl -g` exits 1 when NOTHING MATCHES — measured, as root, on a
+# readable journal — the same status it gives a user outside systemd-journal.
+# So access is asked first with `-n 1` (--system: a plain journalctl answers
+# an unreadable journal with exit 0), which exits 0 on an empty journal too,
+# and the search's own non-zero then means only "no job line yet": success
+# with no output, which job_facts reads as a fresh slot, not a missing journal.
 journal_job_lines() { # UNIT [INVOCATION-ID]
   local args=()
   mapfile -t args < <(journal_job_args "$@")
-  journalctl "${args[@]}" 2>/dev/null || return 1
+  journalctl --system -q --no-pager -n 1 >/dev/null 2>&1 || return 1
+  journalctl "${args[@]}" 2>/dev/null || true
 }
 
 # Journal memo for `watch` (GHR-3). A redraw every 2 s would otherwise run
