@@ -4520,7 +4520,7 @@ case_fleet_watch_S_stops_the_selected_pair_on_its_own_host() {
   expect_rc 0
   expect_out_count "$FRAME_PREFIX" 6
   expect_out_count '^Stop example\.slot-1 on build-2\? runs on build-2: runnerctl stop example\.slot-1 — leaves 3 of 6 slot\(s\) active across the watched hosts  \[y/n\]$' 1
-  expect_out_count '^warning: a job is running \(my-app:test \(12m\)\) — it will be killed and GitHub marks it failed; runnerctl stop --when-idle on the host waits for it instead$' 1
+  expect_out_count '^warning: a job is running \(my-app:test \(12m\)\) — y kills it and GitHub marks it failed; w waits for it instead$' 1
   expect_out_count '^running on build-2: runnerctl stop example\.slot-1$' 1
   expect_out_count '^example\.slot-1 on build-2: stop done\.$' 1
   expect_log_count '^probe:ssh_run build-2 -- runnerctl stop example\.slot-1$' 1
@@ -4565,7 +4565,7 @@ case_fleet_watch_K_decides_on_facts_read_at_the_key() {
   expect_log_count '^probe:ssh_run build-1 -- runnerctl kill example\.slot-1$' 1
   expect_out_count '^example\.slot-1 on build-1: kill done\.$' 1
   expect_out_count '^Restart example\.slot-1 on build-1\? runs on build-1: runnerctl restart example\.slot-1  \[y/n\]$' 1
-  expect_out_count '^warning: a job is running \(my-app:test \(12m\)\) — .* runnerctl restart --when-idle on the host waits for it instead$' 1
+  expect_out_count '^warning: a job is running \(my-app:test \(12m\)\) — y kills it and GitHub marks it failed; w waits for it instead$' 1
   expect_out_count '^cancelled — nothing run$' 1
   expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl restart '
   # a deactivating slot: the unit-kill confirm, from the host's own sub-state
@@ -9331,6 +9331,7 @@ case_fleet_watch_question_mark_lists_every_key() {
   for k in '!' 'b i' '/' 'a' 's' 'c' 'Enter' 'K R S T P L' 'O' '\?' 'q' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
     expect_frame 2 "^  $k   +[a-z]"
   done
+  expect_frame 2 '^  K R S T P L   kill job, restart, stop, start, reap, logs; R S: w = when idle$'
   expect_frame 2 '^          host that is not answering: that host\)\. There q Esc Enter go back, h$'
   expect_frame_lines 2 23
   expect_frame 3 "$(fw_row build-1 0 1)"
@@ -10776,7 +10777,7 @@ case_fleet_watch_pane_keeps_the_cursor_and_acts_on_its_pair() {
   expect_frame 6 '^example\.slot-1 on build-2: https://github\.com/example/my-app/actions/runs/1234567890/attempts/2$'
   expect_frame_line 7 3 '^example\.slot-1 on build-2 — slot details$'
   expect_frame 7 '^Restart example\.slot-1 on build-2\? runs on build-2: runnerctl restart example\.slot-1  \[y/n\]$'
-  expect_frame 7 '^warning: a job is running \(my-app:test \(12m\)\) — .* runnerctl restart --when-idle on the host waits for it instead$'
+  expect_frame 7 '^warning: a job is running \(my-app:test \(12m\)\) — y kills it and GitHub marks it failed; w waits for it instead$'
   expect_log_count '^probe:ssh_run build-2 -- runnerctl restart example\.slot-1$' 1
   expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap) ' 1
   expect_frame_line 8 3 '^example\.slot-1 on build-2 — slot details$'
@@ -13812,6 +13813,156 @@ t "GHR-125: one action per host; another host's starts its own"           case_g
 t "GHR-125: an action's progress line is relayed safe"                    case_ghr125_progress_line_is_relayed
 t "GHR-125: a background action is on the mutating budget"                case_ghr125_a_background_action_is_on_the_mutating_budget
 t "GHR-125: a fitted frame makes room for the progress line"              case_ghr125_a_fitted_frame_makes_room_for_the_progress_line
+
+# --- GHR-126: w at the confirm line of R and S runs the --when-idle form --------
+# `s` is the sort key (GHR-75), so there is no new top-level key: R and S keep
+# their meaning, and their confirm line takes a second answer. y runs today's
+# abrupt command, w the same verb with --when-idle, anything else cancels.
+GHR126_RESTART_LINE='^Restart example\.slot-1 on build-1\? runs on build-1: runnerctl restart example\.slot-1  \[y/n\]'
+GHR126_IDLE_RESTART='^w instead runs on build-1: runnerctl restart example\.slot-1 --when-idle — waits for the job to finish; anything else cancels$'
+GHR126_WARNING='^warning: a job is running \(my-app:test \(12m\)\) — y kills it and GitHub marks it failed; w waits for it instead$'
+
+# R, w: exactly one `restart <slot> --when-idle` to that host and no abrupt one;
+# the busy confirm line keeps its kill warning and names w. The record carries
+# the flag. y on the same slot is still the abrupt command, byte for byte.
+case_ghr126_R_w_restarts_when_idle() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Rwq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "$GHR126_RESTART_LINE" 1
+  expect_out_count "$GHR126_WARNING" 1
+  expect_out_count "$GHR126_IDLE_RESTART" 1
+  expect_no_out 'ssh to the host|on the host waits for it'
+  expect_out_count '^running on build-1: runnerctl restart example\.slot-1 --when-idle$' 1
+  expect_out_count "^${GHR125_DONE}\$" 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart example\.slot-1 --when-idle$' 1
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap) ' 1
+  expect_no_log '^probe:ssh_run build-1 -- runnerctl restart example\.slot-1$'
+  expect_cfg_count "$WRITES/fleet.log" '.' 1
+  expect_cfg "$WRITES/fleet.log" "^$GHR88_TS $ME fleet restart --when-idle --host build-1 example\\.slot-1 \\(fleet watch\\) — build-1=0\$"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Ryq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart example\.slot-1$' 1
+  expect_no_log 'when-idle'
+}
+
+# S, w: one `stop <slot> --when-idle`, on the host the cursor is on. An idle
+# slot has no warning and still offers w.
+case_ghr126_S_w_stops_when_idle_on_its_own_host() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjSwq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^Stop example\.slot-1 on build-2\? runs on build-2: runnerctl stop example\.slot-1 — leaves 3 of 6 slot\(s\) active across the watched hosts  \[y/n\]' 1
+  expect_out_count '^w instead runs on build-2: runnerctl stop example\.slot-1 --when-idle — waits for the job to finish; anything else cancels$' 1
+  expect_out_count '^running on build-2: runnerctl stop example\.slot-1 --when-idle$' 1
+  expect_out_count '^example\.slot-1 on build-2: stop done\.$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl stop example\.slot-1 --when-idle$' 1
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap) ' 1
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jRwq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^Restart example\.slot-2 on build-1\? ' 1
+  expect_no_out '^warning: a job is running'
+  expect_out_count '^w instead runs on build-1: runnerctl restart example\.slot-2 --when-idle ' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart example\.slot-2 --when-idle$' 1
+}
+
+# The negative control: S, w is gated by the capacity floor exactly as S, y is.
+# A stop-when-idle on the host's last active slot is refused with the floor
+# message and issues nothing — walked as the floor's own case walks it, and
+# against a higher --min-available. A stop that stays above the floor runs.
+case_ghr126_S_w_stops_at_the_floor() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='SwjSwq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^example\.slot-2 on build-1: not stopped — it would leave 0 of 3 slot\(s\) active across the watched hosts, under --min-available 1; restart --min-available lower \(0 turns the floor off\), or run 'runnerctl stop example\.slot-2' on build-1\$" 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl stop example\.slot-1 --when-idle$' 1
+  expect_no_log '^probe:ssh_run build-1 -- runnerctl stop example\.slot-2'
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap) ' 1
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Swq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never --min-available 2
+  expect_rc 0
+  expect_out_count '^example\.slot-1 on build-1: not stopped — it would leave 1 of 3 slot\(s\) active .* under --min-available 2; ' 1
+  expect_no_out '^w instead'
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap) '
+}
+
+# R takes no floor, for either answer: the slot comes back. R, w on a host's
+# only active slot is offered and runs.
+case_ghr126_R_w_has_no_floor() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Rwq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never --min-available 3
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart example\.slot-1 --when-idle$' 1
+  expect_no_out 'not restarted|min-available'
+}
+
+# w only means something at the confirm line of R and S. At any other confirm
+# it cancels like every key that is not y, and a w with no confirm up is not a
+# key (s, which the description first asked for, is the sort key).
+case_ghr126_w_elsewhere_cancels_and_the_other_answers_are_unchanged() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='KwTjjjTwq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^Kill the job on ' 1
+  expect_out_count '^Start example\.slot-3 on build-1\? ' 1
+  expect_out_count '^cancelled — nothing run$' 2
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap) '
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Rnq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^cancelled — nothing run$' 1
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap) '
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='wq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_no_out '\[y/n\]'
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap) '
+}
+
+# w runs in the background like y (GHR-125): with the restart held, the j
+# pressed next is read on the poll step while the action runs, the progress
+# line is on the frame, and the notice comes after the release.
+case_ghr126_w_runs_in_the_background() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD=build-1 RUNNERCTL_STUB_KEYS="Rwj${REL}kq" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 5
+  expect_frame_before "the cursor j moved" "$(fw_row build-1 1 2)" "the action's notice" "^${GHR125_DONE}\$"
+  expect_frame 3 "^example\.slot-1 on build-1: restart running — ${GHR125_PROGRESS}\$"
+  expect_no_frame 3 'restart done'
+  expect_frame 4 "^${GHR125_DONE}\$"
+  expect_log_order '^probe:tty_read_char 5 w$' '^probe:ssh_run build-1 -- runnerctl restart example\.slot-1 --when-idle$' \
+                   '^probe:remote_held build-1$' '^probe:act_poll landed=0 held=1$' '^probe:tty_read_char 0\.2 j$' \
+                   '^probe:release$' '^probe:remote_released build-1$'
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart ' 1
+}
+
+# The budget a --when-idle call earns: a restart that takes 1500 s outlasts the
+# abrupt call's FLEET_MUTATE_TIMEOUT (900) and is a timeout for y, but w gets
+# WAIT_TIMEOUT (1800) on top and completes.
+case_ghr126_w_is_on_the_when_idle_budget() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_DELAY="build-1:1500:restart" RUNNERCTL_STUB_KEYS='Ry-q' \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^example\.slot-1 on build-1: restart failed — timed out after 900s " 2
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_DELAY="build-1:1500:restart" RUNNERCTL_STUB_KEYS='Rw-q' \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^${GHR125_DONE}\$" 2
+  expect_no_out 'timed out'
+}
+
+# FLEET_SUDO and --origin apply to the graceful form as to the abrupt one.
+case_ghr126_w_carries_sudo_and_origin() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_KEYS='Rwq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^w instead runs on build-1: sudo -n runnerctl restart example\.slot-1 --when-idle ' 1
+  expect_log_count '^probe:ssh_run build-1 -- sudo -n runnerctl restart example\.slot-1 --when-idle$' 1
+  expect_log_count "^probe:ssh_origin build-1 $GHR88_ORIGIN\$" 1
+}
+
+t "GHR-126: R, w restarts when idle, once, with the kill warning naming w"   case_ghr126_R_w_restarts_when_idle
+t "GHR-126: S, w stops when idle on the cursor's own host"                    case_ghr126_S_w_stops_when_idle_on_its_own_host
+t "GHR-126: S, w stops at the capacity floor, issuing nothing"                case_ghr126_S_w_stops_at_the_floor
+t "GHR-126: R, w takes no capacity floor"                                     case_ghr126_R_w_has_no_floor
+t "GHR-126: w elsewhere cancels; y and n are unchanged"                       case_ghr126_w_elsewhere_cancels_and_the_other_answers_are_unchanged
+t "GHR-126: w runs in the background"                                         case_ghr126_w_runs_in_the_background
+t "GHR-126: w is on the --when-idle budget"                                   case_ghr126_w_is_on_the_when_idle_budget
+t "GHR-126: w carries FLEET_SUDO and --origin"                                case_ghr126_w_carries_sudo_and_origin
 
 # --- Summary ------------------------------------------------------------------
 echo
