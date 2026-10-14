@@ -1404,6 +1404,16 @@ one still out when a tick comes due is skipped for that tick — and
 `FLEET_PARALLEL` still caps how many are in flight. A one-shot `fleet status`
 is not affected by any of this.
 
+A host that is slow to answer says so on its host line, after whatever the line
+already carries: `build-2  v0.21.0 · Disk: … — answered in 3.2s`. The time is
+how long the host's table call took (the number `fleet status --json` reports
+as `duration_ms`), and it only appears from a quarter of the host's
+`FLEET_WATCH_TIMEOUT` up — 2.5 s at the default — so a healthy fleet's frame
+shows none; it turns yellow from three quarters, where the next slow tick is a
+timeout. A host with nothing else on its line gets one for it
+(`build-2  v0.21.0 · answered in 3.2s`). Neither limit is configurable, and
+`fleet status` without `watch` never shows it.
+
 The [fleet summary](#several-hosts-from-one-place-fleet-status) sits directly
 under the header rather than at the bottom, so it stays on screen however long
 the table is. It is refreshed with the table, whenever a host's answer comes
