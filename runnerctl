@@ -607,6 +607,10 @@ REMAINING=()
 TARGETS=()
 
 run_priv() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
+# Is this process root? A hook of its own (GHR-117) so the sim can stand in
+# for a root run without being one: write_as below asks it, and a root run's
+# writes then go through run_priv, where the sim's stub logs them.
+as_root() { [ "$(id -u)" -eq 0 ]; }
 die() { echo "runnerctl: $*" >&2; exit 1; }
 # Call as `need_val "$@"` right after matching a value flag in $1: dies with
 # "$1 needs a value" if no $2 is there to take it, instead of letting a bare
@@ -12562,11 +12566,16 @@ cmd_migrate() {
       echo "$out already exists — not overwriting it; writing $out.migrated instead"
       out="$out.migrated"
     fi
-    local priv=()
-    ! needs_priv "$out" || priv=(run_priv)
+    local priv=() newroot=false
+    ! needs_priv "$out" || { priv=(run_priv); newroot=true; }
+    # GHR-117: mkdir, tee, chown and chmod are four calls on one name, so they
+    # are root's only in a directory nobody else can write (write_as).
+    write_as "$(dirname "$out")" "write $out" "$out"
+    [ "${#WRITE_AS[@]}" -eq 0 ] || priv=("${WRITE_AS[@]}")
+    [ -z "$WRITE_USER" ] || newroot=false
     "${priv[@]}" mkdir -p "$(dirname "$out")"
     printf '%s\n' "$cfg" | "${priv[@]}" tee "$out" >/dev/null
-    [ "${#priv[@]}" -eq 0 ] || run_priv chown root:root "$out"
+    ! $newroot || run_priv chown root:root "$out"
     "${priv[@]}" chmod 644 "$out"
     written="$out"
     echo "Wrote $out"
@@ -12773,16 +12782,33 @@ fetch_script() { # URL DEST [PIN]
 install_file() { # SRC DEST [REF]
   local src="$1" dest="$2" ref="${3:-$2}" dir staged mode=755
   dir="$(dirname "$dest")"; staged="$dir/.$(basename "$dest").new.$$"
-  local priv=()
+  local priv=() newroot=false
   { [ -w "$dir" ] && { [ ! -e "$dest" ] || [ -w "$dest" ]; }; } || priv=(run_priv)
+  # A new file is made root's only where it took sudo to write, as before.
+  [ "${#priv[@]}" -eq 0 ] || newroot=true
+  # GHR-117: four calls on names in DIR follow, and only a DIR nobody but root
+  # can write makes them safe as root. write_as decides before the first one:
+  # root's own calls (run_priv, which for a root process runs the call
+  # itself), the calls as the one user who owns DIR, or a refusal.
+  write_as "$dir" "install $dest" "$dest" "$ref"
+  [ "${#WRITE_AS[@]}" -eq 0 ] || priv=("${WRITE_AS[@]}")
+  local user="$WRITE_USER"
   # GHR-111: DIR can be one its owner writes (a script run in place from a
   # home), so every name here is theirs to plant. --remove-destination unlinks
   # STAGED and creates it exclusively, so a symlink planted at the predictable
   # `.new.<pid>` name is replaced instead of written through; -T below replaces
   # a DEST that is a symlink to a directory instead of moving STAGED into it.
-  "${priv[@]}" cp --remove-destination "$src" "$staged"
+  if [ -n "$user" ] && [ "$src" = "${DOWNLOAD_TMP:-}" ]; then
+    # The download is root's mktemp, 0600: the user cannot open it, so it is
+    # handed over on stdin, already open. Nothing else is opened by root.
+    "${priv[@]}" rm -f -- "$staged"
+    "${priv[@]}" tee -- "$staged" <"$src" >/dev/null
+  else
+    "${priv[@]}" cp --remove-destination "$src" "$staged"
+  fi
   if [ -e "$ref" ]; then
-    "${priv[@]}" chown -h --reference="$ref" "$staged"
+    # As the user, REF is theirs already (write_as checked): nothing to chown.
+    [ -n "$user" ] || "${priv[@]}" chown -h --reference="$ref" "$staged"
     # Keep what the admin set — setuid bits, a wider group — but never less
     # than a+rx, so a host already installed at 0700 heals on the next run
     # instead of staying unrunnable.
@@ -12790,10 +12816,138 @@ install_file() { # SRC DEST [REF]
     [[ "$mode" =~ ^[0-7]+$ ]] || mode=755
     mode="$(printf '%04o' "$(( 8#$mode | 8#0555 ))")"
   else
-    [ "${#priv[@]}" -eq 0 ] || run_priv chown root:root "$staged"
+    ! $newroot || [ -n "$user" ] || run_priv chown root:root "$staged"
   fi
   "${priv[@]}" chmod "$mode" "$staged"
   "${priv[@]}" mv -fT "$staged" "$dest"
+}
+
+# --- Writes into a directory a user controls (GHR-117) -------------------------
+# install_file, the renames that retire a copy, the directories install and
+# upgrade create and migrate's config write are each calls on NAMES in one
+# directory, several of them in a row. As root those names are safe only if
+# nobody else can write the directory: whoever can swaps a name for a symlink
+# between two calls, and the later call acts on whatever it points at. GHR-111's
+# single-call protections (mv -T, cp --remove-destination, chown -h) cannot
+# reach across calls. So before the first privileged call the directory's chain
+# is read — metadata only, GHR-121's rule (dir_chain_problem) — and the write
+# goes one of three ways:
+#   - the chain is root's alone: root's own calls, as always;
+#   - one non-root user controls the chain and owns every existing name the
+#     write touches (a copy in ~/.local/bin under sudo): every call is made AS
+#     THAT USER through runuser, with no chown, so a swapped name can only
+#     redirect a write they could make anyway — GHR-121's deprovision rule;
+#   - anything else (group- or world-writable, two owners, a name someone else
+#     owns): refused, naming the directory and the remedy.
+# A write this process can make without any privilege (not root, the directory
+# and the names writable) is its own, and is not checked.
+
+# "ok UID" when one non-root uid controls PATH's chain — every directory from /
+# down is root's alone (root_exec_problem says nothing) or that uid's and not
+# group- or world-writable, and the deepest existing one is that uid's — else
+# "no WHY". A symlink component must be root's, as in dir_chain_problem.
+dir_chain_owner() { # PATH
+  local path="$1" p="" part owner mode problem uid="" deepest=/
+  local -a parts
+  problem="$(root_exec_problem /)"
+  [ -z "$problem" ] || { echo "no $problem"; return 0; }
+  IFS=/ read -ra parts <<<"${path#/}"
+  for part in "${parts[@]}"; do
+    [ -n "$part" ] || continue
+    p+="/$part"
+    if [ -L "$p" ]; then
+      owner="$(stat -c %u "$p" 2>/dev/null || echo '?')"
+      [ "$owner" = 0 ] || { echo "no $p is a symlink owned by uid $owner, not root"; return 0; }
+      continue
+    fi
+    [ -e "$p" ] || break
+    deepest="$p"
+    problem="$(root_exec_problem "$p")"
+    [ -n "$problem" ] || continue
+    owner="$(stat -c %u "$p" 2>/dev/null || echo '?')"
+    mode="$(stat -c %a "$p" 2>/dev/null || echo '?')"
+    [[ "$owner" =~ ^[1-9][0-9]*$ ]] || { echo "no $problem"; return 0; }
+    case "${mode: -2:1}${mode: -1}" in
+      *[2367]*) echo "no $p is group- or world-writable (mode $mode)"; return 0 ;;
+    esac
+    [ -z "$uid" ] || [ "$uid" = "$owner" ] || { echo "no $p is owned by uid $owner, and a directory above it by uid $uid"; return 0; }
+    uid="$owner"
+  done
+  [ -n "$uid" ] || { echo "no no single user owns $path"; return 0; }
+  owner="$(stat -c %u "$deepest" 2>/dev/null || echo '?')"
+  [ "$owner" = "$uid" ] || { echo "no $deepest is owned by uid $owner, inside a directory uid $uid owns"; return 0; }
+  echo "ok $uid"
+}
+
+# Sets WRITE_AS — the prefix for every call of a write of NAME... in DIR — and
+# WRITE_USER: () when this process writes them itself, (run_priv) when DIR's
+# chain is root's alone, (run_priv runuser -u USER --) with WRITE_USER=USER when
+# one user controls it. Dies otherwise, before any privileged call. WHAT is the
+# write, for the refusal ("install /path/runnerctl").
+WRITE_AS=()
+WRITE_USER=""
+write_as() { # DIR WHAT [NAME...]
+  local dir="$1" what="$2" e n need=false r canon a b owner user uid why
+  shift 2
+  WRITE_AS=(); WRITE_USER=""
+  # A directory yet to be made is judged by the nearest one that exists, as
+  # needs_priv does.
+  e="$dir"
+  while [ ! -e "$e" ] && [ ! -L "$e" ] && [ "$e" != / ]; do e="$(dirname "$e")"; done
+  if as_root || [ ! -w "$e" ]; then need=true; fi
+  for n in "$@"; do
+    if [ -e "$n" ] && [ ! -w "$n" ]; then need=true; fi
+  done
+  $need || return 0
+  canon="$(readlink -m -- "$dir" 2>/dev/null || printf '%s' "$dir")"
+  r="$(dir_chain_problem "$dir")"
+  [ -n "$r" ] || [ "$canon" = "$dir" ] || r="$(dir_chain_problem "$canon")"
+  if [ -z "$r" ]; then WRITE_AS=(run_priv); return 0; fi
+  a="$(dir_chain_owner "$canon")"
+  if [ "$canon" != "$dir" ] && [[ "$a" == ok* ]]; then
+    b="$(dir_chain_owner "$dir")"
+    case "$b" in
+      "$a") ;;
+      ok*) a="no $dir and $canon, which it resolves to, are not one user's" ;;
+      *) a="$b" ;;
+    esac
+  fi
+  why="${a#no }"
+  if [[ "$a" == ok* ]]; then
+    uid="${a#ok }"
+    for n in "$@"; do
+      [ -e "$n" ] || [ -L "$n" ] || continue
+      owner="$(stat -c %u "$n" 2>/dev/null || echo '?')"
+      [ "$owner" = "$uid" ] && continue
+      why="$n is owned by uid $owner, not by uid $uid who owns $dir"; uid=""; break
+    done
+    if [ -n "$uid" ]; then
+      user="$(getent passwd "$uid" 2>/dev/null | cut -d: -f1 || true)"
+      if [[ "$user" =~ ^[A-Za-z_][A-Za-z0-9._-]*$ ]]; then
+        WRITE_USER="$user"; WRITE_AS=(run_priv runuser -u "$user" --)
+        return 0
+      fi
+      why="$dir is owned by uid $uid, which has no user name to write as"
+    fi
+  fi
+  die "refusing to $what as root: $why — whoever can write $dir could swap a name in it between root's calls (GHR-117). Move the copy to a directory only root can write, such as /usr/local/bin, or run this as the user who owns $dir, without sudo"
+}
+
+# Rename a copy out of the way: OLD to NEW, in OLD's directory. -T (GHR-111): a
+# NEW that is a symlink to a directory is replaced, never entered — otherwise
+# `mv` would move OLD into whatever directory that is.
+retire_copy() { # OLD NEW
+  write_as "$(dirname "$1")" "retire $1" "$1" "$2"
+  "${WRITE_AS[@]}" mv -fT "$1" "$2"
+}
+
+# Create DIR (and its missing parents) at an explicit 755 (GHR-47: under
+# root's umask 077 it would be 0700, and nobody else could reach the binary or
+# the config). An existing directory is left exactly as the admin has it.
+make_dir() { # DIR WHAT
+  [ ! -d "$1" ] || return 0
+  write_as "$1" "$2"
+  "${WRITE_AS[@]}" mkdir -p -m 755 "$1"
 }
 
 # --- Where an upgrade should land (GHR-52) ------------------------------------
@@ -12886,7 +13040,7 @@ upgrade_rollback_line() { # TARGET
 }
 
 upgrade_rollback() { # TARGET
-  local target="$1" prev="$1.prev" prev_ver dir priv=()
+  local target="$1" prev="$1.prev" prev_ver dir
   if [ ! -e "$prev" ] && [ ! -L "$prev" ]; then
     die "no rollback copy at $prev — nothing to roll back to (an upgrade keeps the version it replaced there; a fresh install, or a rollback already made, leaves none)"
   fi
@@ -12901,12 +13055,13 @@ upgrade_rollback() { # TARGET
     local problem; problem="$(root_exec_problem "$prev")"
     [ -z "$problem" ] || die "refusing to roll back to $prev under sudo: $problem — the script a sudoers grant names must be writable by root alone"
   fi
+  dir="$(dirname "$target")"
+  # GHR-117: the same directory rule as install_file — the rename is root's
+  # only in a directory nobody else can write, the owner's in theirs.
+  write_as "$dir" "roll back $target" "$target" "$prev"
   echo "installed: $RUNNERCTL_VERSION ($target)"
   echo "rollback: $prev_ver ($prev)"
-  dir="$(dirname "$target")"
-  # install_file's own test, for the same rename into the same directory.
-  { [ -w "$dir" ] && [ -w "$target" ]; } || priv=(run_priv)
-  "${priv[@]}" mv -fT "$prev" "$target"   # -T: GHR-111, a symlinked $target is replaced, never entered
+  "${WRITE_AS[@]}" mv -fT "$prev" "$target"   # -T: GHR-111, a symlinked $target is replaced, never entered
   echo "Rolled back $RUNNERCTL_VERSION -> $prev_ver at $target"
   # The proof comes from the installed file, as install's does.
   echo
@@ -13033,6 +13188,15 @@ cmd_upgrade() {
     if $same; then echo "Already up to date."; else echo "Update available. Run: runnerctl upgrade"; fi
     return 0
   fi
+  # GHR-117: every directory this upgrade writes in is judged before the first
+  # write, so a refusal leaves everything as it was. Each write asks again.
+  # $target's OWN directory, never $prefix: with --no-relocate (or any
+  # in-place upgrade) $target is $self and $prefix is merely the default
+  # that was not used, so creating it would conjure an empty /usr/local/bin
+  # on a host that had deliberately opted out.
+  local tdir=""
+  [ -z "$target" ] || { tdir="$(dirname "$target")"; write_as "$tdir" "upgrade $target" "$target" "$target.prev"; }
+  [ -z "$retire" ] || write_as "$(dirname "$self")" "retire $self" "$self" "$retire"
   # Gated on what $target actually holds, NOT on $same: a relocation must place
   # the file even when the version is unchanged, because the version was never
   # the problem — a same-version copy in ~/.local/bin is exactly the host the
@@ -13041,14 +13205,7 @@ cmd_upgrade() {
     # Same explicit mode as install, and for the same reason (GHR-47): under
     # root's umask 077 a freshly created prefix is 0700 and nobody but root
     # can traverse it to reach the binary.
-    local tdir priv=()
-    # $target's OWN directory, never $prefix: with --no-relocate (or any
-    # in-place upgrade) $target is $self and $prefix is merely the default
-    # that was not used, so creating it would conjure an empty /usr/local/bin
-    # on a host that had deliberately opted out.
-    tdir="$(dirname "$target")"
-    ! needs_priv "$tdir" || priv=(run_priv)
-    [ -d "$tdir" ] || "${priv[@]}" mkdir -p -m 755 "$tdir"
+    make_dir "$tdir" "create $tdir"
     # GHR-84: keep what is being replaced as $target.prev, BEFORE the swap and
     # through the same privilege path, owner and explicit-octal mode as the
     # script itself. Exactly one is kept — the version immediately before —
@@ -13066,8 +13223,9 @@ cmd_upgrade() {
     # the inode, and bash is reading it through an open descriptor.
     # -T (GHR-111): $retire is a name in a directory the invoking user owns. A
     # symlink to a directory planted there would make plain `mv -f` move $self
-    # INTO that directory — as root under sudo. -T replaces the name instead.
-    mv -fT "$self" "$retire"
+    # INTO that directory — as root under sudo. -T replaces the name instead,
+    # and under sudo the rename is that user's own (GHR-117, retire_copy).
+    retire_copy "$self" "$retire"
     if [ -n "$target" ] && [ "$target" != "$self" ] && [ -z "$sys_ver" ]; then
       echo "relocated: $self -> $target"
     fi
@@ -13174,6 +13332,14 @@ cmd_install() {
     old="$HOME_COPY"; where="at $HOME_COPY ($HOME_HOW)"
     if is_legacy_script "$old"; then retired="$old.legacy"; else retired="$old.retired"; fi
   fi
+  # GHR-117: every directory this install writes in — the prefix, the config's
+  # (migrate writes there first), and the retired copy's — is judged before
+  # the first write, a dry run included, so a refusal leaves everything as it
+  # was. Each write asks again.
+  local confdir; confdir="$(dirname "$CONFIG_FILE")"
+  write_as "$prefix" "install $target" "$target" "$target.legacy"
+  write_as "$confdir" "write $CONFIG_FILE" "$CONFIG_FILE"
+  [ -z "$retired" ] || write_as "$(dirname "$old")" "retire $old" "$old" "$retired"
   if [ -n "$old" ]; then
     if is_legacy_script "$old"; then
       echo "existing: pre-config runnerctl (no RUNNERCTL_VERSION) $where"
@@ -13217,22 +13383,18 @@ cmd_install() {
   # file is (GHR-47): under root's umask 077 a freshly created /usr/local/bin
   # or /etc/runnerctl is 0700, and a non-root user cannot then traverse it to
   # reach the binary or read the config. An existing directory is left exactly
-  # as the admin has it.
-  local priv=()
-  ! needs_priv "$prefix" || priv=(run_priv)
-  [ -d "$prefix" ] || "${priv[@]}" mkdir -p -m 755 "$prefix"
+  # as the admin has it (make_dir).
+  make_dir "$prefix" "create $prefix"
   install_file "$src" "$target"
-  local confdir; confdir="$(dirname "$CONFIG_FILE")"
-  priv=(); ! needs_priv "$confdir" || priv=(run_priv)
-  [ -d "$confdir" ] || "${priv[@]}" mkdir -p -m 755 "$confdir"
+  make_dir "$confdir" "create $confdir"
   echo "Installed runnerctl $new_ver at $target"
   if [ -n "$retired" ]; then
     # After the new file is in place, never before: a failure here leaves both
     # copies rather than none.
-    priv=(); ! needs_priv "$(dirname "$old")" || priv=(run_priv)
     # -T (GHR-111): see the same rename in cmd_upgrade — $retired is a name the
-    # invoking user can have planted as a symlink to a directory.
-    "${priv[@]}" mv -fT "$old" "$retired"
+    # invoking user can have planted as a symlink to a directory; under sudo
+    # the rename is that user's own (GHR-117, retire_copy).
+    retire_copy "$old" "$retired"
     echo "Retired $old as $retired — $target is the one to run now."
   fi
   if $fresh; then

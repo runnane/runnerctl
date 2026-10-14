@@ -6274,6 +6274,207 @@ case_ghr121_real_runner_root_check() {
   fi
 }
 
+# --- GHR-117: root's writes into a directory a user controls --------------------
+# install_file, the retire rename, make_dir, the `.prev` copy and the rollback
+# are several calls on names in one directory. Under sudo (RUNNERCTL_STUB_AS_ROOT
+# =1 stands in for it) write_as reads the directory's chain first: root's alone
+# -> root's calls as before; one user's -> every call as that user; else a
+# refusal before any call. The overrides below are sourced AFTER the stub (a
+# snippet sources them itself; run_cfg configs source the stub first): the real
+# root_exec_problem, `stat` faking uid and mode per path from GHR117_TABLE
+# ("PATH UID MODE"; unlisted = root's, 755), and a run_priv that LOGS every call
+# and then makes it for real — as this user, a `runuser -u USER --` prefix
+# dropped — refusing any path outside the case directory. So a file that lands
+# proves the calls worked, and the log says whose calls they were.
+ghr117_overrides() { # PATH CASE-DIR
+  {
+    printf 'GHR117_DIR=%q\n' "$2"
+    cat <<'CFG'
+eval "root_exec_problem() $(declare -f real_root_exec_problem | tail -n +2)"
+stat() {
+  if [ "${1:-}" = -c ] && { [ "${2:-}" = %u ] || [ "${2:-}" = %a ]; }; then
+    local p u m
+    while read -r p u m; do
+      [ "$p" = "$3" ] || continue
+      if [ "$2" = %u ]; then echo "$u"; else echo "$m"; fi
+      return 0
+    done <<<"${GHR117_TABLE:-}"
+    if [ "$2" = %u ]; then echo 0; else echo 755; fi
+    return 0
+  fi
+  command stat "$@"
+}
+ghr117_inside() { case "$1" in "$GHR117_DIR"|"$GHR117_DIR"/*) return 0 ;; esac; return 1; }
+run_priv() {
+  printf '%s\n' "$*" >>"$RUNNERCTL_TEST_LOG"
+  local a
+  local -a argv=("$@")
+  if [ "$1" = runuser ]; then
+    [ "${2:-}" = -u ] && [ "${4:-}" = -- ] || { echo "ghr117: unexpected runuser form '$*'" >&2; return 99; }
+    argv=("${@:5}")
+  fi
+  for a in "${argv[@]}"; do
+    a="${a#--reference=}"
+    case "$a" in /*) ghr117_inside "$a" || { echo "ghr117: refusing '$*': outside the case directory" >&2; return 99; } ;; esac
+  done
+  command "${argv[@]}"
+}
+CFG
+  } >"$1"
+}
+
+# Calls on the case's names that are NOT the user's: any of these in the log of
+# a user-owned target is a root call on that directory's names.
+GHR117_ROOT_CALL='^(cp|chmod|chown|mv|tee|rm|mkdir) '
+
+case_ghr117_a_user_s_own_copy_is_written_as_that_user() {
+  local d="$TMP/ghr117u" ov="$TMP/ghr117u.sh" me u b st
+  rm -rf "$d"; mkdir -p "$d/home/bin"
+  ghr117_overrides "$ov" "$d"
+  u="$(id -u)"; b="$(ere_quote "$d/home/bin")"; st="$b/\\.runnerctl\\.new\\.[0-9]+"
+  me="$(getent passwd "$u" | cut -d: -f1)"
+  printf 'NEW\n' >"$d/src"
+  printf 'OLD\n' >"$d/home/bin/runnerctl"; chmod 750 "$d/home/bin/runnerctl"
+  local tbl="$d/home $u 755
+$d/home/bin $u 755
+$d/home/bin/runnerctl $u 750
+$d/home/bin/runnerctl.prev $u 750
+$d/home/bin/runnerctl.retired $u 755"
+
+  # The `.prev` copy, then the script itself: every call as the owner.
+  GHR117_TABLE="$tbl" RUNNERCTL_STUB_AS_ROOT=1 run_snippet "$STUB" \
+    "$(printf '. %q; install_file %q %q %q; install_file %q %q' "$ov" \
+       "$d/home/bin/runnerctl" "$d/home/bin/runnerctl.prev" "$d/home/bin/runnerctl" "$d/src" "$d/home/bin/runnerctl")"
+  expect_rc 0
+  local sp="$b/\\.runnerctl\\.prev\\.new\\.[0-9]+"
+  expect_log_order \
+    "^runuser -u $me -- cp --remove-destination $b/runnerctl $sp\$" \
+    "^runuser -u $me -- chmod 0755 $sp\$" \
+    "^runuser -u $me -- mv -fT $sp $b/runnerctl\\.prev\$" \
+    "^runuser -u $me -- cp --remove-destination $(ere_quote "$d")/src $st\$" \
+    "^runuser -u $me -- chmod 0755 $st\$" \
+    "^runuser -u $me -- mv -fT $st $b/runnerctl\$"
+  expect_no_log "$GHR117_ROOT_CALL"
+  expect_no_log 'chown'
+  expect_cfg "$d/home/bin/runnerctl.prev" '^OLD$'
+  expect_cfg "$d/home/bin/runnerctl" '^NEW$'
+  expect_mode "$d/home/bin/runnerctl" 755
+  expect_text "staging names left" "" "$(find "$d/home/bin" -name '.runnerctl.new.*'; true)"
+
+  # The download is root's 0600 mktemp: handed over on stdin, never opened by
+  # the user, and the staging name is removed first as the user.
+  printf 'DOWNLOADED\n' >"$d/dl"; chmod 600 "$d/dl"
+  GHR117_TABLE="$tbl" RUNNERCTL_STUB_AS_ROOT=1 run_snippet "$STUB" \
+    "$(printf '. %q; DOWNLOAD_TMP=%q; install_file %q %q' "$ov" "$d/dl" "$d/dl" "$d/home/bin/runnerctl")"
+  expect_rc 0
+  expect_log_order "^runuser -u $me -- rm -f -- $st\$" "^runuser -u $me -- tee -- $st\$" "^runuser -u $me -- mv -fT $st $b/runnerctl\$"
+  expect_no_log "$GHR117_ROOT_CALL"
+  expect_cfg "$d/home/bin/runnerctl" '^DOWNLOADED$'
+
+  # Retiring it, and a directory made inside the home: the owner's calls too.
+  GHR117_TABLE="$tbl" RUNNERCTL_STUB_AS_ROOT=1 run_snippet "$STUB" \
+    "$(printf '. %q; retire_copy %q %q; make_dir %q x' "$ov" "$d/home/bin/runnerctl" "$d/home/bin/runnerctl.retired" "$d/home/new/bin")"
+  expect_rc 0
+  expect_log "^runuser -u $me -- mv -fT $b/runnerctl $b/runnerctl\\.retired\$"
+  expect_log "^runuser -u $me -- mkdir -p -m 755 $(ere_quote "$d")/home/new/bin\$"
+  expect_no_log "$GHR117_ROOT_CALL"
+  expect_cfg "$d/home/bin/runnerctl.retired" '^DOWNLOADED$'
+  expect_no_path "$d/home/bin/runnerctl"
+}
+
+case_ghr117_refuses_a_directory_others_can_write() {
+  local d="$TMP/ghr117r" ov="$TMP/ghr117r.sh" u r
+  rm -rf "$d"; mkdir -p "$d/shared" "$d/home/bin"
+  ghr117_overrides "$ov" "$d"
+  u="$(id -u)"; r="$(ere_quote "$d")"
+  printf 'NEW\n' >"$d/src"
+  printf 'OLD\n' >"$d/home/bin/runnerctl"; printf 'OLD\n' >"$d/shared/runnerctl"
+  local inst_shared inst_home
+  inst_shared="$(printf '. %q; install_file %q %q' "$ov" "$d/src" "$d/shared/runnerctl")"
+  inst_home="$(printf '. %q; install_file %q %q' "$ov" "$d/src" "$d/home/bin/runnerctl")"
+  # (a) world-writable, root's: no single user to write as.
+  GHR117_TABLE="$d/shared 0 777" RUNNERCTL_STUB_AS_ROOT=1 run_snippet "$STUB" "$inst_shared"
+  expect_rc 1
+  expect_err "^runnerctl: refusing to install $r/shared/runnerctl as root: $r/shared is group- or world-writable \\(mode 777\\) — whoever can write $r/shared could swap a name in it between root's calls \\(GHR-117\\)\\. Move the copy to a directory only root can write, such as /usr/local/bin, or run this as the user who owns $r/shared, without sudo\$"
+  expect_text "calls logged by a refused install (world-writable)" "" "$(cat "$LOG")"
+  expect_cfg "$d/shared/runnerctl" '^OLD$'
+  # (b) two owners in one chain.
+  GHR117_TABLE="$d/home $u 755
+$d/home/bin 4242 755
+$d/home/bin/runnerctl 4242 755" RUNNERCTL_STUB_AS_ROOT=1 run_snippet "$STUB" "$inst_home"
+  expect_rc 1
+  expect_err "as root: $r/home/bin is owned by uid 4242, and a directory above it by uid $u — "
+  expect_text "calls logged by a refused install (two owners)" "" "$(cat "$LOG")"
+  # (c) the user's directory, group-writable.
+  GHR117_TABLE="$d/home $u 755
+$d/home/bin $u 775
+$d/home/bin/runnerctl $u 755" RUNNERCTL_STUB_AS_ROOT=1 run_snippet "$STUB" "$inst_home"
+  expect_rc 1
+  expect_err "as root: $r/home/bin is group- or world-writable \\(mode 775\\) — "
+  expect_text "calls logged by a refused install (group-writable)" "" "$(cat "$LOG")"
+  # (d) the user's directory, but a file in it someone else owns (root here).
+  GHR117_TABLE="$d/home $u 755
+$d/home/bin $u 755" RUNNERCTL_STUB_AS_ROOT=1 run_snippet "$STUB" "$inst_home"
+  expect_rc 1
+  expect_err "as root: $r/home/bin/runnerctl is owned by uid 0, not by uid $u who owns $r/home/bin — "
+  expect_text "calls logged by a refused install (foreign file)" "" "$(cat "$LOG")"
+  expect_cfg "$d/home/bin/runnerctl" '^OLD$'
+  # (e) the other writes refuse the same directory the same way, before a call.
+  GHR117_TABLE="$d/shared 0 777" RUNNERCTL_STUB_AS_ROOT=1 run_snippet "$STUB" \
+    "$(printf '. %q; retire_copy %q %q' "$ov" "$d/shared/runnerctl" "$d/shared/runnerctl.retired")"
+  expect_rc 1
+  expect_err "^runnerctl: refusing to retire $r/shared/runnerctl as root: $r/shared is group- or world-writable"
+  expect_text "calls logged by a refused retire" "" "$(cat "$LOG")"
+  GHR117_TABLE="$d/shared 0 777" RUNNERCTL_STUB_AS_ROOT=1 run_snippet "$STUB" \
+    "$(printf '. %q; make_dir %q %q' "$ov" "$d/shared/sub" "create $d/shared/sub")"
+  expect_rc 1
+  expect_err "^runnerctl: refusing to create $r/shared/sub as root: $r/shared is group- or world-writable"
+  expect_text "calls logged by a refused mkdir" "" "$(cat "$LOG")"
+  # (f) install refuses before its FIRST write: here the prefix is root's and
+  # only the config's directory is not, and still nothing is installed.
+  mkdir -p "$d/sys"
+  { echo ". $PWD/$STUB"; cat "$ov"; } >"$d/shared/runnerctl.conf"
+  mkdir -p "$d/nohome"
+  HOME="$d/nohome" GHR117_TABLE="$d/shared 0 777" RUNNERCTL_STUB_AS_ROOT=1 run_cfg "$d/shared/runnerctl.conf" install --prefix "$d/sys"
+  expect_rc 1
+  expect_err "^runnerctl: refusing to write $r/shared/runnerctl\\.conf as root: $r/shared is group- or world-writable"
+  expect_text "calls logged by an install refused for its config directory" "" "$(grep -vE '^probe:' "$LOG"; true)"
+  expect_no_path "$d/sys/runnerctl"
+}
+
+case_ghr117_a_root_owned_target_is_root_s_write_as_before() {
+  local d="$TMP/ghr117t" ov="$TMP/ghr117t.sh" s
+  rm -rf "$d"; mkdir -p "$d/sys"
+  ghr117_overrides "$ov" "$d"
+  s="$(ere_quote "$d/sys")"
+  printf 'NEW\n' >"$d/src"
+  printf 'OLD\n' >"$d/sys/runnerctl"; chmod 750 "$d/sys/runnerctl"
+  # Under sudo, a chain root's alone: root's own four calls, as today.
+  RUNNERCTL_STUB_AS_ROOT=1 run_snippet "$STUB" "$(printf '. %q; install_file %q %q' "$ov" "$d/src" "$d/sys/runnerctl")"
+  expect_rc 0
+  expect_text "root's calls for a trusted target" \
+    "$(printf '%s\n' "cp --remove-destination $d/src $d/sys/.runnerctl.new.X" "chown -h --reference=$d/sys/runnerctl $d/sys/.runnerctl.new.X" \
+       "chmod 0755 $d/sys/.runnerctl.new.X" "mv -fT $d/sys/.runnerctl.new.X $d/sys/runnerctl")" \
+    "$(sed -E 's/\.new\.[0-9]+/.new.X/g' "$LOG"; true)"
+  expect_no_log '^runuser '
+  expect_cfg "$d/sys/runnerctl" '^NEW$'
+  # Not root, and the directory writable: this process's own write, unjudged.
+  printf 'NEWER\n' >"$d/src"
+  GHR117_TABLE="$d/sys 4242 777" run_snippet "$STUB" "$(printf '. %q; install_file %q %q' "$ov" "$d/src" "$d/sys/runnerctl")"
+  expect_rc 0
+  expect_text "calls logged by an unprivileged install" "" "$(cat "$LOG")"
+  expect_cfg "$d/sys/runnerctl" '^NEWER$'
+  expect_no_log "$s"
+}
+
+# The real chain owner over a real directory: /tmp is root's and world-writable
+# (sticky), so nothing under it is any one user's.
+case_ghr117_real_chain_owner() {
+  run_fn dir_chain_owner /tmp/ghr117-no-such-dir
+  expect_rc 0
+  expect_out '^no /tmp is group- or world-writable \(mode 1777\)$'
+}
+
 # The audit itself (GHR-110, narrowed by GHR-116): each shape of a root call
 # into a runner directory is reported, and a real provision's log is not.
 case_runner_dir_audit_catches_root_writes() {
@@ -9845,6 +10046,10 @@ t "GHR-121: a root that is root's still provisions and deprovisions"    case_ghr
 t "GHR-121: deprovision under an untrusted parent removes as the user"  case_ghr121_deprovision_removes_as_the_user_under_an_untrusted_parent
 t "GHR-121: the root is checked again once mkdir -p has run"            case_ghr121_checks_the_root_again_after_mkdir
 t "GHR-121: the real check over real directories (/tmp, symlink, owner)" case_ghr121_real_runner_root_check
+t "GHR-117: a user's own copy under sudo is written as that user"        case_ghr117_a_user_s_own_copy_is_written_as_that_user
+t "GHR-117: a directory others can write is refused before any call"     case_ghr117_refuses_a_directory_others_can_write
+t "GHR-117: a root-owned target is root's write, as before"              case_ghr117_a_root_owned_target_is_root_s_write_as_before
+t "GHR-117: the real chain owner over /tmp"                              case_ghr117_real_chain_owner
 
 # --- GHR-48: the real discover(), not the stub's stand-in -------------------
 t "discover: no matching units is empty and exit 0, not a failure"     case_discover_no_matching_units_is_empty_not_a_failure
