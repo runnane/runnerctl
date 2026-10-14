@@ -3277,6 +3277,133 @@ case_fleet_upgrade_read_back_parsers() {
   run_fn fleet_upgrade_wrote "$TMP/upgrade.out"
   expect_rc 0
   expect_text "an output with no Upgraded sentence" "" "$OUT"
+  # GHR-84: the rollback sentence has a parser of its own, and neither parser
+  # reads the other's sentence
+  printf 'installed: 1.2.3 (/a b/runnerctl)\nrollback: 1.2.2 (/a b/runnerctl.prev)\nRolled back 1.2.3 -> 1.2.2 at /a b/runnerctl\n\nrunnerctl 1.2.2\n' >"$TMP/rollback.out"
+  run_fn fleet_upgrade_rolled "$TMP/rollback.out"
+  expect_rc 0
+  expect_text "the version a Rolled back sentence names" "1.2.2" "$OUT"
+  run_fn fleet_upgrade_wrote "$TMP/rollback.out"
+  expect_text "an Upgraded parser over a rollback" "" "$OUT"
+  printf 'Upgraded 0.0.1 -> 1.2.3 at /x/runnerctl\n' >"$TMP/upgrade.out"
+  run_fn fleet_upgrade_rolled "$TMP/upgrade.out"
+  expect_text "a Rolled back parser over an upgrade" "" "$OUT"
+}
+
+# --- GHR-84: fleet upgrade --rollback -----------------------------------------
+# The stub's rollback hosts: a plain name rolls back 1.0.0 -> 0.9.0 and then
+# answers 0.9.0; *noprev* has nothing to roll back to (rc 1); *shadowed* says
+# it rolled back a copy the fleet path does not run; *rbweird* is an older
+# runnerctl that answers --rollback as if it were an upgrade.
+case_fleet_upgrade_rollback_rows_counts_and_read_back() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet upgrade --rollback
+  expect_rc 0
+  expect_out '^build-1 +1\.0\.0 -> 0\.9\.0 +rolled back$'
+  expect_out '^build-2 +1\.0\.0 -> 0\.9\.0 +rolled back$'
+  expect_out '^2 host\(s\): 2 rolled back, 0 unreachable or unclear$'
+  expect_out '^2 host\(s\) on 0\.9\.0$'
+  expect_no_out 'upgraded'
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl upgrade --rollback$' 2
+  # each host that rolled back is read back, after its rollback
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl version$' 2
+  expect_log_order '^probe:ssh_run build-1 -- runnerctl upgrade --rollback$' '^probe:ssh_run build-1 -- runnerctl version$'
+  # a host with nothing to roll back to, and one whose rollback the fleet path
+  # does not see, are failed rows — and counted as such
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-noprev box-shadowed build-4" run fleet upgrade --rollback
+  expect_rc 1
+  expect_out '^build-1 +1\.0\.0 -> 0\.9\.0 +rolled back$'
+  expect_out '^box-noprev +— +remote exit 1 — runnerctl: no rollback copy at /usr/local/bin/runnerctl\.prev — nothing to roll back to'
+  expect_out '^box-shadowed +0\.0\.1 -> 0\.0\.0 +rolled back to 0\.0\.0 but the fleet path still answers 0\.0\.1$'
+  expect_out '^4 host\(s\): 2 rolled back, 2 unreachable or unclear$'
+  expect_out '^not on one version — 0\.9\.0: build-1 build-4; 0\.0\.1: box-shadowed; unknown: box-noprev$'
+  expect_no_log '^probe:ssh_run box-noprev -- runnerctl version'
+  expect_log_count '^probe:ssh_run box-shadowed -- runnerctl version$' 1
+  # a read-back that cannot reach the host says so, in the rollback's words
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-3-verifydown" run fleet upgrade --rollback
+  expect_rc 1
+  expect_out '^build-3-verifydown +1\.0\.0 -> 0\.9\.0 +rolled back to 0\.9\.0 but the read-back did not answer: unreachable — '
+  expect_out '^2 host\(s\): 1 rolled back, 1 unreachable or unclear$'
+}
+
+# An answer to --rollback that is not the rollback sentence is unrecognised,
+# NOT one of the upgrade's verdicts: an older runnerctl that ignored the flag
+# and said `Already up to date.` did not roll anything back.
+case_fleet_upgrade_rollback_other_answer_is_unrecognised() {
+  RUNNERCTL_STUB_FLEET_HOSTS="node-rbweird" run fleet upgrade --rollback
+  expect_rc 1
+  expect_out '^node-rbweird +1\.0\.0 +unrecognised: Already up to date\.$'
+  expect_out '^1 host\(s\): 0 rolled back, 1 unreachable or unclear$'
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl version'
+}
+
+# What --rollback combines with. --host narrows it; --serial and
+# --stop-on-failure stage it; --check, --canary, --ref and --sha256 are
+# refused before anything is dialled.
+case_fleet_upgrade_rollback_flags() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 build-3" run fleet upgrade --rollback --host build-2
+  expect_rc 0
+  expect_log_count '^probe:ssh_run ' 2
+  expect_no_log '^probe:ssh_run build-(1|3) '
+  expect_out '^1 host\(s\): 1 rolled back, 0 unreachable or unclear$'
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-noprev build-3" run fleet upgrade --rollback --stop-on-failure
+  expect_rc 1
+  expect_no_log '^probe:ssh_run build-3 '
+  expect_out '^build-3 +— +not attempted$'
+  expect_out '^stopped at box-noprev — not attempted: build-3$'
+  expect_out '^3 host\(s\): 1 rolled back, 1 unreachable or unclear, 1 not attempted$'
+  RUNNERCTL_STUB_DETECT_OVERLAP=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet upgrade --rollback --serial
+  expect_rc 0
+  expect_no_log '^probe:ssh_run_overlap '
+  expect_log_order '^probe:ssh_run build-1 -- runnerctl upgrade --rollback$' \
+                   '^probe:ssh_run build-1 -- runnerctl version$' \
+                   '^probe:ssh_run_done build-1$' \
+                   '^probe:ssh_run build-2 -- runnerctl upgrade --rollback$'
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet upgrade --rollback --check
+  expect_rc 1
+  expect_err '--rollback and --check do not combine'
+  expect_no_log '^probe:ssh_run '
+  local a
+  for a in "--canary" "--canary build-1" "--ref v1.2.3" "--sha256 $(printf 'a%.0s' {1..64})"; do
+    # shellcheck disable=SC2086  # one or two words on purpose
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet upgrade --rollback $a
+    expect_rc 1
+    expect_err '--rollback (and --canary do not combine|downloads nothing)'
+    expect_no_log '^probe:ssh_run '
+  done
+}
+
+# --sha256 on an upgrade is validated once, here, and forwarded as given.
+case_fleet_upgrade_sha256_is_validated_and_forwarded() {
+  local sum; sum="$(printf 'a%.0s' {1..64})"
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet upgrade --sha256 "$sum"
+  expect_rc 0
+  expect_log_count "^probe:ssh_run build-1 -- runnerctl upgrade --sha256 $sum\$" 1
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet upgrade --sha256 NOT-HEX
+  expect_rc 1
+  expect_err "--sha256 'NOT-HEX' is invalid — want 64 lowercase hex characters"
+  expect_no_log '^probe:ssh_run '
+}
+
+# The digest URL rule, on the URLs resolve_url produces and a few it does not.
+case_upgrade_digest_url_rule() {
+  run_fn script_digest_url "https://github.com/o/r/releases/latest/download/runnerctl"
+  expect_text "the default UPGRADE_URL's digest" "https://github.com/o/r/releases/latest/download/runnerctl.sha256" "$OUT"
+  run_fn script_digest_url "https://github.com/o/r/releases/download/v1.2.3/runnerctl"
+  expect_text "a pinned release's digest" "https://github.com/o/r/releases/download/v1.2.3/runnerctl.sha256" "$OUT"
+  run_fn script_digest_url "file:///srv/mirror/runnerctl"
+  expect_text "a file:// source's digest" "file:///srv/mirror/runnerctl.sha256" "$OUT"
+  # no digest: a branch, a mirror elsewhere, plain http, a look-alike host,
+  # and a release URL for some other file
+  local u
+  for u in "https://raw.githubusercontent.com/o/r/main/runnerctl" \
+           "https://mirror.example/runnerctl" \
+           "http://github.com/o/r/releases/latest/download/runnerctl" \
+           "https://github.com.example/o/r/releases/latest/download/runnerctl" \
+           "https://github.com/o/r/releases/latest/download/runnerctl.tar"; do
+    run_fn script_digest_url "$u"
+    expect_rc 0
+    expect_text "no digest for $u" "" "$OUT"
+  done
 }
 
 case_fleet_mutating_fans_out_and_forwards_flags() {
@@ -7881,6 +8008,11 @@ t "fleet upgrade --canary H: named, refused if level; nothing to canary" case_fl
 t "fleet upgrade --serial: one host at a time, and it does not stop"   case_fleet_upgrade_serial_is_one_host_at_a_time_and_does_not_stop
 t "fleet upgrade --stop-on-failure: halts and names the hosts left"    case_fleet_upgrade_stop_on_failure_halts_and_names_the_rest
 t "fleet upgrade: the read-back parsers on the real version line"      case_fleet_upgrade_read_back_parsers
+t "fleet upgrade --rollback: per-host rows, counts and the read-back"   case_fleet_upgrade_rollback_rows_counts_and_read_back
+t "fleet upgrade --rollback: any other answer is unrecognised"          case_fleet_upgrade_rollback_other_answer_is_unrecognised
+t "fleet upgrade --rollback: --host/--serial/--stop-on-failure; refusals" case_fleet_upgrade_rollback_flags
+t "fleet upgrade --sha256: validated once, forwarded as given"          case_fleet_upgrade_sha256_is_validated_and_forwarded
+t "upgrade: the digest URL rule"                                        case_upgrade_digest_url_rule
 t "fleet <mutating>: fans out and forwards the remote's own flags"     case_fleet_mutating_fans_out_and_forwards_flags
 t "fleet <mutating>: serial one host at a time; status stays parallel" case_fleet_mutating_is_serial_while_status_is_parallel
 t "fleet --host: targets exactly those hosts, repeatable"              case_fleet_host_targets_exactly_that_host

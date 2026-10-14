@@ -4,3 +4,6 @@
 .claude/worktrees/
 # Tracker MCP config carries an internal hostname; local only.
 /.mcp.json
+# The release job writes the digest in its own checkout (GHR-84); a copy here
+# would be verified against by every upgrade-test case (.agents/gates.md).
+/runnerctl.sha256

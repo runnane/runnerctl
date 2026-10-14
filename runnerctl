@@ -64,8 +64,9 @@
 #                          [--min-available K] [--problems] [--sort config|job|mem]
 #   runnerctl fleet health [--quiet] [--max-restarts N] [--stall-after N] \
 #                          [--restart-stalled]
-#   runnerctl fleet upgrade [--check] [--ref <branch|tag>] [--host H]... \
-#                           [--canary [H]] [--serial] [--stop-on-failure]
+#   runnerctl fleet upgrade [--check] [--ref <branch|tag>] [--sha256 SUM] \
+#                           [--host H]... [--canary [H]] [--serial] [--stop-on-failure]
+#   runnerctl fleet upgrade --rollback [--host H]... [--serial] [--stop-on-failure]
 #   runnerctl fleet <apply|scale|start|stop|restart|drain|kill|reap| \
 #                    remove-limits|enable|disable> [--host H]... \
 #                   [--all-hosts] [--max-unavailable N|N%] [--min-available K] \
@@ -74,7 +75,9 @@
 #   runnerctl config-example
 #   runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
 #   runnerctl install [--prefix DIR] [--ref <branch|tag>] [--no-migrate] [--dry-run]
-#   runnerctl upgrade [--check] [--ref <branch|tag>] [--prefix DIR] [--no-relocate]
+#   runnerctl upgrade [--check] [--ref <branch|tag>] [--sha256 SUM] [--prefix DIR] \
+#                     [--no-relocate]
+#   runnerctl upgrade --rollback
 #   runnerctl version
 #
 # Install or upgrade any host (a pre-config install is migrated first):
@@ -92,6 +95,16 @@
 # free (writable, root, or passwordless sudo): it never prompts, because
 # `fleet upgrade` fans this out and a password prompt would hang it once per
 # host. --no-relocate keeps a deliberately personal copy where it is.
+#
+# A download from a release asset is checked against the `runnerctl.sha256`
+# published beside it and refused on a mismatch, or when the digest cannot be
+# read; a release with no digest, or a source that is not a release asset (a
+# branch --ref, a mirror), installs with a `not verified:` line, and --sha256
+# SUM pins one by hand (GHR-84). The digest shares the script's origin, so it
+# guards against corruption and a tampered mirror, not a compromised release.
+# Each upgrade keeps the script it replaces as <path>.prev, and `upgrade
+# --rollback` renames it back — no download — consuming it; `fleet upgrade
+# --rollback` does that on every host and reads each one's version back.
 #
 # --when-idle (restart, stop, apply --restart, scale) waits for each targeted
 # slot to finish its job before acting on it, one slot at a time so the pool
@@ -6226,19 +6239,30 @@ fleet_run_report() { # SUBCOMMAND
 #   WANT   the version a host that wrote said it wrote
 FLEET_UP_HOSTS=() FLEET_UP_VERS=() FLEET_UP_STATE=() FLEET_UP_KIND=()
 FLEET_UP_NOW=() FLEET_UP_WANT=()
-# --ref R as given, forwarded identically to the check round, the write and
-# therefore to the version each host says it wrote.
+# --ref R (and --sha256 SUM, GHR-84) as given, forwarded identically to the
+# check round, the write and therefore to the version each host says it wrote.
 FLEET_UP_FWD=()
-cmd_fleet_upgrade() { # [--check] [--ref REF] [--host H]... [--canary [H]] [--serial] [--stop-on-failure]
+# GHR-84: `fleet upgrade --rollback` — each host runs `upgrade --rollback`, and
+# the version its `Rolled back A -> B` sentence names is what the read-back
+# must answer. Same stages, same rows, its own words.
+FLEET_UP_ROLLBACK=false
+cmd_fleet_upgrade() { # [--check] [--ref REF] [--sha256 SUM] [--rollback] [--host H]... [--canary [H]] [--serial] [--stop-on-failure]
   local check=false canary=false canary_host="" serial=false stop=false
   local rc=0 k n c="" halted="" names=""
   local -a hosts=() all=() rest=() left=() would=()
-  FLEET_UP_FWD=()
+  FLEET_UP_FWD=() FLEET_UP_ROLLBACK=false
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     case "$1" in
       --check) check=true; shift ;;
       --ref)   need_val "$@"; FLEET_UP_FWD+=(--ref "$2"); shift 2 ;;
+      # Validated here as the host would, so a typo fails once, before any
+      # host is dialled, rather than once per host.
+      --sha256)
+        need_val "$@"
+        [[ "$2" =~ ^[0-9a-f]{64}$ ]] || die "--sha256 '$2' is invalid — want 64 lowercase hex characters"
+        FLEET_UP_FWD+=(--sha256 "$2"); shift 2 ;;
+      --rollback) FLEET_UP_ROLLBACK=true; shift ;;
       --host)  need_val "$@"; hosts+=("$2"); shift 2 ;;
       # The host is optional, and `fleet upgrade` takes no positional
       # argument, so the next word is the canary's name exactly when it is
@@ -6255,6 +6279,28 @@ cmd_fleet_upgrade() { # [--check] [--ref REF] [--host H]... [--canary [H]] [--se
   # the budget flags are in cmd_fleet_run.
   if $check && { $canary || $serial; }; then
     die "--canary, --serial and --stop-on-failure stage a write, and --check writes nothing — drop --check, or drop them"
+  fi
+  # GHR-84: what a rollback combines with. --host, --serial and
+  # --stop-on-failure stage it exactly as they stage an upgrade. The rest are
+  # refused before anything is dialled:
+  #   --check     a rollback has no dry run; `fleet upgrade --check` is the
+  #               upgrade's, and `upgrade --check` on a host names its copy
+  #   --canary    an unnamed canary is "the first host that WOULD CHANGE",
+  #               found with an upgrade --check round, which says nothing about
+  #               a rollback; and a rollback is the recovery from a release
+  #               already misbehaving — --serial --stop-on-failure is the
+  #               careful shape of it
+  #   --ref, --sha256  a rollback downloads nothing
+  if $FLEET_UP_ROLLBACK; then
+    if $check; then
+      die "--rollback and --check do not combine: a rollback has no dry run ('runnerctl upgrade --check' on a host names its rollback copy)"
+    fi
+    if $canary; then
+      die "--rollback and --canary do not combine: a canary is chosen by what an upgrade would change — use --serial --stop-on-failure to roll back one host at a time"
+    fi
+    if [ "${#FLEET_UP_FWD[@]}" -gt 0 ]; then
+      die "--rollback downloads nothing, so --ref and --sha256 do not apply to it"
+    fi
   fi
   require_fleet
   [ "${#hosts[@]}" -eq 0 ] || fleet_select_hosts "${hosts[@]}"
@@ -6352,6 +6398,11 @@ cmd_fleet_upgrade() { # [--check] [--ref REF] [--host H]... [--canary [H]] [--se
 fleet_upgrade_wrote() { # FILE
   sed -n 's/^Upgraded [^ ]* -> \([^ ]*\) at .*/\1/p' "$1" 2>/dev/null | head -1 || true
 }
+# The same for upgrade_rollback's `Rolled back A -> B at PATH` (GHR-84): the
+# version the host says it put back, empty when it did not.
+fleet_upgrade_rolled() { # FILE
+  sed -n 's/^Rolled back [^ ]* -> \([^ ]*\) at .*/\1/p' "$1" 2>/dev/null | head -1 || true
+}
 # The version in a `version` answer (`runnerctl X`), empty for anything else.
 fleet_version_answer() { # FILE
   sed -n 's/^runnerctl \([^ ]*\)$/\1/p' "$1" 2>/dev/null | head -1 || true
@@ -6379,6 +6430,7 @@ fleet_upgrade_stage() { # CHECK INDEX...
   shift
   local -a idx=("$@") wrote=() args=(upgrade)
   ! $check || args+=(--check)
+  ! $FLEET_UP_ROLLBACK || args+=(--rollback)
   args+=(${FLEET_UP_FWD[@]+"${FLEET_UP_FWD[@]}"})
   FLEET_HOSTS=() FLEET_BUDGETS=()
   for k in "${idx[@]}"; do
@@ -6437,8 +6489,24 @@ fleet_upgrade_classify() { # CHECK J K
   fi
   cur="$(fleet_upgrade_field "$j" installed)"
   avail="$(fleet_upgrade_field "$j" available)"
-  FLEET_UP_WANT[k]="$(fleet_upgrade_wrote "$FLEET_DIR/$j.out")"
-  if [ -n "${FLEET_UP_WANT[$k]}" ]; then
+  if $FLEET_UP_ROLLBACK; then
+    # GHR-84: the version a rollback goes back to is on its `rollback:` line.
+    avail="$(fleet_upgrade_field "$j" rollback)"
+    FLEET_UP_WANT[k]="$(fleet_upgrade_rolled "$FLEET_DIR/$j.out")"
+  else
+    FLEET_UP_WANT[k]="$(fleet_upgrade_wrote "$FLEET_DIR/$j.out")"
+  fi
+  if $FLEET_UP_ROLLBACK && [ -n "${FLEET_UP_WANT[$k]}" ]; then
+    # Its own branch: the sentence is not one of the upgrade's four, and a
+    # host that answers anything else to --rollback — an older runnerctl
+    # that ignored it and said `Already up to date.` — did not roll back, so
+    # none of the upgrade's verdicts below may classify it. It goes on to
+    # `unrecognised` instead.
+    state="rolled back"; kind=wrote
+  elif $FLEET_UP_ROLLBACK; then
+    state="unrecognised: $(tail -1 "$FLEET_DIR/$j.out" 2>/dev/null || true)"
+    kind=bad
+  elif [ -n "${FLEET_UP_WANT[$k]}" ]; then
     # Its word, until the read-back has had its say.
     state="upgraded"; kind=wrote
   elif grep -q '^Update available\.' "$FLEET_DIR/$j.out"; then
@@ -6479,24 +6547,30 @@ fleet_upgrade_classify() { # CHECK J K
 #   it answered something else   shown, as an unrecognised `upgrade` answer is.
 # All three are failed rows: `upgraded` is a claim this command now checks,
 # and an unchecked one is not a pass.
+#
+# A rollback (GHR-84) is read back the same way, against the version its
+# `Rolled back` sentence named; a verified one is kind `upgraded` (it is
+# counted where an upgrade is) with the state `rolled back`.
 fleet_upgrade_verify() { # J K
-  local j="$1" k="$2" rc got want="${FLEET_UP_WANT[$2]}"
+  local j="$1" k="$2" rc got want="${FLEET_UP_WANT[$2]}" did done_word=upgraded
+  did="wrote $want"
+  if $FLEET_UP_ROLLBACK; then did="rolled back to $want" done_word="rolled back"; fi
   rc="$(fleet_rc "$j")"
   FLEET_UP_NOW[k]="" FLEET_UP_KIND[k]=bad
   if [ "$rc" != 0 ]; then
-    FLEET_UP_STATE[k]="wrote $want but the read-back did not answer: $(fleet_error_text "$rc" "$FLEET_DIR/$j.err")"
+    FLEET_UP_STATE[k]="$did but the read-back did not answer: $(fleet_error_text "$rc" "$FLEET_DIR/$j.err")"
     return 0
   fi
   got="$(fleet_version_answer "$FLEET_DIR/$j.out")"
   if [ -z "$got" ]; then
-    FLEET_UP_STATE[k]="wrote $want but the read-back answered '$(head -1 "$FLEET_DIR/$j.out" 2>/dev/null || true)', not a version"
+    FLEET_UP_STATE[k]="$did but the read-back answered '$(head -1 "$FLEET_DIR/$j.out" 2>/dev/null || true)', not a version"
     return 0
   fi
   FLEET_UP_NOW[k]="$got"
   if [ "$got" = "$want" ]; then
-    FLEET_UP_KIND[k]=upgraded FLEET_UP_STATE[k]="upgraded"
+    FLEET_UP_KIND[k]=upgraded FLEET_UP_STATE[k]="$done_word"
   else
-    FLEET_UP_STATE[k]="wrote $want but the fleet path still answers $got"
+    FLEET_UP_STATE[k]="$did but the fleet path still answers $got"
   fi
 }
 
@@ -6523,6 +6597,9 @@ fleet_upgrade_report() { # CHECK
   [ "$skipped" -eq 0 ] || tail=", $skipped not attempted"
   if $check; then
     echo "${#FLEET_UP_HOSTS[@]} host(s): $level up to date, $changed would change, $bad unreachable or unclear"
+  elif $FLEET_UP_ROLLBACK; then
+    # No `already level` here: a host that did not roll back is a failed row.
+    echo "${#FLEET_UP_HOSTS[@]} host(s): $changed rolled back, $bad unreachable or unclear$tail"
   else
     echo "${#FLEET_UP_HOSTS[@]} host(s): $level already level, $changed upgraded, $bad unreachable or unclear$tail"
   fi
@@ -9472,12 +9549,103 @@ resolve_url() {
   echo "$url"
 }
 
-# Download URL to DEST and refuse anything that does not parse or has no version.
-fetch_script() {
-  command -v curl >/dev/null || die "curl is required to download from $1"
-  curl -fsSL --max-time 30 "$1" -o "$2" || die "download failed: $1"
-  bash -n "$2" || die "downloaded script does not parse — not installing"
-  [ -n "$(remote_version "$2")" ] || die "downloaded file carries no RUNNERCTL_VERSION — not installing"
+# --- Verifying the download (GHR-84) -------------------------------------------
+# `bash -n` and a RUNNERCTL_VERSION line catch a truncated file or an HTML
+# error page; they do not establish that the bytes are the release. So each
+# release also publishes `runnerctl.sha256` — one `sha256sum` line, written by
+# the release job from the same tagged bytes it attaches — and a download from
+# a release asset is checked against it before anything is written.
+#
+# What this protects against, and what it does not: the digest comes from the
+# same origin as the script, so it catches corruption and a tampered mirror or
+# proxy, not a compromised release (whoever can replace the asset can replace
+# its digest). `--sha256 SUM` pins a digest obtained some other way.
+#
+# The digest URL for a script URL, empty when that source publishes none. The
+# RULE: a GitHub release asset — `https://github.com/<owner>/<repo>/releases/
+# latest/download/runnerctl` (the default UPGRADE_URL) or `…/releases/download/
+# <tag>/runnerctl` (what `--ref vX.Y.Z` maps to) — has its digest beside it,
+# the final `/runnerctl` replaced by `/runnerctl.sha256`. So does a `file://`
+# URL ending in `/runnerctl`: a local mirror can carry the sibling file, and a
+# missing one there is that source's 404. Anything else — a branch `--ref`
+# (raw.githubusercontent.com), a mirror on another host — has none.
+script_digest_url() { # URL
+  if [[ "$1" =~ ^https://github\.com/[^/]+/[^/]+/releases/(latest/download|download/[^/]+)/runnerctl$ ]] \
+     || [[ "$1" =~ ^file:///.*/runnerctl$ ]]; then
+    printf '%s\n' "${1%/runnerctl}/runnerctl.sha256"
+  fi
+}
+
+# Fetch the digest at URL into SCRIPT_DIGEST. Three outcomes, kept apart on
+# purpose, and only ONE of them installs unverified:
+#   0  a well-formed sha256sum line naming runnerctl: SCRIPT_DIGEST holds it
+#   2  the source answered that there is none — HTTP 404 (every release before
+#      the job published one), or a `file://` path that does not exist
+#   3  anything else — a timeout, a 5xx, a refused connection, a body that is
+#      not one sha256sum line. SCRIPT_DIGEST_ERR says which.
+# 3 REFUSES rather than falling back to unverified: if every failure meant
+# "no digest", anyone able to block or garble the one request for the digest
+# would turn verification off for the download beside it.
+SCRIPT_DIGEST="" SCRIPT_DIGEST_ERR=""
+fetch_digest() { # URL FILE
+  local url="$1" f="$2" code="" rc=0 line=""
+  SCRIPT_DIGEST="" SCRIPT_DIGEST_ERR=""
+  # No -f: a 404 has to come back as a status to tell apart from the rest.
+  code="$(curl -sSL --max-time 30 -w '%{http_code}' -o "$f" "$url" 2>/dev/null)" || rc=$?
+  if [ "$rc" -eq 0 ] && [ "$code" = 404 ]; then return 2; fi
+  if [ "$rc" -eq 37 ] && [[ "$url" == file://* ]]; then return 2; fi
+  if [ "$rc" -ne 0 ]; then
+    SCRIPT_DIGEST_ERR="could not fetch $url (curl exit $rc)"; return 3
+  fi
+  if [ "$code" != 200 ] && [[ "$url" != file://* ]]; then
+    SCRIPT_DIGEST_ERR="$url answered HTTP ${code:-?}"; return 3
+  fi
+  IFS= read -r line <"$f" || true
+  if [[ "$line" =~ ^([0-9a-fA-F]{64})\ [\ *]runnerctl$ ]]; then
+    SCRIPT_DIGEST="${BASH_REMATCH[1],,}"; return 0
+  fi
+  # The body is the remote's text, so it is not echoed back.
+  SCRIPT_DIGEST_ERR="$url is not a sha256sum line for runnerctl"
+  return 3
+}
+
+script_sha256() { # FILE
+  command -v sha256sum >/dev/null || die "sha256sum is required to verify the download — not installing"
+  sha256sum "$1" | awk '{print $1}'
+}
+
+# Download URL to DEST and refuse anything that does not parse, has no
+# version, or does not match its digest — before the caller writes anything.
+# PIN is a --sha256 the caller was handed: it replaces the published digest,
+# which is then not fetched at all. One line says which way it went:
+# `verified: …` or `not verified: <reason>`.
+fetch_script() { # URL DEST [PIN]
+  local url="$1" dest="$2" pin="${3:-}" durl="" want="" from="" got dtmp rc=0
+  command -v curl >/dev/null || die "curl is required to download from $url"
+  curl -fsSL --max-time 30 "$url" -o "$dest" || die "download failed: $url"
+  bash -n "$dest" || die "downloaded script does not parse — not installing"
+  [ -n "$(remote_version "$dest")" ] || die "downloaded file carries no RUNNERCTL_VERSION — not installing"
+  if [ -n "$pin" ]; then
+    want="$pin" from="--sha256"
+  else
+    durl="$(script_digest_url "$url")"
+    if [ -z "$durl" ]; then
+      echo "not verified: $url is not a release asset, so no digest is published for it (pass --sha256 SUM to pin one)"
+      return 0
+    fi
+    dtmp="$(mktemp)"
+    fetch_digest "$durl" "$dtmp" || rc=$?
+    rm -f "$dtmp"
+    if [ "$rc" -eq 2 ]; then
+      echo "not verified: no digest is published beside this release ($durl was not found) — pass --sha256 SUM to pin one"
+      return 0
+    fi
+    [ "$rc" -eq 0 ] || die "$SCRIPT_DIGEST_ERR — refusing to install unverified bytes when the digest could not be read (pass --sha256 SUM to pin one)"
+    want="$SCRIPT_DIGEST" from="$durl"
+  fi
+  got="$(script_sha256 "$dest")"
+  [ "$got" = "$want" ] || die "downloaded runnerctl does not match its digest — not installing (sha256 $got, want $want from $from)"
+  echo "verified: sha256 ${want:0:12}… matches $from"
 }
 
 # Put SRC at DEST atomically, readable and executable by everyone: a runnerctl
@@ -9492,18 +9660,24 @@ fetch_script() {
 # (umask 022), and 0711 is broken too: running a #! script needs read as well
 # as execute, so the invoking user got "Permission denied" either way while
 # the install's own `"$target" version` proof passed as root.
-install_file() {
-  local src="$1" dest="$2" dir staged mode=755
+#
+# REF (default DEST) is the file whose owner and mode the result takes. It is
+# not DEST only for `upgrade`'s rollback copy (GHR-84): `$target.prev` takes
+# the owner and mode of the $target it is a copy of, not of whatever older
+# `.prev` it replaces — and it is staged and renamed exactly like the script,
+# so a failed copy never leaves a half-written `.prev` in place of a good one.
+install_file() { # SRC DEST [REF]
+  local src="$1" dest="$2" ref="${3:-$2}" dir staged mode=755
   dir="$(dirname "$dest")"; staged="$dir/.$(basename "$dest").new.$$"
   local priv=()
   { [ -w "$dir" ] && { [ ! -e "$dest" ] || [ -w "$dest" ]; }; } || priv=(run_priv)
   "${priv[@]}" cp "$src" "$staged"
-  if [ -e "$dest" ]; then
-    "${priv[@]}" chown --reference="$dest" "$staged"
+  if [ -e "$ref" ]; then
+    "${priv[@]}" chown --reference="$ref" "$staged"
     # Keep what the admin set — setuid bits, a wider group — but never less
     # than a+rx, so a host already installed at 0700 heals on the next run
     # instead of staying unrunnable.
-    mode="$(stat -c '%a' "$dest" 2>/dev/null || echo 755)"
+    mode="$(stat -c '%a' "$ref" 2>/dev/null || echo 755)"
     [[ "$mode" =~ ^[0-7]+$ ]] || mode=755
     mode="$(printf '%04o' "$(( 8#$mode | 8#0555 ))")"
   else
@@ -9569,13 +9743,71 @@ priv_is_free() { # DEST
   sudo -n true 2>/dev/null
 }
 
+# --- Rolling back (GHR-84) ------------------------------------------------------
+# `upgrade` keeps the script it replaces as `<target>.prev`; `upgrade
+# --rollback` renames that back over the running copy. A rename, not a copy:
+# atomic, same owner and mode as the .prev was given (the script's own, at the
+# time it was kept), and nothing downloaded — a host whose new release
+# misbehaves needs no working network path, and no working download code, to
+# get back.
+#
+# The rollback CONSUMES .prev: a second `--rollback` finds none and refuses.
+# Keeping the rolled-back-from file as the new .prev would make `--rollback`
+# a toggle whose direction depends on history nobody can see from the
+# command line, and `.prev` would then sometimes hold a NEWER script than the
+# one installed. Going forward again is `upgrade` (or `upgrade --ref vX.Y.Z`).
+#
+# The version printed comes from the .prev file, so it is validated as a
+# version before it is printed: `fleet upgrade --rollback` relays this output
+# to the central node and reads the version out of the sentence.
+
+# The `rollback:` line `upgrade --check` prints.
+upgrade_rollback_line() { # TARGET
+  local prev="$1.prev" v
+  if [ ! -e "$prev" ] && [ ! -L "$prev" ]; then
+    echo "rollback: none (no $prev)"
+    return 0
+  fi
+  v="$(remote_version "$prev" 2>/dev/null || true)"
+  if [ -f "$prev" ] && [ ! -L "$prev" ] && valid_runner_version "$v"; then
+    echo "rollback: $v ($prev)"
+  else
+    echo "rollback: unusable ($prev is not a runnerctl with a valid version)"
+  fi
+}
+
+upgrade_rollback() { # TARGET
+  local target="$1" prev="$1.prev" prev_ver dir priv=()
+  if [ ! -e "$prev" ] && [ ! -L "$prev" ]; then
+    die "no rollback copy at $prev — nothing to roll back to (an upgrade keeps the version it replaced there; a fresh install, or a rollback already made, leaves none)"
+  fi
+  prev_ver="$(remote_version "$prev" 2>/dev/null || true)"
+  if [ ! -f "$prev" ] || [ -L "$prev" ] || ! valid_runner_version "$prev_ver" \
+     || ! looks_like_runnerctl "$prev" || ! bash -n "$prev" 2>/dev/null; then
+    die "$prev is not a runnerctl with a valid version — not rolling back to it"
+  fi
+  echo "installed: $RUNNERCTL_VERSION ($target)"
+  echo "rollback: $prev_ver ($prev)"
+  dir="$(dirname "$target")"
+  # install_file's own test, for the same rename into the same directory.
+  { [ -w "$dir" ] && [ -w "$target" ]; } || priv=(run_priv)
+  "${priv[@]}" mv -f "$prev" "$target"
+  echo "Rolled back $RUNNERCTL_VERSION -> $prev_ver at $target"
+  # The proof comes from the installed file, as install's does.
+  echo
+  "$target" version
+}
+
 cmd_upgrade() {
-  local check=false ref="" prefix="" relocate=true
+  local check=false ref="" prefix="" relocate=true rollback=false sha_pin=""
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     case "$1" in
       --check)       check=true; shift ;;
       --ref)         need_val "$@"; ref="$2"; shift 2 ;;
+      # GHR-84: provision's flag and provision's validation, for this script.
+      --sha256)      need_val "$@"; sha_pin="$2"; shift 2 ;;
+      --rollback)    rollback=true; shift ;;
       # Where a home copy is moved TO. Mirrors install's flag, and is what
       # makes any of this testable without writing to a real /usr/local/bin.
       --prefix)      need_val "$@"; prefix="${2%/}"; shift 2 ;;
@@ -9584,13 +9816,23 @@ cmd_upgrade() {
       *) die "unknown option: $1" ;;
     esac
   done
+  [ -z "$sha_pin" ] || [[ "$sha_pin" =~ ^[0-9a-f]{64}$ ]] || die "--sha256 '$sha_pin' is invalid — want 64 lowercase hex characters"
   local self url new_ver sys sys_ver=""
   self="$(readlink -f "${BASH_SOURCE[0]}")"
+  if $rollback; then
+    # Every other flag is about a download or a placement, and a rollback
+    # makes neither: refused rather than silently ignored.
+    if $check || [ -n "$ref$sha_pin$prefix" ] || ! $relocate; then
+      die "--rollback takes no other option — it downloads nothing and moves nothing, it puts $self.prev back ('runnerctl upgrade --check' names the rollback copy)"
+    fi
+    upgrade_rollback "$self"
+    return 0
+  fi
   [ -n "$prefix" ] || prefix="/usr/local/bin"
   sys="$prefix/runnerctl"
   url="$(resolve_url "$ref")"
   DOWNLOAD_TMP="$(mktemp)"; trap 'rm -f "$DOWNLOAD_TMP"' EXIT
-  fetch_script "$url" "$DOWNLOAD_TMP"
+  fetch_script "$url" "$DOWNLOAD_TMP" "$sha_pin"
   new_ver="$(remote_version "$DOWNLOAD_TMP")"
 
   # --- placement -------------------------------------------------------------
@@ -9638,12 +9880,16 @@ cmd_upgrade() {
   echo "installed: $cur_ver ($cur_path)"
   echo "available: $new_ver ($url)"
   [ -z "$note" ] || echo "$note"
+  # GHR-84: whether `--rollback` has anything to go back to. Additive, and
+  # never the last line, so fleet_upgrade_classify reads past it.
+  ! $check || upgrade_rollback_line "$self"
 
   # These four sentences are a PARSED CONTRACT, not prose: fleet_upgrade_report
   # greps ^Upgraded, ^Already up to date\. (with the period), ^Update
   # available\. and `not downgrading`, and counts anything it cannot classify
   # as a failed host. Every line this function added above is additive and on
-  # its own line for exactly that reason. Do not reword them.
+  # its own line for exactly that reason. Do not reword them. (A fifth,
+  # `Rolled back A -> B at PATH`, is upgrade_rollback's — GHR-84.)
   # "same" is about the VERSION, so it compares against the file that holds
   # cur_ver today ($cur_path) — never against $target, which does not exist yet
   # when this call is relocating. Getting that backwards reports
@@ -9686,6 +9932,16 @@ cmd_upgrade() {
     tdir="$(dirname "$target")"
     ! needs_priv "$tdir" || priv=(run_priv)
     [ -d "$tdir" ] || "${priv[@]}" mkdir -p -m 755 "$tdir"
+    # GHR-84: keep what is being replaced as $target.prev, BEFORE the swap and
+    # through the same privilege path, owner and explicit-octal mode as the
+    # script itself. Exactly one is kept — the version immediately before —
+    # so an existing .prev is replaced, by staged rename. A relocation onto a
+    # fresh $target replaces nothing and keeps nothing; neither does a
+    # pre-config script, which has no version to roll back to.
+    if [ -f "$target" ] && [ -n "$(remote_version "$target" 2>/dev/null || true)" ]; then
+      install_file "$target" "$target.prev" "$target"
+      echo "kept: $(remote_version "$target") as $target.prev ('runnerctl upgrade --rollback' puts it back)"
+    fi
     install_file "$DOWNLOAD_TMP" "$target"
   fi
   if [ -n "$retire" ]; then
