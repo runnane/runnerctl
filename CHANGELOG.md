@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.22.0](https://github.com/runnane/runnerctl/compare/v0.21.0...v0.22.0) (2026-10-14)
+
+
+### Features
+
+* fleet mutating fan-outs show each host's lines as they are printed, host-prefixed and relayed safe, and the budget walk shows its slots' lines instead of discarding them (GHR-92) ([#113](https://github.com/runnane/runnerctl/issues/113)) ([1e4cb30](https://github.com/runnane/runnerctl/commit/1e4cb302d5a447feed062128222558283767519f))
+* fleet watch runs a confirmed action in the background over the held connection, with a progress line, Esc to detach and a notice when it ends (GHR-125) ([#118](https://github.com/runnane/runnerctl/issues/118)) ([8fe5014](https://github.com/runnane/runnerctl/commit/8fe5014256af139485a91ca26ee05fbe7c079a07))
+* fleet watch shows how long a slow host took to answer on its host line, yellow near the budget (GHR-95) ([#116](https://github.com/runnane/runnerctl/issues/116)) ([19be3ca](https://github.com/runnane/runnerctl/commit/19be3caaca5bb085aeb10355ba5aa74342de0f56))
+* fleet watch's R and S confirm line takes w to run restart or stop with --when-idle in the background (GHR-126) ([#119](https://github.com/runnane/runnerctl/issues/119)) ([1f1c3d1](https://github.com/runnane/runnerctl/commit/1f1c3d166be1df23f7b4ca755da091640f0059d7))
+* status --json reports the host's SUDO_CONTRACT, and under FLEET_SUDO=1 fleet status and fleet watch name every host that does not say narrow, with ! keeping it (GHR-113) ([#117](https://github.com/runnane/runnerctl/issues/117)) ([c9627a0](https://github.com/runnane/runnerctl/commit/c9627a0afe7d54b6e2563365678e6f2ecf0eecdd))
+* watch remembers a job's run facts (repository, workflow, run id, url ...) while the same job runs, so they stop vanishing between steps (GHR-102) ([#120](https://github.com/runnane/runnerctl/issues/120)) ([f7225fd](https://github.com/runnane/runnerctl/commit/f7225fd37e2b73153a7fed82a302f5cdf0336dd3))
+
+
+### Bug Fixes
+
+* a command interrupted by SIGINT or SIGTERM while its record is armed records interrupted (SIGINT|SIGTERM) and still dies by the signal (GHR-119) ([#115](https://github.com/runnane/runnerctl/issues/115)) ([49c633e](https://github.com/runnane/runnerctl/commit/49c633e87638121707ab2b08f74196b39fb01948))
+* fleet watch ! keeps a host whose answered payload carries no runnerctl version, as the summary counts it unknown (GHR-112) ([#112](https://github.com/runnane/runnerctl/issues/112)) ([53c97b3](https://github.com/runnane/runnerctl/commit/53c97b307d438e694b9a18bc496209f6ee85d355))
+
 ## [0.21.0](https://github.com/runnane/runnerctl/compare/v0.20.0...v0.21.0) (2026-10-14)
 
 
