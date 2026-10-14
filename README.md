@@ -1877,6 +1877,18 @@ runs on `FLEET_TIMEOUT`, not on the upgrade's `FLEET_MUTATE_TIMEOUT`. It
 compares version numbers, so a `--ref <branch>` whose bytes changed under an
 unchanged version number verifies as that number and no further.
 
+**A host that only said `Update available.` is still behind.** On a host where
+`upgrade` retired a home copy that shadowed the system one but could not write
+the system copy without a password, the row reads `update available`. A write
+counts it in its own number, not as upgraded, and the exit code is non-zero,
+because someone with sudo still has to finish it:
+
+```
+2 host(s): 0 already level, 1 upgraded, 0 unreachable or unclear, 1 still behind
+```
+
+`--check` is unchanged: there `update available` is what would change.
+
 The last line names where the fleet ended up: `N host(s) on X` when every
 host is known to be on one version, otherwise each version with its hosts,
 and `unknown` for the ones that did not say.
@@ -1907,8 +1919,9 @@ build-3  0.8.2           up to date
 - **`--serial`** upgrades one host at a time, each one written and read back
   before the next is dialled. Every host is still attempted and every row
   reported.
-- **`--stop-on-failure`** is `--serial` that halts at the first failed row and
-  lists the hosts it did not attempt.
+- **`--stop-on-failure`** is `--serial` that halts at the first failed row, or
+  at a host that is still behind (it only said `Update available.`), and lists
+  the hosts it did not attempt.
 
 They combine: `--canary --stop-on-failure` is one verified host, then the rest
 one at a time until something fails.
