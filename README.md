@@ -239,7 +239,7 @@ runnerctl kill [--dry-run] [--if-stalled] [--stall-after N] \
 runnerctl compose-reap [--apply] [--standalone] [--project NAME] \
                        [--max-age-hours N] [--grace-minutes N]
 runnerctl compose-reap-timer install|status|remove
-runnerctl health [--quiet] [--max-restarts N] [--stall-after N] [--restart-stalled]
+runnerctl health [--quiet|--json] [--max-restarts N] [--stall-after N] [--restart-stalled]
 runnerctl profiles
 runnerctl config-example
 runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
@@ -849,6 +849,29 @@ does stays read-only. A root cron that self-heals the pool:
 */5 * * * *  runnerctl health --quiet --restart-stalled
 ```
 
+`--json` prints the same problems as one object, with the **same exit code**
+(0 healthy, 1 with problems), one problem per line:
+
+```json
+{"ok":false,"slots":5,"problems":[
+  {"host":"build-1","slot":"example.slot-3","kind":"stalled","detail":"stalled — job my-app:build running 1h33m, longer than 1h (--stall-after 3600)"},
+  {"host":"build-1","slot":null,"kind":"disk","detail":"/var/lib/docker [docker] is 96% full (37.3G free, DISK_CRIT_PCT=95)"}
+]}
+```
+
+| key | meaning |
+| --- | --- |
+| `ok` | true exactly when `problems` is empty — the exit code, as a value. |
+| `slots` | how many slots were checked (the `N` of `ok: N slot(s) healthy`). |
+| `problems[].host` | this host's own name (`status --json`'s `host.name`), null when it cannot be read. |
+| `problems[].slot` | the slot's `RUNNER` name, null for a host-wide problem. |
+| `problems[].kind` | `not-running` (enabled, not active), `restarts` (past `--max-restarts`), `stalled`, `leaked`, `pressure` (full memory pressure past `PRESSURE_CRIT_PCT`) for a slot; `disk` (a filesystem past `DISK_CRIT_PCT`), `oom` (a host-wide OOM kill) and `disk-full` (a `No space left on device` line) for the host. |
+| `problems[].detail` | the prose line after its `<slot>: ` or `host: ` — so `--restart-stalled`'s `— restarted` is there too. |
+
+`--restart-stalled` works with `--json` and is recorded the same way (see
+[history](#who-changed-what-history-and-fleet-history)). `--quiet` cannot be
+combined with `--json`: the object is the whole answer.
+
 A disabled, scaled-down slot is not a problem — only an *enabled* slot that
 is not running counts. The restart count is systemd's `NRestarts`, which
 resets on `systemctl start`/`restart`: it is restarts since the unit's last
@@ -1115,7 +1138,8 @@ beside them — so the summary costs one more call to every host that answered
 the first. Under `fleet watch` that is another channel on the connection
 already held. For a one-shot `fleet status` it is a second ssh login per
 answering host; a host that did not answer is not dialled again.
-`fleet status --json` carries no summary.
+`fleet status --json` carries the same numbers as its `summary` object (below),
+counted by the same code from the payloads it already has — no second call.
 
 Each host that answered gets a **host line** above its slots: the `runnerctl`
 version it runs, then the `load`, `Disk:` and `last 1h:` part of its own
@@ -1216,17 +1240,62 @@ unchanged**:
 ```json
 {"fleet":[
   {"host_name":"build-1","reachable":true,"exit_code":0,"error":null,
-   "status":{"runnerctl":"0.8.1","host":{"name":"build-1",…},"slots":[…]}},
+   "status":{"runnerctl":"0.8.1","host":{"name":"build-1",…},"slots":[…]},
+   "duration_ms":212,"stale":false,"last_seen":1791882000},
   {"host_name":"build-3","reachable":false,"exit_code":255,
    "error":"unreachable — ssh: connect to host build-3 port 22: No route to host",
-   "status":null}
-]}
+   "status":null,"duration_ms":10021,"stale":false,"last_seen":null}
+],
+ "generated_at":1791882000,"runnerctl":"0.8.1",
+ "summary":{"hosts":2,"hosts_answering":1,"slots":3,"busy":1,"idle":1,"stalled":0,"down":0,
+            "disabled":1,"leaking":0,"disk_crit_hosts":0,"disk_warn_hosts":0,"event_hosts":0,
+            "overloaded_hosts":0,"capacity_free":1,"capacity_total":2,"versions":1}}
 ```
 
 `host_name` is the alias the central node dialled; `status.host.name` is what
 the host calls itself. They are separate on purpose — a disagreement between
 them is worth seeing. `reachable` is false only for the two "nothing is known"
 cases, so a remote error keeps it true.
+
+Every key added since the first release of this envelope comes **after** the
+ones that were there, at its level, so a consumer that read it before reads
+it the same way:
+
+| key | meaning |
+| --- | --- |
+| `fleet[].duration_ms` | how long the host's call took, measured on the central node around the ssh call. A call that timed out reports its budget (`FLEET_TIMEOUT`, or `FLEET_WATCH_TIMEOUT` in the stream); a call still out in the stream is null. |
+| `fleet[].stale` | true when `status` is an **earlier** answer, kept by the stream for a host that is not answering now (below). Always false one-shot. |
+| `fleet[].last_seen` | epoch seconds of the payload in `status`; null when there is none. |
+| `generated_at` | epoch seconds when the envelope was assembled, so a saved payload can be aged. |
+| `runnerctl` | this (the central) node's version, to measure skew against each `status.runnerctl`. |
+| `summary` | the [summary line](#several-hosts-from-one-place-fleet-status)'s numbers, every one always present (a zero is a zero): `hosts`, `hosts_answering`, `slots` and each state `busy` / `idle` / `stalled` / `down` / `disabled`, `leaking`, `disk_crit_hosts` / `disk_warn_hosts` (this node's thresholds, each host once at its worst partition), `event_hosts` (an OOM kill or a disk-full line), `overloaded_hosts` (this node's `LOAD_CRIT_RATIO`), `capacity_free` of `capacity_total` (idle of active), and `versions` (distinct versions, this node's included — 0 when no host answered). Counted by the same code as the line, over exactly the payloads nested above: a host whose payload is not nested, or is stale, counts towards `hosts` (and `hosts_answering`, if it answered) and nothing else. |
+
+#### A stream for a front end: `fleet status --json --watch`
+
+A UI that polls `fleet status --json` pays a full ssh login to every host on
+every poll — the cost [`fleet watch`](#a-live-fleet-view-fleet-watch) exists to
+avoid. `fleet status --json --watch [--interval N]` (default 5 s) holds one
+connection per host the way `fleet watch` does and writes **one envelope per
+tick, each on a line of its own** (newline-delimited JSON), until it is
+stopped:
+
+```bash
+runnerctl fleet status --json --watch --interval 10 | my-dashboard-feed
+```
+
+Each tick asks every host one `status --json` over its held connection, in the
+background, as `fleet watch` does, and the envelope is written once every host
+has answered or the interval is up. A host whose call is still out then, or
+whose call failed, is reported as `fleet watch` draws it: `reachable` false
+with its `error`, and — if it answered on an earlier tick — that earlier
+payload in `status`, `stale` true and `last_seen` its time; `summary` does not
+count it. It exits 0, leaving nothing running behind it, on Ctrl-C, on
+SIGTERM, and when its reader goes away (the pipe closes). `--stall-after` is
+forwarded as for the one-shot.
+
+The one-host `status` refuses `--json --watch` and says to poll it instead:
+polling it locally costs a fork, so a stream would buy nothing. Polling the
+fleet costs a login per host, so there the trade goes the other way.
 
 Because each payload is nested rather than re-serialised, fleet mode needs no
 JSON parser and `runnerctl` still depends on nothing beyond coreutils, awk,
@@ -1556,6 +1625,21 @@ come from, so a quiet remote would leave nothing to report.
 `--restart-stalled` restarts slots on the remote hosts, so it needs
 passwordless sudo there. Without it the call fails fast and says so, per host
 — it never hangs, because the fan-out runs ssh with `BatchMode=yes`.
+
+`fleet health --json` is [`health --json`](#health-checks-for-cron--uptime-monitors-health)
+for the fleet, with the prose form's exit code: one object, every host's
+problems in it, `host` being the name in `FLEET_HOSTS` and `slots` the slots
+checked across the fleet (null when a host cannot say). A host that is not
+`healthy` in the usual sense is a problem of its own, `slot` null: `kind`
+`unreachable` when it did not answer (ssh failed, or the call timed out) and
+`error` when its `runnerctl` answered with nothing to read (a host with no
+runner units, say), `detail` the row the prose form prints. Each field a host
+sends is decoded and filtered as the table's text is (see [what the central
+node relays](#several-hosts-from-one-place-fleet-status)) before it is written
+again, never passed on as it came. A host on a `runnerctl` from before
+`health --json` refuses the flag; it is asked again without it, and each of
+its prose lines becomes one problem of kind **`unclassified`**, `slot` the
+word before its first `: `.
 
 #### Keeping the fleet on one version: `fleet upgrade`
 
