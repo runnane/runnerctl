@@ -6806,6 +6806,31 @@ fleet_stale_line() { # INDEX RC
     "$(fmt_dur $(($(now_epoch) - seen)))" "$(date -d "@$seen" +%H:%M:%S)" "$why"
 }
 
+# --- How long a host took to answer (GHR-95) ----------------------------------
+# `fleet watch` shows it on the host line — `answered in 3.2s` — only when it
+# is worth reading: from FLEET_ANSWER_SHOW_PCT percent of the host's budget
+# (FLEET_BUDGETS, else FLEET_WATCH_TIMEOUT) up, so a healthy fleet's frame
+# grows no number, and yellow from FLEET_ANSWER_WARN_PCT, where the next slow
+# tick is a timeout. Both fixed: nobody has asked to tune them. The number is
+# the one `fleet status --json` reports as `duration_ms` — read through
+# fleet_duration_ms from the same <i>.ms file, so the two cannot disagree.
+FLEET_ANSWER_SHOW_PCT=25 FLEET_ANSWER_WARN_PCT=75
+fleet_answer_note() { # INDEX
+  local ms budget
+  ms="$(fleet_duration_ms "$1" 0)"
+  [[ "$ms" =~ ^[0-9]+$ ]] || return 0
+  num_int "${FLEET_BUDGETS[$1]:-$FLEET_WATCH_TIMEOUT}"
+  budget="${NUM_INT:-0}"
+  [ "$budget" -gt 0 ] || return 0
+  [ $((ms * 100)) -ge $((budget * 1000 * FLEET_ANSWER_SHOW_PCT)) ] || return 0
+  local text="answered in $((ms / 1000)).$((ms % 1000 / 100))s"
+  if [ $((ms * 100)) -ge $((budget * 1000 * FLEET_ANSWER_WARN_PCT)) ]; then
+    paint "$C_YELLOW" "$text"
+  else
+    printf '%s\n' "$text"
+  fi
+}
+
 fleet_status_table() {
   local i host rc hostw=4 ver="" bad=0 n=0 hdr="" stale v
   local -a lines notes=() skew_order=() skew_parts=()
@@ -6885,8 +6910,20 @@ fleet_status_table() {
       # with no fragment (older than 0.16.0, or nothing to report) still
       # gets the line when its version is not this node's.
       info="$(fleet_host_info "${lines[0]}")"
-      if [ -n "$info" ] || [ "$ver" != "$RUNNERCTL_VERSION" ]; then
-        printf '%-*s %s%s\n' "$hostw" "$host" "$(fleet_ver_cell "$ver")" "${info:+ · $info}"
+      # GHR-95: `fleet watch` only (it is the one with a state directory) —
+      # how long the host took, when that is worth reading. It is ours, so it
+      # is appended after the remote's (already relayed) text and never
+      # relayed or parsed itself; a host with no other fragment gets it as
+      # the fragment, so the line is still `HOST VERSION · …` for
+      # FLEET_INFO_RE.
+      local note="" tail=""
+      [ -z "$FW_STATE" ] || note="$(fleet_answer_note "$i")"
+      if [ -n "$info" ]; then tail=" · $info"; fi
+      if [ -n "$note" ]; then
+        if [ -n "$info" ]; then tail+=" — $note"; else tail=" · $note"; fi
+      fi
+      if [ -n "$tail" ] || [ "$ver" != "$RUNNERCTL_VERSION" ]; then
+        printf '%-*s %s%s\n' "$hostw" "$host" "$(fleet_ver_cell "$ver")" "$tail"
       fi
     fi
     for l in "${lines[@]:3}"; do

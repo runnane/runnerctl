@@ -7248,6 +7248,119 @@ case_fleet_watch_host_line_does_not_count_for_width() {
   expect_out '^31$'
 }
 
+# --- GHR-95: how long a host took to answer, on its host line ------------------
+# The time is modelled, not measured: RUNNERCTL_STUB_FLEET_MS gives a host's
+# call a length as now_ms sees it (the knob GHR-80's duration_ms cases use, and
+# the same <i>.ms file). The budget is FLEET_WATCH_TIMEOUT (10 s): shown from a
+# quarter of it (2.5 s), yellow from three quarters (7.5 s), whole tenths.
+GHR95_DISK='Disk: / \[docker,work\] 24% \(353\.9G free\)'
+case_ghr95_a_slow_host_shows_its_answer_time_and_a_fast_one_none() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    RUNNERCTL_STUB_FLEET_MS="build-1:3200 build-2:80" run fleet watch --iterations 2 --color never
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 2
+  expect_out_count "^build-1 +${HV}${GHR95_DISK} — answered in 3\\.2s\$" 2
+  expect_out_count "^build-2 +${HV}${GHR95_DISK}\$" 2
+  expect_out_count 'answered in' 2
+  # the other way round: the number follows the host that was slow
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    RUNNERCTL_STUB_FLEET_MS="build-1:90 build-2:4700" run fleet watch --iterations 1 --color never
+  expect_rc 0
+  expect_out_count "^build-1 +${HV}${GHR95_DISK}\$" 1
+  expect_out_count "^build-2 +${HV}${GHR95_DISK} — answered in 4\\.7s\$" 1
+  expect_out_count 'answered in' 1
+  # two slow hosts, two different times
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    RUNNERCTL_STUB_FLEET_MS="build-1:2600 build-2:6100" run fleet watch --iterations 1 --color never
+  expect_rc 0
+  expect_out_count "^build-1 +${HV}${GHR95_DISK} — answered in 2\\.6s\$" 1
+  expect_out_count "^build-2 +${HV}${GHR95_DISK} — answered in 6\\.1s\$" 1
+  # the frame is otherwise the frame it was: nothing else moves
+  expect_out_count '^build-[12] +[0-9] +example\.slot-' 6
+}
+
+# The edges: 2499 ms of a 10 s budget is not worth reading, 2500 is; the
+# threshold is a fraction of the host's budget, so a 2 s FLEET_WATCH_TIMEOUT
+# shows 600 ms; and a fleet that answers promptly draws what it always drew.
+case_ghr95_threshold_is_a_fraction_of_the_budget() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_FLEET_MS="build-1:2499" \
+    run fleet watch --iterations 1 --color never
+  expect_rc 0
+  expect_no_out 'answered in'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_FLEET_MS="build-1:2500" \
+    run fleet watch --iterations 1 --color never
+  expect_rc 0
+  expect_out_count "^build-1 +${HV}${GHR95_DISK} — answered in 2\\.5s\$" 1
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_FLEET_MS="build-1:600" \
+    run fleet watch --iterations 1 --color never
+  expect_rc 0
+  expect_no_out 'answered in'
+  printf '. %q\nFLEET_WATCH_TIMEOUT=2\n' "$PWD/$STUB" >"$TMP/ghr95.config"
+  chmod 644 "$TMP/ghr95.config"
+  STUB="$TMP/ghr95.config" RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    RUNNERCTL_STUB_FLEET_MS="build-1:600" run fleet watch --iterations 1 --color never
+  expect_rc 0
+  expect_out_count "^build-1 +${HV}${GHR95_DISK} — answered in 0\\.6s\$" 1
+  # one-shot `fleet status` has no such line, however slow the host
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_FLEET_MS="build-1:9000" run fleet status
+  expect_rc 0
+  expect_no_out 'answered in'
+}
+
+# Yellow from 75 % of the budget, only on the duration text; the remote's own
+# colours on the rest of the line are left as they came. With colour off it is
+# the same words, unpainted.
+case_ghr95_the_time_is_yellow_near_the_budget() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    RUNNERCTL_STUB_FLEET_MS="build-1:7499 build-2:7500" run fleet watch --iterations 1 --color always
+  expect_rc 0
+  expect_out_count "^build-1 +${HV}Disk: $ESC\\[32m/ \\[docker,work\\] 24% \\(353\\.9G free\\)$ESC\\[0m — answered in 7\\.4s\$" 1
+  expect_out_count "^build-2 +${HV}Disk: $ESC\\[32m/ \\[docker,work\\] 24% \\(353\\.9G free\\)$ESC\\[0m — $ESC\\[33manswered in 7\\.5s$ESC\\[0m\$" 1
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-2" \
+    RUNNERCTL_STUB_FLEET_MS="build-2:9300" run fleet watch --iterations 1 --color never
+  expect_rc 0
+  expect_out_count "^build-2 +${HV}${GHR95_DISK} — answered in 9\\.3s\$" 1
+}
+
+# A host with no Disk / events fragment and this node's version has no host
+# line at all; a slow one gets one, which is the version cell and the time.
+case_ghr95_a_host_without_a_host_line_gets_one_when_slow() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_DISKS=none \
+    RUNNERCTL_STUB_FLEET_MS="build-1:3200" run fleet watch --iterations 1 --color never
+  expect_rc 0
+  expect_out_count "^build-1 +${HV}answered in 3\\.2s\$" 1
+  expect_no_out '^build-2 +v'
+  expect_out_count '^build-[12] +[0-9] +example\.slot-' 6
+  # a host of another version already had a line: the time follows its cell
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_DISKS=none \
+    RUNNERCTL_STUB_FLEET_VER="build-2:0.0.1" RUNNERCTL_STUB_FLEET_MS="build-2:3200" \
+    run fleet watch --iterations 1 --color never
+  expect_rc 0
+  expect_out_count '^build-2 +v0\.0\.1 · answered in 3\.2s$' 1
+}
+
+# The line carrying a time is a host line like the others: the cursor walks
+# slot rows only (fw_cursor_skips: five highlighted rows, none a host line).
+case_ghr95_cursor_skips_the_line_with_a_time() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjkq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_MS="build-1:3200 build-2:5100" run fleet watch --color never
+  fw_cursor_skips "^build-[12] +${HV}Disk: .* — answered in [35]\\.[21]s\$" 10
+  expect_out_count 'answered in 3\.2s$' 5
+  expect_out_count 'answered in 5\.1s$' 5
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjkq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_DISKS=none RUNNERCTL_STUB_FLEET_MS="build-1:3200 build-2:5100" run fleet watch --color never
+  fw_cursor_skips "^build-[12] +${HV}answered in [35]\\.[21]s\$" 10
+}
+
+# ... and it does not count toward the table width, in the shape the watch
+# draws it (the version cell, the fragment, the time), however long.
+case_ghr95_the_line_with_a_time_does_not_count_for_width() {
+  local long; long="build-1 v0.1.0 · Disk: /$(printf 'x%.0s' {1..300}) 24% (1G free) — answered in 3.2s"
+  run_fn watch_table_width "$long"$'\n''build-1 v0.1.0 · answered in 3.2s'$'\n''build-1 0 example.slot-1 active' '[^ ]+ +'
+  expect_rc 0
+  expect_out '^31$'
+}
+
 # --- GHR-72: the fleet summary line ------------------------------------------
 # Every expected line below is PINNED TEXT, not derived from another surface:
 # the stub host has three slots — slot-1 running a job for 12m, slot-2 idle,
@@ -9430,6 +9543,12 @@ t "fleet status: no fragment, other version: a host line of the version" case_fl
 t "fleet watch: the host line keeps the remote's colours"                 case_fleet_watch_host_line_keeps_the_remote_colours
 t "fleet watch: the cursor skips host lines, in all three shapes"         case_fleet_watch_cursor_skips_host_lines
 t "fleet watch: a host line does not count toward the table width"       case_fleet_watch_host_line_does_not_count_for_width
+t "GHR-95: a slow host shows its answer time on its host line, a fast one none" case_ghr95_a_slow_host_shows_its_answer_time_and_a_fast_one_none
+t "GHR-95: the time shows from a quarter of the budget"                  case_ghr95_threshold_is_a_fraction_of_the_budget
+t "GHR-95: the time is yellow from three quarters of the budget"         case_ghr95_the_time_is_yellow_near_the_budget
+t "GHR-95: a host with no host line gets one when it is slow"            case_ghr95_a_host_without_a_host_line_gets_one_when_slow
+t "GHR-95: the cursor skips the line with a time, in both shapes"        case_ghr95_cursor_skips_the_line_with_a_time
+t "GHR-95: the line with a time does not count toward the table width"   case_ghr95_the_line_with_a_time_does_not_count_for_width
 t "fleet summary: a healthy fleet is one short last line"                 case_fleet_summary_healthy_fleet_is_a_short_line
 t "fleet summary: a stalled job is counted STALLED, not busy"             case_fleet_summary_counts_a_stalled_job
 t "fleet summary: an unreachable host is a host, its slots are not down"  case_fleet_summary_unreachable_host_counts_as_a_host_only
