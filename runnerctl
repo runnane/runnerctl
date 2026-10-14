@@ -1082,6 +1082,19 @@ sudo_contract_of_default() {
   if [ "$v" = full ]; then echo full; else echo narrow; fi
 }
 
+# The JSON `host.sudo_contract` (GHR-113): what sudo_contract_of_default says,
+# for the central node to read under FLEET_SUDO=1. `status` runs as the plain
+# login, and the default config is root-owned and world-readable (0644) — it is
+# sourced here the way it is under sudo, no privilege asked. Empty (null in
+# the JSON) when the file exists and THIS user cannot read it: sourcing it
+# would fail and read as `full`, which is a claim this host cannot back.
+# No file, or one that fails the trust check, is `full`, as the guard itself
+# treats it. Behind a function so a test config can pin it, like host_facts.
+host_sudo_contract() {
+  if [ -f "$CONFIG_DEFAULT" ] && [ ! -r "$CONFIG_DEFAULT" ]; then return 0; fi
+  sudo_contract_of_default
+}
+
 # Everything a run under sudo on a host with SUDO_CONTRACT=narrow checks
 # before it sources a config or acts on the host. Each refusal says what to
 # do instead; none of them is reachable without sudo, nor on a `full` host —
@@ -3694,6 +3707,9 @@ host_events_json() {
 # `host` carries `name` (the host's own hostname, null when it cannot be
 # read — GHR-38) alongside `cores`, `mem_total`, `mem_available` and `load`
 # ([1m, 5m, 15m] from /proc/loadavg, null when unreadable — GHR-79).
+# `host.sudo_contract` (GHR-113), the LAST key of `host`: "narrow" or "full",
+# the value sudo_contract_of_default reads, or null when this host cannot say
+# (see host_sudo_contract). A host from before the key has none at all.
 # Unlike the table, this never dies on a host with no runner units: it
 # prints `"slots": []` and exits 0 (GHR-38).
 render_status_json() {
@@ -3707,10 +3723,10 @@ render_status_json() {
   local cores mem_total mem_avail i=0 u sep="" job idle_since completed
   read -r cores mem_total mem_avail < <(host_facts) || true
   collect_host
-  printf '{"runnerctl":%s,"host":{"name":%s,"cores":%s,"mem_total":%s,"mem_available":%s,"load":%s,"disks":%s,"events":%s},\n "slots":[' \
+  printf '{"runnerctl":%s,"host":{"name":%s,"cores":%s,"mem_total":%s,"mem_available":%s,"load":%s,"disks":%s,"events":%s,"sudo_contract":%s},\n "slots":[' \
     "$(json_str "$RUNNERCTL_VERSION")" "$(json_strn "$(host_name)")" \
     "$(json_num "$cores")" "$(json_num "$mem_total")" "$(json_num "$mem_avail")" \
-    "$(host_load_json)" "$(host_disks_json)" "$(host_events_json)"
+    "$(host_load_json)" "$(host_disks_json)" "$(host_events_json)" "$(json_strn "$(host_sudo_contract)")"
   while read -r u; do
     [ -n "$u" ] || continue
     collect_slot "$u" "$i"
@@ -6926,8 +6942,8 @@ fleet_answer_note() { # INDEX
 }
 
 fleet_status_table() {
-  local i host rc hostw=4 ver="" bad=0 n=0 hdr="" stale v
-  local -a lines notes=() skew_order=() skew_parts=()
+  local i host rc hostw=4 ver="" bad=0 n=0 hdr="" stale v sudo_frag
+  local -a lines notes=() skew_order=() skew_parts=() sudo_full=() sudo_unrep=() sudo_parts=()
   # GHR-77: hosts whose version is not this node's, by version, in the order
   # each version was first seen.
   local -A skew_hosts=()
@@ -6995,6 +7011,16 @@ fleet_status_table() {
     fi
     n=$((n + 1))
     local l info
+    # GHR-113: under FLEET_SUDO=1, a host without the opt-in. Not for kept
+    # rows: what a host said half a minute ago is not its contract today.
+    sudo_frag=""
+    if ! $stale; then
+      fleet_sudo_state "$i"
+      case "$FSC_STATE" in
+        full)       sudo_full+=("$host") sudo_frag="no SUDO_CONTRACT=narrow" ;;
+        unreported) sudo_unrep+=("$host") sudo_frag="SUDO_CONTRACT not reported" ;;
+      esac
+    fi
     if $stale; then
       # Where the host line would be: the age line, and no Disk/OOM line —
       # those facts are as old as the rows and would not be dimmed by them.
@@ -7013,8 +7039,14 @@ fleet_status_table() {
       local note="" tail=""
       [ -z "$FW_STATE" ] || note="$(fleet_answer_note "$i")"
       if [ -n "$info" ]; then tail=" · $info"; fi
+      # GHR-113: ours too, and what makes `fleet watch`'s `!` view have a line
+      # to keep for a host that is otherwise level with this node.
+      if [ -n "$sudo_frag" ]; then
+        sudo_frag="$(paint "$C_YELLOW" "$sudo_frag")"
+        if [ -n "$tail" ]; then tail+=" — $sudo_frag"; else tail=" · $sudo_frag"; fi
+      fi
       if [ -n "$note" ]; then
-        if [ -n "$info" ]; then tail+=" — $note"; else tail=" · $note"; fi
+        if [ -n "$tail" ]; then tail+=" — $note"; else tail=" · $note"; fi
       fi
       if [ -n "$tail" ] || [ "$ver" != "$RUNNERCTL_VERSION" ]; then
         printf '%-*s %s%s\n' "$hostw" "$host" "$(fleet_ver_cell "$ver")" "$tail"
@@ -7058,6 +7090,20 @@ fleet_status_table() {
       fi
     done
     paint "$C_YELLOW" "note: $(join_by "; " "${skew_parts[@]}") — this node runs $RUNNERCTL_VERSION; 'runnerctl fleet upgrade --check' shows what would change"
+  fi
+  # GHR-113: FLEET_SUDO=1 here relies on the narrow contract's two halves; the
+  # opt-in is the one this node can read. Hosts that say `full` and hosts that
+  # say nothing it can read are different facts (one is a choice, the other an
+  # older runnerctl or an unreadable config), so they are worded apart, and
+  # both are named — only the host's name is quoted, never its payload.
+  if [ "${#sudo_full[@]}" -gt 0 ]; then
+    sudo_parts+=("$(join_by ", " "${sudo_full[@]}") report$([ "${#sudo_full[@]}" -gt 1 ] || echo s) SUDO_CONTRACT full")
+  fi
+  if [ "${#sudo_unrep[@]}" -gt 0 ]; then
+    sudo_parts+=("$(join_by ", " "${sudo_unrep[@]}") do$([ "${#sudo_unrep[@]}" -gt 1 ] || echo es) not report a SUDO_CONTRACT this node can read")
+  fi
+  if [ "${#sudo_parts[@]}" -gt 0 ]; then
+    paint "$C_YELLOW" "note: FLEET_SUDO=1 runs 'sudo -n runnerctl …' on every host, and without SUDO_CONTRACT=narrow in the host's /etc/runnerctl/config that grant is root-equivalent — $(join_by "; " "${sudo_parts[@]}"); set it there (a host that reports nothing may need 'runnerctl fleet upgrade' first; 'The narrow sudo contract' in the README)"
   fi
   [ "$bad" -eq 0 ]
 }
@@ -7224,10 +7270,23 @@ fleet_slot_classify() { # SLOT-LINE
 # and this node's LOAD_CRIT_RATIO / LOAD_WARN_RATIO, empty below both or
 # when either is missing — or no number this node takes: both are the host's
 # text, held to dec_hundredths and num_int (`016` cores is not 14, nor 16).
-HC_VER="" HC_DISK="" HC_EVENTS=false HC_LOAD=""
+#
+# GHR-113: HC_SUDO the host's `sudo_contract`, exactly `narrow` or `full` as
+# the host wrote it, else `unreported` — a host from before the key, a null (it
+# could not read its default config) and any other text alike. The text is the
+# host's, so it is compared and never kept or drawn. First occurrence, which
+# is safe: the key is the last of `host`, and every string before it is
+# escaped by json_str, so no text of the host's can spell a bare
+# `"sudo_contract":`. It must also be a JSON string, which json_line_get alone
+# does not say (`narrow` bare is a keyword to it).
+HC_VER="" HC_DISK="" HC_EVENTS=false HC_LOAD="" HC_SUDO=""
 fleet_host_classify() { # HOST-LINE
   local line="$1" lvl n m l1=""
-  HC_DISK="" HC_EVENTS=false HC_LOAD=""
+  HC_DISK="" HC_EVENTS=false HC_LOAD="" HC_SUDO=unreported
+  json_line_get "$line" sudo_contract
+  case "$JF" in
+    narrow|full) [[ "$line" != *"\"sudo_contract\":\"$JF\""* ]] || HC_SUDO="$JF" ;;
+  esac
   json_line_get "$line" runnerctl; fleet_ver "$JF"; HC_VER="$FLEET_VER"
   [[ ! "$line" =~ \"load\":\[([^],]*), ]] || l1="${BASH_REMATCH[1]}"
   json_line_get "$line" cores
@@ -7245,6 +7304,28 @@ fleet_host_classify() { # HOST-LINE
   if { [ -n "$n" ] && [ "$n" -gt 0 ]; } || { [ -n "$NUM_INT" ] && [ "$NUM_INT" -gt 0 ]; }; then
     HC_EVENTS=true
   fi
+}
+
+# GHR-113: what host INDEX says about its sudo contract, into FSC_STATE, for
+# the table's note and host line: narrow | full | unreported, or empty when
+# there is nothing to judge — FLEET_SUDO is not 1 (the contract is then not
+# what this node relies on, so no host is flagged and nothing is read), or the
+# host's `status --json` call (fleet_summary_fetch's, in $FLEET_DIR/<i>.json)
+# did not answer: its table is all there is, and a host that cannot be asked
+# is not one to call unopted. A payload that answered but whose first line is
+# not the host line fleet_host_classify reads is unreported, as an older host
+# whose first line is `{"host":` is.
+FSC_STATE=""
+fleet_sudo_state() { # INDEX
+  local line=""
+  FSC_STATE=""
+  [ "$FLEET_SUDO" = 1 ] || return 0
+  [ "$(cat "$FLEET_DIR/$1.jrc" 2>/dev/null || echo 255)" = 0 ] || return 0
+  IFS= read -r line <"$FLEET_DIR/$1.json" || true
+  case "$line" in
+    '{"runnerctl":'*) fleet_host_classify "$line"; FSC_STATE="$HC_SUDO" ;;
+    *)                FSC_STATE=unreported ;;
+  esac
 }
 
 # `6 slots: 2 busy, 2 idle, 1 STALLED, 1 down` — the summary's slot segment,
@@ -9903,6 +9984,12 @@ fleet_watch_load_facts() {
           # node forwards flags it may not know. Its host line is there to
           # show, since a version other than this node's always draws one.
           if [ -n "$HC_DISK" ] || $HC_EVENTS || [ "$HC_VER" != "$RUNNERCTL_VERSION" ]; then
+            FW_HOSTBAD[$host]=1
+          fi
+          # GHR-113: and under FLEET_SUDO=1 a host that does not say `narrow`
+          # — the table draws its host line (fleet_status_table) for it. A
+          # payload with no host line at all is kept by GHR-112's rule below.
+          if [ "$FLEET_SUDO" = 1 ] && [ "$HC_SUDO" != narrow ]; then
             FW_HOSTBAD[$host]=1
           fi ;;
         '  {"idx":'*)

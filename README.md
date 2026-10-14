@@ -774,10 +774,16 @@ carries `name` (the host's own `hostname`, null when it cannot be read),
 `disks` (one object per watched filesystem — `mount`, `device`, `fstype`,
 `size`, `used`, `avail` in bytes, `use_pct` and `roles`, e.g.
 `["docker","work"]` — the filesystems the header's `Disk:`
-lists) and `events` (the last `EVENTS_SEC` of journal: `window` in seconds,
+lists), `events` (the last `EVENTS_SEC` of journal: `window` in seconds,
 `oom_kills` host-wide and `cgroup_oom_kills` per-cgroup, `disk_full` lines,
 and the epoch second, process and syslog identifier of the last of each;
-null when the journal cannot be read or `EVENTS_SEC=0`);
+null when the journal cannot be read or `EVENTS_SEC=0`) and, last,
+`sudo_contract` — `"narrow"` or `"full"`, the host's `SUDO_CONTRACT` as read
+from its default config (`/etc/runnerctl/config`, world-readable, so no
+privilege is asked; no file, or one that fails the trust check, is `"full"`,
+as the sudo guard itself reads it), or null when that file exists and the
+login cannot read it. A host from before the key has none; `fleet` flags both
+under `FLEET_SUDO=1` (see [The narrow sudo contract](#the-narrow-sudo-contract));
 `runnerctl` is the version of the script that produced the object, for
 inventorying a fleet.
 `--json` is one-shot and refuses `--watch`; poll it instead.
@@ -2081,12 +2087,30 @@ shell from `sudo -i` also has: on an opted-in host the refusals apply there
 too. To use a refused flag there, run the command without `sudo` (runnerctl
 asks sudo for each privileged step itself) or set the value in the config.
 
-**The central node cannot check either half for you.** It cannot read a
-host's sudoers, so it cannot tell the narrow line from a full grant, and a
-host with the narrow line but without the opt-in answers every fan-out
-exactly as an opted-in one does — the difference only shows when someone
-passes a flag the opt-in would refuse. Check each host yourself, e.g. `ssh
-<host> grep SUDO_CONTRACT /etc/runnerctl/config`.
+**The central node can check one half for you.** It cannot read a host's
+sudoers, so it cannot tell the narrow line from a full grant — check that on
+each host yourself. It can read the opt-in: every host reports its
+`SUDO_CONTRACT` in `status --json` (`host.sudo_contract`), and with
+`FLEET_SUDO=1` `fleet status` and `fleet watch` name each host that does not
+say `narrow` — on its host line, and in a note:
+
+```
+note: FLEET_SUDO=1 runs 'sudo -n runnerctl …' on every host, and without
+SUDO_CONTRACT=narrow in the host's /etc/runnerctl/config that grant is
+root-equivalent — box-2 reports SUDO_CONTRACT full; box-3 does not report a
+SUDO_CONTRACT this node can read; set it there (…)
+```
+
+A host that reports `full` is a choice (or a forgotten line); one that
+"does not report a `SUDO_CONTRACT` this node can read" is an older runnerctl
+(upgrade it first), a config its login cannot read, or a value that is neither
+`narrow` nor `full` — all treated alike, since none of them shows an opt-in.
+Only a host that answered is judged, and only its answer of the moment (the
+rows `fleet watch` keeps for a host that stopped answering are not). Under
+`FLEET_SUDO=0` nothing is read or drawn. In `fleet watch`, `!` keeps a flagged
+host. A host whose value the central node can read as `narrow` is the opt-in
+as that host's config states it; a host that merely lies, or has the sudoers
+half wrong, is not something a status call can see.
 
 **What it does not bound.** The verbs themselves: the login can stop,
 restart, kill, reap, provision and deprovision runners, roll the script back

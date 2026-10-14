@@ -1541,7 +1541,7 @@ case_journal_restart_reason_line_no_match() {
 case_status_json_parses_and_carries_the_slot_facts() {
   run status --json
   expect_rc 0
-  expect_out '^\{"runnerctl":"[0-9]+\.[0-9]+\.[0-9]+","host":\{"name":"stub-host-1","cores":16,"mem_total":68719476736,"mem_available":51539607552,"load":null,"disks":\[.*\],"events":\{.*\}\},$'
+  expect_out '^\{"runnerctl":"[0-9]+\.[0-9]+\.[0-9]+","host":\{"name":"stub-host-1","cores":16,"mem_total":68719476736,"mem_available":51539607552,"load":null,"disks":\[.*\],"events":\{.*\},"sudo_contract":"narrow"\},$'
   expect_out '^ "slots":\[$'
   expect_out '^\]\}$'
   # read-only, like the table: no privileged call at all.
@@ -1550,7 +1550,10 @@ case_status_json_parses_and_carries_the_slot_facts() {
   expect_no_out '^note:'
   if ! $HAVE_PYTHON3; then skip "python3 not on PATH: status --json parse assertions not run"; return 0; fi
   expect_json 'len(d["slots"]) == 3'
-  expect_json '{k: v for k, v in d["host"].items() if k not in ("disks", "events")} == {"name": "stub-host-1", "cores": 16, "mem_total": 68719476736, "mem_available": 51539607552, "load": None}'
+  expect_json '{k: v for k, v in d["host"].items() if k not in ("disks", "events")} == {"name": "stub-host-1", "cores": 16, "mem_total": 68719476736, "mem_available": 51539607552, "load": None, "sudo_contract": "narrow"}'
+  # GHR-113: appended, so it is the LAST key of `host` and the older ones keep
+  # their places.
+  expect_json 'list(d["host"].keys()) == ["name", "cores", "mem_total", "mem_available", "load", "disks", "events", "sudo_contract"]'
   # GHR-32: the version the script carries, so a fleet can be inventoried
   expect_json 'isinstance(d["runnerctl"], str) and len(d["runnerctl"].split(".")) == 3 and all(x.isdigit() for x in d["runnerctl"].split("."))'
   expect_json '[s["idx"] for s in d["slots"]] == [0, 1, 2]'
@@ -7619,6 +7622,172 @@ bad: h1 h3 " "$OUT"
   rm -rf "$d"
 }
 
+# --- GHR-113: each host's SUDO_CONTRACT, flagged under FLEET_SUDO=1 ------------
+# `status --json`'s `host` object ends with `sudo_contract`, and a central node
+# with FLEET_SUDO=1 names every host that does not say `narrow`. The stub pins
+# the value (host_sudo_contract: narrow unless a knob says otherwise):
+# RUNNERCTL_STUB_SUDOC for the local run, RUNNERCTL_STUB_FLEET_SUDOC="host:value
+# …" per fleet host (`-` is an empty answer: null), and
+# RUNNERCTL_STUB_FLEET_NOSUDOC="host…" for a host from before the key.
+
+case_ghr113_status_json_carries_the_contract() {
+  run status --json
+  expect_rc 0
+  expect_out '"events":\{.*\},"sudo_contract":"narrow"\},$'
+  RUNNERCTL_STUB_SUDOC=full run status --json
+  expect_out '"events":\{.*\},"sudo_contract":"full"\},$'
+  # a host that cannot read its default config says nothing rather than guess
+  RUNNERCTL_STUB_SUDOC=- run status --json
+  expect_out '"events":\{.*\},"sudo_contract":null\},$'
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test) '
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: sudo_contract parse assertions not run"; return 0; fi
+  expect_json 'd["host"]["sudo_contract"] is None and list(d["host"].keys())[-1] == "sudo_contract"'
+}
+
+# The real reader (the stub pins the hook), over files of its own: it sources
+# the DEFAULT config as the plain login and asks sudo for nothing (a sudo that
+# would answer is a function here, and says so). Missing and untrusted files
+# are `full`, as the guard reads them; a file this user cannot read is no
+# answer, since sourcing it would fail and read as `full`.
+case_ghr113_the_host_reads_its_default_config_without_privilege() {
+  local n="$TMP/ghr113-narrow.config" f="$TMP/ghr113-full.config" u="$TMP/ghr113-unreadable.config" w="$TMP/ghr113-writable.config"
+  printf 'SUDO_CONTRACT=narrow\n' >"$n"; printf 'SUDO_CONTRACT=full\n' >"$f"
+  printf 'SUDO_CONTRACT=narrow\n' >"$u"; printf 'SUDO_CONTRACT=narrow\n' >"$w"
+  chmod 644 "$n" "$f"; chmod 000 "$u"; chmod 666 "$w"
+  # shellcheck disable=SC2016
+  GHR113_N="$n" GHR113_F="$f" GHR113_U="$u" GHR113_W="$w" GHR113_A="$TMP/ghr113-absent.config" run_fn eval '
+    sudo() { echo "SUDO CALLED"; return 97; }
+    CONFIG_DEFAULT="$GHR113_N"; echo "narrow: [$(host_sudo_contract)]"
+    CONFIG_DEFAULT="$GHR113_F"; echo "full: [$(host_sudo_contract)]"
+    CONFIG_DEFAULT="$GHR113_A"; echo "absent: [$(host_sudo_contract)]"
+    CONFIG_DEFAULT="$GHR113_W"; echo "world-writable: [$(host_sudo_contract)]"
+    CONFIG_DEFAULT="$GHR113_U"; echo "unreadable: [$(host_sudo_contract)]"'
+  expect_rc 0
+  if [ "$(id -u)" = 0 ] || [ -r "$u" ]; then
+    expect_text "the value for each default (unreadable not testable here)" 'narrow: [narrow]
+full: [full]
+absent: [full]
+world-writable: [full]
+unreadable: [narrow]' "$OUT"
+  else
+    expect_text "the value for each default" 'narrow: [narrow]
+full: [full]
+absent: [full]
+world-writable: [full]
+unreadable: []' "$OUT"
+  fi
+  chmod 600 "$u" "$w"; rm -f "$n" "$f" "$u" "$w"
+}
+
+# Acceptance: a host without the opt-in, under FLEET_SUDO=1, is named — in a
+# note, and on its own host line (which is what `!` keeps) — and the same host
+# under FLEET_SUDO=0 is not. build-1, on narrow, is the negative control: not
+# named anywhere.
+case_ghr113_fleet_status_names_a_host_without_the_opt_in() {
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_SUDOC="build-2:full" run fleet status
+  expect_rc 0
+  expect_out_count "^note: FLEET_SUDO=1 runs 'sudo -n runnerctl …' on every host, and without SUDO_CONTRACT=narrow in the host's /etc/runnerctl/config that grant is root-equivalent — build-2 reports SUDO_CONTRACT full; set it there \\(a host that reports nothing may need 'runnerctl fleet upgrade' first; 'The narrow sudo contract' in the README\\)\$" 1
+  expect_out_count "^build-2 +${HV}Disk: .* — no SUDO_CONTRACT=narrow\$" 1
+  expect_no_out '^build-1 .*SUDO_CONTRACT'
+  expect_no_out 'build-1 report'
+  # the summary line is the GHR-72 one, unchanged
+  expect_last_line "$SUM_OK"
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_SUDOC="build-2:full" run fleet status
+  expect_rc 0
+  expect_no_out 'SUDO_CONTRACT'
+  expect_no_out 'root-equivalent'
+  expect_last_line "$SUM_OK"
+}
+
+# `narrow` is the opt-in: a fleet of narrow hosts draws nothing, whatever
+# FLEET_SUDO says. A host that is `full` and one that says nothing are worded
+# apart; both are named, several to a sentence, and a host whose call failed
+# is not one of them.
+case_ghr113_fleet_status_words_full_and_unreported_apart() {
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status
+  expect_rc 0
+  expect_no_out 'SUDO_CONTRACT'
+  expect_no_out 'root-equivalent'
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 build-3 build-4 build-5 build-6-unreachable" \
+    RUNNERCTL_STUB_FLEET_SUDOC="build-2:full build-3:full build-5:-" RUNNERCTL_STUB_FLEET_NOSUDOC="build-4" run fleet status
+  expect_out_count '^note: FLEET_SUDO=1 .* — build-2, build-3 report SUDO_CONTRACT full; build-4, build-5 do not report a SUDO_CONTRACT this node can read; set it there ' 1
+  expect_out_count '^build-[23] +v[0-9.]+ · Disk: .* — no SUDO_CONTRACT=narrow$' 2
+  expect_out_count '^build-[45] +v[0-9.]+ · Disk: .* — SUDO_CONTRACT not reported$' 2
+  expect_no_out '^build-1 .*SUDO_CONTRACT'
+  expect_no_out '^build-6-unreachable .*SUDO_CONTRACT'
+  expect_no_out 'build-6-unreachable[,;]'
+  expect_no_out 'build-6-unreachable (reports|does)'
+}
+
+# The value is the host's text. Only `narrow` and `full`, as JSON strings, are
+# read: any other word, a JSON bareword, a hostile string with control bytes
+# (escaped by the host's own json_str, so the payload line stays one line) is
+# `unreported`, and none of it is drawn.
+case_ghr113_a_contract_that_is_no_contract_is_unreported_and_never_drawn() {
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 build-3 build-4 build-5" \
+    RUNNERCTL_STUB_FLEET_SUDOC="build-2:narrow-ish build-3:Narrow build-4:x;id|0 build-5:$ESC]0;owned${ESC}[2J" run fleet status
+  expect_rc 0
+  expect_out_count '^note: FLEET_SUDO=1 .* — build-2, build-3, build-4, build-5 do not report a SUDO_CONTRACT this node can read; ' 1
+  expect_out_count '^build-[2345] +v[0-9.]+ · Disk: .* — SUDO_CONTRACT not reported$' 4
+  expect_no_out 'narrow-ish'
+  expect_no_out 'Narrow'
+  expect_no_out 'x;id'
+  expect_no_out 'owned'
+  expect_no_out "$ESC"
+  expect_no_out $'\a'
+  # a bareword is a JSON keyword to json_line_get, and not a string
+  # shellcheck disable=SC2016
+  run_fn eval 'for v in "\"narrow\"" narrow "\"full\"" full null "\"narrow\\\"" "[\"narrow\"]"; do
+      fleet_host_classify "{\"runnerctl\":\"1.0.0\",\"host\":{\"name\":\"h\",\"events\":null,\"sudo_contract\":$v},"; echo "$v -> $HC_SUDO"; done
+    fleet_host_classify "{\"runnerctl\":\"1.0.0\",\"host\":{\"name\":\"h\",\"events\":null},"; echo "absent -> $HC_SUDO"
+    fleet_host_classify "{\"runnerctl\":\"1.0.0\",\"host\":{\"name\":\"\\\"sudo_contract\\\":\\\"narrow\\\"\",\"events\":null,\"sudo_contract\":\"full\"},"; echo "name that spells it -> $HC_SUDO"'
+  expect_rc 0
+  expect_text "each value classified" '"narrow" -> narrow
+narrow -> unreported
+"full" -> full
+full -> unreported
+null -> unreported
+"narrow\" -> unreported
+["narrow"] -> unreported
+absent -> unreported
+name that spells it -> full' "$OUT"
+}
+
+# The envelope nests each host's payload unchanged: the key is there as the
+# host sent it (and absent for a host from before it), and the GHR-80 summary
+# is not touched.
+case_ghr113_fleet_status_json_nests_the_key_unchanged() {
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 build-3" \
+    RUNNERCTL_STUB_FLEET_SUDOC="build-2:full" RUNNERCTL_STUB_FLEET_NOSUDOC="build-3" run fleet status --json
+  expect_rc 0
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: fleet status --json parse assertions not run"; return 0; fi
+  expect_json '[h["status"]["host"].get("sudo_contract", "absent") for h in d["fleet"]] == ["narrow", "full", "absent"]'
+  expect_json 'list(d["summary"].keys()) == ["hosts", "hosts_answering", "slots", "busy", "idle", "stalled", "down", "disabled", "leaking", "disk_crit_hosts", "disk_warn_hosts", "event_hosts", "overloaded_hosts", "capacity_free", "capacity_total", "versions"]'
+}
+
+# `!` keeps a host under FLEET_SUDO=1 that does not say `narrow`, by its host
+# line, over healthy slots; build-1 (narrow) stays hidden, and so does the
+# flagged host when FLEET_SUDO is 0. The same host is a note in every frame.
+case_ghr113_fleet_watch_problems_keeps_a_host_without_the_opt_in() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='!acq' RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_SUDOC="build-2:full" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 4
+  expect_frame_line 2 1 "$(view_hdr ' — view: problems only')"
+  expect_frame_line 2 4 "^build-2 +${HV}Disk: .* — no SUDO_CONTRACT=narrow\$"
+  expect_frame_count_of 2 "$V_ROW" 0
+  expect_no_frame 2 "^(${REV})?build-1 "
+  expect_frame 2 '^note: FLEET_SUDO=1 .* — build-2 reports SUDO_CONTRACT full; '
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='!acq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_SUDOC="build-2:full" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 4
+  expect_no_frame 2 '^build-[12] '
+  expect_no_frame 2 'SUDO_CONTRACT'
+}
+
 # The problem segments, each from a state the host really reports: a unit
 # stopped by hand (enabled, not active) is `down` where slot-3 is `disabled`;
 # an idle slot with processes left behind is leaking; a host with a partition
@@ -9560,6 +9729,13 @@ t "GHR-77: a version that is no version is unknown, drawn ?"               case_
 t "GHR-77: fleet watch's ! and collapse carry the version"                 case_ghr77_fleet_watch_problems_and_collapse_carry_the_version
 t "GHR-77: the pane draws the version as the host line does"               case_ghr77_fleet_pane_draws_the_version_as_the_host_line_does
 t "GHR-112: ! keeps a host whose version is unknown, not one on this node's" case_ghr112_problems_keeps_a_host_whose_version_is_unknown
+t "GHR-113: status --json ends the host object with sudo_contract"          case_ghr113_status_json_carries_the_contract
+t "GHR-113: the host reads its default config without privilege"            case_ghr113_the_host_reads_its_default_config_without_privilege
+t "GHR-113: fleet status names a host without the opt-in under FLEET_SUDO=1" case_ghr113_fleet_status_names_a_host_without_the_opt_in
+t "GHR-113: full and unreported hosts are worded apart, narrow is not named" case_ghr113_fleet_status_words_full_and_unreported_apart
+t "GHR-113: a contract that is no contract is unreported and never drawn"   case_ghr113_a_contract_that_is_no_contract_is_unreported_and_never_drawn
+t "GHR-113: fleet status --json nests the key unchanged"                    case_ghr113_fleet_status_json_nests_the_key_unchanged
+t "GHR-113: fleet watch ! keeps a host without the opt-in"                  case_ghr113_fleet_watch_problems_keeps_a_host_without_the_opt_in
 t "fleet summary: down, leaking, disk and event segments"                case_fleet_summary_names_what_is_wrong
 t "fleet summary: capacity 0 free is still shown"                         case_fleet_summary_capacity_zero_is_still_shown
 t "fleet summary: painted like the table"                                 case_fleet_summary_is_painted_like_the_table
