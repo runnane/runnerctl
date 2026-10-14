@@ -766,6 +766,8 @@ audit_finish() { # RC
     outcome="failed (exit $rc)"
   fi
   [ -z "$AUDIT_NOTE" ] || outcome+=" ($AUDIT_NOTE)"
+  # GHR-91: a guarded command whose caller went away before it finished.
+  ! $CALLER_GONE || outcome+=" (caller gone, ran to the end)"
   msg="$(audit_message "$outcome" 2>/dev/null)" || msg=""
   # Finished: a second call in this process — the EXIT trap after the
   # signal handler wrote the record (GHR-119) — writes nothing.
@@ -824,6 +826,8 @@ trap() {
 }
 exit_run() {
   local rc=$?
+  # GHR-91: first, so the record knows whether the caller was still there.
+  caller_guard_end
   audit_finish "$rc"
   fleet_log_finish
   if [ "$EXIT_PID" = "$BASHPID" ] && [ -n "$EXIT_CMD" ] && [ "$EXIT_CMD" != - ]; then
@@ -900,6 +904,99 @@ audit_signal() { # INT|TERM
   fi
   builtin trap - "$1"
   kill -s "$1" "$BASHPID"
+}
+
+# --- A run that loses its caller finishes what it started (GHR-91) -------------
+# `drain`, `stop`/`restart` (with or without --when-idle), `apply` and `scale`
+# act one slot after another, and a slot's wait can be long. Their caller can
+# go away part-way: the central node's ssh is ended by its budget, by Ctrl-C
+# there, by `fleet watch`'s q, or by the network; a terminal is closed. Until
+# now the command then died at its next write to the dead stdout (SIGPIPE), or
+# at once on SIGHUP from a closed terminal — so how many slots it got through
+# was an accident of where its next `echo` fell.
+#
+# The choice is to FINISH WHAT WAS STARTED, not to stop at a slot boundary:
+#   * what the command describes is a whole state (every slot drained, the new
+#     config live everywhere), and stopping at a boundary is still a half-done
+#     host, only a tidier one — with mixed configs, or capacity out with no
+#     one left to bring it back;
+#   * every wait is already bounded (--timeout per slot), so a run with no
+#     caller still ends, and ends by itself the way it would have with one;
+#   * a write is the only way to notice the caller has gone, so "stop at the
+#     next boundary" would still depend on when the command happens to write;
+#   * the record (GHR-88) is written at the end with the real outcome, so
+#     `fleet history --host H` reads how it ended; nothing else has to be
+#     left behind for the central node to find.
+#
+# How, from the moment the command arms its record (it is about to change
+# something — a refusal before that is not affected):
+#   * SIGHUP is ignored, as nohup does, and the ignore is inherited by what the
+#     command runs (systemctl, sudo, the sleep between polls), so a terminal's
+#     hangup reaches none of it;
+#   * stdout and stderr go through a relay each (caller_relay) that passes
+#     every line on while it can and, once a write fails, drops the rest. The
+#     command itself only ever writes to the relay's pipe, which is read to the
+#     end, so it never meets a closed reader — no SIGPIPE, and no failed `echo`
+#     for `set -e` to end the script on. Ignoring SIGPIPE alone would not do:
+#     the write then fails with EPIPE, and `set -e` ends the script at the
+#     first such write it is watching. Measured on `drain`: the `waiting for`
+#     lines fail inside wait_idle, which runs under `||` where `set -e` is off,
+#     so the slots are stopped — and then the drain exits 1 with a write
+#     error on stderr, having done its work. Where a failed write lands
+#     decides the outcome, which is the timing dependence this removes. The relay passes lines as they come, so a fan-out
+#     still shows them as they are printed (GHR-92).
+#   * SIGINT and SIGTERM are untouched: an operator's Ctrl-C or a TERM is a
+#     decision to stop, and is recorded and dies by the signal as GHR-119
+#     made it. The relays ignore both, so they go on draining until the
+#     command and everything it started have gone.
+# On the way out (exit_run) the relays are closed and waited for, so nothing
+# the command printed comes after its exit; a relay that could not deliver
+# makes the record say `(caller gone, ran to the end)`.
+#
+# So for a command guarded here, SIGHUP and SIGPIPE are not interruptions:
+# HUP is ignored and PIPE cannot arise, and the record carries the command's
+# own outcome. Every other command keeps the default for both.
+CALLER_GUARD_PID="" CALLER_GUARD_OUT="" CALLER_GUARD_ERR=""
+CALLER_GUARD_P1="" CALLER_GUARD_P2="" CALLER_GONE=false
+# One stream, on stdin, to stdout: each line passed on until a write fails,
+# then read and dropped to the end. Exit 3 when something could not be passed.
+caller_relay() {
+  builtin trap '' INT TERM HUP PIPE
+  local line nl=$'\n' gone=false
+  while IFS= read -r line || { [ -n "$line" ] && nl=""; }; do
+    $gone || printf '%s%s' "$line" "$nl" 2>/dev/null || gone=true
+  done
+  ! $gone || return 3
+}
+# Arm it for this process (once; a subshell arms its own — the local watch
+# runs its action's command in one).
+caller_guard() {
+  [ "$CALLER_GUARD_PID" != "$BASHPID" ] || return 0
+  CALLER_GUARD_PID="$BASHPID" CALLER_GONE=false
+  builtin trap '' HUP
+  # A stream that is not open at all has nothing to relay to.
+  # (Its own complaint about fd 2 has nowhere to go, which is the point.)
+  true 2>/dev/null >&1 || exec 1>/dev/null
+  true >&2 || exec 2>/dev/null
+  exec {CALLER_GUARD_OUT}>&1 {CALLER_GUARD_ERR}>&2
+  exec 1> >(caller_relay 1>&"$CALLER_GUARD_OUT" 2>/dev/null); CALLER_GUARD_P1=$!
+  exec 2> >(caller_relay 1>&"$CALLER_GUARD_ERR" 2>/dev/null); CALLER_GUARD_P2=$!
+}
+# Close the relays and wait for them to finish passing lines on; the streams
+# are then the caller's again, or /dev/null when the caller has gone.
+caller_guard_end() {
+  local rc1=0 rc2=0
+  [ -n "$CALLER_GUARD_PID" ] && [ "$CALLER_GUARD_PID" = "$BASHPID" ] || return 0
+  CALLER_GUARD_PID=""
+  exec 1>/dev/null 2>/dev/null
+  wait "$CALLER_GUARD_P1" 2>/dev/null || rc1=$?
+  wait "$CALLER_GUARD_P2" 2>/dev/null || rc2=$?
+  if [ "$rc1" = 3 ] || [ "$rc2" = 3 ]; then
+    CALLER_GONE=true
+  else
+    exec 1>&"$CALLER_GUARD_OUT" 2>&"$CALLER_GUARD_ERR"
+  fi
+  exec {CALLER_GUARD_OUT}>&- {CALLER_GUARD_ERR}>&-
 }
 
 # --- The central node's record (GHR-88) -----------------------------------------
@@ -3857,6 +3954,7 @@ cmd_apply() {
   fi
   audit_begin apply "--profile $PROFILE" "$($do_restart && echo --restart)" "$($when_idle && echo --when-idle)" "$($do_save && echo --save)"
   audit_slots "${#TARGETS[@]}" "${units[@]}"
+  caller_guard
   for u in "${units[@]}"; do apply_to "$u"; echo "  wrote drop-in for $u"; done
   run_priv systemctl daemon-reload
   if [ "${#TARGETS[@]}" -gt 0 ]; then
@@ -3899,6 +3997,7 @@ cmd_scale() {
   local total=${#units[@]}
   { [ "$n" -ge 1 ] && [ "$n" -le "$total" ]; } || die "N must be 1..$total"
   audit_begin scale "to $n of $total" "--profile $PROFILE" "$($do_restart && echo --restart)" "$($when_idle && echo --when-idle)" "$($do_save && echo --save)"
+  caller_guard
   local i u
   # Write every drop-in that will be needed, THEN reload, THEN start/stop —
   # otherwise the first `enable --now` on a stopped slot races systemd's own
@@ -3995,6 +4094,7 @@ cmd_ctl() { # start|stop|restart [--when-idle] [--timeout N] [--if-stalled] [--s
   if ! $if_stalled; then
     audit_begin "${AUDIT_AS:-$action}" "$($when_idle && [ -z "$AUDIT_AS" ] && echo --when-idle)"
     audit_slots "${#targets[@]}" "${units[@]}"
+    caller_guard
   fi
   for i in "${!units[@]}"; do
     u="${units[$i]}"
@@ -4002,6 +4102,7 @@ cmd_ctl() { # start|stop|restart [--when-idle] [--timeout N] [--if-stalled] [--s
       stalled_gate "$u" "${verb%ed}ing" || continue
       acted=$((acted + 1))
       audit_begin "$action" --if-stalled "$(short_name "$u")"
+      caller_guard
     else
       idle_gate "$u" "$verb" "${units[*]:0:$i}" "${units[*]:$((i + 1))}"
     fi
@@ -6209,9 +6310,21 @@ cmd_history() { # [-n N]
 # which is exactly what a polling loop is, and what `fleet watch` opens one
 # for (fleet_ssh_control_open, below); FLEET_SSH_CONTROL_OPTS is empty for
 # every other command. A site that wants multiplexing for all of them adds it
-# through FLEET_SSH_OPTS, appended LAST so it overrides both what is set here
-# and the watch's own sockets. Host key policy is deliberately left to the
-# caller's ssh config rather than decided here.
+# through FLEET_SSH_OPTS. ssh keeps the FIRST value it is given for an option
+# (`ssh -G -o ServerAliveInterval=15 -o ServerAliveInterval=99 h` prints 15),
+# so FLEET_SSH_OPTS cannot change BatchMode, ConnectTimeout or the watch's own
+# sockets, which come before it — and does set the keepalive, which comes
+# after it on purpose. Host key policy is deliberately left to the caller's
+# ssh config rather than decided here.
+#
+# The keepalive (GHR-91): a host that vanishes mid-call — powered off, its
+# network gone — sends nothing, and without ServerAlive* ssh waits on the TCP
+# connection for as long as the budget allows, which for a mutating call is
+# FLEET_MUTATE_TIMEOUT plus a wait per slot. With a probe every 15 s and 4
+# unanswered ones allowed, ssh gives up after about a minute and exits 255,
+# so the host is reported unreachable and the fan-out moves on. A slow but
+# live host answers the probes, so a long --when-idle wait is not cut short.
+# Set them in FLEET_SSH_OPTS to change them.
 #
 # The budget (GHR-81) is FLEET_TIMEOUT unless the caller names another for
 # this one call in FLEET_CALL_TIMEOUT — which every MUTATING caller does, from
@@ -6227,6 +6340,8 @@ ssh_run() { # HOST COMMAND...
     -o ConnectTimeout=10 \
     ${FLEET_SSH_CONTROL_OPTS+"${FLEET_SSH_CONTROL_OPTS[@]}"} \
     ${FLEET_SSH_OPTS+"${FLEET_SSH_OPTS[@]}"} \
+    -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=4 \
     -- "$host" "$@"
 }
 
@@ -6246,6 +6361,8 @@ ssh_run_stdin() { # HOST FILE -- COMMAND...
     -o ConnectTimeout=10 \
     ${FLEET_SSH_CONTROL_OPTS+"${FLEET_SSH_CONTROL_OPTS[@]}"} \
     ${FLEET_SSH_OPTS+"${FLEET_SSH_OPTS[@]}"} \
+    -o ServerAliveInterval=15 \
+    -o ServerAliveCountMax=4 \
     -- "$host" "$@" <"$file"
 }
 
@@ -6646,10 +6763,12 @@ fleet_reachable() { # RC
 }
 
 # What a timed-out MUTATING call adds to `timed out after Ns` (GHR-81).
-# `timeout` kills the local ssh, not the remote runnerctl, which carries on
-# until it next writes to its closed stdout — so the host may be part-way
-# through or about to finish, and "nothing is known about it" is the one thing
-# an operator must not read into the row.
+# `timeout` kills the local ssh, not the remote runnerctl. Since GHR-91 a
+# guarded command there (caller_guard) runs to the end and records how it
+# ended, which `fleet history --host H` reads; one from before carries on
+# until it next writes to its closed stdout. Either way the host may be
+# part-way through or about to finish, and "nothing is known about it" is the
+# one thing an operator must not read into the row.
 FLEET_TIMEOUT_STILL_RUNNING="the command may still be running on that host; 'runnerctl fleet status' shows where it got to"
 
 # BUDGET is the seconds the call was given, for the timed-out wording; empty
@@ -12812,8 +12931,13 @@ cmd_config_example() {
 # here, never in the runnerctl script.
 #FLEET_HOSTS=(build-1 build-2 build-3)
 
-# Extra ssh options, appended after the built-in ones — and after the ones
-# `fleet watch` sets for its own session — so they can override any of them.
+# Extra ssh options, appended after the built-in ones and after the ones
+# `fleet watch` sets for its own session. ssh keeps the FIRST value it is
+# given for an option, so these cannot change BatchMode, ConnectTimeout or the
+# watch's own connection. They can change the dead-peer keepalive, which comes
+# after them: by default ServerAliveInterval=15 and ServerAliveCountMax=4, so
+# a host that stops answering mid-call is reported unreachable after about a
+# minute instead of holding its place in the fan-out for the whole budget.
 # `fleet watch` already holds one connection per host open for as long as it
 # runs, so this is only needed to reuse connections ACROSS separate commands.
 # Note %C rather than %r@%h:%p: a unix socket path is capped near 104 bytes

@@ -4108,7 +4108,7 @@ case_fleet_real_ssh_run_times_out_on_the_budget_of_the_call() {
   run_fn eval 'FLEET_TIMEOUT=1; FLEET_CALL_TIMEOUT=30 ssh_run host-a runnerctl restart'
   PATH="$saved"
   expect_rc 0
-  expect_out '^answered: -o BatchMode=yes -o ConnectTimeout=10 -- host-a runnerctl restart$'
+  expect_out '^answered: -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -- host-a runnerctl restart$'
   rm -rf "$d"
 }
 
@@ -4335,7 +4335,9 @@ case_fleet_watch_control_session_opens_and_tears_down() {
 #
 # So this drives the REAL ssh_run with `ssh` and `timeout` shadowed inside the
 # eval, and reads the argv. It also pins the ORDER, which is a contract of its
-# own: FLEET_SSH_OPTS comes LAST so a site can override the watch's sockets.
+# own: FLEET_SSH_OPTS comes after the watch's sockets and before the keepalive
+# (GHR-91). ssh keeps the FIRST value it is given for an option, so the
+# watch's sockets win over a site's, and a site's keepalive wins over ours.
 case_fleet_ssh_run_puts_the_session_options_on_the_ssh_command_line() {
   # shellcheck disable=SC2016
   run_fn eval '
@@ -4353,18 +4355,19 @@ case_fleet_ssh_run_puts_the_session_options_on_the_ssh_command_line() {
     rm -f "$f"
   '
   expect_rc 0
-  # no session open: byte-for-byte what a one-shot fan-out sent before GHR-54
-  expect_out '^-o BatchMode=yes -o ConnectTimeout=10 -o SiteOption=yes -- host-a runnerctl status$'
+  # no session open: what a one-shot fan-out sends — as before GHR-54, plus
+  # the GHR-91 keepalive after the site's options
+  expect_out '^-o BatchMode=yes -o ConnectTimeout=10 -o SiteOption=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -- host-a runnerctl status$'
   # session open: the master options are ON the command line, ahead of the
   # site's own options
-  expect_out '^-o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPath=/.+/%C -o ControlPersist=90 -o SiteOption=yes -- host-a runnerctl status$'
+  expect_out '^-o BatchMode=yes -o ConnectTimeout=10 -o ControlMaster=auto -o ControlPath=/.+/%C -o ControlPersist=90 -o SiteOption=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -- host-a runnerctl status$'
   # and the teardown is a control-socket operation carrying no remote command
   expect_out '^-o BatchMode=yes -o ControlMaster=auto -o ControlPath=/.+/%C -o ControlPersist=90 -O exit -- host-a$'
 }
 
 # Every other command leaves the control options EMPTY, so nothing but the
 # watch pays for a socket directory — and a one-shot fan-out's ssh command
-# line is byte-identical to what it was before GHR-54.
+# line carries no control options, as before GHR-54.
 case_fleet_one_shot_commands_open_no_control_session() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status
   expect_rc 0
@@ -9033,7 +9036,7 @@ EOF
   expect_no_out 'SURVIVED'
   expect_out '^reaped job=\[\]$'
   # and what was dialled is the table call, on the real ssh command line
-  expect_cfg "$d/calls" '^-o BatchMode=yes -o ConnectTimeout=10 -- hang-1 runnerctl status --color never$'
+  expect_cfg "$d/calls" '^-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -- hang-1 runnerctl status --color never$'
   expect_cfg_count "$d/calls" ' -- hang-1 ' 1
   rm -rf "$d"
 }
@@ -13389,7 +13392,7 @@ t "GHR-88: fleet history merges the hosts' records by time"                case_
 # (a foreground `sleep 30` in run_priv), sends it SIG, and reads how it ended
 # from a real waitpid — WIFSIGNALED, which a shell's `$?` cannot tell from an
 # `exit 130`. The parent is perl, because it can say that and bash cannot, and
-# because it sets INT and TERM back to the default first: a gate started in the
+# because it sets INT and TERM (and HUP, GHR-91) back to the default first: a gate started in the
 # background runs every case with SIGINT ignored (GHR-75), the child would
 # inherit that, and bash cannot trap a signal ignored at its start. The child
 # leads a process group of its own (setsid), so `group` is what a terminal's
@@ -13402,7 +13405,7 @@ SIGNALLED=""
 # shellcheck disable=SC2016  # perl's own variables
 GHR119_PERL='use strict; use POSIX qw(:sys_wait_h setsid);
 my ($sig, $whom, $flag, $out, $err, @cmd) = @ARGV;
-$SIG{INT} = $SIG{TERM} = "DEFAULT";
+$SIG{INT} = $SIG{TERM} = $SIG{HUP} = "DEFAULT";
 sub nap { select undef, undef, undef, $_[0] }
 my $pid = fork() // die "fork: $!";
 if (!$pid) {
@@ -13418,7 +13421,9 @@ until (-e $flag) {
 }
 # the stub has written the flag; wait for its sleep to be the running step
 my $kids = "/proc/$pid/task/$pid/children";
-for (1 .. 40) { last if -r $kids && -s $kids; nap 0.05 }
+# (read, not -s: a /proc file always reports size 0 — GHR-91 found this loop
+# always ran its full 2 s, which a block shorter than that slept through)
+for (1 .. 40) { if (open my $k, "<", $kids) { local $/; my $c = <$k> // ""; last if $c =~ /\d/ } nap 0.05 }
 kill $sig, ($whom eq "group" ? -$pid : $pid);
 $t = 0;
 until (waitpid($pid, WNOHANG) == $pid) {
@@ -13605,6 +13610,139 @@ t "GHR-119: an interrupted command records it and dies by the signal"      case_
 t "GHR-119: interrupted before arming, nothing is recorded or trapped"     case_ghr119_interrupted_before_arming_records_nothing
 t "GHR-119: the record composes with a command's own INT/TERM handler"     case_ghr119_composes_with_a_commands_own_handler
 t "GHR-119: history and fleet history show an interrupted record"          case_ghr119_history_shows_an_interrupted_record
+
+# --- GHR-91: a run that loses its caller finishes what it started --------------
+# run_cut runs a command with its stdout read by cut_reader, which keeps N
+# lines, closes its end of the pipe and only THEN touches $WRITES/.cut; the
+# stub's K-th pause (RUNNERCTL_STUB_CUT_AT=K) waits for that file. So every
+# write the command makes after that pause meets a closed reader — the remote
+# whose ssh was ended by the central node's budget, by Ctrl-C there or by
+# `fleet watch`'s q — at a point the case chooses, not wherever the two
+# processes happen to be. OUT is what the reader kept, RC the command's own
+# exit status (not the pipeline's).
+run_cut() { # N ARGS...
+  local n="$1"
+  shift
+  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
+  rm -rf "$WRITES"; mkdir -p "$WRITES"
+  : >"$TMP/cut.out"
+  echo none >"$TMP/cut.rc"
+  { c=0
+    RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
+      timeout "$RUN_TIMEOUT" "$RUNNERCTL" "$@" 2>"$TMP/err" || c=$?
+    echo "$c" >"$TMP/cut.rc"; } | cut_reader "$n" "$WRITES/.cut" "$TMP/cut.out"
+  RC="$(cat "$TMP/cut.rc")"
+  OUT="$(cat "$TMP/cut.out")"
+  ERR="$(cat "$TMP/err")"
+}
+cut_reader() { # N CUT-FILE OUT-FILE
+  local i=0 l
+  while [ "$i" -lt "$1" ] && IFS= read -r l; do
+    printf '%s\n' "$l" >>"$3"
+    i=$((i + 1))
+  done
+  exec 0<&-
+  : >"$2"
+}
+
+# Acceptance: a three-slot drain whose stdout is closed part-way ends in the
+# same state wherever the cut falls — every slot stopped, exit 0, and a record
+# that says it ran to the end without its caller. slot-1 is busy for 30 polls,
+# so the drain says `waiting for` at its 1st, 13th and 25th; the cut is made
+# after the 1st line (pause 1) and after the 2nd (pause 13). Before GHR-91 the
+# next write killed it there, with no slot stopped. The control: the same
+# drain left alone records a plain `ok`.
+case_ghr91_a_drain_cut_off_part_way_finishes() {
+  local cut n k
+  for cut in 1:1 2:13; do
+    n="${cut%%:*}" k="${cut#*:}"
+    RUNNERCTL_STUB_BUSY_POLLS=30 RUNNERCTL_STUB_CUT_AT="$k" run_cut "$n" drain
+    expect_rc 0
+    expect_log_order "^probe:cut_seen $k\$" "^systemctl stop $U1\$" "^systemctl stop $U2\$" "^systemctl stop $U3\$"
+    expect_one_record "drain all by $ME — ok \\(caller gone, ran to the end\\)"
+    expect_out_count '^waiting for example\.slot-1 ' "$n"
+    expect_no_err .
+  done
+  RUNNERCTL_STUB_BUSY_POLLS=30 run drain
+  expect_rc 0
+  expect_out_count '^waiting for example\.slot-1 ' 3
+  expect_out '^stop done\.$'
+  expect_log_order "^systemctl stop $U1\$" "^systemctl stop $U2\$" "^systemctl stop $U3\$"
+  expect_one_record "drain all by $ME — ok"
+}
+
+# A terminal's hangup mid-drain (HUP to the whole process group, as a closed
+# terminal sends it) does not stop it: the slot in progress and the rest are
+# stopped and it exits 0. Before GHR-91 it died of the HUP with slot-3 left.
+case_ghr91_a_hangup_does_not_stop_a_drain() {
+  if ! $HAVE_PERL; then
+    skip "GHR-91: no perl, so no process group to hang up"
+    RUNNERCTL_STUB_BUSY_POLLS=1 run drain
+    expect_one_record "drain all by $ME — ok"
+    return 0
+  fi
+  # 2 s: the HUP has to land while the block's sleep is the running step.
+  RUNNERCTL_STUB_BUSY_POLLS=1 RUNNERCTL_STUB_BLOCK_SECS=2 run_signalled HUP group "^systemctl stop $U2\$" drain
+  expect_rc 0
+  expect_log_order "^probe:blocked systemctl stop $U2\$" "^systemctl stop $U3\$"
+  expect_out '^stop done\.$'
+  expect_one_record "drain all by $ME — ok"
+}
+
+# Composition with GHR-119: an operator's Ctrl-C, and a TERM, still stop a
+# guarded command — recorded as interrupted, death by the signal, and the
+# slot after the one in progress never touched.
+case_ghr91_ctrl_c_and_term_still_interrupt_a_drain() {
+  if ! $HAVE_PERL; then
+    skip "GHR-91: no perl, so no waitpid to tell death by signal from an exit"
+    # shellcheck disable=SC2016  # run_fn's child expands it
+    run_fn eval 'audit_logger() { :; }; audit_begin drain; caller_guard; AUDIT_SIGNAL=SIGINT; audit_message "interrupted ($AUDIT_SIGNAL)"'
+    expect_out '— interrupted \(SIGINT\)$'
+    return 0
+  fi
+  RUNNERCTL_STUB_BUSY_POLLS=1 run_signalled INT group "^systemctl stop $U2\$" drain
+  expect_rc 130
+  expect_signalled 2
+  expect_one_record "drain all by $ME — interrupted \\(SIGINT\\)"
+  expect_no_log "^systemctl stop $U3\$"
+  RUNNERCTL_STUB_BUSY_POLLS=1 run_signalled TERM group "^systemctl stop $U2\$" drain
+  expect_rc 143
+  expect_signalled 15
+  expect_one_record "drain all by $ME — interrupted \\(SIGTERM\\)"
+  expect_no_log "^systemctl stop $U3\$"
+}
+
+# Dead-peer detection: the REAL ssh_run and ssh_run_stdin (run_fn: no stub)
+# hand ssh a keepalive, after FLEET_SSH_OPTS — ssh keeps the first value it
+# is given, so a site's own ServerAliveInterval there wins. ssh is a fake that
+# prints its argv, and the call refuses to run unless that fake is the ssh it
+# would reach: no case may connect anywhere.
+GHR91_SSH="$TMP/ghr91-ssh"
+case_ghr91_ssh_carries_a_keepalive() {
+  mkdir -p "$GHR91_SSH"
+  cat >"$GHR91_SSH/ssh" <<'FAKE'
+#!/bin/sh
+printf 'argv:'
+printf ' %s' "$@"
+printf '\n'
+FAKE
+  chmod 755 "$GHR91_SSH/ssh"
+  local guard="[ \"\$(command -v ssh)\" = '$GHR91_SSH/ssh' ] || { echo 'not the fake ssh' >&2; exit 99; }"
+  PATH="$GHR91_SSH:$PATH" run_fn eval "$guard; ssh_run build-1 runnerctl status"
+  expect_rc 0
+  expect_out '^argv: -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -- build-1 runnerctl status$'
+  PATH="$GHR91_SSH:$PATH" run_fn eval "$guard; ssh_run_stdin build-1 /dev/null -- runnerctl version"
+  expect_rc 0
+  expect_out '^argv: -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -- build-1 runnerctl version$'
+  PATH="$GHR91_SSH:$PATH" run_fn eval "$guard; FLEET_SSH_OPTS=(-o ServerAliveInterval=5); ssh_run build-1 runnerctl status"
+  expect_rc 0
+  expect_out '^argv: -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=5 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -- build-1 runnerctl status$'
+}
+
+t "GHR-91: a drain whose stdout is cut part-way stops every slot and says so" case_ghr91_a_drain_cut_off_part_way_finishes
+t "GHR-91: a hangup does not stop a drain part-way"                         case_ghr91_a_hangup_does_not_stop_a_drain
+t "GHR-91: Ctrl-C and TERM still interrupt a drain, as GHR-119 made them"   case_ghr91_ctrl_c_and_term_still_interrupt_a_drain
+t "GHR-91: ssh_run and ssh_run_stdin carry a keepalive a site can override" case_ghr91_ssh_carries_a_keepalive
 
 # --- GHR-80: fleet JSON for a UI — the envelope, the stream, health --json ----
 # `fleet status --json` gains `generated_at`, `runnerctl`, `summary` and, per

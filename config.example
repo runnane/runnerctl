@@ -144,8 +144,13 @@
 # here, never in the runnerctl script.
 #FLEET_HOSTS=(build-1 build-2 build-3)
 
-# Extra ssh options, appended after the built-in ones — and after the ones
-# `fleet watch` sets for its own session — so they can override any of them.
+# Extra ssh options, appended after the built-in ones and after the ones
+# `fleet watch` sets for its own session. ssh keeps the FIRST value it is
+# given for an option, so these cannot change BatchMode, ConnectTimeout or the
+# watch's own connection. They can change the dead-peer keepalive, which comes
+# after them: by default ServerAliveInterval=15 and ServerAliveCountMax=4, so
+# a host that stops answering mid-call is reported unreachable after about a
+# minute instead of holding its place in the fan-out for the whole budget.
 # `fleet watch` already holds one connection per host open for as long as it
 # runs, so this is only needed to reuse connections ACROSS separate commands.
 # Note %C rather than %r@%h:%p: a unix socket path is capped near 104 bytes

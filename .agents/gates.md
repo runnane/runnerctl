@@ -188,6 +188,21 @@ Traps:
   its `RUN_TIMEOUT` under a backgrounded one. The stub now reads `SigIgn` and
   sends SIGTERM there instead (logged `probe:sigterm`, not `probe:sigint`), so
   check which of the two a log shows before claiming the SIGINT path ran.
+- **A guarded command's output goes through relays (GHR-91).** From the point
+  `drain`, `stop`/`restart`, `apply` and `scale` arm their record,
+  `caller_guard` sends stdout and stderr through a relay process each and
+  ignores SIGHUP. So a cut reader or a hangup no longer ends them, and
+  `exit_run` waits for the relays before it writes the record. A case that
+  closes the reader part-way uses `run_cut N` with `RUNNERCTL_STUB_CUT_AT=K`.
+  The reader keeps N lines, closes its end, and only then touches
+  `$WRITES/.cut`. The stub's K-th `pause` waits for that file
+  (`probe:cut_seen K`), so every later write meets a closed reader at a known
+  point. `RC` is the command's own status, not the pipeline's. Without
+  `RUNNERCTL_STUB_BUSY_POLLS`, the stub's slot-1 is busy for ever, so a
+  `drain` case sits out the whole `WAIT_TIMEOUT` in polls. For a signal the
+  command is meant to survive, `RUNNERCTL_STUB_BLOCK_SECS` shortens
+  `RUNNERCTL_STUB_BLOCK`'s 30 s hang. `run_signalled` resets HUP to the
+  default as well as INT and TERM.
 - The `status --json` case (GHR-16) asserts the parsed JSON through
   `python3` (`expect_json`): where python3 is absent the case keeps its
   exit-code, shape and read-only assertions, prints a `skip` notice for the
