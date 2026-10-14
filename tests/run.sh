@@ -193,6 +193,32 @@ run_cfg() { # CONFIG-PATH ARGS...
   ERR="$(cat "$TMP/err")"
 }
 
+# `run`, with the central node's stdout read LINE BY LINE as it is written
+# (GHR-92) — the ordered evidence that a streamed line was on the screen before
+# the remote returned. Each line the reader sees is logged `probe:central_saw
+# LINE` in the same log the stub's remote writes `probe:remote_*` markers to, so
+# their order is the order things happened in, not a duration. The line that
+# says `... 1m` also touches $WRITES/central.saw, which the stub's remote waits
+# for (stub_fleet_progress) before it writes its next line: a node that buffers
+# never creates it until the call has returned, and the remote gives up
+# (`probe:remote_gave_up`) instead of seeing it.
+run_streamed() {
+  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
+  rm -rf "$WRITES"; mkdir -p "$WRITES"
+  RC=0
+  OUT="$(RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
+         timeout "$RUN_TIMEOUT" "$RUNNERCTL" "$@" 2>"$TMP/err" | stream_reader)" || RC=$?
+  ERR="$(cat "$TMP/err")"
+}
+stream_reader() {
+  local l
+  while IFS= read -r l || [ -n "$l" ]; do
+    printf 'probe:central_saw %s\n' "$l" >>"$LOG"
+    case "$l" in *"... 1m") : >"$WRITES/central.saw" ;; esac
+    printf '%s\n' "$l"
+  done
+}
+
 # Source the script's functions plus the stub, then eval SNIPPET with
 # CONFIG-PATH in force. The white-box hatch for a path no CLI run can reach:
 # save_profile's create-the-config branch is one, because under the stub the
@@ -3971,6 +3997,95 @@ case_fleet_other_mutating_callers_are_on_the_mutating_budget() {
     run fleet health --restart-stalled
   expect_rc 1
   expect_out "^build-1: timed out after 900s — the command may still be running on that host; 'runnerctl fleet status' shows where it got to\$"
+}
+
+# --- GHR-92: a mutating host's lines are shown as they are printed ---------------
+# The remote (stub_fleet_progress) writes line 1, records it, waits until the
+# central node's reader has shown line 1, then writes line 2: so the ORDER in
+# the log, not a duration, says whether a line was on the screen before the
+# remote returned.
+case_fleet_mutating_streams_a_hosts_lines_before_it_returns() {
+  RUNNERCTL_STUB_FLEET_PROGRESS=build-1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run_streamed fleet restart
+  expect_rc 0
+  expect_log_order '^probe:remote_wrote_line1 build-1$' \
+                   '^probe:central_saw build-1: waiting for slot-1 \(job-a\) \.\.\. 1m$' \
+                   '^probe:remote_saw_line1_shown build-1$' \
+                   '^probe:remote_wrote_line2 build-1$' \
+                   '^probe:central_saw build-1: waiting for slot-1 \(job-a\) \.\.\. 2m$' \
+                   '^probe:central_saw build-1: restart done\.$' \
+                   '^probe:central_saw build-2: restart done\.$' \
+                   '^probe:central_saw fleet restart: 2 host\(s\) ok, 0 failed$'
+  expect_no_log '^probe:remote_gave_up'
+  # the final block is reduced to what the stream cannot say: no line is
+  # printed twice, and the count is still there
+  expect_out_count '^build-1: restart done\.$' 1
+  expect_out_count '^build-2: restart done\.$' 1
+  expect_out_count '^build-1: waiting for slot-1 \(job-a\) \.\.\. [12]m$' 2
+  expect_out '^fleet restart: 2 host\(s\) ok, 0 failed$'
+  # stderr stays on stderr, prefixed like the rest
+  expect_err '^build-1: warning: slot-1 is slow$'
+  expect_no_out 'warning'
+  # still one ssh per host, in the order the hosts are worked
+  expect_log_count '^probe:ssh_run ' 2
+}
+
+# The streams are a tee: the files `fleet_error_text`, the report and the
+# upgrade parsers read are still written. A failing host's row is built from
+# its stderr file; an upgrade's verdict is parsed out of its stdout file.
+case_fleet_mutating_stream_still_keeps_the_record() {
+  RUNNERCTL_STUB_FLEET_NOSUDO=build-2 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet restart
+  expect_rc 1
+  expect_err '^build-2: sudo: a password is required$'
+  expect_out '^build-2: remote exit 1 — sudo: a password is required — the ssh login needs passwordless sudo on that host; see the fleet section of the README for the exact sudoers line$'
+  expect_out '^fleet restart: 1 host\(s\) ok, 1 failed$'
+  # the central record reads the exit statuses, which are written after the stream
+  expect_cfg "$WRITES/fleet.log" " fleet restart — build-1=0 build-2=1\$"
+  RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" run fleet upgrade
+  expect_rc 0
+  expect_out '^build-2-oldver: Upgraded 0\.0\.1 -> 9\.9\.9 at '
+  expect_out '^build-2-oldver +0\.0\.1 -> 9\.9\.9 +upgraded$'
+}
+
+# The budget walk used to throw the remote's output away (`>/dev/null`).
+case_fleet_budget_walk_shows_each_slots_lines() {
+  RUNNERCTL_STUB_FLEET_PROGRESS=build-1 RUNNERCTL_STUB_FLEET_SLOTS=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run_streamed fleet restart --max-unavailable 1
+  expect_rc 0
+  expect_log_order '^probe:remote_wrote_line1 build-1$' \
+                   '^probe:central_saw build-1 slot 0: waiting for slot-1 \(job-a\) \.\.\. 1m$' \
+                   '^probe:remote_saw_line1_shown build-1$' \
+                   '^probe:central_saw build-1 slot 0: waiting for slot-1 \(job-a\) \.\.\. 2m$' \
+                   '^probe:central_saw build-1 slot 0: restart done\.$' \
+                   '^probe:central_saw build-1 slot 0: restart ok$'
+  expect_err '^build-1 slot 0: warning: slot-1 is slow$'
+  expect_out '^fleet restart: 1 slot\(s\) done, 0 failed$'
+  # the floor walk (a different branch of the same loop) the same
+  RUNNERCTL_STUB_FLEET_PROGRESS=build-1 RUNNERCTL_STUB_FLEET_SLOTS=2 RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run_streamed fleet drain --min-available 1
+  expect_rc 2
+  expect_out_count '^build-1 slot 0: waiting for slot-1 \(job-a\) \.\.\. [12]m$' 2
+  expect_out '^build-1 slot 0: drain ok$'
+}
+
+# A read-only fan-out is still buffered: `fleet status --json` is byte for byte
+# the text pinned in tests/expected, taken from the script before this change.
+case_fleet_read_only_fan_out_is_not_streamed() {
+  RUNNERCTL_STUB_FLEET_PROGRESS=build-1 RUNNERCTL_STUB_VERSION=1.0.0 RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet status --json
+  expect_rc 0
+  expect_text "fleet status --json" "$(cat tests/expected/fleet-status-json.json)" "$OUT"
+  expect_no_err '.'
+  # the table and the health verdict carry no `host: ` stream either
+  RUNNERCTL_STUB_FLEET_PROGRESS=build-1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet status
+  expect_no_out '^build-1: '
+  expect_no_err '^build-1: '
+  # a mutating call asked for --json is data for a program, not a stream: the
+  # remote's second line is written before the central node has shown the
+  # first (it gives up waiting), which is also this harness's negative control
+  # — the thing the first case's order assertion is the opposite of
+  RUNNERCTL_STUB_FLEET_PROGRESS=build-1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_streamed fleet restart --json
+  expect_rc 0
+  expect_log '^probe:remote_gave_up build-1$'
+  expect_no_log '^probe:remote_saw_line1_shown'
 }
 
 # Every case above goes through the stub's ssh_run, which MODELS `timeout`.
@@ -9275,6 +9390,10 @@ t "fleet <mutating>: the budget arithmetic"                            case_flee
 t "fleet budget walk: each slot call is on the mutating budget"        case_fleet_budget_walk_gives_each_slot_the_mutating_budget
 t "fleet watch keys, upgrade, health --restart-stalled: same budget"   case_fleet_other_mutating_callers_are_on_the_mutating_budget
 t "fleet ssh_run: the real timeout wrapper honours the call's budget"  case_fleet_real_ssh_run_times_out_on_the_budget_of_the_call
+t "fleet <mutating>: a host's lines are shown before it returns (GHR-92)" case_fleet_mutating_streams_a_hosts_lines_before_it_returns
+t "fleet <mutating>: the stream still keeps the files the report reads"  case_fleet_mutating_stream_still_keeps_the_record
+t "fleet budget walk: each slot's lines are shown, not discarded"        case_fleet_budget_walk_shows_each_slots_lines
+t "fleet: a read-only fan-out is not streamed; status --json is unchanged" case_fleet_read_only_fan_out_is_not_streamed
 t "fleet <mutating>: a sudo failure is a named row with the remedy"    case_fleet_sudo_failure_is_a_named_row_with_the_remedy
 t "fleet env-init/logs: excluded, each saying why"                     case_fleet_excluded_commands_say_why
 # --- GHR-44: capacity budgets -------------------------------------------------
@@ -10766,6 +10885,23 @@ case_fleet_status_relays_only_sgr_from_a_host() {
   fi
 }
 
+# GHR-92: a mutating host's lines are drawn as they arrive, so the relay runs
+# on a line in flight. A host's bytes never reach the terminal raw: control
+# sequences inside a streamed line, and a last line the remote never finished
+# (no newline) — held in the read until the stream ends, then relayed.
+case_fleet_mutating_stream_relays_only_sgr_from_a_host() {
+  RUNNERCTL_STUB_FLEET_PARTIAL=hostile RUNNERCTL_STUB_FLEET_HOSTS="build-1 hostile" run fleet restart
+  expect_rc 0
+  expect_text "the hostile host's streamed lines" "hostile: restart done.$HOSTILE_KEPT
+hostile: cut off$HOSTILE_KEPT" "$(relay_got "$OUT")"
+  expect_no_hostile_rest
+  # the same unfinished line from a host that is not hostile is still a line
+  RUNNERCTL_STUB_FLEET_PARTIAL=build-1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet restart
+  expect_rc 0
+  expect_out_count '^build-1: restart done\.$' 1
+  expect_out_count '^build-1: cut off$' 1
+}
+
 # The mutating fan-out, `fleet health` and `fleet upgrade` print what a host
 # said with its name in front: each line from a hostile host, stdout and
 # stderr, keeps the painted word and nothing else — the read-back's first
@@ -10785,7 +10921,13 @@ hostile-unreachable: unreachable — ssh: connect to host hostile-unreachable po
   expect_rc 1
   expect_text "fleet upgrade's rows" "hostile-weird       1.0.0          unrecognised: something this tool has never said before$HOSTILE_KEPT
 hostile-oldver      0.0.1 -> 9.9.9 wrote 9.9.9 but the read-back answered 'runnerctl 9.9.9$HOSTILE_KEPT', not a version
-hostile-unreachable —              unreachable — ssh: connect to host hostile-unreachable port 22: No route to host$HOSTILE_KEPT" "$(relay_got "$OUT")"
+hostile-unreachable —              unreachable — ssh: connect to host hostile-unreachable port 22: No route to host$HOSTILE_KEPT" "$(relay_got "$OUT" | grep -avE '^hostile[a-z-]*: ' || true)"
+  # GHR-92: the write streams, so each host's own lines come first, `host: line`
+  # — the rows above are what is left once those are set aside. The hosts of a
+  # stage run side by side, so their order is not pinned, only that each line is
+  # there once and made safe.
+  expect_out_count '^hostile-oldver: installed: 0\.0\.1 \(/usr/local/bin/runnerctl\)'"$HOSTILE_KEPT_RE"'$' 1
+  expect_out_count '^hostile-weird: something this tool has never said before'"$HOSTILE_KEPT_RE"'$' 1
   expect_no_hostile_rest
 }
 
@@ -10868,6 +11010,7 @@ s1 on h1 is stuck stopping (deactivating/stop-sigterm) — SIGKILL the whole uni
 t "relay_safe: SGR kept, every other sequence gone whole, under any locale" case_relay_safe_pins_the_bytes
 t "fleet status: a host's rows, header, note, error and JSON relay only SGR" case_fleet_status_relays_only_sgr_from_a_host
 t "fleet run/health/upgrade: a host's lines relay only its SGR"              case_fleet_reports_relay_only_sgr_from_a_host
+t "fleet <mutating>: a streamed line is relayed safe, a cut-off one too (GHR-92)" case_fleet_mutating_stream_relays_only_sgr_from_a_host
 t "fleet watch: a host's frame lines and age line relay only its SGR"        case_fleet_watch_relays_only_sgr_from_a_host
 t "fleet watch: action notices and L's journal relay only a host's SGR"      case_fleet_watch_notices_relay_only_sgr_from_a_host
 t "fleet watch: facts, confirm lines and the pane relay only a host's SGR"   case_fleet_watch_key_reads_relay_only_sgr_from_a_host
