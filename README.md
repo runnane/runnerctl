@@ -1486,7 +1486,7 @@ has its own `slot-1`:
 | `PgUp` / `PgDn` | move the cursor a page; no round trip |
 | `g` / `G`, `Home` / `End` | the first / last row of the fleet |
 | `K` | kill the running job (`runnerctl kill <slot>` there) |
-| `R` / `S` / `T` | restart / stop / start the slot |
+| `R` / `S` / `T` | restart / stop / start the slot; at the confirm line of `R` and `S`, `y` runs it now and `w` runs it **when idle** (`--when-idle`) |
 | `P` | reap processes a finished job leaked |
 | `L` | page the slot's last 50 journal lines through your `$PAGER` |
 | `O` | print the URL of the running job's run on the status line; no round trip |
@@ -1544,7 +1544,14 @@ round trip over the held connection — and decides on *that*, not on the frame,
 which may be an interval old: a job that finished since the last redraw is not
 offered for killing. The confirm line quotes what the host said and names the
 exact remote command (`runs on build-2: runnerctl stop example.slot-1`); `y`
-runs it, anything else cancels. The result, or the remote's error with its
+runs it, anything else cancels. `R` and `S` offer a second answer on a line of
+their own: `w` runs the same command with `--when-idle`
+(`runs on build-2: runnerctl stop example.slot-1 --when-idle`), which waits for
+the slot's job to finish instead of killing it. It is not a new top-level key —
+`s` is the sort key — and it runs in the background like any action, on the
+budget a `--when-idle` call earns (`WAIT_TIMEOUT` plus `FLEET_MUTATE_TIMEOUT`).
+On a busy slot the warning says `y` kills the job and `w` waits for it. The
+result, or the remote's error with its
 remedy (a missing sudoers line, say), is the notice under the next frame, which
 is a fresh poll so it shows the effect.
 
@@ -1569,7 +1576,9 @@ an unguarded `fleet stop`, one explicit confirm at a time. So `S` re-reads every
 watched host and refuses a stop that would leave fewer than `--min-available K`
 slots active across them (default **1**: the watch never stops the last running
 slot it can see; `0` turns the floor off). A host that is not answering counts
-as nothing available, and the confirm line says how many it left out. `R` and
+as nothing available, and the confirm line says how many it left out. The floor
+is checked once, when the confirm line is built, so `w` (stop when idle) passes
+it exactly as `y` does; `R`, `w` takes none, since the slot comes back. `R` and
 `K` are transient and `T`/`P` take nothing away, so they are not gated — the
 same split as the fleet commands below.
 

@@ -258,6 +258,8 @@
 # watch's keys act on it over the held connection (GHR-55): K kill job, R
 # restart, S stop, T start, P reap, each decided on facts read from that host
 # at the keypress and confirmed with a line naming the exact remote command,
+# (R and S also take w there, GHR-126: the same command with --when-idle,
+# which waits for the slot's job instead of killing it),
 # and L pages that slot's last 50 journal lines. O prints the run URL of the
 # cursor's job, from the payload the last tick brought (GHR-78). Enter opens
 # the local watch's slot pane for the cursor's pair (GHR-76), read from that
@@ -9689,7 +9691,15 @@ fleet_watch_run_url() { # HOST NAME
 # The `warning:` line R and S carry when the host says a job is in flight.
 fleet_watch_job_warning() { # VERB
   [ -n "${FF[job]}" ] || return 0
-  printf '\nwarning: a job is running (%s) — it will be killed and GitHub marks it failed; runnerctl %s --when-idle on the host waits for it instead' "${FF[job_cell]}" "$1"
+  printf '\nwarning: a job is running (%s) — y kills it and GitHub marks it failed; w waits for it instead' "${FF[job_cell]}"
+}
+
+# GHR-126: the line R and S carry under their confirm line for the second
+# answer: `w` runs the same verb with --when-idle, which waits for the slot's
+# job (up to WAIT_TIMEOUT) instead of killing it. It runs in the background
+# like any action, so the wait does not freeze the view.
+fleet_watch_idle_line() { # RUNS VERB NAME
+  printf '\nw instead %s %s %s --when-idle — waits for the job to finish; anything else cancels' "$1" "$2" "$3"
 }
 
 # S's capacity floor (see the block above). 0 with FW_CAPACITY describing what
@@ -9793,7 +9803,7 @@ fleet_watch_slot_action() { # KEY HOST NAME
       case "${FF[active]}" in
         active|activating|reloading)
           FW_ACTION=restart
-          FW_PROMPT="Restart $lbl? $runs restart $name  [y/n]$(fleet_watch_job_warning restart)" ;;
+          FW_PROMPT="Restart $lbl? $runs restart $name  [y/n]$(fleet_watch_job_warning restart)$(fleet_watch_idle_line "$runs" restart "$name")" ;;
         *) FW_NOTICE="$lbl: not active (${FF[active]:-unknown}) — T starts it" ;;
       esac ;;
     S)
@@ -9801,7 +9811,7 @@ fleet_watch_slot_action() { # KEY HOST NAME
         active|activating|reloading)
           fleet_watch_floor "$host" "$name" "${FF[active]}" || return 0
           FW_ACTION=stop
-          FW_PROMPT="Stop $lbl? $runs stop $name — $FW_CAPACITY  [y/n]$(fleet_watch_job_warning stop)" ;;
+          FW_PROMPT="Stop $lbl? $runs stop $name — $FW_CAPACITY  [y/n]$(fleet_watch_job_warning stop)$(fleet_watch_idle_line "$runs" stop "$name")" ;;
         *) FW_NOTICE="$lbl: already stopped (${FF[active]:-unknown})" ;;
       esac ;;
     T)
@@ -9832,15 +9842,21 @@ fleet_watch_slot_action() { # KEY HOST NAME
 # restart that sits out a wedged job's TimeoutStopSec is minutes, and giving
 # up sooner only made the frame say `failed` about an action that then
 # completed behind it.
-fleet_watch_run_action() {
+#
+# GHR-126: WHEN-IDLE (`w` at the confirm line of R and S) is --when-idle,
+# carried through as a remote argument, and the budget is the one that
+# argument earns: a wait of up to WAIT_TIMEOUT for the slot plus the action's.
+# S's capacity floor was passed when the confirm line was built, for either
+# answer. R takes none for either: the slot comes back.
+fleet_watch_run_action() { # [--when-idle]
   local budget
-  budget="$(fleet_mutate_budget "$FW_ACTION" 1)"
+  budget="$(fleet_mutate_budget "$FW_ACTION" 1 "$@")"
   fleet_priv_cmd
-  printf '\nrunning on %s: %s %s %s\n' "$FW_ACT_HOST" "${FLEET_PRIV[*]}" "$FW_ACTION" "$FW_ACT_NAME"
+  printf '\nrunning on %s: %s %s %s%s\n' "$FW_ACT_HOST" "${FLEET_PRIV[*]}" "$FW_ACTION" "$FW_ACT_NAME" "${1:+ $1}"
   # GHR-88: recorded on this node as the command line the key stands for.
   fleet_watch_act_start "$FW_ACT_HOST" "$FW_ACT_NAME on $FW_ACT_HOST" "$FW_ACTION" \
-    "fleet $FW_ACTION --host $FW_ACT_HOST $FW_ACT_NAME (fleet watch)" "$budget" \
-    "$FW_ACTION" "$(printf %q "$FW_ACT_NAME")" || true
+    "fleet $FW_ACTION${1:+ $1} --host $FW_ACT_HOST $FW_ACT_NAME (fleet watch)" "$budget" \
+    "$FW_ACTION" "$(printf %q "$FW_ACT_NAME")" "$@" || true
   FW_ACTION="" FW_PROMPT=""
 }
 
@@ -10167,7 +10183,7 @@ FLEET_WATCH_HELP="fleet watch — keys
   Enter   the cursor's slot in full, in place of the table (on the row of a
           host that is not answering: that host). There q Esc Enter go back, h
           shows the host alone, ↑ ↓ PgUp PgDn scroll, K R S T P L O act on it
-  K R S T P L   kill job, restart, stop, start, reap, logs: the cursor's slot
+  K R S T P L   kill job, restart, stop, start, reap, logs; R S: w = when idle
   O     print the run URL of the cursor's job — nothing is opened
   ?     this list
   q     quit; Esc stops following a running action, which carries on
@@ -10607,6 +10623,11 @@ fleet_watch_handle_key() { # KEY
     FW_ACT_NOTICE=false
     case "$1" in
       y|Y) FW_NOTICE=""; fleet_watch_run_action ;;
+      # GHR-126: the graceful form, offered by R and S alone.
+      w)   case "$FW_ACTION" in
+             restart|stop) FW_NOTICE=""; fleet_watch_run_action --when-idle ;;
+             *)            FW_NOTICE="cancelled — nothing run"; FW_ACTION="" FW_PROMPT="" ;;
+           esac ;;
       *)   FW_NOTICE="cancelled — nothing run"; FW_ACTION="" FW_PROMPT="" ;;
     esac
     # GHR-125: an action's notice that landed under the confirm line.
