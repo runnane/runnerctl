@@ -259,7 +259,7 @@ runnerctl start|stop|restart [--when-idle] [--timeout N] \
                              [--if-stalled] [--stall-after N] \
                              [<unit|slot-index|name> ...]
 runnerctl drain [--timeout N] [<unit|slot-index|name> ...]
-runnerctl enable|disable <unit|slot-index|name>
+runnerctl enable|disable <unit|slot-index|name> [<unit|slot-index|name> ...]
 runnerctl logs [<unit|slot-index|name>] [-f|--follow] [-n N] \
                [--since WHEN] [-g PATTERN]
 runnerctl remove-limits [<unit|slot-index|name> ...]

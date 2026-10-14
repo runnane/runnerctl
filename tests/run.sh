@@ -762,6 +762,24 @@ case_enable_by_unit_name() {
   expect_log_order "^systemctl enable --now $U3\$" "^probe:audit enable example\\.slot-3 by $ME — ok\$"
 }
 
+# GHR-134: several targets are all acted on, in order, under one record.
+case_disable_several_targets() {
+  run disable 0 "$U2"
+  expect_rc 0
+  expect_out '^disable done\.$'
+  expect_log_count '.' 3
+  expect_log_order "^systemctl disable --now $U1\$" "^systemctl disable --now $U2\$" "^probe:audit disable example\\.slot-1 example\\.slot-2 by $ME — ok\$"
+}
+
+# GHR-134: one bad target among good ones refuses before any call is made.
+case_disable_bad_later_target_changes_nothing() {
+  run disable 0 7
+  expect_rc 1
+  expect_err 'slot index 7 out of range'
+  expect_no_out 'done\.'
+  expect_no_log '^systemctl'
+}
+
 case_logs_by_index() {
   run logs 2
   expect_rc 0
@@ -9625,6 +9643,8 @@ t "remove-limits: rm -f on every slot, then daemon-reload"         case_remove_l
 t "restart 1: slot index resolves to the second unit"              case_restart_by_index
 t "stop: every slot in discovery order"                            case_stop_all
 t "enable <unit>: full unit name passes through"                   case_enable_by_unit_name
+t "disable 0 <unit>: every named target is disabled"               case_disable_several_targets
+t "disable 0 7: a bad later target changes nothing"                case_disable_bad_later_target_changes_nothing
 t "logs 2: journalctl on the third unit"                           case_logs_by_index
 t "restart 5: out of range exits 1 without a systemctl call"       case_restart_out_of_range
 t "restart example.slot-2: short RUNNER name resolves"             case_restart_by_short_name
