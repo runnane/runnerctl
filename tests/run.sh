@@ -398,15 +398,15 @@ case_status_table() {
   # GHR-64: the stubbed root drive rides on the same line, and an empty
   # event window adds nothing to it.
   expect_out '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: 16 cores, 64Gi RAM, 48Gi available — Disk: / \[docker,work\] 24% \(353\.9G free\)$'
-  expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$'
+  expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +CPU +RESTART +ENVFILE +WORKING-ON$'
   # slot-1 also carries MemoryPeak (GHR-8), so USED is current/peak; PRESS
   # is — until the stub answers cgroup_memory_facts (GHR-31).
-  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +always +— +my-app:test \(12m\)$'
+  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +— +always +— +my-app:test \(12m\)$'
   # slot-2 has restarted (GHR-8): the ACTIVE cell carries ↻3 and the
   # journal-derived reason, so the plain "active/running" is followed by
   # that annotation before SINCE, not by spaces straight to 41m.
   expect_out '^1 +example\.slot-2 +— +active/running .* +41m +enabled '
-  expect_out '^2 +example\.slot-3 +— +inactive/dead +6d +disabled +— +— +— +— +always +— +—$'
+  expect_out '^2 +example\.slot-3 +— +inactive/dead +6d +disabled +— +— +— +— +— +always +— +—$'
   expect_no_out '^3 '
   # status is read-only: no privileged call at all (the `probe:` lines below
   # are the stub logging its own unit_props hits, not a host mutation).
@@ -876,7 +876,7 @@ case_status_dash_cells_keep_columns_aligned() {
   rpos="${row%—}"; rpos="${#rpos}"             # offset of the final — (WORKING-ON cell)
   _expect
   [ "$hpos" -eq "$rpos" ] || FAILS+=("WORKING-ON column: header at $hpos, slot-3 row at $rpos")
-  expect_out '^2 +example\.slot-3 +— +inactive/dead +6d +disabled +— +— +— +— +always +— +—$'
+  expect_out '^2 +example\.slot-3 +— +inactive/dead +6d +disabled +— +— +— +— +— +always +— +—$'
 }
 
 # --- GHR-15: apply/remove-limits take targets; status shows the PROFILE ------
@@ -1341,7 +1341,7 @@ case_watch_three_iterations_redraw_frames() {
   expect_out_count "${FRAME_PREFIX}runnerctl watch — [^ ]+ — [0-9]{2}:[0-9]{2}:[0-9]{2} — every 1s \(Ctrl-C to quit\)$" 3
   expect_out_count "$FRAME_PREFIX" 3
   expect_out_count '^runnerctl watch —' 0
-  expect_out_count '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$' 3
+  expect_out_count '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +CPU +RESTART +ENVFILE +WORKING-ON$' 3
   # every frame carries the version header too (GHR-32), with the same
   # pinned host_line() fragment as `status` on every redraw (GHR-34)
   expect_out_count '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: ' 3
@@ -1420,14 +1420,14 @@ case_status_used_shows_current_over_peak_when_present() {
   run status
   expect_rc 0
   # slot-1 carries MemoryPeak: USED is current/peak, both `hbytes`-formatted.
-  expect_out '^0 +example\.slot-1 .* +1\.0G/25\.0G +— +always '
+  expect_out '^0 +example\.slot-1 .* +1\.0G/25\.0G +— +— +always '
 }
 
 case_status_used_stays_current_only_without_peak() {
   run status
   expect_rc 0
   # slot-2 has no MemoryPeak: USED is unchanged, current only, no slash.
-  expect_out '^1 +example\.slot-2 .* +1\.0G +— +always '
+  expect_out '^1 +example\.slot-2 .* +1\.0G +— +— +always '
   expect_no_out '^1 +example\.slot-2 .* +1\.0G/'
 }
 
@@ -1482,7 +1482,7 @@ case_journal_restart_reason_line_no_match() {
 case_status_json_parses_and_carries_the_slot_facts() {
   run status --json
   expect_rc 0
-  expect_out '^\{"runnerctl":"[0-9]+\.[0-9]+\.[0-9]+","host":\{"name":"stub-host-1","cores":16,"mem_total":68719476736,"mem_available":51539607552,"disks":\[.*\],"events":\{.*\}\},$'
+  expect_out '^\{"runnerctl":"[0-9]+\.[0-9]+\.[0-9]+","host":\{"name":"stub-host-1","cores":16,"mem_total":68719476736,"mem_available":51539607552,"load":null,"disks":\[.*\],"events":\{.*\}\},$'
   expect_out '^ "slots":\[$'
   expect_out '^\]\}$'
   # read-only, like the table: no privileged call at all.
@@ -1491,7 +1491,7 @@ case_status_json_parses_and_carries_the_slot_facts() {
   expect_no_out '^note:'
   if ! $HAVE_PYTHON3; then skip "python3 not on PATH: status --json parse assertions not run"; return 0; fi
   expect_json 'len(d["slots"]) == 3'
-  expect_json '{k: v for k, v in d["host"].items() if k not in ("disks", "events")} == {"name": "stub-host-1", "cores": 16, "mem_total": 68719476736, "mem_available": 51539607552}'
+  expect_json '{k: v for k, v in d["host"].items() if k not in ("disks", "events")} == {"name": "stub-host-1", "cores": 16, "mem_total": 68719476736, "mem_available": 51539607552, "load": None}'
   # GHR-32: the version the script carries, so a fleet can be inventoried
   expect_json 'isinstance(d["runnerctl"], str) and len(d["runnerctl"].split(".")) == 3 and all(x.isdigit() for x in d["runnerctl"].split("."))'
   expect_json '[s["idx"] for s in d["slots"]] == [0, 1, 2]'
@@ -1803,11 +1803,11 @@ case_status_color_always_paints_by_meaning() {
   expect_rc 0
   # header bold; slot-1 ACTIVE green (no restarts); its stalled job bold red
   expect_out "^$ESC\[1mIDX +RUNNER .* WORKING-ON$ESC\[0m$"
-  expect_out "^0 +example\.slot-1 +$ESC\[2m—$ESC\[0m +$ESC\[32mactive/running$ESC\[0m +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +always +— +$ESC\[1m$ESC\[31mmy-app:test \(12m\) STALLED$ESC\[0m$"
+  expect_out "^0 +example\.slot-1 +$ESC\[2m—$ESC\[0m +$ESC\[32mactive/running$ESC\[0m +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +— +always +— +$ESC\[1m$ESC\[31mmy-app:test \(12m\) STALLED$ESC\[0m$"
   # slot-2: restarted → yellow ACTIVE; idle → dim WORKING-ON
   expect_out "^1 +example\.slot-2 .* $ESC\[33mactive/running ↻3 \(last: oom-kill\)$ESC\[0m +41m +enabled .* $ESC\[2midle 2h31m \(2 jobs\)$ESC\[0m$"
   # slot-3: inactive → red ACTIVE, disabled → dim ENABLED, WORKING-ON — → dim
-  expect_out "^2 +example\.slot-3 +$ESC\[2m—$ESC\[0m +$ESC\[31minactive/dead$ESC\[0m +6d +$ESC\[2mdisabled$ESC\[0m +— +— +— +— +always +— +$ESC\[2m—$ESC\[0m$"
+  expect_out "^2 +example\.slot-3 +$ESC\[2m—$ESC\[0m +$ESC\[31minactive/dead$ESC\[0m +6d +$ESC\[2mdisabled$ESC\[0m +— +— +— +— +— +always +— +$ESC\[2m—$ESC\[0m$"
   expect_out "^$ESC\[31mnote: STALLED = .*$ESC\[0m$"
   # the columns: with the SGR sequences stripped, the painted table is the
   # plain one byte for byte (the GHR-21 padding invariant, now under colour)
@@ -1838,7 +1838,7 @@ case_status_color_never_and_default_are_plain() {
   NO_COLOR='' RUNNERCTL_STUB_TTY=1 run status --color never
   expect_rc 0
   expect_no_out "$SGR"
-  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +always +— +my-app:test \(12m\)$'
+  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +— +always +— +my-app:test \(12m\)$'
 }
 
 case_status_color_invalid_rejected() {
@@ -2156,14 +2156,14 @@ case_watch_narrow_terminal_drops_max_high_envfile() {
   expect_log_count '^probe:unit_props ' 9
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 RUNNERCTL_STUB_KEYS='q' run watch
   expect_rc 0
-  expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$'
+  expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +CPU +RESTART +ENVFILE +WORKING-ON$'
   expect_out '^1 +example\.slot-2 .* /etc/x \(ignore_errors=no\) idle 2h31m \(2 jobs\)$'
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='q' run watch
   expect_rc 0
-  expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$'
+  expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +CPU +RESTART +ENVFILE +WORKING-ON$'
   RUNNERCTL_STUB_COLS=80 run status
   expect_rc 0
-  expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$'
+  expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +CPU +RESTART +ENVFILE +WORKING-ON$'
   expect_out '^1 +example\.slot-2 .* /etc/x \(ignore_errors=no\) idle 2h31m \(2 jobs\)$'
 }
 
@@ -2542,8 +2542,8 @@ case_health_without_restart_stalled_never_restarts() {
 case_status_press_column_from_the_stub() {
   RUNNERCTL_STUB_PRESSURE=1 run status
   expect_rc 0
-  expect_out '^0 +example\.slot-1 .* +1\.0G/25\.0G +63\.2% +always '
-  expect_out '^1 +example\.slot-2 .* +1\.0G +0\.0% +always '
+  expect_out '^0 +example\.slot-1 .* +1\.0G/25\.0G +63\.2% +— +always '
+  expect_out '^1 +example\.slot-2 .* +1\.0G +0\.0% +— +always '
   expect_out '^2 +example\.slot-3 .* +— +— +— +— +always '
   # one read per slot, from the same collector the table and --json share
   expect_log_count '^probe:cgroup_memory_facts ' 3
@@ -2554,8 +2554,8 @@ case_status_press_column_from_the_stub() {
 case_status_press_painted_by_threshold() {
   RUNNERCTL_STUB_PRESSURE=1 run status --color always
   expect_rc 0
-  expect_out "^0 +example\.slot-1 .* +1\.0G/25\.0G +$ESC\[31m63\.2%$ESC\[0m +always "
-  expect_out "^1 +example\.slot-2 .* +1\.0G +0\.0% +always "
+  expect_out "^0 +example\.slot-1 .* +1\.0G/25\.0G +$ESC\[31m63\.2%$ESC\[0m +— +always "
+  expect_out "^1 +example\.slot-2 .* +1\.0G +0\.0% +— +always "
   expect_no_out "$ESC\[3[13]m0\.0%"
 }
 
@@ -4287,8 +4287,9 @@ case_fleet_watch_a_failed_action_is_a_notice_not_an_exit() {
 
 # --- GHR-56: the narrow table, as a flag the fleet can forward -----------------
 # The full and narrow column headers, with and without the fleet's HOST cell.
-# MAX, HIGH and ENVFILE are the columns --narrow drops (STATUS_NARROW_DROP).
-HDR_FULL='IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$'
+# MAX, HIGH, CPU (GHR-79) and ENVFILE are the columns --narrow drops
+# (STATUS_NARROW_DROP).
+HDR_FULL='IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +CPU +RESTART +ENVFILE +WORKING-ON$'
 HDR_NARROW='IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +USED +PRESS +RESTART +WORKING-ON$'
 
 # `status --narrow` draws exactly the table the local watch narrows to, so a
@@ -4300,7 +4301,7 @@ case_status_narrow_drops_max_high_envfile() {
   run status --narrow
   expect_rc 0
   expect_out "^$HDR_NARROW"
-  expect_no_out 'MAX|HIGH|ENVFILE|/etc/x'
+  expect_no_out 'MAX|HIGH|CPU|ENVFILE|/etc/x'
   expect_out '^1 +example\.slot-2 .* +always +idle 2h31m \(2 jobs\)$'
   run status --narrow --json
   expect_rc 1
@@ -8202,7 +8203,7 @@ t "fleet watch: the control session opens, then tears itself down"     case_flee
 t "fleet watch: the session options reach the real ssh command line"   case_fleet_ssh_run_puts_the_session_options_on_the_ssh_command_line
 t "fleet one-shots: no control session, ssh line unchanged"            case_fleet_one_shot_commands_open_no_control_session
 t "fleet watch: bad options die before anything is dialled"            case_fleet_watch_bad_options_die_before_dialling
-t "status --narrow: drops MAX/HIGH/ENVFILE; refused with --json"      case_status_narrow_drops_max_high_envfile
+t "status --narrow: drops MAX/HIGH/CPU/ENVFILE; refused with --json"  case_status_narrow_drops_max_high_envfile
 t "fleet status --narrow: forwarded, and the narrow table arrives"     case_fleet_status_narrow_is_forwarded_and_arrives
 t "watch: once narrowed, holds until the margin fits"                  case_watch_narrow_holds_inside_the_margin
 t "fleet watch: a too-wide frame narrows next tick and stays narrow"   case_fleet_watch_narrows_on_the_next_tick_and_holds
@@ -8413,21 +8414,22 @@ case_run_facts_absent_are_null_and_the_cell_is_unchanged() {
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run status
   expect_rc 0
   expect_text "the cell on a 300-column terminal, no run named" 'my-app:test (12m)' "$(slot1_cell)"
-  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +always +— +my-app:test \(12m\)$'
+  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +— +always +— +my-app:test \(12m\)$'
 }
 
 # The long cell, `repo:workflow / job @ref`, only where the terminal has the
-# columns for it BEYOND the full table (144 here, so 28 more at 172), only on
+# columns for it BEYOND the full table (150 here since GHR-79's CPU column,
+# so 28 more at 178), only on
 # a terminal, and never through `fleet`. The short cell is what every other
 # width, a pipe and a remote's table draw — byte for byte what it was.
 case_run_facts_wide_cell_only_where_it_fits() {
   local short='my-app:test (12m)' long='my-app:CI / test @main (12m)'
-  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=172 run status
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=178 run status
   expect_rc 0
-  expect_text "172 columns: the long cell fits exactly" "$long" "$(slot1_cell)"
-  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +always +— +my-app:CI / test @main \(12m\)$'
-  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=171 run status
-  expect_text "171 columns: one short of it" "$short" "$(slot1_cell)"
+  expect_text "178 columns: the long cell fits exactly" "$long" "$(slot1_cell)"
+  expect_out '^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +— +always +— +my-app:CI / test @main \(12m\)$'
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=177 run status
+  expect_text "177 columns: one short of it" "$short" "$(slot1_cell)"
   RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_COLS=300 run status
   expect_text "300 columns, stdout not a terminal" "$short" "$(slot1_cell)"
   RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 run status
@@ -8447,7 +8449,7 @@ case_run_facts_wide_cell_only_where_it_fits() {
   # short. 178 is where this table gets MAX, HIGH and ENVFILE back with or
   # without a run named (slot-2's row is 156 wide when narrow, plus the
   # margin of 22) — and there it is the full table AND the long cell.
-  local narrow='^0 +example\.slot-1 +— +active/running +3d 4h +enabled +1\.0G/25\.0G +— +always +' full='^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +always +— +'
+  local narrow='^0 +example\.slot-1 +— +active/running +3d 4h +enabled +1\.0G/25\.0G +— +always +' full='^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +— +always +— +'
   RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=150,178 run watch --iterations 2 --color never
   expect_rc 0
   expect_out_count "${narrow}my-app:test \\(12m\\)\$" 1
@@ -8458,18 +8460,18 @@ case_run_facts_wide_cell_only_where_it_fits() {
   # The long cell is measured against the FULL table, so it is never what
   # keeps those columns away: a 50-character one would fit beside the narrow
   # table at 178 (56 to spare) and, drawn there, hold the table narrow for
-  # good. It does not fit beside the full one (34), so the cell is the short
+  # good. It does not fit beside the full one (28), so the cell is the short
   # one and the columns are back.
   RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_REF_NAME='release/2026-10-candidate1' RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=150,178 \
     run watch --iterations 2 --color never
   expect_out_count "${full}my-app:test \\(12m\\)\$" 1
   expect_no_out 'candidate1'
-  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_REF_NAME='release/2026-10-candidate1' RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=194 run status
-  expect_text "194 columns: the 50-character cell fits" 'my-app:CI / test @release/2026-10-candidate1 (12m)' "$(slot1_cell)"
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_REF_NAME='release/2026-10-candidate1' RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=200 run status
+  expect_text "200 columns: the 50-character cell fits" 'my-app:CI / test @release/2026-10-candidate1 (12m)' "$(slot1_cell)"
   # the fit is counted in characters, like every padded cell (GHR-21): this
-  # one is 34 of them and 37 bytes, and 34 is what 178 columns leave
-  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_WORKFLOW='Bygg æøå' RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=178 run status
-  expect_text "178 columns: 34 characters fit" 'my-app:Bygg æøå / test @main (12m)' "$(slot1_cell)"
+  # one is 34 of them and 37 bytes, and 34 is what 184 columns leave
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_WORKFLOW='Bygg æøå' RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=184 run status
+  expect_text "184 columns: 34 characters fit" 'my-app:Bygg æøå / test @main (12m)' "$(slot1_cell)"
   # a remote's table is drawn for no terminal: the fleet row is the short cell
   RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=400 RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet status
   expect_out '^build-1 +0 +example\.slot-1 .* my-app:test \(12m\)$'
@@ -10687,6 +10689,289 @@ t "GHR-89: under sudo migrate sources no file the caller can write"           ca
 t "GHR-89: under sudo --rollback needs a .prev root alone can write"           case_ghr89_rollback_under_sudo_needs_a_root_owned_prev
 t "GHR-89: without SUDO_CONTRACT=narrow nothing is refused under sudo"        case_ghr89_no_opt_in_changes_nothing_under_sudo
 t "GHR-89: a caller-chosen config can neither set nor unset the opt-in"       case_ghr89_caller_config_cannot_set_the_opt_in
+
+# --- GHR-79: host load and per-slot CPU ----------------------------------------
+# The stub's knobs (tests/stub.config): RUNNERCTL_STUB_CPU="N:MILLICORES …"
+# gives slot-N a CPU counter, each slot from a DIFFERENT base, so a rate taken
+# against another slot's sample is far off rather than right by accident;
+# RUNNERCTL_STUB_CPU_RESET=1 sends every counter backwards once the clock has
+# moved; RUNNERCTL_STUB_LOAD="L1 L5 L15" is /proc/loadavg. Unset, no slot has
+# CPU accounting and no load can be read, which is what every older case sees.
+GHR79_ROW1='^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +'
+GHR79_ROW3='^2 +example\.slot-3 +— +inactive/dead +6d +disabled +— +— +— +— +— +always +— +—$'
+GHR79_HDR_OLD='IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +RESTART +ENVFILE +WORKING-ON$'
+
+# A one-shot table: two reads of every slot with a cgroup, around ONE wait.
+case_ghr79_status_cpu_column_from_two_samples() {
+  RUNNERCTL_STUB_CPU="1:3200 2:1500" run status
+  expect_rc 0
+  expect_out "^$HDR_FULL"
+  expect_out "${GHR79_ROW1}3\\.2 +always +— +my-app:test \\(12m\\)\$"
+  expect_out '^1 +example\.slot-2 .* +1\.0G +— +1\.5 +always +/etc/x \(ignore_errors=no\) +idle 2h31m \(2 jobs\)$'
+  # slot-3 has no cgroup: never read, and `—`
+  expect_out "$GHR79_ROW3"
+  expect_log_count '^probe:cpu_window_wait 250$' 1
+  expect_log_count '^probe:cgroup_cpu_facts /system\.slice/actions\.runner\.example\.slot-1\.service$' 2
+  expect_log_count '^probe:cgroup_cpu_facts /system\.slice/actions\.runner\.example\.slot-2\.service$' 2
+  expect_log_count '^probe:cgroup_cpu_facts ' 4
+  # the wait comes after every first read and before every second one
+  expect_log_order '^probe:cgroup_cpu_facts .*slot-1' '^probe:cgroup_cpu_facts .*slot-2' '^probe:cpu_window_wait ' \
+    '^probe:cgroup_cpu_facts .*slot-1' '^probe:cgroup_cpu_facts .*slot-2'
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+}
+
+# Accounting off is `—` in the table and null in --json, never 0; --json reads
+# the counter once and never waits.
+case_ghr79_missing_cpu_accounting_is_a_dash_and_null() {
+  RUNNERCTL_STUB_CPU="1:3200" run status
+  expect_rc 0
+  expect_out "${GHR79_ROW1}3\\.2 +always "
+  expect_out '^1 +example\.slot-2 .* +1\.0G +— +— +always '
+  expect_no_out ' 0\.0 '
+  # nothing has accounting: nothing to wait for
+  run status
+  expect_rc 0
+  expect_no_log '^probe:cpu_window_wait'
+  expect_out "${GHR79_ROW1}— +always "
+  RUNNERCTL_STUB_CPU="1:3200" run status --json
+  expect_rc 0
+  expect_out '"name":"example\.slot-1".*"profile":null,"cpu_usage_usec":9000000000,"cpu_pressure":\{"some_avg10":12\.50,"some_avg60":8\.00,"some_total":5555\},"job":\{'
+  expect_out '"name":"example\.slot-2".*"profile":null,"cpu_usage_usec":null,"cpu_pressure":null,"job":null,'
+  expect_out '"name":"example\.slot-3".*"profile":null,"cpu_usage_usec":null,"cpu_pressure":null,"job":null,'
+  expect_no_log '^probe:cpu_window_wait'
+  expect_log_count '^probe:cgroup_cpu_facts ' 2
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: the cpu keys' parse assertions not run"; return 0; fi
+  expect_json 'd["slots"][0]["cpu_usage_usec"] == 9000000000 and d["slots"][0]["cpu_pressure"] == {"some_avg10": 12.5, "some_avg60": 8.0, "some_total": 5555}'
+  expect_json 'd["slots"][1]["cpu_usage_usec"] is None and d["slots"][1]["cpu_pressure"] is None and d["slots"][2]["cpu_usage_usec"] is None'
+}
+
+# A counter that went backwards between the two reads (the unit restarted) is
+# no rate: `—`, never a negative number.
+case_ghr79_cpu_counter_backwards_is_a_dash() {
+  RUNNERCTL_STUB_CPU="1:3200" RUNNERCTL_STUB_CPU_RESET=1 run status
+  expect_rc 0
+  expect_out "${GHR79_ROW1}— +always +— +my-app:test \\(12m\\)\$"
+  expect_no_out ' -[0-9]'
+  # the rule itself, through the helper: backwards, no time between, a value
+  # num_int does not take — each unknown; forwards is hundredths of a core
+  # shellcheck disable=SC2016  # the child expands these
+  run_fn eval 'for a in "500 1000 100 2000" "1 5 2 5" "0100 1000000 3200100 2000000" "0 1000000 3200000 2000000" "7 1 7 2"; do
+      cpu_rate $a; echo "[$CPU_RATE]"; done'
+  expect_rc 0
+  expect_text "cpu_rate over five pairs of samples" '[]
+[]
+[]
+[320]
+[0]' "$OUT"
+}
+
+# Under `watch` the previous tick is the first sample: one wait on the first
+# frame (there is no tick before it), none after.
+case_ghr79_watch_takes_the_previous_tick_as_the_first_sample() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_CPU="1:3200 2:1500" run watch --iterations 3 --interval 2
+  expect_rc 0
+  expect_out_count "${GHR79_ROW1}3\\.2 +always " 3
+  expect_out_count '^1 +example\.slot-2 .* +1\.0G +— +1\.5 +always ' 3
+  expect_log_count '^probe:cpu_window_wait ' 1
+  expect_log_count '^probe:cgroup_cpu_facts ' 8
+}
+
+# The narrow table drops CPU, and then only a STALLED job's qualifier is worth
+# a wait — and only that slot is read twice.
+case_ghr79_narrow_drops_cpu_and_waits_only_for_a_stalled_job() {
+  RUNNERCTL_STUB_CPU="1:3200 2:1500" run status --narrow
+  expect_rc 0
+  expect_out "^$HDR_NARROW"
+  expect_no_out 'CPU|3\.2|1\.5'
+  expect_no_log '^probe:cpu_window_wait'
+  RUNNERCTL_STUB_CPU="1:3200 2:1500" run status --narrow --stall-after 600
+  expect_rc 0
+  expect_out '^0 +example\.slot-1 .* +always +my-app:test \(12m\) STALLED \(still computing\)$'
+  expect_log_count '^probe:cpu_window_wait ' 1
+  expect_log_count '^probe:cgroup_cpu_facts .*slot-1' 2
+  expect_log_count '^probe:cgroup_cpu_facts .*slot-2' 1
+}
+
+# The qualifier is informational. A computing job and an idle one are both
+# STALLED, both what --if-stalled acts on and both a health problem, with the
+# lines they always had — and --if-stalled never samples CPU at all.
+case_ghr79_stalled_qualifier_is_informational() {
+  RUNNERCTL_STUB_CPU="1:3200" run status --stall-after 600
+  expect_rc 0
+  expect_out "${GHR79_ROW1}3\\.2 +always +— +my-app:test \\(12m\\) STALLED \\(still computing\\)\$"
+  RUNNERCTL_STUB_CPU="1:0" run status --stall-after 600
+  expect_out "${GHR79_ROW1}0\\.0 +always +— +my-app:test \\(12m\\) STALLED \\(idle CPU, likely hung\\)\$"
+  run status --stall-after 600
+  expect_out "${GHR79_ROW1}— +always +— +my-app:test \\(12m\\) STALLED\$"
+  local m
+  for m in 3200 0; do
+    RUNNERCTL_STUB_CPU="1:$m" run restart --if-stalled --stall-after 600
+    expect_rc 0
+    expect_out '^example\.slot-1: stalled — my-app:test, 12m, longer than 10m — restarting$'
+    expect_out '^restart done \(1 stalled slot\(s\)\)\.$'
+    expect_log_count '^systemctl restart ' 1
+    expect_log "^systemctl restart $U1\$"
+    expect_no_log '^probe:(cpu_window_wait|cgroup_cpu_facts)'
+    RUNNERCTL_STUB_CPU="1:$m" run health --stall-after 600
+    expect_rc 1
+    expect_out '^example\.slot-1: stalled — job my-app:test running 12m, longer than 10m \(--stall-after 600\)$'
+    expect_no_out 'computing|hung'
+  done
+}
+
+# The header's load against the cores, painted by the ratios (inclusive), and
+# the three figures in --json.
+case_ghr79_status_header_load_against_cores() {
+  RUNNERCTL_STUB_LOAD="20.25 9.00 4.00" run status
+  expect_rc 0
+  expect_out '^runnerctl [0-9]+\.[0-9]+\.[0-9]+ — Host: 16 cores, 64Gi RAM, 48Gi available — load 20\.3/16 — Disk: / \[docker,work\] 24% \(353\.9G free\)$'
+  local l want
+  for l in "15.99:32:16.0" "16.00:33:16.0" "31.99:33:32.0" "32.00:31:32.0" "40.00:31:40.0"; do
+    want="${l#*:}"
+    RUNNERCTL_STUB_LOAD="${l%%:*} 1.00 1.00" run status --color always
+    expect_out "16 cores, 64Gi RAM, 48Gi available — $ESC\\[${want%%:*}mload ${want#*:}/16$ESC\\[0m — Disk: "
+  done
+  RUNNERCTL_STUB_LOAD="20.25 9.00 4.00" run status --json
+  expect_rc 0
+  expect_out '^\{"runnerctl":"[0-9.]+","host":\{"name":"stub-host-1","cores":16,"mem_total":68719476736,"mem_available":51539607552,"load":\[20\.25,9\.00,4\.00\],"disks":'
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: host.load parse assertion not run"; return 0; fi
+  expect_json 'd["host"]["load"] == [20.25, 9.0, 4.0]'
+}
+
+# The ratios are config knobs, validated; CPU_SAMPLE_MS=0 never waits.
+case_ghr79_load_ratios_and_sample_are_config_knobs() {
+  local cfg="$TMP/ghr79.config"
+  save_config "$cfg" <<<$'LOAD_WARN_RATIO="0.5"\nLOAD_CRIT_RATIO="1.25"'
+  RUNNERCTL_STUB_LOAD="20.25 9.00 4.00" run_cfg "$cfg" status --color always
+  expect_rc 0
+  expect_out "— $ESC\\[31mload 20\\.3/16$ESC\\[0m — "
+  RUNNERCTL_STUB_LOAD="8.00 9.00 4.00" run_cfg "$cfg" status --color always
+  expect_out "— $ESC\\[33mload 8\\.0/16$ESC\\[0m — "
+  local bad
+  for bad in 'LOAD_WARN_RATIO="1.234"' 'LOAD_CRIT_RATIO="2e0"' 'LOAD_WARN_RATIO="01.0"'; do
+    save_config "$cfg" <<<"$bad"
+    run_cfg "$cfg" status
+    expect_rc 1
+    expect_err "^runnerctl: LOAD_WARN_RATIO/LOAD_CRIT_RATIO set in $cfg are invalid"
+  done
+  save_config "$cfg" <<<'CPU_SAMPLE_MS="1e3"'
+  run_cfg "$cfg" status
+  expect_rc 1
+  expect_err "^runnerctl: CPU_SAMPLE_MS '1e3' set in $cfg is invalid"
+  save_config "$cfg" <<<'CPU_SAMPLE_MS="0"'
+  RUNNERCTL_STUB_CPU="1:3200" run_cfg "$cfg" status
+  expect_rc 0
+  expect_out "${GHR79_ROW1}— +always "
+  expect_no_log '^probe:cpu_window_wait'
+  run config-example
+  expect_out '^#LOAD_WARN_RATIO="1\.0"$'
+  expect_out '^#LOAD_CRIT_RATIO="2\.0"$'
+  expect_out '^#CPU_SAMPLE_MS="250"$'
+}
+
+# The real readers, over fixture files: the stub shadows host_loadavg and
+# cgroup_cpu_facts, so every case above is the stub's.
+case_ghr79_real_readers_over_fixture_files() {
+  local d="$TMP/ghr79.fx"
+  mkdir -p "$d"
+  printf '0.52 1.75 3.10 2/345 6789\n' >"$d/loadavg"
+  run_fn loadavg_read "$d/loadavg"
+  expect_rc 0
+  expect_text "loadavg: the 1-, 5- and 15-minute figures, in that order" '0.52 1.75 3.10' "$OUT"
+  printf 'n/a 1.75 3.10 2/345 6789\n' >"$d/loadavg.bad"
+  run_fn loadavg_read "$d/loadavg.bad"
+  expect_text "loadavg: a figure that is no decimal" '' "$OUT"
+  run_fn loadavg_read "$d/missing"
+  expect_rc 0
+  expect_text "loadavg: no file" '' "$OUT"
+  printf 'usage_usec 7340032123\nuser_usec 5000000000\nsystem_usec 2340032123\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\n' >"$d/cpu.stat"
+  run_fn cpu_stat_usage "$d/cpu.stat"
+  expect_rc 0
+  expect_text "cpu.stat: usage_usec, not user_usec or system_usec" '7340032123' "$OUT"
+  printf 'user_usec 5000000000\nsystem_usec 2340032123\n' >"$d/cpu.stat.nousage"
+  run_fn cpu_stat_usage "$d/cpu.stat.nousage"
+  expect_text "cpu.stat without usage_usec" '' "$OUT"
+  printf 'some avg10=1.50 avg60=0.75 avg300=0.20 total=987654\nfull avg10=0.40 avg60=0.10 avg300=0.00 total=12345\n' >"$d/cpu.pressure"
+  run_fn cpu_pressure_some "$d/cpu.pressure"
+  expect_text "cpu.pressure: the some line, not the full one" 'pressure_some_avg10=1.50
+pressure_some_avg60=0.75
+pressure_some_total=987654' "$OUT"
+  # this box's own /proc/loadavg and clock, through the real hooks
+  run_fn host_loadavg
+  expect_out '^[0-9]+\.[0-9]+ [0-9]+\.[0-9]+ [0-9]+\.[0-9]+$'
+  run_fn now_us
+  expect_out '^[0-9]{16}$'
+  rm -rf "$d"
+}
+
+# `fleet status`: each host's line carries its load, repainted against THIS
+# node's ratios, and the summary counts the hosts at LOAD_CRIT_RATIO.
+case_ghr79_fleet_host_line_load_and_overloaded_count() {
+  RUNNERCTL_STUB_LOAD="40.00 9.00 4.00" RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status
+  expect_rc 0
+  expect_out_count "^build-[12] +${HV}load 40\\.0/16 — Disk: / \\[docker,work\\] 24% \\(353\\.9G free\\)\$" 2
+  expect_last_line '2/2 hosts answering · 6 slots: 2 busy, 2 idle, 2 disabled · 2 hosts overloaded · capacity 2 free of 4'
+  RUNNERCTL_STUB_LOAD="40.00 9.00 4.00" RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet status --color always
+  expect_out_count "^build-1 +${HV}$ESC\\[31mload 40\\.0/16$ESC\\[0m — Disk: $ESC\\[32m/ " 1
+  # WARN is not counted; no load at all is not either
+  RUNNERCTL_STUB_LOAD="20.25 9.00 4.00" RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status
+  expect_last_line "$SUM_OK"
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status
+  expect_last_line "$SUM_OK"
+  expect_out_count "^build-[12] +${HV}Disk: " 2
+}
+
+# A host's load and cores are its text: held to dec_hundredths and num_int
+# before any arithmetic — `016` cores is neither 14 (octal) nor 16.
+case_ghr79_fleet_load_is_held_to_numbers_the_node_takes() {
+  # shellcheck disable=SC2016  # the child expands these
+  run_fn eval 'f() { fleet_host_classify "{\"runnerctl\":\"1.0.0\",\"host\":{\"name\":\"h\",\"cores\":$1,\"mem_total\":null,\"mem_available\":null,\"load\":$2,\"disks\":[],\"events\":null},"; echo "[$HC_LOAD]"; }
+    f 16 "[40.00,1.00,1.00]"; f 016 "[40.00,1.00,1.00]"; f 16 "[040.00,1.00,1.00]"; f 08 "[40.00,1.00,1.00]"
+    f 16 "[20.00,1.00,1.00]"; f 16 null; f 0 "[40.00,1.00,1.00]"; f 99999999999999999999 "[40.00,1.00,1.00]"'
+  expect_rc 0
+  expect_text "HC_LOAD for eight host lines" '[crit]
+[]
+[]
+[]
+[warn]
+[]
+[]
+[]' "$OUT"
+  expect_text "stderr" "" "$ERR"
+}
+
+# A mixed fleet: a host from before the CPU column renders under its OWN
+# header, and the next host's header comes back after it.
+case_ghr79_mixed_fleet_each_host_under_its_own_header() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 build-3" RUNNERCTL_STUB_FLEET_NOCPU="build-2" RUNNERCTL_STUB_CPU="1:3200" run fleet status
+  expect_rc 0
+  expect_out_count "^HOST +$HDR_FULL" 2
+  expect_out_count "^HOST +$GHR79_HDR_OLD" 1
+  expect_out_count '^build-[13] +0 +example\.slot-1 .* +1\.0G/25\.0G +— +3\.2 +always +— +my-app:test \(12m\)$' 2
+  expect_out_count '^build-2 +0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +always +— +my-app:test \(12m\)$' 1
+  expect_out_count '^build-2 +2 +example\.slot-3 +— +inactive/dead +6d +disabled +— +— +— +— +always +— +—$' 1
+  local h1 h2 h3 r1 r2 r3
+  h1="$(first_line "^HOST +$HDR_FULL")"; r1="$(first_line '^build-1 +0 ')"
+  h2="$(first_line "^HOST +$GHR79_HDR_OLD")"; r2="$(first_line '^build-2 +0 ')"
+  r3="$(first_line '^build-3 +0 ')"
+  h3="$(grep -nE "^HOST +$HDR_FULL" <<<"$OUT" | sed -n 2p | cut -d: -f1; true)"
+  NEXPECT=$((NEXPECT + 1))
+  { [ "$h1" -lt "$r1" ] && [ "$r1" -lt "$h2" ] && [ "$h2" -lt "$r2" ] && [ "$r2" -lt "${h3:-0}" ] && [ "${h3:-0}" -lt "$r3" ]; } \
+    || FAILS+=("headers out of place: full $h1, build-1 $r1, old $h2, build-2 $r2, full again ${h3:-none}, build-3 $r3")
+}
+
+t "GHR-79: status draws CPU from two samples around one wait"                case_ghr79_status_cpu_column_from_two_samples
+t "GHR-79: no CPU accounting is — in the table and null in --json"           case_ghr79_missing_cpu_accounting_is_a_dash_and_null
+t "GHR-79: a CPU counter that went backwards is —, never negative"           case_ghr79_cpu_counter_backwards_is_a_dash
+t "GHR-79: watch takes the previous tick as the first CPU sample"            case_ghr79_watch_takes_the_previous_tick_as_the_first_sample
+t "GHR-79: the narrow table drops CPU and waits only for a stalled job"      case_ghr79_narrow_drops_cpu_and_waits_only_for_a_stalled_job
+t "GHR-79: the STALLED CPU qualifier changes no selection"                   case_ghr79_stalled_qualifier_is_informational
+t "GHR-79: the header's load against the cores, painted by the ratios"       case_ghr79_status_header_load_against_cores
+t "GHR-79: load ratios and CPU_SAMPLE_MS are validated config knobs"         case_ghr79_load_ratios_and_sample_are_config_knobs
+t "GHR-79: the real loadavg / cpu.stat / cpu.pressure readers"               case_ghr79_real_readers_over_fixture_files
+t "GHR-79: fleet host lines carry load; the summary counts overloaded hosts" case_ghr79_fleet_host_line_load_and_overloaded_count
+t "GHR-79: a host's load and cores are held to numbers the node takes"       case_ghr79_fleet_load_is_held_to_numbers_the_node_takes
+t "GHR-79: a mixed fleet keeps each host under its own header"               case_ghr79_mixed_fleet_each_host_under_its_own_header
 
 # --- Summary ------------------------------------------------------------------
 echo

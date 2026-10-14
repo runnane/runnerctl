@@ -54,6 +54,17 @@
 #PRESSURE_WARN_PCT="10"
 #PRESSURE_CRIT_PCT="50"
 
+# The host's 1-minute load average against its cores on the status header,
+# as a ratio of load to cores (at most two decimals): green below WARN,
+# yellow from WARN, red from CRIT. `fleet`'s summary counts the hosts at CRIT.
+#LOAD_WARN_RATIO="1.0"
+#LOAD_CRIT_RATIO="2.0"
+#
+# The CPU column is cores in use over a sample: `watch` uses its previous
+# tick; a one-shot `status` table samples while it collects and waits up to
+# this many milliseconds more. 0 = never wait (a one-shot table draws `—`).
+#CPU_SAMPLE_MS="250"
+
 # Disk usage of the filesystems that hold Docker's data root, every slot's
 # work folder and DISK_PATHS, once per filesystem, labelled with what is on
 # it, in percent: green below WARN, yellow from WARN, red and a `health`

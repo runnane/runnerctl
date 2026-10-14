@@ -231,18 +231,27 @@ an idle slot, how long it has been idle and how many jobs it has finished
 since it started:
 
 ```
-runnerctl 0.7.0 — Host: 16 cores, 62Gi RAM, 48Gi available — Disk: /var/lib/docker [docker] 96% (37.3G free), /srv/runners [work] 41% (602.4G free) — last 1h: 1 OOM kill
+runnerctl 0.7.0 — Host: 16 cores, 62Gi RAM, 48Gi available — load 9.4/16 — Disk: /var/lib/docker [docker] 96% (37.3G free), /srv/runners [work] 41% (602.4G free) — last 1h: 1 OOM kill
 
-IDX RUNNER                 PROFILE  ACTIVE                              SINCE    ENABLED   MAX    HIGH   USED        PRESS  RESTART  ENVFILE WORKING-ON
-0   org.host-1             ci       active/running                     3d 4h    enabled   26.0G  25.0G  3.1G/24.9G  0.4%   always   —       my-app:test (12m)
-1   org.host-2             ci       active/running ↻3 (last: oom-kill)  2d 7h    enabled   26.0G  25.0G  128M        0.0%   always   —       idle 2h31m (7 jobs)
-2   org.host-3             deploy   inactive/dead                      6d       disabled  —      —      —           —      always   —       —
+IDX RUNNER                 PROFILE  ACTIVE                              SINCE    ENABLED   MAX    HIGH   USED        PRESS  CPU   RESTART  ENVFILE WORKING-ON
+0   org.host-1             ci       active/running                     3d 4h    enabled   26.0G  25.0G  3.1G/24.9G  0.4%   7.8   always   —       my-app:test (12m)
+1   org.host-2             ci       active/running ↻3 (last: oom-kill)  2d 7h    enabled   26.0G  25.0G  128M        0.0%   0.0   always   —       idle 2h31m (7 jobs)
+2   org.host-3             deploy   inactive/dead                      6d       disabled  —      —      —           —      —     always   —       —
 ```
 
 The header leads with the version of the `runnerctl` that is running — each
 host only picks up a new one when `upgrade` runs, so on a fleet that is
 otherwise only visible through a second command — then the host's cores and
 memory.
+
+`load 9.4/16` is the host's 1-minute load average against its core count —
+the quickest read of which box is overcommitted. Green below
+`LOAD_WARN_RATIO` (config, default `1.0`: load equal to the cores), yellow
+from it, red from `LOAD_CRIT_RATIO` (default `2.0`); both are ratios of load
+to cores with at most two decimals, compared as whole hundredths rather than
+by floating point. Left out when `/proc/loadavg` cannot be read. It is
+informational: `health` does not treat load as a problem; `fleet`'s summary
+line counts the hosts at `LOAD_CRIT_RATIO` as `N hosts overloaded`.
 
 `Disk:` lists the filesystems a build pool fills, not every disk: the one
 holding Docker's data root (`DISK_DOCKER_DIR`, default `/var/lib/docker`),
@@ -298,6 +307,27 @@ restarting the slot. The cgroup's `memory.events` counters (`high`: times
 `memory.high` throttled it, `max`: times it hit `memory.max`, `oom_kill`:
 processes the OOM killer took, all since the unit started) are read at the
 same time and reported in `--json` and in `health`'s line.
+
+`CPU` is the cores the slot's cgroup used over the last sample — `cpu.stat`'s
+`usage_usec` read twice, the difference divided by the time between the two
+reads: `7.8` is a build keeping almost eight cores busy, `0.0` a slot doing
+nothing. `watch` takes the previous tick as the first read, so it costs
+nothing there. A one-shot `status` table reads every slot as it collects
+them and once more at the end, waiting until at least `CPU_SAMPLE_MS`
+(config, default 250) have passed since the last first read — the collecting
+itself counts toward that, so a slow host waits for nothing; `0` never waits
+and draws `—`. It does not wait when the column is not drawn (`--narrow`)
+and no job is `STALLED`. `—` means unknown, never zero: no cgroup, CPU
+accounting off, or a counter that went backwards between the two reads (the
+unit restarted). `status --json` never waits — it reports the cumulative
+counter and leaves the rate to the poller.
+
+On a `STALLED` job the CPU rate is added to the cell: `STALLED (idle CPU,
+likely hung)` below a tenth of a core, `STALLED (still computing)` from it —
+a job that has run past the threshold at 0 % is wedged, one at 800 % is a
+slow build. It is informational only: `--if-stalled`, `health` and `fleet
+watch`'s problem view decide on the stall threshold exactly as before, and
+act on a stalled job whatever its CPU.
 
 `SINCE` is measured from systemd's active-enter timestamp for a running slot
 and from its inactive-enter timestamp for a stopped or failed one (`—` for a
@@ -632,7 +662,7 @@ as before.
 
 The redraws keep coming at `--interval` while a confirm line is up, so the
 table under it is current when you answer. On a terminal narrower than the
-table the `MAX`, `HIGH` and `ENVFILE` columns are dropped, never
+table the `MAX`, `HIGH`, `CPU` and `ENVFILE` columns are dropped, never
 `WORKING-ON` — its `idle 2h31m (7 jobs)` is what tells you a slot is safe to
 act on. They come back once the full table fits with 22 columns to spare, so
 a terminal near the edge does not flip the table on every redraw.
@@ -651,13 +681,14 @@ memory values); no `jq` needed to produce it, and the table and the JSON are
 rendered from one collector, so they cannot disagree on a value:
 
 ```json
-{"runnerctl":"0.7.0","host":{"name":"build-1","cores":16,"mem_total":64424509440,"mem_available":51539607552,"disks":[{"mount":"/","device":"/dev/nvme0n1p2","fstype":"ext4","size":500000000000,"used":120000000000,"avail":380000000000,"use_pct":24,"roles":["docker","work"]}],"events":{"window":3600,"oom_kills":0,"cgroup_oom_kills":1,"disk_full":0,"last_oom":null,"last_oom_process":null,"last_disk_full":null,"last_disk_full_source":null}},
+{"runnerctl":"0.7.0","host":{"name":"build-1","cores":16,"mem_total":64424509440,"mem_available":51539607552,"load":[9.42,7.10,5.03],"disks":[{"mount":"/","device":"/dev/nvme0n1p2","fstype":"ext4","size":500000000000,"used":120000000000,"avail":380000000000,"use_pct":24,"roles":["docker","work"]}],"events":{"window":3600,"oom_kills":0,"cgroup_oom_kills":1,"disk_full":0,"last_oom":null,"last_oom_process":null,"last_disk_full":null,"last_disk_full_source":null}},
  "slots":[
   {"idx":0,"unit":"actions.runner.org.host-1.service","name":"org.host-1",
    "active":"active","sub":"running","enabled":"enabled",
    "memory_max":27917287424,"memory_high":23622320128,"memory_current":3328599552,"memory_peak":26743545600,
    "restart":"always","env_file":null,"since":1757622000,
    "restarts":0,"result":"success","last_restart_reason":null,"profile":"ci",
+   "cpu_usage_usec":81234567890,"cpu_pressure":{"some_avg10":3.20,"some_avg60":2.75,"some_total":123456789},
    "job":{"repo":"my-app","name":"test","since":1757707200,"stalled":false,
           "workflow":"CI","run_id":1234567890,"run_attempt":1,"run_number":57,"ref":"main",
           "sha":"0123456789abcdef0123456789abcdef01234567","actor":"octocat","event":"push",
@@ -689,7 +720,11 @@ could be read, so `job` may be present but `idle_since` never is) or
 `"no-access"` — the note under the table, per slot, and `leaked_procs`: how
 many processes a finished job left in an idle slot's cgroup (the table's
 `+N leaked`; `0` when none, null while busy or when the cgroup cannot be
-read), `memory_events` (`{"high","max","oom_kill"}` from the cgroup's
+read), `cpu_usage_usec` (the cgroup's cumulative CPU time from `cpu.stat`,
+microseconds — a poller divides the difference of two payloads by the time
+between them for the `CPU` column's rate; null with CPU accounting off, never
+0) and `cpu_pressure` (`{"some_avg10","some_avg60","some_total"}` from
+`cpu.pressure`, null likewise), `memory_events` (`{"high","max","oom_kill"}` from the cgroup's
 `memory.events`, counts since the unit started) and `memory_pressure`
 (`{"full_avg10","full_avg60","full_total"}` from `memory.pressure` —
 percentages and total stall microseconds; the `PRESS` column is
@@ -697,6 +732,7 @@ percentages and total stall microseconds; the `PRESS` column is
 carries `name` (the host's own `hostname`, null when it cannot be read),
 `cores`
 (`nproc`), `mem_total` / `mem_available` (bytes, from `/proc/meminfo`),
+`load` (`[1m, 5m, 15m]` from `/proc/loadavg`, null when it cannot be read),
 `disks` (one object per watched filesystem — `mount`, `device`, `fstype`,
 `size`, `used`, `avail` in bytes, `use_pct` and `roles`, e.g.
 `["docker","work"]` — the filesystems the header's `Disk:`
@@ -947,6 +983,7 @@ out, so a healthy fleet is a short line:
 | `N leaking` | slots whose finished job left processes behind. |
 | `N host(s) disk crit` / `disk warn` | hosts with a partition past this node's `DISK_CRIT_PCT` / `DISK_WARN_PCT`, each host once, at its worst partition. |
 | `N host(s) OOM/disk-full` | hosts with an OOM kill or a disk-full line in their event window. |
+| `N host(s) overloaded` | hosts whose 1-minute load is this node's `LOAD_CRIT_RATIO` × their cores or more. Only the red level counts: a pool at `LOAD_WARN_RATIO` (every core busy) is a pool doing its job. A host that does not report a load, or reports one that is not a plain decimal, is not counted. |
 | `capacity 1 free of 3` | idle slots, of the active ones — what can take a job now. Printed whenever there are slots, `0 free` included. |
 | `N versions` | distinct `runnerctl` versions, **this node's included**, when there is more than one — so a fleet level with itself but behind this node counts 2. A version that is not `X.Y.Z` is one more. |
 
@@ -962,12 +999,20 @@ answering host; a host that did not answer is not dialled again.
 `fleet status --json` carries no summary.
 
 Each host that answered gets a **host line** above its slots: the `runnerctl`
-version it runs, then the `Disk:` and `last 1h:` part of its own `status`
-header. Each partition on it is green, yellow or red: `fleet watch` keeps the
-colours the host painted, and `fleet status` (which asks hosts for plain
-output) paints the line itself from the percentages, against this node's
-`DISK_WARN_PCT` / `DISK_CRIT_PCT`. The `fleet watch` cursor never stops on a
-host line.
+version it runs, then the `load`, `Disk:` and `last 1h:` part of its own
+`status` header. The load and each partition on it are green, yellow or red:
+`fleet watch` keeps the colours the host painted, and `fleet status` (which
+asks hosts for plain output) paints the line itself from the numbers, against
+this node's `LOAD_WARN_RATIO` / `LOAD_CRIT_RATIO` and `DISK_WARN_PCT` /
+`DISK_CRIT_PCT`. The `fleet watch` cursor never stops on a host line.
+
+A host on a release from before the `CPU` column answers with a table
+without it. Its rows come under a column header of their own — the header is
+printed again whenever a host's differs from the one above it — so on a
+fleet mid-upgrade the table shows two header shapes until every host is
+upgraded. A central node older than the `load` fragment, under `fleet status
+--color always`, paints a newer host's whole host line red, as it paints
+events; the text is right, only its colour is not.
 
 The version is compared with **this node's own**, not only with the other
 hosts': a fleet uniformly one release behind the central node is level with

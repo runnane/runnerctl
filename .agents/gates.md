@@ -290,6 +290,22 @@ Traps:
   with a copy of `sleep` named so its comm is hostile; it prints a `skip` where
   that cgroup cannot be read.
 
+- **CPU and load (GHR-79) are stub hooks too, and their real readers take a
+  FILE.** The stub shadows `cgroup_cpu_facts`, `host_loadavg`, `now_us` and
+  `cpu_window_wait` (the one wait a one-shot table makes, logged
+  `probe:cpu_window_wait MS` — not `pause`, which --when-idle's cases count).
+  Unset, no slot has CPU accounting and no load is readable, so every CPU
+  cell is `—`, nothing waits and the header has no `load` fragment — every
+  case from before reads what it read. `RUNNERCTL_STUB_CPU="N:MILLICORES …"`
+  gives slot-N a counter (a different base per slot, so a rate against the
+  wrong slot's sample is visibly wrong), `RUNNERCTL_STUB_CPU_RESET=1` sends it
+  backwards, `RUNNERCTL_STUB_LOAD="L1 L5 L15"` is /proc/loadavg and
+  `RUNNERCTL_STUB_FLEET_NOCPU="host…"` makes a fleet host draw the table of a
+  release from before the column. The sample clock moves only by
+  `cpu_window_wait`, or by whole seconds under `RUNNERCTL_STUB_CLOCK=1`, and is
+  kept per remote host. The real parsers — `loadavg_read`, `cpu_stat_usage`,
+  `cpu_pressure_some` — are covered by `run_fn` over fixture files.
+
 ## migrate-test
 
 `bash tests/migrate-test.sh`. Runs `runnerctl migrate` against
