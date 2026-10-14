@@ -1768,6 +1768,45 @@ case_journal_job_args_use_grep_not_a_window() {
   expect_no_out '^-n$'
 }
 
+# --- GHR-65: a -g search with no match is not "no access" --------------------
+# The real journal_job_lines over a journalctl function (run_fn does not load
+# the stub config, so nothing shadows it). The fake answers as journalctl
+# does: the -n 1 access probe is JC_ACCESS (0 readable, 1 not), the -g search
+# is JC_GREP (1 = nothing matched) and prints one job line when it matches.
+# shellcheck disable=SC2016  # evaluated by the child shell, not here
+JC_FAKE='journalctl() {
+  case " $* " in
+    *" -g "*) echo "g:$*" >>"$JC_LOG"; [ "$JC_GREP" = 0 ] && echo "1000000000.000000 x: Running job: t"; return "$JC_GREP" ;;
+    *) echo "p:$*" >>"$JC_LOG"; return "$JC_ACCESS" ;;
+  esac
+}'
+
+case_journal_job_lines_no_match_is_empty_success() {
+  : >"$TMP/jc.log"
+  JC_LOG="$TMP/jc.log" JC_ACCESS=0 JC_GREP=1 run_fn eval "$JC_FAKE
+    rc=0; journal_job_lines u.service inv || rc=\$?; echo rc=\$rc"
+  expect_out '^rc=0$'
+  expect_no_out 'Running job'
+  grep -q '^p:--system -q --no-pager -n 1$' "$TMP/jc.log" || FAILS+=("access probe not run")
+  grep -q '^g:' "$TMP/jc.log" || FAILS+=("search not run")
+}
+
+case_journal_job_lines_no_access_fails_without_searching() {
+  : >"$TMP/jc.log"
+  JC_LOG="$TMP/jc.log" JC_ACCESS=1 JC_GREP=1 run_fn eval "$JC_FAKE
+    rc=0; journal_job_lines u.service inv || rc=\$?; echo rc=\$rc"
+  expect_out '^rc=1$'
+  if grep -q '^g:' "$TMP/jc.log"; then FAILS+=("searched a journal it could not read"); fi
+}
+
+case_journal_job_lines_match_passes_through() {
+  : >"$TMP/jc.log"
+  JC_LOG="$TMP/jc.log" JC_ACCESS=0 JC_GREP=0 run_fn eval "$JC_FAKE
+    rc=0; journal_job_lines u.service inv || rc=\$?; echo rc=\$rc"
+  expect_out 'Running job: t$'
+  expect_out '^rc=0$'
+}
+
 case_journal_job_args_without_invocation_id() {
   run_fn journal_job_args actions.runner.example.slot-1.service
   expect_rc 0
@@ -9893,6 +9932,9 @@ t "json_str: escapes backslash, quote, newline, control chars"         case_json
 # --- GHR-26: journal fetch filters with -g ------------------------------------
 t "journal_job_args: -g with the job pattern, invocation scope, no -n"  case_journal_job_args_use_grep_not_a_window
 t "journal_job_args: no invocation id -> no scope argument"             case_journal_job_args_without_invocation_id
+t "journal_job_lines: a -g search with no match is empty success (GHR-65)"  case_journal_job_lines_no_match_is_empty_success
+t "journal_job_lines: no access fails and never searches (GHR-65)"          case_journal_job_lines_no_access_fails_without_searching
+t "journal_job_lines: a matching search passes its lines through (GHR-65)"  case_journal_job_lines_match_passes_through
 t "status --stall-after 600: a 12m job is STALLED, note once"          case_status_stall_after_flags_slot1
 t "status --stall-after: = form, and the threshold is inclusive"       case_status_stall_after_equals_form_and_boundary
 t "status --stall-after 0: the flag is off"                            case_status_stall_after_zero_disables
