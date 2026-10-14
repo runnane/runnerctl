@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.21.0](https://github.com/runnane/runnerctl/compare/v0.20.0...v0.21.0) (2026-10-14)
+
+
+### Features
+
+* Enter opens a slot detail pane in watch and fleet watch — identity, state, the job's run, memory with a bar, leaks and the host block, with h for the host alone (GHR-76) ([#92](https://github.com/runnane/runnerctl/issues/92)) ([1455739](https://github.com/runnane/runnerctl/commit/1455739a498c0c87bde0670a3ca325aad8c044a5))
+* every host-changing command leaves one journal record, fleet mutations a central log line with --origin from the central node, and history / fleet history read them back (GHR-88) ([#106](https://github.com/runnane/runnerctl/issues/106)) ([9aa407b](https://github.com/runnane/runnerctl/commit/9aa407b048665413188d3c939914ae3e54fe5871))
+* fleet host lines carry each host's runnerctl version, and skew is measured against the central node (GHR-77) ([#102](https://github.com/runnane/runnerctl/issues/102)) ([46b3fe9](https://github.com/runnane/runnerctl/commit/46b3fe9c27aa3683cabc804f962b7a3d2bf9fc7c))
+* fleet upgrade --push sends this node's own runnerctl over ssh, each host checks its sha256, installs it as a file and is read back by checksum, and --push --check reports same / differs / absent / newer (GHR-83) ([#110](https://github.com/runnane/runnerctl/issues/110)) ([369e01a](https://github.com/runnane/runnerctl/commit/369e01aa27dc712d149c69774f11fa928051f299))
+* FLEET_SUDO=1 runs mutating fan-outs as `sudo -n runnerctl <verb>` so one sudoers line naming runnerctl is enough, and a host that opts in with SUDO_CONTRACT=narrow refuses under sudo a caller-chosen config, a writable script and each flag that would widen the grant back to root (GHR-89) ([#101](https://github.com/runnane/runnerctl/issues/101)) ([7a0d0c7](https://github.com/runnane/runnerctl/commit/7a0d0c7f0f0610efb8773ed7d273f1215b254623))
+* status shows the host's load against its cores and a CPU column of cores in use per slot, with an informational CPU note on STALLED jobs; --json carries host.load, cpu_usage_usec and cpu_pressure (GHR-79) ([#103](https://github.com/runnane/runnerctl/issues/103)) ([f4e02fa](https://github.com/runnane/runnerctl/commit/f4e02fabba5f17c270430873b8b5c50e876870c8))
+* upgrade verifies a release download against its published runnerctl.sha256, keeps the script it replaces as .prev, and upgrade --rollback / fleet upgrade --rollback put it back (GHR-84) ([#100](https://github.com/runnane/runnerctl/issues/100)) ([a82ff4c](https://github.com/runnane/runnerctl/commit/a82ff4c9b924ed163342dab84c597e3afcdf5b86))
+
+
+### Bug Fixes
+
+* a number a host writes reaches arithmetic only through one guard — a leading zero or an over-long digit string is unknown, not an octal error that ends fleet watch (GHR-104) ([#96](https://github.com/runnane/runnerctl/issues/96)) ([e1b6127](https://github.com/runnane/runnerctl/commit/e1b612716f8e37dd511201f8891b689d845eb6fb))
+* compose-reap takes ids and times from docker's own fields and labels as JSON, so no label chooses what --apply removes, and a record that does not parse skips its project (GHR-109) ([#99](https://github.com/runnane/runnerctl/issues/99)) ([fc83a2c](https://github.com/runnane/runnerctl/commit/fc83a2c889015abf0e607d20a3e9ea895d5f5386))
+* fleet relays only a host's SGR colours — every other escape sequence and control byte a remote sends is removed whole before it is printed (GHR-101) ([#95](https://github.com/runnane/runnerctl/issues/95)) ([acecfdc](https://github.com/runnane/runnerctl/commit/acecfdcc78640fbaf76d875f59f440afd4c8a025))
+* health, --if-stalled, reap, kill and their watch confirm lines draw a job's and a process's text with every escape sequence removed whole, and a comm with a comma keeps its pid (GHR-100) ([#97](https://github.com/runnane/runnerctl/issues/97)) ([4bfad76](https://github.com/runnane/runnerctl/commit/4bfad76fd03bd2b01ad15a39e7cbedd11c118692))
+* install and upgrade replace a symlinked .retired/.legacy/.prev destination instead of moving into it, and install_file stages with cp --remove-destination so a planted staging symlink is not written through (GHR-111) ([#105](https://github.com/runnane/runnerctl/issues/105)) ([0ae581c](https://github.com/runnane/runnerctl/commit/0ae581c19138d3b9147d707a794fbe9a66205541))
+* provision and deprovision write and remove the runner's systemd unit themselves instead of running the runner's own svc.sh as root from a directory the runner user owns (GHR-110) ([#104](https://github.com/runnane/runnerctl/issues/104)) ([d4a91e0](https://github.com/runnane/runnerctl/commit/d4a91e04a73d7ce7b6c7c8bbc2c31f50a914af5b))
+* provision refuses a runner root, or a parent of it, that root does not own or others can write, and deprovision removes a slot under one as its runner user (GHR-121) ([#108](https://github.com/runnane/runnerctl/issues/108)) ([a0d22b0](https://github.com/runnane/runnerctl/commit/a0d22b0050b039d2267a782be966c479deee0404))
+* provision unpacks and chowns each slot only inside a root-only staging directory it just created and renames it into place, so --replace never writes through a runner-owned tree (GHR-116) ([#107](https://github.com/runnane/runnerctl/issues/107)) ([cebaa97](https://github.com/runnane/runnerctl/commit/cebaa97755259300d660e44f9744d7fb06c44896))
+* the slot pane and fleet watch's job cell draw a job's text with every escape sequence removed whole, as the table does (GHR-108) ([#98](https://github.com/runnane/runnerctl/issues/98)) ([6bcb9ca](https://github.com/runnane/runnerctl/commit/6bcb9ca2474916d7b37f79cded77726eaf9c4766))
+
 ## [0.20.0](https://github.com/runnane/runnerctl/compare/v0.19.0...v0.20.0) (2026-10-13)
 
 
