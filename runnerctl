@@ -939,12 +939,18 @@ fleet_log_result() { # HOST[/SLOT] RC
   FLEET_LOG_RESULTS+="${FLEET_LOG_RESULTS:+ }$1=$2"
 }
 fleet_log_finish() {
-  local f line cmd
+  local cmd="$FLEET_LOG_CMD" results="$FLEET_LOG_RESULTS"
   [ -n "$FLEET_LOG_CMD" ] && [ "$FLEET_LOG_PID" = "$BASHPID" ] || return 0
-  audit_clean "$FLEET_LOG_CMD" 1000; cmd="$AUDIT_CLEAN"
-  audit_clean "${FLEET_LOG_RESULTS:-no host answered}" 4000
-  line="$(date -u +%Y-%m-%dT%H:%M:%SZ) $(audit_actor) $cmd — $AUDIT_CLEAN"
   FLEET_LOG_CMD="" FLEET_LOG_RESULTS=""
+  fleet_log_write "$cmd" "$results"
+}
+# One line, now, with nothing armed: `fleet watch`'s background actions
+# (GHR-125) each write theirs when the action ends, or when the watch does.
+fleet_log_write() { # COMMAND-TEXT RESULTS
+  local f line cmd
+  audit_clean "$1" 1000; cmd="$AUDIT_CLEAN"
+  audit_clean "${2:-no host answered}" 4000
+  line="$(date -u +%Y-%m-%dT%H:%M:%SZ) $(audit_actor) $cmd — $AUDIT_CLEAN"
   f="$(fleet_log_path)"
   # umask in a subshell: the directory and the file are born private, and
   # nothing about an existing one is changed.
@@ -9161,6 +9167,8 @@ fleet_watch_reap() {
 fleet_watch_cleanup() {
   term_cursor show
   viewport_close
+  # GHR-125: the actions still out, before their directory goes.
+  fleet_watch_act_quit
   fleet_watch_reap
   fleet_cleanup
   [ -z "$FW_TMP" ] || rm -rf "$FW_TMP"
@@ -9760,6 +9768,9 @@ fleet_watch_slot_action() { # KEY HOST NAME
     FW_NOTICE="$lbl: $(fleet_watch_run_url "$host" "$name")"
     return 0
   fi
+  # GHR-125: one action per host. Refused before the facts read, so a key on
+  # a busy host issues nothing at all.
+  ! fleet_watch_act_refuse "$host" || return 0
   fleet_watch_facts "$host" "$name" || return 0
   runs="runs on $host: ${FLEET_PRIV[*]}"
   case "$1" in
@@ -9811,40 +9822,265 @@ fleet_watch_slot_action() { # KEY HOST NAME
   esac
 }
 
-# The confirmed action, over the held connection. The remote's last line is
-# the next frame's notice; a failure is a notice carrying fleet_error_text's
-# remedy (a sudo refusal says what sudoers needs), never fatal to the watch.
-# FW_REFRESH asks the loop for a fresh fan-out, so the frame after an action
-# shows its effect rather than the table from before it.
-# The slot name was read off the host's own frame, and ssh hands its argv to
-# the remote shell as one string: %q keeps a systemd-escaped name (`\x2d`)
-# or anything else odd a single argument there. A plain name is unchanged.
+# The confirmed action, over the held connection — in the background since
+# GHR-125 (see the block below). The slot name was read off the host's own
+# frame, and ssh hands its argv to the remote shell as one string: %q keeps a
+# systemd-escaped name (`\x2d`) or anything else odd a single argument there. A
+# plain name is unchanged.
 #
-# GHR-81: on the mutating budget, not FLEET_TIMEOUT. The watch is held for as
-# long as the action takes either way — a restart that sits out a wedged
-# job's TimeoutStopSec is minutes — but giving up at 30 s only made the frame
-# say `failed` about an action that then completed behind it.
+# GHR-81: on the mutating budget, not FLEET_TIMEOUT or FLEET_WATCH_TIMEOUT: a
+# restart that sits out a wedged job's TimeoutStopSec is minutes, and giving
+# up sooner only made the frame say `failed` about an action that then
+# completed behind it.
 fleet_watch_run_action() {
-  local rc=0 last budget
+  local budget
   budget="$(fleet_mutate_budget "$FW_ACTION" 1)"
   fleet_priv_cmd
   printf '\nrunning on %s: %s %s %s\n' "$FW_ACT_HOST" "${FLEET_PRIV[*]}" "$FW_ACTION" "$FW_ACT_NAME"
-  # GHR-88: with the origin, and recorded on this node as the command line
-  # the key stands for. GHR-101: out and err are relayed — either one becomes
-  # the next frame's notice.
+  # GHR-88: recorded on this node as the command line the key stands for.
+  fleet_watch_act_start "$FW_ACT_HOST" "$FW_ACT_NAME on $FW_ACT_HOST" "$FW_ACTION" \
+    "fleet $FW_ACTION --host $FW_ACT_HOST $FW_ACT_NAME (fleet watch)" "$budget" \
+    "$FW_ACTION" "$(printf %q "$FW_ACT_NAME")" || true
+  FW_ACTION="" FW_PROMPT=""
+}
+
+# --- Fleet watch: an action in the background (GHR-125) -------------------------
+# A confirmed action used to run in the foreground, and the frame froze until
+# the remote returned — for a --when-idle restart or a drain, up to
+# WAIT_TIMEOUT per slot. Now it is a job of its own over the host's held
+# connection, as a tick's fetch is (GHR-74), and the watch goes on around it:
+# the ticks keep coming, the cursor and the view keys keep working.
+#
+#   * ONE ACTION PER HOST. FW_ACT_PID is indexed like FLEET_HOSTS; an action
+#     key on a host that has one out says so and issues nothing — not even its
+#     facts read (fleet_watch_act_refuse). A key on another host starts that
+#     host's own. A slot action, a host action and each host of a marked set
+#     are all one thing here: fleet_watch_act_start takes the host, the words
+#     the notices name it by, its FLEET_LOG text, its budget and the remote
+#     argv, and the rest is the same for every caller.
+#   * The job is fleet_call_mutating — the origin, the older-host retry, the
+#     relay — on the budget it is handed (GHR-81's, for every key so far),
+#     writing the remote's stdout and stderr into FW_TMP/act.<i>/ as they come
+#     and its exit status into `rc` LAST, so the loop never takes half a result.
+#   * While it runs the frame has a line for it between the table and the
+#     legend: the latest complete line the remote has written (its progress
+#     lines — `waiting for slot-1 (job-a) ... 2m`), made safe with relay_safe,
+#     which is the only filter between those bytes and the terminal until the
+#     call ends. At most FW_ACT_LINES of them, the last saying how many more:
+#     the lines are chrome the viewport fits the window around (GHR-73), and a
+#     fleet of actions must not leave the table no rows.
+#   * Esc DETACHES. The line goes and the legend stops offering it; the job,
+#     and the remote command, carry on — nothing is signalled — and its notice
+#     still arrives. It cancels nothing, and says so.
+#   * When it ends: its notice (the last line, or the error with its remedy —
+#     a budget overrun in GHR-81's may-still-be-running words), its FLEET_LOG
+#     line, and a fresh round so the frame shows the effect. A notice lives as
+#     long as any notice does — until the next key — and one that lands while
+#     a confirm line is up waits under it until that is answered.
+#   * q, Ctrl-C and every other way out end the LOCAL side only: the job, and
+#     the ssh under it (proc_tree_kill, as fleet_watch_reap ends a fetch). The
+#     remote command is not signalled, and the watch says it was still running
+#     and where to look. Its FLEET_LOG line says `HOST=detached`: the one
+#     result this node never learnt.
+#
+# The record is FLEET_LOG's alone. The job is a subshell, so it inherits no
+# EXIT trap and arms nothing, and the watch writes exactly one line per action
+# — on the action's end while the watch is running (Esc or not: detaching stops
+# the view, not the command), else `detached` on the way out. Neither is a
+# record of an interruption: nothing interrupted the command.
+FW_ACT_PID=() FW_ACT_LABEL=() FW_ACT_VERB=() FW_ACT_LOG=() FW_ACT_BUDGET=() FW_ACT_DETACHED=() FW_ACT_SHOWN=()
+FW_ACT_LINES=3 FW_ACT_LAUNCHED=false FW_ACT_DRAW=false FW_ACT_NOTICE=false
+FW_ACT_HELD="" FW_ACT_FOOT="" ACT_LAST="" FLEET_HOST_I=""
+
+# HOST's position in FLEET_HOSTS, into FLEET_HOST_I; 1 when it is not watched.
+fleet_host_index() { # HOST
+  local i
+  FLEET_HOST_I=""
+  for i in "${!FLEET_HOSTS[@]}"; do
+    if [ "${FLEET_HOSTS[$i]}" = "$1" ]; then FLEET_HOST_I="$i"; return 0; fi
+  done
+  return 1
+}
+
+# The one-per-host rule: 0, with FW_NOTICE saying why, when HOST has an
+# action out — detached or not, since its command is still running there.
+fleet_watch_act_refuse() { # HOST
+  local i
+  fleet_host_index "$1" || return 1
+  i="$FLEET_HOST_I"
+  [ -n "${FW_ACT_PID[$i]:-}" ] || return 1
+  FW_NOTICE="$1: busy — ${FW_ACT_VERB[$i]} of ${FW_ACT_LABEL[$i]} is still running there${FW_ACT_DETACHED[$i]:+ (detached)}; one action per host at a time, nothing issued"
+}
+
+# Start an action on HOST. LABEL and VERB are what its lines say
+# (`example.slot-1 on build-1`, `restart`), LOG-TEXT its FLEET_LOG command,
+# BUDGET its seconds. 1, with FW_NOTICE, when the host is busy.
+fleet_watch_act_start() { # HOST LABEL VERB LOG-TEXT BUDGET REMOTE-ARGS...
+  local i d
+  fleet_host_index "$1" || return 1
+  ! fleet_watch_act_refuse "$1" || return 1
+  i="$FLEET_HOST_I" d="$FW_TMP/act.$FLEET_HOST_I"
+  rm -rf "$d"
+  mkdir "$d"
+  FW_ACT_LABEL[i]="$2" FW_ACT_VERB[i]="$3" FW_ACT_LOG[i]="$4" FW_ACT_BUDGET[i]="$5"
+  FW_ACT_DETACHED[i]="" FW_ACT_SHOWN[i]=""
+  shift 5
+  # GHR-88: the origin the call carries, read here so the job inherits it.
   fleet_origin
-  fleet_log_begin "fleet $FW_ACTION --host $FW_ACT_HOST $FW_ACT_NAME (fleet watch)"
-  fleet_call_mutating "$FW_ACT_HOST" "$FW_TMP/out" "$FW_TMP/err" "$budget" "$FW_ACTION" "$(printf %q "$FW_ACT_NAME")"
-  rc="$FLEET_CALL_RC"
-  fleet_log_result "$FW_ACT_HOST" "$rc"
-  fleet_log_finish
-  if [ "$rc" = 0 ]; then
-    last="$(grep . "$FW_TMP/out" | tail -1 || true)"
-    FW_NOTICE="$FW_ACT_NAME on $FW_ACT_HOST: ${last:-$FW_ACTION done}"
-  else
-    FW_NOTICE="$FW_ACT_NAME on $FW_ACT_HOST: $FW_ACTION failed — $(fleet_error_text "$rc" "$FW_TMP/err" "$budget" mutating)"
+  # Nothing to say on the terminal, and nothing to read from it: every byte
+  # it has is in its files.
+  fleet_watch_act_job "$i" "${FW_ACT_BUDGET[$i]}" "$@" </dev/null >/dev/null 2>&1 &
+  FW_ACT_PID[i]="$!"
+  # The loop's first look at it is one FW_POLL on, as for a round's fetches.
+  FW_ACT_LAUNCHED=true
+}
+fleet_watch_act_job() { # INDEX BUDGET REMOTE-ARGS...
+  local i="$1" d="$FW_TMP/act.$1"
+  shift
+  fleet_call_mutating "${FLEET_HOSTS[$i]}" "$d/out" "$d/err" "$@"
+  echo "$FLEET_CALL_RC" >"$d/rc.new"
+  mv -f "$d/rc.new" "$d/rc"
+}
+
+# Whether any action is out / any is still being watched (not detached).
+fleet_watch_act_out() {
+  local i
+  for i in "${!FW_ACT_PID[@]}"; do [ -z "${FW_ACT_PID[$i]}" ] || return 0; done
+  return 1
+}
+fleet_watch_act_attached() {
+  local i
+  for i in "${!FW_ACT_PID[@]}"; do
+    [[ -z "${FW_ACT_PID[$i]}" || -n "${FW_ACT_DETACHED[$i]}" ]] || return 0
+  done
+  return 1
+}
+
+# The last non-empty COMPLETE line of FILE made safe — relay_safe, PLAIN for a
+# line that is never painted — into ACT_LAST. A line the remote is still
+# writing has no newline yet, and `read` hands it back false: it is not shown
+# half-written.
+fleet_watch_act_last() { # FILE [PLAIN]
+  local line latest=""
+  ACT_LAST=""
+  [ -s "$1" ] || return 0
+  while IFS= read -r line; do [ -z "$line" ] || latest="$line"; done <"$1"
+  relay_safe "$latest" ${2:+plain}
+  ACT_LAST="$RELAY_SAFE"
+}
+
+# A running action's line, into FW_ACT_SHOWN; FW_ACT_DRAW when it changed.
+fleet_watch_act_progress() { # INDEX
+  local i="$1" s
+  fleet_watch_act_last "$FW_TMP/act.$i/out" plain
+  [ -n "$ACT_LAST" ] || fleet_watch_act_last "$FW_TMP/act.$i/err" plain
+  s="${FW_ACT_LABEL[$i]}: ${FW_ACT_VERB[$i]} running${ACT_LAST:+ — $ACT_LAST}"
+  [ "$s" = "${FW_ACT_SHOWN[$i]:-}" ] || FW_ACT_SHOWN[i]="$s" FW_ACT_DRAW=true
+}
+
+# A notice from an action that ended. Kept beside one that landed since the
+# last key; held while a confirm line is up, which it would otherwise replace.
+fleet_watch_act_notice() { # TEXT
+  if [ -n "$FW_PROMPT" ]; then FW_ACT_HELD+="${FW_ACT_HELD:+ · }$1"; return 0; fi
+  if $FW_ACT_NOTICE && [ -n "$FW_NOTICE" ]; then FW_NOTICE+=" · $1"; else FW_NOTICE="$1"; fi
+  FW_ACT_NOTICE=true
+}
+
+# Take in every action that has ended, and each running one's latest line.
+# 0 when one ended: the loop then asks for a fresh round, so the next frame
+# shows what the action did. A job gone without its `rc` — killed from
+# outside — is an answer too, as for a fetch (fleet_watch_collect).
+fleet_watch_act_collect() {
+  local i d rc n ended=1
+  for i in "${!FW_ACT_PID[@]}"; do
+    [ -n "${FW_ACT_PID[$i]}" ] || continue
+    d="$FW_TMP/act.$i"
+    if [ ! -e "$d/rc" ]; then
+      if kill -0 "${FW_ACT_PID[$i]}" 2>/dev/null; then
+        [ -n "${FW_ACT_DETACHED[$i]}" ] || fleet_watch_act_progress "$i"
+        continue
+      fi
+      if [ ! -e "$d/rc" ]; then
+        echo 255 >"$d/rc"
+        echo "the call ended without an answer" >"$d/err"
+      fi
+    fi
+    rc="$(cat "$d/rc" 2>/dev/null || echo 255)"
+    if [ "$rc" = 0 ]; then
+      fleet_watch_act_last "$d/out"
+      n="${FW_ACT_LABEL[$i]}: ${ACT_LAST:-${FW_ACT_VERB[$i]} done}"
+    else
+      n="${FW_ACT_LABEL[$i]}: ${FW_ACT_VERB[$i]} failed — $(fleet_error_text "$rc" "$d/err" "${FW_ACT_BUDGET[$i]}" mutating)"
+    fi
+    fleet_log_write "${FW_ACT_LOG[$i]}" "${FLEET_HOSTS[$i]}=$rc"
+    fleet_watch_act_notice "$n"
+    FW_ACT_PID[i]="" FW_ACT_SHOWN[i]="" FW_ACT_DETACHED[i]=""
+    rm -rf "$d"
+    ended=0
+  done
+  return "$ended"
+}
+
+# Esc: stop watching the cursor's host's action — or, with none there, every
+# action still watched. Nothing is signalled.
+fleet_watch_act_detach() {
+  local i at="" where="" n=0
+  if fleet_host_index "$FW_HOST" && [[ -n "${FW_ACT_PID[$FLEET_HOST_I]:-}" && -z "${FW_ACT_DETACHED[$FLEET_HOST_I]:-}" ]]; then
+    at="$FLEET_HOST_I"
   fi
-  FW_ACTION="" FW_PROMPT="" FW_REFRESH=true
+  for i in "${!FW_ACT_PID[@]}"; do
+    [[ -n "${FW_ACT_PID[$i]}" && -z "${FW_ACT_DETACHED[$i]}" ]] || continue
+    [[ -z "$at" || "$i" = "$at" ]] || continue
+    FW_ACT_DETACHED[i]=1
+    where+="${where:+, }${FLEET_HOSTS[$i]}" n=$((n + 1))
+  done
+  if [ "$n" -eq 1 ]; then
+    FW_NOTICE="detached — the command continues on $where; its notice comes when it ends"
+  elif [ "$n" -gt 1 ]; then
+    FW_NOTICE="detached — the commands continue on $where; each one's notice comes when it ends"
+  fi
+}
+
+# The lines the watched actions take under the table, into FW_ACT_FOOT, each
+# ending in a newline; empty with none.
+fleet_watch_act_foot() {
+  local i k=0 rest=""
+  local -a on=()
+  FW_ACT_FOOT=""
+  for i in "${!FW_ACT_PID[@]}"; do
+    [[ -z "${FW_ACT_PID[$i]}" || -n "${FW_ACT_DETACHED[$i]}" ]] || on+=("$i")
+  done
+  for i in ${on[@]+"${on[@]}"}; do
+    k=$((k + 1))
+    if [ "${#on[@]}" -gt "$FW_ACT_LINES" ] && [ "$k" -ge "$FW_ACT_LINES" ]; then
+      rest+="${rest:+, }${FLEET_HOSTS[$i]}"
+      continue
+    fi
+    [ -n "${FW_ACT_SHOWN[$i]:-}" ] || fleet_watch_act_progress "$i"
+    FW_ACT_FOOT+="${FW_ACT_SHOWN[$i]}"$'\n'
+  done
+  [ -z "$rest" ] || FW_ACT_FOOT+="… and $((${#on[@]} - FW_ACT_LINES + 1)) more running: $rest"$'\n'
+}
+
+# On the way out (the EXIT trap): what ended meanwhile is taken in, and every
+# action still out is left to its host — its job and the ssh under it ended
+# here, its command not signalled — and said so, under the last frame.
+fleet_watch_act_quit() {
+  local i pid host
+  fleet_watch_act_out || return 0
+  fleet_watch_act_collect || true
+  for i in "${!FW_ACT_PID[@]}"; do
+    pid="${FW_ACT_PID[$i]}" host="${FLEET_HOSTS[$i]}"
+    [ -n "$pid" ] || continue
+    FW_ACT_PID[i]=""
+    printf "%s: %s was still running when the watch ended — the watch stopped following it and did not cancel it; 'runnerctl fleet status --host %s' shows where it got to\n" \
+      "${FW_ACT_LABEL[$i]}" "${FW_ACT_VERB[$i]}" "$host"
+    fleet_log_write "${FW_ACT_LOG[$i]}" "$host=detached"
+    # Only a job that is still this process's child: a reaped pid can belong
+    # to anything by now.
+    [ "$(proc_ppid "$pid")" = "$$" ] || continue
+    proc_tree_kill "$pid"
+  done
 }
 
 # --- Fleet watch views (GHR-75) ------------------------------------------------
@@ -9934,7 +10170,7 @@ FLEET_WATCH_HELP="fleet watch — keys
   K R S T P L   kill job, restart, stop, start, reap, logs: the cursor's slot
   O     print the run URL of the cursor's job — nothing is opened
   ?     this list
-  q     quit
+  q     quit; Esc stops following a running action, which carries on
 ! b i / a s c ask no host anything, and the summary counts the whole fleet."
 
 # Whether nothing is chosen — the frame as fleet_status_table drew it.
@@ -10368,13 +10604,18 @@ fleet_watch_handle_key() { # KEY
   if [ "$FW_MODE" = help ]; then FW_MODE=""; return 0; fi
   if [ "$FW_MODE" = search ]; then fleet_watch_search_key "$1"; return 0; fi
   if [ -n "$FW_ACTION" ]; then
+    FW_ACT_NOTICE=false
     case "$1" in
-      y|Y) fleet_watch_run_action ;;
+      y|Y) FW_NOTICE=""; fleet_watch_run_action ;;
       *)   FW_NOTICE="cancelled — nothing run"; FW_ACTION="" FW_PROMPT="" ;;
     esac
+    # GHR-125: an action's notice that landed under the confirm line.
+    if [ -n "$FW_ACT_HELD" ]; then
+      FW_NOTICE="${FW_NOTICE:+$FW_NOTICE · }$FW_ACT_HELD" FW_ACT_HELD="" FW_ACT_NOTICE=true
+    fi
     return 0
   fi
-  FW_NOTICE=""
+  FW_NOTICE="" FW_ACT_NOTICE=false
   # GHR-76: with the pane up every key is the pane's — `q` goes back to the
   # table rather than quitting, and no key moves the cursor or changes a view.
   if [ "$FW_MODE" = pane ]; then fleet_watch_pane_key "$1"; return 0; fi
@@ -10384,6 +10625,8 @@ fleet_watch_handle_key() { # KEY
     up|k)   [ "$FW_POS" -le 0 ] || fleet_watch_select $((FW_POS - 1)) ;;
     pgdn|pgup|g|G|home|end) fleet_watch_page "$1" ;;
     K|R|S|T|P|L|O) fleet_watch_key_action "$1" ;;
+    # GHR-125: Esc stops following an action; it never cancels one.
+    esc) fleet_watch_act_detach ;;
     '!') FW_FILTER=problems ;;
     b)   FW_FILTER=busy ;;
     i)   FW_FILTER=idle ;;
@@ -10482,11 +10725,15 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
   done
   term_cursor hide
   while :; do
-    # A round per TICK, and after an action ran — not per key. Moving the
+    # A round per TICK, and after an action ended — not per key. Moving the
     # cursor, a confirm line or a refusal redraws the frame in hand: a round
     # trip to every host to move a highlight one row is the cost this command
     # exists to avoid.
     launched=false
+    # GHR-125: an action just started is first looked at one FW_POLL on, as a
+    # round's fetches are — a call that answers at once is then drawn with
+    # its result, and the frame in hand is not redrawn in between.
+    if $FW_ACT_LAUNCHED; then FW_ACT_LAUNCHED=false launched=true; fi
     if [ -n "$fetch" ]; then
       narrow_arg=()
       ! $narrow || narrow_arg=(--narrow)
@@ -10500,6 +10747,10 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
     # promptly already has — one frame per tick, not one per host.
     if ! $launched || [ -n "$iterations" ]; then
       fleet_watch_collect
+      # GHR-125: an action that ended asks for a fresh round, and its notice
+      # is drawn with what that round brings back — the action's effect.
+      if fleet_watch_act_collect; then fetch=refresh; continue; fi
+      if $FW_ACT_DRAW; then FW_ACT_DRAW=false draw=true; fi
       if $FW_DIRTY; then
         FW_DIRTY=false draw=true
         # Unpainted: the view's name is added when the frame is drawn, since a
@@ -10553,6 +10804,9 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
         FW_ACTION="" FW_PROMPT=""
       fi
     fi
+    # GHR-125: a line per action being watched, between the body and the
+    # legend — chrome, so a fitted frame's window is what gives way.
+    if $draw && ! $launched; then fleet_watch_act_foot; fi
     if $draw && ! $launched && [ "$FW_MODE" = pane ]; then
       draw=false
       legend="$PANE_LEGEND_SLOT"
@@ -10560,14 +10814,14 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
       elif [ "$FW_PANE" = host ]; then legend="$PANE_LEGEND_HOST"
       fi
       viewport_draw "$head"$'\n'"$summary" "$PANE_OUT" \
-        $'\n'"$(paint "$C_DIM" "$legend")"$'\n'"${FW_PROMPT:-$FW_NOTICE}" 0 0 0
+        $'\n'"$FW_ACT_FOOT$(paint "$C_DIM" "$legend")"$'\n'"${FW_PROMPT:-$FW_NOTICE}" 0 0 0
     elif $draw && ! $launched && [ "$FW_MODE" = help ]; then
       # GHR-75: the keys, where the table was, until a key. Chrome and all
       # through the viewport, so the terminal is left as any frame leaves it;
       # the fetches go on behind it and the next draw shows what they brought.
       draw=false
       viewport_draw "$head"$'\n'"$summary" "$FLEET_WATCH_HELP" \
-        $'\n'"$(paint "$C_DIM" "any key closes this list")"$'\n' 0 0 0
+        $'\n'"$FW_ACT_FOOT$(paint "$C_DIM" "any key closes this list")"$'\n' 0 0 0
     elif $draw && ! $launched; then
       draw=false
       fleet_watch_view "$frame"
@@ -10588,16 +10842,19 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
       # being typed while / is open.
       legend="$WATCH_LEGEND" status="${FW_PROMPT:-$FW_NOTICE}"
       fleet_watch_view_plain || legend="$FLEET_WATCH_VIEW_LEGEND"
+      ! fleet_watch_act_attached || legend+="  Esc detach"
       [ "$FW_MODE" != search ] || status="filter: /${FW_SEARCH}_ — Enter keeps it, Esc cancels, an empty one matches everything"
       viewport_draw "$head"$'\n'"$summary" "$(fleet_watch_highlight "$FW_VIEW" "$hl")" \
-        $'\n'"$(paint "$C_DIM" "$legend")"$'\n'"$status" "$hl" "$lead" "$tail"
+        $'\n'"$FW_ACT_FOOT$(paint "$C_DIM" "$legend")"$'\n'"$status" "$hl" "$lead" "$tail"
     fi
     # GHR-74: the wait is the key read, always. A step while a call is out,
     # so an answer is drawn soon after it lands; what is left of the interval
     # otherwise. The interval running out is a tick; a step running out is one
     # only when the clock says the interval has gone by as well.
     polling=false
-    if fleet_watch_busy; then
+    # GHR-125: an action out is polled for as a fetch is — its lines and its
+    # end are drawn within a step of arriving.
+    if fleet_watch_busy || fleet_watch_act_out; then
       polling=true step="$FW_POLL"
     else
       left=$((FW_NEXT - $(now_ms)))

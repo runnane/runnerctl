@@ -1114,6 +1114,10 @@ with that host's exit status, or each slot for a budget walk:
 2026-10-14T09:20:11Z alice fleet restart --host build-2 example.slot-1 (fleet watch) — build-2=0
 ```
 
+A `fleet watch` key's line is written when its action ends — detached with
+`Esc` or not — or, when the watch ends first, with `detached` for the status
+this node never learnt (`— build-2=detached`).
+
 The file is created `0600` and its directory `0700`. Reads and refusals
 write nothing; a file that cannot be written is silence.
 
@@ -1488,6 +1492,7 @@ has its own `slot-1`:
 | `O` | print the URL of the running job's run on the status line; no round trip |
 | `Enter` | show the selected slot in full, in place of the table; no round trip — below |
 | `!` `b` `i` `/` `a` `s` `c` `?` | [view keys](#a-live-fleet-view-fleet-watch): filter, sort, collapse, help — below |
+| `Esc` | while an action runs: stop following it — the command carries on, its notice still comes — below |
 | `q` | quit |
 
 **The slot in full.** `Enter` on a slot row opens the same pane the local
@@ -1543,6 +1548,20 @@ runs it, anything else cancels. The result, or the remote's error with its
 remedy (a missing sudoers line, say), is the notice under the next frame, which
 is a fresh poll so it shows the effect.
 
+**A confirmed action runs in the background**, over the host's held
+connection, so the table keeps refreshing and every key keeps working while it
+runs — a `--when-idle` restart or a drain can take as long as its wait. While it
+runs, a line under the table shows the latest line the remote has printed
+(`example.slot-1 on build-1: restart running — waiting for example.slot-1
+(job-a) ... 2m`), at most three of them with the rest counted. When it ends, its
+result is the notice, as above. **One action per host**: an action key on a host
+that has one running says so and issues nothing; a key on another host starts
+that host's own. **`Esc` detaches** — the line goes, the command does not: nothing
+is signalled, and its notice still arrives. **`q`** (or Ctrl-C) with an action
+still running ends only this node's side of it — the job and its ssh — says
+which command was left running and that `runnerctl fleet status --host <host>`
+shows where it got to, and records it in the fleet log as `<host>=detached`.
+
 `S` has a **capacity floor**. A single-slot key is as bounded a target as
 there is, so it needs neither `--host` nor `--all-hosts` — but a cursor walked
 down the fleet pressing `S`, `y` on every row reaches zero capacity as surely as
@@ -1561,9 +1580,9 @@ on nothing, and the cursor is back on its slot when the host answers. A slot
 that goes away drops the cursor to that host's first slot. `L` is not a stream: the host's
 `logs <slot> -n 50` runs to completion under `FLEET_TIMEOUT` and the result is
 paged locally. The keys that change something (`K` `R` `S` `T` `P`) run under
-`FLEET_MUTATE_TIMEOUT` instead, and the watch waits for them: a restart that
-sits out a wedged job's `TimeoutStopSec` holds the frame for those minutes
-rather than reporting `failed` about an action that then completes behind it.
+`FLEET_MUTATE_TIMEOUT` instead, in the background: a restart that sits out a
+wedged job's `TimeoutStopSec` is followed for those minutes rather than
+reported `failed` about an action that then completes behind it.
 Every remote action needs what the same command needs run by
 hand over ssh: passwordless sudo on that host, `L` included (`logs` reads the
 journal through it). The facts read is a plain `status --json` and needs none.
