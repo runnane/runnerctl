@@ -4576,22 +4576,56 @@ case_provision_fresh_host_installs_and_registers() {
   expect_log '^chown -R github-runner:github-runner /opt/actions-runner/slot-1$'
   expect_log 'config\.sh --unattended --url https://github\.com/acme --token .* --name slot-1 --work _work --labels ci,linux$'
   expect_log 'config\.sh --unattended --url https://github\.com/acme --token .* --name slot-2 --work _work --labels ci,linux$'
-  expect_log '/opt/actions-runner/slot-1 \./svc\.sh install github-runner$'
-  expect_log '/opt/actions-runner/slot-2 \./svc\.sh start$'
+  # GHR-110: what svc.sh install + start did, done by runnerctl — the unit
+  # written by root under SYSTEMD_DIR, enabled and started with systemctl, and
+  # the two files svc.sh put in the runner's directory written as the runner.
+  expect_out '^\[slot-1\] installing the service actions\.runner\.acme\.slot-1\.service$'
+  expect_log '^systemctl enable actions\.runner\.acme\.slot-1\.service$'
+  expect_log '^systemctl start actions\.runner\.acme\.slot-2\.service$'
   expect_log_order \
     '^useradd ' \
     '^mkdir -p /opt/actions-runner/slot-1$' \
     'slot-1 \./config\.sh ' \
-    'slot-1 \./svc\.sh install ' \
-    'slot-1 \./svc\.sh start$' \
-    'slot-2 \./svc\.sh start$' \
+    '^install -m 0644 -o root -g root /dev/null .*/actions\.runner\.acme\.slot-1\.service$' \
+    '^tee .*/actions\.runner\.acme\.slot-1\.service$' \
+    '^runuser -u github-runner -- .* /opt/actions-runner/slot-1 install -m 0755 \./bin/runsvc\.sh \./runsvc\.sh$' \
+    '^systemctl daemon-reload$' \
+    '^systemctl enable actions\.runner\.acme\.slot-1\.service$' \
+    '^runuser -u github-runner -- .* /opt/actions-runner/slot-1 bash -c .*>\.service runnerctl actions\.runner\.acme\.slot-1\.service$' \
+    '^systemctl start actions\.runner\.acme\.slot-1\.service$' \
+    'slot-2 \./config\.sh ' \
+    '^systemctl start actions\.runner\.acme\.slot-2\.service$' \
     '^systemctl daemon-reload$'
+  expect_file "$DROPIN_DIR/actions.runner.acme.slot-1.service" '^ExecStart=/opt/actions-runner/slot-1/runsvc\.sh$'
+  expect_file "$DROPIN_DIR/actions.runner.acme.slot-2.service" '^User=github-runner$'
   # config.sh must not run as root — it refuses to, and a root runner would let
-  # any job rewrite the runner. svc.sh install must, since it writes the unit.
+  # any job rewrite the runner.
   expect_log '^runuser -u github-runner -- bash -c .* \./config\.sh '
-  expect_no_log '^runuser -u root '
-  # provision never writes a unit file itself: svc.sh owns that.
-  expect_no_file "/etc/systemd/system/actions.runner.example.slot-1.service"
+  # ...and nothing else in a runner's directory runs as root either (GHR-110).
+  expect_no_root_exec_in_runner_dirs
+}
+
+# The runner's svc.sh by file name — not runsvc.sh, which the unit runs (as the
+# runner user) and provision copies into place (as the runner user).
+SVC_SH='(^|[ /])svc\.sh'
+
+# GHR-110: every privileged call that names a path inside a runner directory
+# (/opt/actions-runner/... in the sim) is either dropped to a non-root user by
+# runuser, or one of the four things root does TO the directory — create,
+# unpack into, chown, delete. Anything else there run as root (svc.sh, env.sh,
+# config.sh, run.sh, a runner-owned runsvc.sh...) is a job's code run as root,
+# since the runner user owns the directory and every job runs as that user.
+expect_no_root_exec_in_runner_dirs() {
+  _expect
+  local bad
+  bad="$(grep -Ev '^runuser -u [a-z_][a-z0-9_-]* -- ' "$LOG" | grep -F '/opt/actions-runner/' \
+    | grep -Ev '^(mkdir -p|chown -R [^ ]+|rm -rf --|tar -xzf [^ ]+ -C) /opt/actions-runner/[^ ]+$' || true)"
+  [ -z "$bad" ] || FAILS+=("a root call names a path inside a runner directory: ${bad%%$'\n'*}")
+  ! grep -Eq '^runuser -u root ' "$LOG" || FAILS+=("a runner_exec ran as root: $(grep -E -m1 '^runuser -u root ' "$LOG"; true)")
+  # Captured, not piped into `grep -q`: under pipefail an early-exiting grep
+  # -q SIGPIPEs the first one and the negated pipeline would read as clean.
+  bad="$(grep -Ev '^runuser -u [a-z_][a-z0-9_-]* -- ' "$LOG" | grep -E "$SVC_SH|(^|[ /])env\.sh" || true)"
+  [ -z "$bad" ] || FAILS+=("svc.sh or env.sh reached a root call: ${bad%%$'\n'*}")
 }
 
 case_provision_is_idempotent_against_the_target_count() {
@@ -4633,7 +4667,9 @@ case_provision_dry_run_changes_nothing() {
   expect_out '^\(dry run — nothing downloaded, nothing changed\)$'
   expect_out '^would download: https://github\.com/actions/runner/releases/download/v2\.337\.0/'
   expect_out '^would register: slot-1 via config\.sh .* --token \*\*\* --name slot-1$'
-  expect_out '^would install:  svc\.sh install github-runner   \(in /opt/actions-runner/slot-1\)$'
+  expect_out '^would install:  .*/actions\.runner\.acme-app\.slot-1\.service   \(runs /opt/actions-runner/slot-1/runsvc\.sh as github-runner\), then enable and start it$'
+  expect_no_out "$SVC_SH"
+  expect_no_file "$DROPIN_DIR/actions.runner.acme-app.slot-1.service"
   # Reading the release metadata is allowed; changing the host is not.
   expect_log '^api: GET .*/releases/latest'
   expect_no_log '^fetch: '
@@ -4804,6 +4840,23 @@ case_provision_refuses_a_bad_invocation() {
   RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" --token t --runner-user 0bad
   expect_rc 1
   expect_err "--runner-user '0bad' is invalid"
+  # GHR-110: a runner never runs as root, and the root path is written into
+  # the unit, so it may hold nothing systemd would read as more than a path.
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" --token t --runner-user root
+  expect_rc 1
+  expect_err "--runner-user 'root' is invalid — a runner never runs as root"
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" --token t --runner-root $'/opt/x\nExecStartPre=+/tmp/evil'
+  expect_rc 1
+  expect_err "is invalid — want an absolute path of letters, digits"
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" --token t --runner-root '/opt/a b'
+  expect_rc 1
+  expect_err "--runner-root '/opt/a b' is invalid"
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" --token t --runner-root '/opt/%h'
+  expect_rc 1
+  expect_err "--runner-root '/opt/%h' is invalid"
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" --token t --runner-root '/opt/../etc'
+  expect_rc 1
+  expect_err "--runner-root '/opt/\.\./etc' is invalid"
   # A value flag with nothing after it dies rather than eating the next one.
   RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url
   expect_rc 1
@@ -4877,25 +4930,32 @@ case_deprovision_removes_each_target_in_order() {
   # (config.sh refuses while it is installed), then GitHub, then the files.
   local s
   for s in 2 3; do
-    expect_log "^bash -c .* runnerctl /opt/actions-runner/slot-$s \./svc\.sh stop\$"
+    expect_log "^systemctl stop actions\.runner\.example\.slot-$s\.service\$"
     expect_log "^runuser -u github-runner -- bash -c .* runnerctl /opt/actions-runner/slot-$s \./config\.sh remove\$"
     expect_log "^rm -rf -- /opt/actions-runner/slot-$s\$"
     expect_log "^rm -f .*/actions\.runner\.example\.slot-$s\.service\.d/10-runnerctl\.conf\$"
   done
+  # GHR-110: svc.sh stop + uninstall are runnerctl's own systemctl calls and
+  # an rm of the unit file by name; the runner's .service marker goes as the
+  # runner user, before config.sh remove (which refuses while it exists).
   expect_log_order \
     '^api: POST .*remove-token' \
-    'slot-2 \./svc\.sh stop$' \
-    'slot-2 \./svc\.sh uninstall$' \
+    '^systemctl stop actions\.runner\.example\.slot-2\.service$' \
+    '^systemctl disable actions\.runner\.example\.slot-2\.service$' \
+    '^rm -f -- .*/etc/systemd/system/actions\.runner\.example\.slot-2\.service$' \
+    '^runuser -u github-runner -- .* /opt/actions-runner/slot-2 rm -f \.service$' \
     'slot-2 \./config\.sh remove$' \
     '^rm -rf -- /opt/actions-runner/slot-2$' \
-    'slot-3 \./svc\.sh stop$' \
-    'slot-3 \./svc\.sh uninstall$' \
+    '^systemctl stop actions\.runner\.example\.slot-3\.service$' \
+    '^systemctl disable actions\.runner\.example\.slot-3\.service$' \
+    '^rm -f -- .*/etc/systemd/system/actions\.runner\.example\.slot-3\.service$' \
     'slot-3 \./config\.sh remove$' \
     '^rm -rf -- /opt/actions-runner/slot-3$' \
     '^systemctl daemon-reload$'
   expect_log_count '\./config\.sh remove$' 2
-  # svc.sh needs root; config.sh refuses root, so it runs as the unit's user.
-  expect_no_log '^runuser .*svc\.sh'
+  # Nothing in a runner's directory runs as root — svc.sh least of all.
+  expect_no_log "$SVC_SH"
+  expect_no_root_exec_in_runner_dirs
   # The token was DELIVERED — once per slot, on stdin — not merely absent.
   expect_cfg "$DEPROV_STDIN" '^STUB-REMOVAL-TOKEN$'
   expect_cfg_count "$DEPROV_STDIN" '^STUB-REMOVAL-TOKEN$' 2
@@ -4926,7 +4986,7 @@ case_deprovision_when_idle_waits_for_the_job() {
   expect_rc 0
   expect_out '^waiting for example\.slot-1 \(my-app:test, 12m\) …$'
   expect_log_count '^probe:pause 5$' 2
-  expect_log_order '^probe:pause 5$' '^probe:pause 5$' 'slot-1 \./svc\.sh stop$' '^rm -rf -- /opt/actions-runner/slot-1$'
+  expect_log_order '^probe:pause 5$' '^probe:pause 5$' '^systemctl stop actions\.runner\.example\.slot-1\.service$' '^rm -rf -- /opt/actions-runner/slot-1$'
   expect_out '^Deprovisioned 1 runner slot\(s\): example\.slot-1$'
   # Busy for good: the wait times out, and nothing was stopped or removed.
   RUNNERCTL_STUB_BUSY_POLLS=99 run deprovision 0 --token "$DEPROV_TOKEN" --yes --when-idle --timeout 10
@@ -4942,9 +5002,12 @@ case_deprovision_dry_run_changes_nothing() {
   expect_rc 0
   expect_out '^\(dry run — no token minted, nothing changed\)$'
   expect_out '^would mint:  a removal token — POST https://api\.github\.com/repos/acme/app/actions/runners/remove-token \(repo\)$'
-  expect_out '^would run:   cd /opt/actions-runner/slot-2 && \./svc\.sh stop$'
-  expect_out '^would run:   cd /opt/actions-runner/slot-2 && \./svc\.sh uninstall$'
+  expect_out '^would run:   systemctl stop actions\.runner\.example\.slot-2\.service$'
+  expect_out '^would run:   systemctl disable actions\.runner\.example\.slot-2\.service$'
+  expect_out '^would run:   rm -f -- .*/etc/systemd/system/actions\.runner\.example\.slot-2\.service$'
+  expect_out '^would run:   cd /opt/actions-runner/slot-2 && rm -f \.service   \(as github-runner\)$'
   expect_out '^would run:   cd /opt/actions-runner/slot-2 && ACTIONS_RUNNER_INPUT_TOKEN=\*\*\* \./config\.sh remove   \(as github-runner\)$'
+  expect_no_out "$SVC_SH"
   expect_out '^would run:   rm -rf -- /opt/actions-runner/slot-3$'
   expect_out '^would run:   systemctl daemon-reload$'
   expect_no_out '^Deprovisioned'
@@ -4999,7 +5062,7 @@ case_deprovision_already_deregistered_still_cleans_up() {
   RUNNERCTL_STUB_CONFIG_REMOVE_FAIL=1 run deprovision 1 --token "$DEPROV_TOKEN" --yes
   expect_rc 0
   expect_err '^runnerctl: warning: example\.slot-2: config\.sh remove failed — GitHub may already have forgotten this runner\. Cleaning up locally anyway\.$'
-  expect_log_order 'slot-2 \./svc\.sh uninstall$' 'slot-2 \./config\.sh remove$' '^rm -rf -- /opt/actions-runner/slot-2$' '^systemctl daemon-reload$'
+  expect_log_order '^rm -f -- .*/actions\.runner\.example\.slot-2\.service$' 'slot-2 \./config\.sh remove$' '^rm -rf -- /opt/actions-runner/slot-2$' '^systemctl daemon-reload$'
   expect_out '^Deprovisioned 1 runner slot\(s\): example\.slot-2$'
   expect_out '^GitHub did not confirm removing: example\.slot-2\. If still listed under Settings -> Actions -> Runners, remove them there\.$'
   # --local-only never asks GitHub at all, and needs no credential.
@@ -5010,6 +5073,10 @@ case_deprovision_already_deregistered_still_cleans_up() {
   expect_no_log 'config\.sh'
   expect_log '^rm -rf -- /opt/actions-runner/slot-2$'
   expect_out '^--local-only: still registered with GitHub \(offline\)\. Remove them under Settings -> Actions -> Runners\.$'
+  # --local-only runs nothing as the runner user either: the directory the
+  # .service marker is in is deleted whole.
+  expect_no_log '^runuser '
+  expect_log '^rm -f -- .*/actions\.runner\.example\.slot-2\.service$'
 }
 
 # A credential GitHub refuses is not a runner GitHub forgot: the mint fails
@@ -5147,13 +5214,239 @@ echo "cwd=$PWD"
 FAKE
   chmod +x "$d/config.sh"
   # The stub is sourced by run_snippet, so its logging run_priv is replaced
-  # here by one that actually runs the command — as the invoking user, root
-  # being the user argument only so no runuser is involved.
-  run_snippet "$STUB" "run_priv() { \"\$@\"; }; runner_exec_with_token '$DEPROV_TOKEN' '$d' root ./config.sh remove"
+  # here by one that actually runs the command — as the invoking user: it
+  # drops the `runuser -u <user> --` prefix (GHR-110: there is no root form
+  # left to choose instead) after checking it names the user asked for.
+  run_snippet "$STUB" "run_priv() { [ \"\$1 \$2 \$3 \$4\" = 'runuser -u github-runner --' ] || return 99; shift 4; \"\$@\"; }; runner_exec_with_token '$DEPROV_TOKEN' '$d' github-runner ./config.sh remove"
   expect_rc 0
   expect_out '^argv=remove$'
   expect_out "^env=$DEPROV_TOKEN\$"
   expect_out "^cwd=$d\$"
+}
+
+# --- GHR-110: nothing in a runner's directory runs as root --------------------
+# provision and deprovision used to run the runner's own svc.sh as root from
+# the runner's directory, which the runner user — every job's account — owns.
+# Now runnerctl writes and removes the unit itself (render_runner_unit, the
+# template svc.sh install fills in, read from actions/runner v2.338.0), and
+# the two helpers that run a runner's scripts refuse uid 0 outright. Every
+# case below calls the real functions; runner_exec and runner_exec_with_token
+# go through run_snippet so the stub's logging run_priv is the one a mutant
+# would reach — a real sudo is never one call away.
+
+# The unit, pinned whole: actions.runner.service.template with Description,
+# User and RunnerRoot filled in, byte for byte — so a unit runnerctl wrote and
+# one svc.sh wrote are the same file, and a change to any field that decides
+# what runs, as whom, from where, or how it is stopped and restarted is red.
+GHR110_UNIT='[Unit]
+Description=GitHub Actions Runner (acme-app.slot-1)
+After=network-online.target
+
+[Service]
+ExecStart=/opt/actions-runner/slot-1/runsvc.sh
+User=github-runner
+WorkingDirectory=/opt/actions-runner/slot-1
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=5min
+
+[Install]
+WantedBy=multi-user.target'
+
+case_runner_unit_matches_upstream_template() {
+  run_fn render_runner_unit actions.runner.acme-app.slot-1.service /opt/actions-runner/slot-1 github-runner
+  expect_rc 0
+  expect_text "render_runner_unit" "$GHR110_UNIT" "$OUT"
+  # The same text reaches the unit file provision writes, through tee.
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url https://github.com/acme/app \
+    --name-prefix slot --token "$PROV_TOKEN"
+  expect_rc 0
+  expect_text "the unit provision wrote" "$GHR110_UNIT" "$(cat "$DROPIN_DIR/actions.runner.acme-app.slot-1.service" 2>/dev/null; true)"
+}
+
+# The unit name config.sh would give the runner (ServiceControlManager.cs):
+# the URL's path with anything outside [0-9A-Za-z._-] made '-'.
+case_runner_unit_name_follows_the_runner() {
+  run_fn runner_unit_name https://github.com/acme slot-1
+  expect_out '^actions\.runner\.acme\.slot-1\.service$'
+  run_fn runner_unit_name https://github.com/acme/app/ slot-1
+  expect_out '^actions\.runner\.acme-app\.slot-1\.service$'
+  run_fn runner_unit_name https://github.com/enterprises/acme slot-1
+  expect_out '^actions\.runner\.enterprises-acme\.slot-1\.service$'
+  # Bytes a URL may carry and a unit name may not are made '-', never kept.
+  run_fn runner_unit_name $'https://github.com/a%b]c\nd/e=f' slot-1
+  expect_rc 0
+  expect_out '^actions\.runner\.a-b-c-d-e-f\.slot-1\.service$'
+  # Past 150 characters the runner adds a random suffix runnerctl cannot
+  # predict, so it refuses rather than write a unit under another name.
+  run_fn runner_unit_name "https://github.com/$(printf 'o%.0s' {1..140})" slot-1
+  expect_rc 1
+  expect_err 'the runner truncates names past 150 with a random suffix'
+  expect_no_out .
+  # Through provision, that refusal comes before anything is touched.
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "https://github.com/$(printf 'o%.0s' {1..140})" \
+    --name-prefix slot --token "$PROV_TOKEN"
+  expect_rc 1
+  expect_err 'pass a shorter --name-prefix$'
+  expect_no_log '^(fetch:|mkdir |tar |useradd |chown |install |tee |systemctl |runuser )'
+}
+
+# A value that would write a directive of its own into a unit systemd runs as
+# root — a newline, ']', '=', '%', a space — is refused by the RENDERER, not
+# only by provision's own checks in front of it, and nothing is printed.
+case_runner_unit_refuses_hostile_values() {
+  run_fn render_runner_unit actions.runner.acme.slot-1.service $'/opt/x\nExecStartPre=+/tmp/evil' github-runner
+  expect_rc 1
+  expect_no_out 'ExecStartPre'
+  expect_err "refusing to render a unit for the directory"
+  run_fn render_runner_unit actions.runner.acme.slot-1.service '/opt/a]b=c' github-runner
+  expect_rc 1
+  expect_no_out .
+  run_fn render_runner_unit actions.runner.acme.slot-1.service '/opt/%h' github-runner
+  expect_rc 1
+  expect_no_out .
+  run_fn render_runner_unit actions.runner.acme.slot-1.service '/opt/a b' github-runner
+  expect_rc 1
+  expect_no_out .
+  run_fn render_runner_unit actions.runner.acme.slot-1.service /opt/actions-runner/slot-1 $'github-runner\nExecStartPre=+/tmp/evil'
+  expect_rc 1
+  expect_no_out 'ExecStartPre'
+  expect_err "refusing to render a unit for the user"
+  run_fn render_runner_unit actions.runner.acme.slot-1.service /opt/actions-runner/slot-1 'a]b=c'
+  expect_rc 1
+  expect_no_out .
+  run_fn render_runner_unit actions.runner.acme.slot-1.service /opt/actions-runner/slot-1 root
+  expect_rc 1
+  expect_err 'refusing to render a unit that runs a runner as root'
+  run_fn render_runner_unit $'actions.runner.a\n]b.slot-1.service' /opt/actions-runner/slot-1 github-runner
+  expect_rc 1
+  expect_no_out .
+}
+
+# The audit the unit is held to before it is written: only ExecStart, only as
+# a non-root User=, no '+'/'!' prefix. Asked of the real check, on the real
+# rendered unit and on each way a unit could run a runner-owned file as root.
+case_runner_unit_runs_nothing_as_root() {
+  local d=/opt/actions-runner/slot-1 good nl=$'\n'
+  good="$GHR110_UNIT"
+  run_fn runner_unit_root_exec_problem "$d" <<<"$good"
+  expect_rc 0
+  expect_no_out .
+  run_fn runner_unit_root_exec_problem "$d" <<<"${good/${nl}User=/${nl}ExecStartPre=+$d/env.sh${nl}User=}"
+  expect_out '^the unit has an Exec line other than ExecStart: ExecStartPre=\+/opt/actions-runner/slot-1/env\.sh$'
+  run_fn runner_unit_root_exec_problem "$d" <<<"${good/${nl}User=/${nl}ExecStop=$d/svc.sh stop${nl}User=}"
+  expect_out '^the unit has an Exec line other than ExecStart: ExecStop='
+  run_fn runner_unit_root_exec_problem "$d" <<<"${good/ExecStart=/ExecStart=+}"
+  expect_out "^ExecStart= runs with full privileges \('\+' or '!'\)$"
+  run_fn runner_unit_root_exec_problem "$d" <<<"${good/ExecStart=/ExecStart=-!}"
+  expect_out "^ExecStart= runs with full privileges"
+  run_fn runner_unit_root_exec_problem "$d" <<<"${good/User=github-runner/User=root}"
+  expect_out "^the unit runs as root \(User='root'\)$"
+  run_fn runner_unit_root_exec_problem "$d" <<<"${good/${nl}User=github-runner/}"
+  expect_out "^the unit runs as root \(User=''\)$"
+  # A unit whose ExecStart names a file outside the runner's directory is not
+  # the runner's unit at all.
+  run_fn runner_unit_root_exec_problem /opt/actions-runner/slot-2 <<<"$good"
+  expect_out '^ExecStart= is not /opt/actions-runner/slot-2/runsvc\.sh$'
+  # What provision actually wrote passes it, and so does the drop-in apply
+  # lays over it: neither carries an Exec line beyond the template's one.
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" --name-prefix slot --token "$PROV_TOKEN"
+  expect_rc 0
+  expect_file_lacks "$DROPIN_DIR/actions.runner.acme.slot-1.service" '^Exec(StartPre|StartPost|Stop|StopPost|Reload|Condition)='
+  expect_file "$DROPIN_DIR/actions.runner.acme.slot-1.service" '^ExecStart=/opt/actions-runner/slot-1/runsvc\.sh$'
+  run apply --profile ci
+  expect_rc 0
+  expect_file_lacks "$DROPIN_DIR/$U1.d/10-runnerctl.conf" '^Exec'
+}
+
+# The unit file is root's: created empty as 0644 root:root BEFORE the text is
+# written into it, by root and never through runuser; svc.sh's 664 is not
+# kept. And a unit already there is never overwritten.
+case_runner_unit_file_is_root_owned() {
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" --name-prefix slot --token "$PROV_TOKEN"
+  expect_rc 0
+  local p='.*/etc/systemd/system/actions\.runner\.acme\.slot-1\.service'
+  expect_log_count "^install -m 0644 -o root -g root /dev/null $p\$" 1
+  expect_log_order "^install -m 0644 -o root -g root /dev/null $p\$" "^tee $p\$"
+  expect_log_count "$p" 2
+  expect_no_log "^(chmod|chown) [^ ]* $p\$"
+  expect_no_log '^runuser .*/etc/systemd/'
+  # An existing unit of that name is left alone and the slot reported failed.
+  mkdir -p "$DROPIN_DIR"
+  : >"$DROPIN_DIR/actions.runner.acme.slot-1.service"
+  RUNNERCTL_STUB_NO_UNITS=1 run_keep provision 1 --url "$PROV_URL" --name-prefix slot --token "$PROV_TOKEN"
+  expect_rc 1
+  expect_err 'actions\.runner\.acme\.slot-1\.service already exists — not overwriting'
+  expect_out '^  \[FAILED\] installing actions\.runner\.acme\.slot-1\.service$'
+  expect_no_log "^(install|tee) $p\$"
+  expect_no_log '^systemctl (enable|start) '
+}
+
+# runner_exec and runner_exec_with_token refuse root by name and by uid, and
+# reach no privileged call when they do — the stub's run_priv logs every call.
+case_runner_exec_refuses_root() {
+  run_snippet "$STUB" "runner_exec /opt/actions-runner/slot-1 root ./svc.sh install github-runner"
+  expect_rc 1
+  expect_err "refusing to run '\./svc\.sh install github-runner' in /opt/actions-runner/slot-1 as root"
+  expect_no_log .
+  run_snippet "$STUB" "runner_exec_with_token T /opt/actions-runner/slot-1 root ./config.sh remove"
+  expect_rc 1
+  expect_err "refusing to run '\./config\.sh remove' in /opt/actions-runner/slot-1 as root"
+  expect_no_log .
+  # A non-root user goes through runuser, always.
+  run_snippet "$STUB" "runner_exec /opt/actions-runner/slot-1 github-runner ./config.sh --help"
+  expect_rc 0
+  expect_log '^runuser -u github-runner -- bash -c .* runnerctl /opt/actions-runner/slot-1 \./config\.sh --help$'
+  # The real uid check: root by name, and an account resolving to uid 0.
+  run_fn runner_user_is_root root
+  expect_rc 0
+  run_fn runner_user_is_root "$(id -un 0 2>/dev/null || echo root)"
+  expect_rc 0
+  run_fn runner_user_is_root nobody
+  expect_rc 1
+  run_fn runner_user_is_root no-such-user-ghr110
+  expect_rc 1
+}
+
+# A unit svc.sh installed — the stub's actions.runner.example.slot-N, with
+# svc.sh's WorkingDirectory and User — is stopped, disabled and its file
+# removed BY NAME, exactly as `svc.sh uninstall` did, with no svc.sh run.
+case_deprovision_removes_a_unit_svc_sh_installed() {
+  run deprovision 1 --token "$DEPROV_TOKEN" --yes
+  expect_rc 0
+  expect_out '^Deprovisioned 1 runner slot\(s\): example\.slot-2$'
+  expect_log_count '^systemctl stop actions\.runner\.example\.slot-2\.service$' 1
+  expect_log_count '^systemctl disable actions\.runner\.example\.slot-2\.service$' 1
+  expect_log_count '^rm -f -- .*/etc/systemd/system/actions\.runner\.example\.slot-2\.service$' 1
+  expect_log_count '^runuser -u github-runner -- .* /opt/actions-runner/slot-2 rm -f \.service$' 1
+  expect_no_log "$SVC_SH"
+  expect_no_root_exec_in_runner_dirs
+  # A unit whose User= is root: its config.sh would run as root, so it is
+  # refused before anything changes — unless --local-only, which runs none of
+  # the runner's scripts at all.
+  RUNNERCTL_STUB_UNIT_USER=root run deprovision 1 --token "$DEPROV_TOKEN" --yes
+  expect_rc 1
+  expect_err "example\.slot-2: its unit runs the runner as 'root' — runnerctl never runs a runner's own scripts \(config\.sh remove\) as root"
+  expect_no_log "$DEPROV_CHANGES"
+  RUNNERCTL_STUB_UNIT_USER=root run deprovision 1 --local-only --yes
+  expect_rc 0
+  expect_no_log '^runuser '
+  expect_log '^rm -rf -- /opt/actions-runner/slot-2$'
+  expect_no_root_exec_in_runner_dirs
+}
+
+# The defect as reported: provision and deprovision, end to end, never hand a
+# path inside a runner's directory to a root call other than create, unpack,
+# chown and delete — and never run svc.sh at all.
+case_provision_deprovision_run_nothing_as_root_in_runner_dirs() {
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 2 --url "$PROV_URL" --name-prefix slot --token "$PROV_TOKEN" --replace
+  expect_rc 0
+  expect_no_root_exec_in_runner_dirs
+  expect_no_log "$SVC_SH"
+  run deprovision 1 2 --url "$PROV_URL" --pat ghp_EXAMPLE_PAT --yes
+  expect_rc 0
+  expect_no_root_exec_in_runner_dirs
+  expect_no_log "$SVC_SH"
 }
 
 # --- GHR-48: the REAL discover(), against a fake systemctl -------------------
@@ -8316,6 +8609,14 @@ t "deprovision --help, and the top-level usage"                        case_depr
 t "scale/provision notes point at deprovision, not 'not automated'"    case_deprovision_is_named_where_removal_was_manual
 t "fleet deprovision: excluded, saying why"                            case_deprovision_is_excluded_from_fleet
 t "deprovision: the real dir check and token hand-off"                 case_deprovision_real_helpers
+t "GHR-110: the runner unit is upstream's template, byte for byte"      case_runner_unit_matches_upstream_template
+t "GHR-110: the unit name follows the runner's own rule, or refuses"    case_runner_unit_name_follows_the_runner
+t "GHR-110: a hostile user, path or name never reaches the unit"        case_runner_unit_refuses_hostile_values
+t "GHR-110: the unit runs no runner file as root (the audit check)"     case_runner_unit_runs_nothing_as_root
+t "GHR-110: the unit file is 0644 root:root, and never overwritten"     case_runner_unit_file_is_root_owned
+t "GHR-110: runner_exec and runner_exec_with_token refuse root"         case_runner_exec_refuses_root
+t "GHR-110: deprovision removes a unit svc.sh installed, by name"       case_deprovision_removes_a_unit_svc_sh_installed
+t "GHR-110: provision/deprovision run nothing in a runner dir as root"  case_provision_deprovision_run_nothing_as_root_in_runner_dirs
 
 # --- GHR-48: the real discover(), not the stub's stand-in -------------------
 t "discover: no matching units is empty and exit 0, not a failure"     case_discover_no_matching_units_is_empty_not_a_failure
