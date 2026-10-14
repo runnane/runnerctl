@@ -840,14 +840,17 @@ trap() {
     case "$cmd" in -) EXIT_CMD="" ;; esac
     builtin trap exit_run EXIT
   fi
-  # GHR-119: INT and TERM are the record's while one is armed, so a command's
-  # own handler for them (`watch`, `fleet watch`) is kept by sig_own and
-  # chained to, never replaced. Every other signal is the builtin's.
+  # GHR-119, GHR-131: INT, TERM, HUP and PIPE are the record's while one is
+  # armed, so a command's own handler for them (`watch`, `fleet watch`, the
+  # `fleet status --json --watch` stream) is kept by sig_own and chained to,
+  # never replaced. Every other signal is the builtin's.
   local others=()
   for s in ${rest[@]+"${rest[@]}"}; do
     case "$s" in
       INT|SIGINT)   sig_own INT "$cmd" ;;
       TERM|SIGTERM) sig_own TERM "$cmd" ;;
+      HUP|SIGHUP)   sig_own HUP "$cmd" ;;
+      PIPE|SIGPIPE) sig_own PIPE "$cmd" ;;
       *)            others+=("$s") ;;
     esac
   done
@@ -889,39 +892,78 @@ exit_run() {
 # TERM sent to runnerctl's pid alone — not its process group, as a terminal's
 # Ctrl-C, systemd and `timeout` do — waits for the step in progress (a
 # download, a sleep in a --when-idle wait) before the process ends.
-AUDIT_SIG_PID=""
-# The command's own INT / TERM handlers (`-` none), for the process that set
-# them: a subshell inherits these but not the traps.
-SIG_OWN_PID="" SIG_OWN_INT=- SIG_OWN_TERM=-
-sig_own() { # INT|TERM CMD
-  if [ "$SIG_OWN_PID" != "$BASHPID" ]; then SIG_OWN_PID="$BASHPID" SIG_OWN_INT=- SIG_OWN_TERM=-; fi
-  case "$1" in INT) SIG_OWN_INT="$2" ;; TERM) SIG_OWN_TERM="$2" ;; esac
-  # With a record armed here the trap stays audit_signal, which chains to it.
-  [ "$AUDIT_SIG_PID" = "$BASHPID" ] || builtin trap -- "$2" "$1"
+#
+# GHR-131: HUP (a terminal, or an ssh session with a tty, closed under it) and
+# PIPE (its stdout's reader gone) are the record's in the same way, with one
+# exception: a process where caller_guard has run (GHR-91). There HUP is
+# ignored, and that ignore is the point — it is inherited by everything the
+# command runs — so it is never trapped and never handed back; and PIPE
+# cannot arise, because the command only ever writes to its relays. The
+# record there carries the command's own outcome. PIPE is never ignored in
+# the main process: a child would inherit the ignore, and a `cmd | head` in it
+# would then fail its write under pipefail instead of ending quietly.
+AUDIT_SIG_PID="" AUDIT_SIG_ARMED=""
+# The command's own INT / TERM / HUP / PIPE handlers (`-` none), for the
+# process that set them: a subshell inherits these but not the traps.
+SIG_OWN_PID="" SIG_OWN_INT=- SIG_OWN_TERM=- SIG_OWN_HUP=- SIG_OWN_PIPE=-
+sig_own() { # INT|TERM|HUP|PIPE CMD
+  if [ "$SIG_OWN_PID" != "$BASHPID" ]; then
+    SIG_OWN_PID="$BASHPID" SIG_OWN_INT=- SIG_OWN_TERM=- SIG_OWN_HUP=- SIG_OWN_PIPE=-
+  fi
+  case "$1" in
+    INT) SIG_OWN_INT="$2" ;; TERM) SIG_OWN_TERM="$2" ;;
+    HUP) SIG_OWN_HUP="$2" ;; PIPE) SIG_OWN_PIPE="$2" ;;
+  esac
+  # With a record armed here the trap stays audit_signal, which chains to it;
+  # under a caller guard HUP stays ignored, whatever the command asks for.
+  ! audit_sig_holds "$1" || return 0
+  [ "$1" != HUP ] || [ -z "$CALLER_GUARD_PID" ] || return 0
+  builtin trap -- "$2" "$1"
 }
 # This process's own handler for SIG into SIG_OWNER (`-` none).
-sig_owner() { # INT|TERM
+sig_owner() { # INT|TERM|HUP|PIPE
   SIG_OWNER=-
   [ "$SIG_OWN_PID" = "$BASHPID" ] || return 0
-  case "$1" in INT) SIG_OWNER="$SIG_OWN_INT" ;; TERM) SIG_OWNER="$SIG_OWN_TERM" ;; esac
+  case "$1" in
+    INT) SIG_OWNER="$SIG_OWN_INT" ;; TERM) SIG_OWNER="$SIG_OWN_TERM" ;;
+    HUP) SIG_OWNER="$SIG_OWN_HUP" ;; PIPE) SIG_OWNER="$SIG_OWN_PIPE" ;;
+  esac
+}
+# Whether SIG runs audit_signal in this process now.
+audit_sig_holds() { # SIG
+  [ "$AUDIT_SIG_PID" = "$BASHPID" ] && [[ " $AUDIT_SIG_ARMED " == *" $1 "* ]]
 }
 audit_sig_arm() {
   [ "$AUDIT_SIG_PID" != "$BASHPID" ] || return 0
-  AUDIT_SIG_PID="$BASHPID"
+  AUDIT_SIG_PID="$BASHPID" AUDIT_SIG_ARMED="INT TERM"
   builtin trap 'audit_signal INT' INT
   builtin trap 'audit_signal TERM' TERM
+  # A guard here, or in the process this one was forked from, owns both.
+  [ -z "$CALLER_GUARD_PID" ] || return 0
+  AUDIT_SIG_ARMED+=" HUP PIPE"
+  builtin trap 'audit_signal HUP' HUP
+  builtin trap 'audit_signal PIPE' PIPE
 }
-# Back to what the command itself asked for, when its record is finished.
-audit_sig_disarm() {
-  local s
+# A caller guard taking this process over: HUP and PIPE are no longer the
+# record's. HUP is the guard's to ignore; PIPE goes back to the command's own.
+audit_sig_yield() {
   [ "$AUDIT_SIG_PID" = "$BASHPID" ] || return 0
-  AUDIT_SIG_PID=""
-  for s in INT TERM; do
+  AUDIT_SIG_ARMED="INT TERM"
+  sig_owner PIPE
+  builtin trap -- "$SIG_OWNER" PIPE
+}
+# Back to what the command itself asked for, when its record is finished —
+# only the signals the record took, so a guard's ignored HUP stays ignored.
+audit_sig_disarm() {
+  local s armed="$AUDIT_SIG_ARMED"
+  [ "$AUDIT_SIG_PID" = "$BASHPID" ] || return 0
+  AUDIT_SIG_PID="" AUDIT_SIG_ARMED=""
+  for s in $armed; do
     sig_owner "$s"
     builtin trap -- "$SIG_OWNER" "$s"
   done
 }
-audit_signal() { # INT|TERM
+audit_signal() { # INT|TERM|HUP|PIPE
   local owner
   sig_owner "$1"; owner="$SIG_OWNER"
   # A command that ignores the signal goes on: nothing was interrupted.
@@ -985,7 +1027,8 @@ audit_signal() { # INT|TERM
 #
 # So for a command guarded here, SIGHUP and SIGPIPE are not interruptions:
 # HUP is ignored and PIPE cannot arise, and the record carries the command's
-# own outcome. Every other command keeps the default for both.
+# own outcome. Every other armed command records both as `interrupted
+# (SIGHUP|SIGPIPE)` and dies by them, as GHR-119 does for INT and TERM (GHR-131).
 CALLER_GUARD_PID="" CALLER_GUARD_OUT="" CALLER_GUARD_ERR=""
 CALLER_GUARD_P1="" CALLER_GUARD_P2="" CALLER_GONE=false
 # One stream, on stdin, to stdout: each line passed on until a write fails,
@@ -1004,6 +1047,8 @@ caller_guard() {
   [ "$CALLER_GUARD_PID" != "$BASHPID" ] || return 0
   CALLER_GUARD_PID="$BASHPID" CALLER_GONE=false
   builtin trap '' HUP
+  # GHR-131: the record armed just before this no longer takes HUP or PIPE.
+  audit_sig_yield
   # A stream that is not open at all has nothing to relay to.
   # (Its own complaint about fd 2 has nowhere to go, which is the point.)
   true 2>/dev/null >&1 || exec 1>/dev/null

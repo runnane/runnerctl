@@ -463,6 +463,18 @@ Traps:
   no-op there — the first run of GHR-119's composition case was green under
   a plain `make sim` and red under `agent-gate-admit`, with `trap -p` showing
   `trap -- '' SIGINT`.
+- **HUP and PIPE are the record's too, except under a caller guard**
+  (GHR-131). Armed and not guarded, both run `audit_signal` exactly as INT
+  and TERM do (`interrupted (SIGHUP|SIGPIPE)`, then death by the signal).
+  `caller_guard` takes both back (`audit_sig_yield`): HUP stays the guard's
+  ignore and is never handed back by `audit_sig_disarm`, PIPE goes back to
+  the command's own. **An agent harness starts the gate with SIGPIPE
+  ignored** (`SigIgn` bit 12 in `/proc/self/status`), so a `run_fn` case
+  cannot trap PIPE at all — use `run_fn_sigdfl` (perl resets INT, TERM, HUP
+  and PIPE before exec), and `run_signalled` resets PIPE too. The GHR-80
+  stream-reader case therefore exercises its PIPE trap only where the gate's
+  PIPE is at its default (CI); under an agent the trap is a silent no-op and
+  the case is green by some other path out.
 - **A space in `RUNNERCTL_STUB_KEYS` is a key (GHR-129)**: `fleet watch`'s
   mark. The real `IFS= read -rsn1` hands back `' '` for it, and so does the
   stub (logged `probe:tty_read_char 5 \ `). While any row is marked the table
