@@ -9328,10 +9328,13 @@ case_fleet_watch_question_mark_lists_every_key() {
   # a line per key, and the list short enough for a 24-row terminal: its 17
   # lines (GHR-78 added O, GHR-76 Enter and what the pane's own keys are), the
   # header, the summary and the three lines under it
-  for k in '!' 'b i' '/' 'a' 's' 'c' 'Enter' 'K R S T P L' 'O' '\?' 'q' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
+  for k in '!' 'b i' '/' 'a' 's' 'c' 'Enter' 'K R S T P L' 'D W E X' 'O' 'q \?' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
     expect_frame 2 "^  $k   +[a-z]"
   done
   expect_frame 2 '^  K R S T P L   kill job, restart, stop, start, reap, logs; R S: w = when idle$'
+  # GHR-127: the host keys took the line `?` had; `?` folded into q's
+  expect_frame 2 "^  D W E X   the row's host: drain, restart when idle, enable, disable\$"
+  expect_frame 2 '^  q \?   quit, this list; Esc stops following a running action, which carries on$'
   expect_frame 2 '^          host that is not answering: that host\)\. There q Esc Enter go back, h$'
   expect_frame_lines 2 23
   expect_frame 3 "$(fw_row build-1 0 1)"
@@ -14076,6 +14079,191 @@ t "GHR-126: w elsewhere cancels; y and n are unchanged"                       ca
 t "GHR-126: w runs in the background"                                         case_ghr126_w_runs_in_the_background
 t "GHR-126: w is on the --when-idle budget"                                   case_ghr126_w_is_on_the_when_idle_budget
 t "GHR-126: w carries FLEET_SUDO and --origin"                                case_ghr126_w_carries_sudo_and_origin
+
+# --- GHR-127: host keys D W E X act on the host of the cursor's row ------------
+# D drain, W restart --when-idle (rolling), E enable, X disable — every slot of
+# the host the cursor's row belongs to, named on the confirm line. D and W are
+# one call naming the slots; E and X one call per slot (a host's enable and
+# disable take one target). D and X hold the capacity floor for the host's
+# active slots as a SET. A stub host has three slots: slot-1 busy, slot-2 idle,
+# slot-3 not active — so a host takes 2 of the fleet's active slots with it.
+GHR127_SLOTS='example\.slot-1 example\.slot-2 example\.slot-3'
+GHR127_MUTATING='^probe:ssh_run [^ ]+ -- (sudo -n )?runnerctl (stop|start|restart|kill|reap|drain|enable|disable) '
+
+# The acceptance case: D, y from build-2's first row issues exactly one drain,
+# to build-2, naming its slots; nothing reaches build-1. From build-1's LAST
+# row it drains build-1: any row of a host is the host.
+case_ghr127_D_drains_the_cursors_host_once() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjDyq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^Drain build-2\\? runs on build-2: runnerctl drain $GHR127_SLOTS — each slot stopped once its job is done, one at a time; leaves 2 of 6 slot\\(s\\) active across the watched hosts  \\[y/n\\]\$" 1
+  expect_out_count "^running on build-2: runnerctl drain $GHR127_SLOTS\$" 1
+  expect_out_count '^build-2: drain done\.$' 1
+  expect_log_count "^probe:ssh_run build-2 -- runnerctl drain $GHR127_SLOTS\$" 1
+  expect_log_count "$GHR127_MUTATING" 1
+  expect_no_log '^probe:ssh_run build-1 -- runnerctl drain'
+  expect_cfg_count "$WRITES/fleet.log" '.' 1
+  expect_cfg "$WRITES/fleet.log" "^$GHR88_TS $ME fleet drain --host build-2 $GHR127_SLOTS \\(fleet watch\\) — build-2=0\$"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjDyq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_log_count "^probe:ssh_run build-1 -- runnerctl drain $GHR127_SLOTS\$" 1
+  expect_log_count "$GHR127_MUTATING" 1
+}
+
+# The negative control, for D and X: under --min-available 3, with 4 of 6
+# slots active, each of build-1's slots ALONE passes the floor — S on its
+# slot-1 is offered, `leaves 3 of 6` (answered n) — but the host's two active
+# slots together would leave 2: D and X are refused with the floor message and
+# issue nothing.
+case_ghr127_D_and_X_hold_the_floor_for_the_whole_host() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='SnDyq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never --min-available 3
+  expect_rc 0
+  expect_out_count '^Stop example\.slot-1 on build-1\? runs on build-1: runnerctl stop example\.slot-1 — leaves 3 of 6 slot\(s\) active across the watched hosts  \[y/n\]' 1
+  expect_out_count "^build-1: not drained — it would leave 2 of 6 slot\\(s\\) active across the watched hosts, under --min-available 3; restart --min-available lower \\(0 turns the floor off\\), or run 'runnerctl drain' on build-1\$" 1
+  expect_no_out '^Drain '
+  expect_no_log "$GHR127_MUTATING"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='SnXyq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never --min-available 3
+  expect_rc 0
+  expect_out_count '^Stop example\.slot-1 on build-1\? .* leaves 3 of 6 ' 1
+  expect_out_count "^build-1: not disabled — it would leave 2 of 6 slot\\(s\\) active across the watched hosts, under --min-available 3; restart --min-available lower \\(0 turns the floor off\\), or disable its slots one at a time with 'runnerctl disable' on build-1\$" 1
+  expect_no_out '^Disable '
+  expect_no_log "$GHR127_MUTATING"
+}
+
+# X, y: one `disable <slot>` per slot of the cursor's host, in turn, each once,
+# nothing elsewhere; the confirm line names every call and warns about the job
+# it kills. Above the floor it runs.
+case_ghr127_X_disables_every_slot_of_its_host() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjXyq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^Disable build-2's slots\\? runs on build-2, one call per slot: runnerctl disable example\\.slot-1; runnerctl disable example\\.slot-2; runnerctl disable example\\.slot-3 — leaves 2 of 6 slot\\(s\\) active across the watched hosts  \\[y/n\\]\$" 1
+  expect_out_count '^warning: a job is running \(example\.slot-1 \(my-app:test\)\) — disable stops its slot now and GitHub marks the job failed; D drains instead$' 1
+  expect_out_count '^build-2: disable done\.$' 1
+  local s
+  for s in 1 2 3; do expect_log_count "^probe:ssh_run build-2 -- runnerctl disable example\\.slot-$s\$" 1; done
+  expect_log_count "$GHR127_MUTATING" 3
+  expect_log_order '^probe:ssh_run build-2 -- runnerctl disable example\.slot-1$' '^probe:ssh_run build-2 -- runnerctl disable example\.slot-2$' \
+                   '^probe:ssh_run build-2 -- runnerctl disable example\.slot-3$'
+  expect_cfg_count "$WRITES/fleet.log" '.' 1
+  expect_cfg "$WRITES/fleet.log" "^$GHR88_TS $ME fleet disable --host build-2 $GHR127_SLOTS \\(fleet watch\\) — build-2=0\$"
+}
+
+# A host line (here build-2's Disk/OOM line) is the host's, and so is every row
+# under it: the cursor passes over the line, as it always has, and D from the
+# row under it drains THAT host. A folded host (c) is one line, and D there
+# drains it too.
+case_ghr127_D_from_a_host_with_a_host_line_and_from_a_folded_host() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjDyq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" RUNNERCTL_STUB_FLEET_FULL="build-2" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out "^build-2 +${HV}Disk: "
+  expect_out_count "^Drain build-2\\? runs on build-2: runnerctl drain $GHR127_SLOTS " 1
+  expect_log_count "^probe:ssh_run build-2 -- runnerctl drain $GHR127_SLOTS\$" 1
+  expect_log_count "$GHR127_MUTATING" 1
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='cjDyq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" RUNNERCTL_STUB_FLEET_FULL="build-2" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_log_count "^probe:ssh_run build-2 -- runnerctl drain $GHR127_SLOTS\$" 1
+  expect_log_count "$GHR127_MUTATING" 1
+}
+
+# A host that is not answering (no rows to keep: one error row) refuses a host
+# key in its own words and issues nothing — not even with its `--json` reads
+# answering, which is what the refusal must not lean on. A slot key on the
+# same row still says there is no slot there.
+case_ghr127_an_unreachable_host_refuses_a_host_key() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjDyXySq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_DOWN="build-2:1,2,3" run fleet watch --color never
+  expect_rc 0
+  expect_out "^${REV}build-2 +unreachable"
+  expect_out_count '^build-2: not answering — D decides on what the host says, and it says nothing; nothing issued$' 1
+  expect_out_count '^build-2: not answering — X decides on what the host says, and it says nothing; nothing issued$' 1
+  expect_out_count '^build-2: not answering — no slot there to act on$' 1
+  expect_no_out '\[y/n\]'
+  expect_no_log "$GHR127_MUTATING"
+}
+
+# W: one `restart --when-idle <slots>` — rolling, so no floor, as R has none
+# (offered under a --min-available every host key that removes capacity would
+# cross), on the budget a wait per slot earns. E: one `enable <slot>` per
+# slot. Neither carries a warning; w at their confirm line cancels.
+case_ghr127_W_and_E_issue_exactly_their_commands() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Wyq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never --min-available 3
+  expect_rc 0
+  expect_out_count "^Restart build-1 when idle\\? runs on build-1: runnerctl restart --when-idle $GHR127_SLOTS — each slot restarted once its job is done, one at a time  \\[y/n\\]\$" 1
+  expect_out_count '^build-1: restart done\.$' 1
+  expect_log_count "^probe:ssh_run build-1 -- runnerctl restart --when-idle $GHR127_SLOTS\$" 1
+  expect_log_count "$GHR127_MUTATING" 1
+  expect_no_out '^warning:|min-available'
+  expect_cfg "$WRITES/fleet.log" "^$GHR88_TS $ME fleet restart --when-idle --host build-1 $GHR127_SLOTS \\(fleet watch\\) — build-1=0\$"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Eyq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^Enable build-1's slots\\? runs on build-1, one call per slot: runnerctl enable example\\.slot-1; runnerctl enable example\\.slot-2; runnerctl enable example\\.slot-3  \\[y/n\\]\$" 1
+  expect_out_count '^build-1: enable done\.$' 1
+  local s
+  for s in 1 2 3; do expect_log_count "^probe:ssh_run build-1 -- runnerctl enable example\\.slot-$s\$" 1; done
+  expect_log_count "$GHR127_MUTATING" 3
+  expect_no_out '^warning:'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='WwEwq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^cancelled — nothing run$' 2
+  expect_no_log "$GHR127_MUTATING"
+}
+
+# A host key runs in the background (GHR-125): with the drain held, the j
+# pressed next is read on the poll step while it runs, and lands before its
+# notice; the progress line names the host. (One host draining is the whole
+# watched fleet, so the floor is off.)
+case_ghr127_a_host_key_runs_in_the_background() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD=build-1 RUNNERCTL_STUB_KEYS="Dyj${REL}kq" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never --min-available 0
+  expect_rc 0
+  frames
+  expect_frame_before "the cursor j moved" "$(fw_row build-1 1 2)" "the drain's notice" '^build-1: drain done\.$'
+  expect_frame 3 "^build-1: drain running — ${GHR125_PROGRESS}\$"
+  expect_log_order '^probe:tty_read_char 5 y$' "^probe:ssh_run build-1 -- runnerctl drain $GHR127_SLOTS\$" \
+                   '^probe:remote_held build-1$' '^probe:act_poll landed=0 held=1$' '^probe:tty_read_char 0\.2 j$' \
+                   '^probe:release$' '^probe:remote_released build-1$'
+  expect_log_count "$GHR127_MUTATING" 1
+}
+
+# The budget a drain earns is a wait per slot: a drain of three slots that
+# takes 3000 s outlasts one slot's wait plus the action (2700) and completes.
+case_ghr127_a_drain_is_on_a_budget_of_a_wait_per_slot() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_DELAY="build-1:3000:drain" RUNNERCTL_STUB_KEYS='Dy-q' \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never --min-available 0
+  expect_rc 0
+  expect_out '^build-1: drain done\.$'
+  expect_no_out 'timed out'
+  expect_cfg "$WRITES/fleet.log" '— build-1=0$'
+}
+
+# FLEET_SUDO and --origin apply to a host key's every call.
+case_ghr127_host_keys_carry_sudo_and_origin() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_KEYS='Dyq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet watch --color never --min-available 0
+  expect_rc 0
+  expect_out_count "^Drain build-1\\? runs on build-1: sudo -n runnerctl drain $GHR127_SLOTS " 1
+  expect_log_count "^probe:ssh_run build-1 -- sudo -n runnerctl drain $GHR127_SLOTS\$" 1
+  expect_log_count "^probe:ssh_origin build-1 $GHR88_ORIGIN\$" 1
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_KEYS='Eyq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^Enable build-1's slots\\? runs on build-1, one call per slot: sudo -n runnerctl enable example\\.slot-1; sudo -n runnerctl enable example\\.slot-2; " 1
+  local s
+  for s in 1 2 3; do expect_log_count "^probe:ssh_run build-1 -- sudo -n runnerctl enable example\\.slot-$s\$" 1; done
+  expect_log_count "^probe:ssh_origin build-1 $GHR88_ORIGIN\$" 3
+}
+
+t "GHR-127: D drains the cursor's host, once, from any of its rows"           case_ghr127_D_drains_the_cursors_host_once
+t "GHR-127: D and X hold the floor for the whole host, not slot by slot"      case_ghr127_D_and_X_hold_the_floor_for_the_whole_host
+t "GHR-127: X disables every slot of its host, one call each"                 case_ghr127_X_disables_every_slot_of_its_host
+t "GHR-127: D from under a host line and from a folded host"                  case_ghr127_D_from_a_host_with_a_host_line_and_from_a_folded_host
+t "GHR-127: an unreachable host refuses a host key"                           case_ghr127_an_unreachable_host_refuses_a_host_key
+t "GHR-127: W and E issue exactly their commands"                             case_ghr127_W_and_E_issue_exactly_their_commands
+t "GHR-127: a host key runs in the background"                                case_ghr127_a_host_key_runs_in_the_background
+t "GHR-127: a drain is on a budget of a wait per slot"                        case_ghr127_a_drain_is_on_a_budget_of_a_wait_per_slot
+t "GHR-127: host keys carry FLEET_SUDO and --origin"                          case_ghr127_host_keys_carry_sudo_and_origin
 
 # --- Summary ------------------------------------------------------------------
 echo

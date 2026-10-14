@@ -1488,6 +1488,7 @@ has its own `slot-1`:
 | `K` | kill the running job (`runnerctl kill <slot>` there) |
 | `R` / `S` / `T` | restart / stop / start the slot; at the confirm line of `R` and `S`, `y` runs it now and `w` runs it **when idle** (`--when-idle`) |
 | `P` | reap processes a finished job leaked |
+| `D` / `W` / `E` / `X` | on the **host** of the cursor's row, every slot it has: drain, restart when idle (rolling), enable, disable — below |
 | `L` | page the slot's last 50 journal lines through your `$PAGER` |
 | `O` | print the URL of the running job's run on the status line; no round trip |
 | `Enter` | show the selected slot in full, in place of the table; no round trip — below |
@@ -1582,13 +1583,42 @@ it exactly as `y` does; `R`, `w` takes none, since the slot comes back. `R` and
 `K` are transient and `T`/`P` take nothing away, so they are not gated — the
 same split as the fleet commands below.
 
+**Host keys.** `D` `W` `E` `X` act on a whole host: the host of the row the
+cursor is on, from any of its slot rows or its folded line (`c`). A host's
+`Disk:` line stays a line the cursor passes over — the rows under it are that
+host's, and a host key on any of them acts on it. Each reads the host's own
+`status --json` at the keypress and names, on its confirm line, the exact
+command and every slot it touches; `y` runs it in the background with the host
+as its label, anything else cancels (`w` included):
+
+| key | runs on the host |
+| --- | --- |
+| `D` | `runnerctl drain <every slot>` — one call; each slot stopped once its job is done, one at a time |
+| `W` | `runnerctl restart --when-idle <every slot>` — one call; a rolling restart, each slot once its job is done |
+| `E` | `runnerctl enable <slot>`, one call per slot, in turn |
+| `X` | `runnerctl disable <slot>`, one call per slot, in turn — the confirm line warns about any job it kills |
+
+`E` and `X` are a call per slot because a host's `enable` / `disable` take one
+slot; a call that fails ends the action there, with its error as the notice.
+`D` and `X` take a whole host's capacity at once, so their **floor is checked
+for the host's active slots together**: each slot alone may pass
+`--min-available K` while all of them would cross it, and then the key is
+refused (`build-1: not drained — it would leave 2 of 6 slot(s) active …`).
+`W` takes no floor, as `R` takes none: the roll puts each slot back before it
+takes the next. A drain or a rolling restart runs on a budget of
+`WAIT_TIMEOUT` per slot plus `FLEET_MUTATE_TIMEOUT`. On the one row of a host
+that is not answering, a host key is refused — there is nothing to decide on —
+and a slot key still says there is no slot there. `FLEET_SUDO` and the origin
+apply as for the slot keys.
+
 The cursor survives the frame changing under it. A host that stops answering
 keeps its rows, so the cursor stays on the slot it was on (the age line above
 them is never a stop); a host with no rows to keep is one row, where keys act
 on nothing, and the cursor is back on its slot when the host answers. A slot
 that goes away drops the cursor to that host's first slot. `L` is not a stream: the host's
 `logs <slot> -n 50` runs to completion under `FLEET_TIMEOUT` and the result is
-paged locally. The keys that change something (`K` `R` `S` `T` `P`) run under
+paged locally. The keys that change something (`K` `R` `S` `T` `P`, and the
+host keys `D` `W` `E` `X`) run under
 `FLEET_MUTATE_TIMEOUT` instead, in the background: a restart that sits out a
 wedged job's `TimeoutStopSec` is followed for those minutes rather than
 reported `failed` about an action that then completes behind it.
