@@ -2995,7 +2995,7 @@ save_profile() { # COMMAND
     "${priv[@]}" cp -p "$f" "$f.bak"
     "${priv[@]}" tee "$f" <"$cand" >/dev/null
   else
-    "${priv[@]}" mkdir -p "$(dirname "$f")"
+    "${priv[@]}" mkdir -p -m 755 "$(dirname "$f")"
     "${priv[@]}" tee "$f" <"$cand" >/dev/null
     ! $newroot || run_priv chown root:root "$f"
     "${priv[@]}" chmod 644 "$f"
@@ -4151,7 +4151,7 @@ cmd_env_init() {
     return 0
   fi
   audit_begin env-init "$ENV_FILE" "--profile $PROFILE"
-  run_priv mkdir -p "$(dirname "$ENV_FILE")"
+  run_priv mkdir -p -m 755 "$(dirname "$ENV_FILE")"
   render_env_template | run_priv tee "$ENV_FILE" >/dev/null
   run_priv chown root:root "$ENV_FILE"
   run_priv chmod 600 "$ENV_FILE"
@@ -13441,7 +13441,7 @@ cmd_migrate() {
     write_as "$(dirname "$out")" "write $out" "$out"
     [ "${#WRITE_AS[@]}" -eq 0 ] || priv=("${WRITE_AS[@]}")
     [ -z "$WRITE_USER" ] || newroot=false
-    "${priv[@]}" mkdir -p "$(dirname "$out")"
+    "${priv[@]}" mkdir -p -m 755 "$(dirname "$out")"
     printf '%s\n' "$cfg" | "${priv[@]}" tee "$out" >/dev/null
     ! $newroot || run_priv chown root:root "$out"
     "${priv[@]}" chmod 644 "$out"

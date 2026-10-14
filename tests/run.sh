@@ -715,7 +715,7 @@ case_env_init_scaffolds() {
   run env-init --profile deploy
   expect_rc 0
   expect_out "^Scaffolded $DEPLOY_ENV \\(root:root, 600\\)\\.\$"
-  expect_log_order "^test -f $DEPLOY_ENV\$" '^mkdir -p /etc/runnerctl$' "^tee $DEPLOY_ENV\$" \
+  expect_log_order "^test -f $DEPLOY_ENV\$" '^mkdir -p -m 755 /etc/runnerctl$' "^tee $DEPLOY_ENV\$" \
                    "^chown root:root $DEPLOY_ENV\$" "^chmod 600 $DEPLOY_ENV\$"
   expect_file "$DEPLOY_ENV" '^# deploy runner — on-device secrets/config'
   expect_file "$DEPLOY_ENV" '^# KEY=value$'
@@ -6910,10 +6910,46 @@ $d/home/new $u 755"
   expect_rc 0
   expect_out "^Created $nq with profile 'ci'\\.$"
   expect_text "calls of a new config's save in a user's directory" \
-    "$(printf '%s\n' "runuser -u $me -- mkdir -p $d/home/new/cfg" "runuser -u $me -- tee $n" "runuser -u $me -- chmod 644 $n")" \
+    "$(printf '%s\n' "runuser -u $me -- mkdir -p -m 755 $d/home/new/cfg" "runuser -u $me -- tee $n" "runuser -u $me -- chmod 644 $n")" \
     "$(cat "$LOG")"
   expect_cfg "$n" "^  MEM_HIGH='infinity'$"
   expect_mode "$n" 644
+}
+
+# GHR-140: a directory these writes have to create is made at an explicit 755.
+# `mkdir -p` with no mode takes root's umask, and under 077 that is a 0700
+# config directory nobody else can traverse (the GHR-47 shape), so an
+# unprivileged status or watch could no longer load the config. The run is
+# under umask 077 and the directories are made for real by the stub, so both
+# the logged call and the mode on disk are asserted. Only the last component
+# gets the mode: the case creates one level, which is all it can see.
+case_ghr140_created_config_and_env_directories_are_755_under_umask_077() {
+  local d="$TMP/ghr140" ov="$TMP/ghr140.sh" c um
+  rm -rf "$d"; mkdir -p "$d/sys"
+  ghr117_overrides "$ov" "$d"
+  c="$d/sys/config"
+  ghr135_config "$c" "$ov" </dev/null
+  um="$(umask)"; umask 077
+  # save_profile, new-file branch.
+  RUNNERCTL_STUB_AS_ROOT=1 run_snippet "$d/sys/s/config" \
+    "$(printf '. %q; PROFILE=ci; load_profile; MEM_HIGH=infinity; save_profile apply' "$ov")"
+  expect_rc 0
+  expect_log "^mkdir -p -m 755 $(ere_quote "$d")/sys/s\$"
+  expect_mode "$d/sys/s" 755
+  # migrate's output write.
+  RUNNERCTL_STUB_AS_ROOT=1 run_cfg "$c" migrate --from tests/fixtures/runnerctl-legacy --output "$d/sys/m/config"
+  expect_rc 0
+  expect_log "^mkdir -p -m 755 $(ere_quote "$d")/sys/m\$"
+  expect_mode "$d/sys/m" 755
+  # env-init: the file is root:root 600 whatever the directory is, so the
+  # directory is 755 like the config directory it usually shares.
+  # A no-op chown stands in for root's: this process is not root.
+  mkdir -p "$d/bin"; printf '#!/bin/sh\nexit 0\n' >"$d/bin/chown"; chmod +x "$d/bin/chown"
+  PATH="$d/bin:$PATH" RUNNERCTL_STUB_AS_ROOT=1 run_cfg "$c" env-init --profile deploy --env-file "$d/sys/e/deploy.env"
+  expect_rc 0
+  expect_log "^mkdir -p -m 755 $(ere_quote "$d")/sys/e\$"
+  expect_mode "$d/sys/e" 755
+  umask "$um"
 }
 
 case_ghr135_save_refuses_a_directory_others_can_write() {
@@ -6982,7 +7018,7 @@ case_ghr135_save_in_a_root_owned_directory_is_root_s_write_as_before() {
     "$(printf '. %q; PROFILE=ci; load_profile; MEM_HIGH=infinity; save_profile apply' "$ov")"
   expect_rc 0
   expect_text "root's calls for a new trusted config" \
-    "$(printf '%s\n' "mkdir -p $d/sys/new" "tee $n" "chmod 644 $n")" \
+    "$(printf '%s\n' "mkdir -p -m 755 $d/sys/new" "tee $n" "chmod 644 $n")" \
     "$(cat "$LOG")"
   expect_mode "$n" 644
   # Not root, and the directory writable: this process's own write, unjudged
@@ -10335,6 +10371,7 @@ t "GHR-117: the real chain owner over /tmp"                              case_gh
 t "GHR-135: --save in a user's directory is written as that user"       case_ghr135_save_in_a_user_s_directory_is_written_as_that_user
 t "GHR-135: --save refuses a directory others can write, before a call" case_ghr135_save_refuses_a_directory_others_can_write
 t "GHR-135: --save in a root-owned directory is root's write, as before" case_ghr135_save_in_a_root_owned_directory_is_root_s_write_as_before
+t "GHR-140: created config and env directories are 755 under umask 077" case_ghr140_created_config_and_env_directories_are_755_under_umask_077
 
 # --- GHR-48: the real discover(), not the stub's stand-in -------------------
 t "discover: no matching units is empty and exit 0, not a failure"     case_discover_no_matching_units_is_empty_not_a_failure
@@ -13826,14 +13863,14 @@ case_ghr119_an_interrupted_command_records_it_and_dies_by_the_signal() {
     expect_out '— interrupted \(SIGTERM\)$'
     return 0
   fi
-  run_signalled TERM group '^mkdir -p /etc/runnerctl$' env-init --profile deploy
+  run_signalled TERM group '^mkdir -p -m 755 /etc/runnerctl$' env-init --profile deploy
   expect_rc 143
   expect_signalled 15
   expect_one_record "env-init /etc/runnerctl/deploy\\.env \\(--profile deploy\\) by $ME — interrupted \\(SIGTERM\\)"
-  expect_log_order '^probe:blocked mkdir -p /etc/runnerctl$' '^probe:audit '
+  expect_log_order '^probe:blocked mkdir -p -m 755 /etc/runnerctl$' '^probe:audit '
   expect_no_log '^tee '
   expect_no_out '^Scaffolded'
-  run_signalled INT group '^mkdir -p /etc/runnerctl$' env-init --profile deploy
+  run_signalled INT group '^mkdir -p -m 755 /etc/runnerctl$' env-init --profile deploy
   expect_rc 130
   expect_signalled 2
   expect_one_record "env-init /etc/runnerctl/deploy\\.env \\(--profile deploy\\) by $ME — interrupted \\(SIGINT\\)"
@@ -14111,11 +14148,11 @@ case_ghr131_a_hangup_interrupts_an_armed_command() {
     expect_out "^trap -- 'audit_signal HUP' SIGHUP\$"
     return 0
   fi
-  run_signalled HUP group '^mkdir -p /etc/runnerctl$' env-init --profile deploy
+  run_signalled HUP group '^mkdir -p -m 755 /etc/runnerctl$' env-init --profile deploy
   expect_rc 129
   expect_signalled 1
   expect_one_record "env-init /etc/runnerctl/deploy\\.env \\(--profile deploy\\) by $ME — interrupted \\(SIGHUP\\)"
-  expect_log_order '^probe:blocked mkdir -p /etc/runnerctl$' '^probe:audit '
+  expect_log_order '^probe:blocked mkdir -p -m 755 /etc/runnerctl$' '^probe:audit '
   expect_no_log '^tee '
 }
 case_ghr131_a_cut_pipe_interrupts_an_armed_command() {
@@ -14127,11 +14164,11 @@ case_ghr131_a_cut_pipe_interrupts_an_armed_command() {
     expect_one_record "env-init /etc/runnerctl/deploy\\.env \\(--profile deploy\\) by $ME — ok"
     return 0
   fi
-  run_signalled PIPE group '^mkdir -p /etc/runnerctl$' env-init --profile deploy
+  run_signalled PIPE group '^mkdir -p -m 755 /etc/runnerctl$' env-init --profile deploy
   expect_rc 141
   expect_signalled 13
   expect_one_record "env-init /etc/runnerctl/deploy\\.env \\(--profile deploy\\) by $ME — interrupted \\(SIGPIPE\\)"
-  expect_log_order '^probe:blocked mkdir -p /etc/runnerctl$' '^probe:audit '
+  expect_log_order '^probe:blocked mkdir -p -m 755 /etc/runnerctl$' '^probe:audit '
   expect_no_log '^tee '
 }
 
