@@ -4603,10 +4603,20 @@ case_provision_fresh_host_installs_and_registers() {
   expect_out '^Provisioned 2 runner\(s\): slot-1 slot-2$'
   # The account is created before anything is unpacked into its directories.
   expect_log '^useradd --system --create-home .* github-runner$'
-  # Per slot: unpack, own, register, install the unit, start it.
-  expect_log '^mkdir -p /opt/actions-runner/slot-1$'
-  expect_log '^tar -xzf .*/actions-runner-linux-x64-2\.337\.0\.tar\.gz -C /opt/actions-runner/slot-1$'
-  expect_log '^chown -R github-runner:github-runner /opt/actions-runner/slot-1$'
+  # Per slot: unpack, own, register, install the unit, start it. GHR-116: the
+  # unpack and the chown name a directory root has just created inside a
+  # staging directory of its own (the stub fills mktemp's X's with stub0001),
+  # which is then renamed into place — never the slot directory itself.
+  local st='/opt/actions-runner/\.slot-1\.provision\.stub0001'
+  expect_log '^mktemp -d /opt/actions-runner/\.slot-1\.provision\.XXXXXXXX$'
+  expect_log "^mkdir -m 0755 $st/new\$"
+  expect_log "^tar -xzf .*/actions-runner-linux-x64-2\\.337\\.0\\.tar\\.gz -C $st/new\$"
+  expect_log "^chown -R github-runner:github-runner $st/new\$"
+  expect_log "^mv -T -- $st/new /opt/actions-runner/slot-1\$"
+  expect_log "^rm -rf -- $st\$"
+  # A fresh host has no old directory to move aside.
+  expect_no_log '^mv -T -- /opt/actions-runner/slot-[0-9]+ '
+  expect_no_log '^(mkdir|tar|chown)( .*)? /opt/actions-runner/slot-[0-9]+$'
   expect_log 'config\.sh --unattended --url https://github\.com/acme --token .* --name slot-1 --work _work --labels ci,linux$'
   expect_log 'config\.sh --unattended --url https://github\.com/acme --token .* --name slot-2 --work _work --labels ci,linux$'
   # GHR-110: what svc.sh install + start did, done by runnerctl — the unit
@@ -4617,7 +4627,11 @@ case_provision_fresh_host_installs_and_registers() {
   expect_log '^systemctl start actions\.runner\.acme\.slot-2\.service$'
   expect_log_order \
     '^useradd ' \
-    '^mkdir -p /opt/actions-runner/slot-1$' \
+    '^mktemp -d /opt/actions-runner/\.slot-1\.provision\.XXXXXXXX$' \
+    "^tar -xzf .* -C $st/new\$" \
+    "^chown -R github-runner:github-runner $st/new\$" \
+    "^mv -T -- $st/new /opt/actions-runner/slot-1\$" \
+    "^rm -rf -- $st\$" \
     'slot-1 \./config\.sh ' \
     '^install -m 0644 -o root -g root /dev/null .*/actions\.runner\.acme\.slot-1\.service$' \
     '^tee .*/actions\.runner\.acme\.slot-1\.service$' \
@@ -4643,16 +4657,29 @@ case_provision_fresh_host_installs_and_registers() {
 SVC_SH='(^|[ /])svc\.sh'
 
 # GHR-110: every privileged call that names a path inside a runner directory
-# (/opt/actions-runner/... in the sim) is either dropped to a non-root user by
-# runuser, or one of the four things root does TO the directory — create,
-# unpack into, chown, delete. Anything else there run as root (svc.sh, env.sh,
-# config.sh, run.sh, a runner-owned runsvc.sh...) is a job's code run as root,
-# since the runner user owns the directory and every job runs as that user.
-expect_no_root_exec_in_runner_dirs() {
+# (/opt/actions-runner/... in the sim, or RUNNER-ROOT) is either dropped to a
+# non-root user by runuser, or one of the things root does TO a directory.
+# Anything else there run as root (svc.sh, env.sh, config.sh, run.sh, a
+# runner-owned runsvc.sh...) is a job's code run as root, since the runner
+# user owns the directory and every job runs as that user.
+#
+# GHR-116 narrows "TO a directory": root creates, unpacks into and chowns only
+# STAGE/new, where STAGE is a mktemp -d staging directory of its own under the
+# root (`.<name>.provision.<8 random>`); it may rename a slot directory to
+# STAGE/old and STAGE/new to a slot directory, and delete either. A tar -C,
+# chown -R or mkdir naming a slot directory — a tree the runner user may have
+# owned — is a root write into a runner-owned tree, and fails here.
+ere_quote() { printf '%s' "$1" | sed "s/[][\\.*^\$()+?{}|]/\\\\&/g"; }
+expect_no_root_exec_in_runner_dirs() { # [RUNNER-ROOT]
   _expect
-  local bad
-  bad="$(grep -Ev '^runuser -u [a-z_][a-z0-9_-]* -- ' "$LOG" | grep -F '/opt/actions-runner/' \
-    | grep -Ev '^(mkdir -p|chown -R [^ ]+|rm -rf --|tar -xzf [^ ]+ -C) /opt/actions-runner/[^ ]+$' || true)"
+  local r="${1:-/opt/actions-runner}" re bad slot stage ok
+  re="$(ere_quote "$r")"
+  slot="$re/[A-Za-z0-9_-][A-Za-z0-9._-]*"
+  stage="$re/\\.[A-Za-z0-9_-][A-Za-z0-9._-]*\\.provision\\.[A-Za-z0-9]{8}"
+  ok="^(mktemp -d $re/\\.[A-Za-z0-9_-][A-Za-z0-9._-]*\\.provision\\.XXXXXXXX"
+  ok+="|mkdir -m 0755 $stage/new|tar -xzf [^ ]+ -C $stage/new|chown -R [^ ]+ $stage/new"
+  ok+="|mv -T -- $slot $stage/old|mv -T -- $stage/new $slot|rm -rf -- ($slot|$stage))\$"
+  bad="$(grep -Ev '^runuser -u [a-z_][a-z0-9_-]* -- ' "$LOG" | grep -F "$r/" | grep -Ev "$ok" || true)"
   [ -z "$bad" ] || FAILS+=("a root call names a path inside a runner directory: ${bad%%$'\n'*}")
   ! grep -Eq '^runuser -u root ' "$LOG" || FAILS+=("a runner_exec ran as root: $(grep -E -m1 '^runuser -u root ' "$LOG"; true)")
   # Captured, not piped into `grep -q`: under pipefail an early-exiting grep
@@ -4667,7 +4694,7 @@ case_provision_is_idempotent_against_the_target_count() {
   expect_rc 0
   expect_out '^Host has 3 runner slot\(s\); target 3\.$'
   expect_out '^Nothing to provision\.'
-  expect_no_log '^(mkdir|tar|useradd|chown) '
+  expect_no_log '^(mktemp|mkdir|tar|useradd|chown|mv) '
   expect_no_log 'config\.sh '
   expect_no_log '^api: '
   # Fewer than it has is equally a no-op: provision never deregisters.
@@ -4706,7 +4733,7 @@ case_provision_dry_run_changes_nothing() {
   # Reading the release metadata is allowed; changing the host is not.
   expect_log '^api: GET .*/releases/latest'
   expect_no_log '^fetch: '
-  expect_no_log '^(mkdir|tar|chown|useradd|groupadd|systemctl) '
+  expect_no_log '^(mktemp|mkdir|tar|chown|mv|rm|useradd|groupadd|systemctl) '
   expect_no_log 'config\.sh '
   expect_no_log '^api: POST '
 }
@@ -4771,7 +4798,7 @@ case_provision_token_sources() {
     run provision 1 --url "$PROV_URL" --name-prefix slot
   expect_rc 1
   expect_err 'no registration token: pass --token .*, or --pat/.GITHUB_TOKEN, or log in with the gh CLI'
-  expect_no_log '^(mkdir|tar|useradd) '
+  expect_no_log '^(mktemp|mkdir|tar|useradd) '
   expect_no_log 'config\.sh '
 }
 
@@ -4895,7 +4922,7 @@ case_provision_refuses_a_bad_invocation() {
   expect_rc 1
   expect_err '[-][-]url needs a value'
   # Every one of these refuses before touching the host or the network.
-  expect_no_log '^(api:|fetch:|mkdir |tar |useradd |chown )'
+  expect_no_log '^(api:|fetch:|mktemp |mkdir |tar |useradd |chown )'
 }
 
 case_provision_help_and_defaults() {
@@ -5321,7 +5348,7 @@ case_runner_unit_name_follows_the_runner() {
     --name-prefix slot --token "$PROV_TOKEN"
   expect_rc 1
   expect_err 'pass a shorter --name-prefix$'
-  expect_no_log '^(fetch:|mkdir |tar |useradd |chown |install |tee |systemctl |runuser )'
+  expect_no_log '^(fetch:|mktemp |mkdir |tar |useradd |chown |install |tee |systemctl |runuser )'
 }
 
 # A value that would write a directive of its own into a unit systemd runs as
@@ -5480,6 +5507,191 @@ case_provision_deprovision_run_nothing_as_root_in_runner_dirs() {
   expect_rc 0
   expect_no_root_exec_in_runner_dirs
   expect_no_log "$SVC_SH"
+}
+
+# --- GHR-116: --replace never writes through a runner-owned tree -------------
+# `provision --replace` reuses a slot whose directory already exists, and that
+# directory belongs to the runner user — every job's account — so a job may
+# have left symlinks in it. Root used to unpack over it and chown -R it. GNU
+# tar extracts THROUGH a symlink standing where a member's parent directory
+# goes when the archive has no entry for that directory (measured, tar 1.35),
+# so that wrote outside the runner's tree as root.
+#
+# This case runs the real provision with a run_priv that EXECUTES the file
+# operations (mktemp, mkdir, tar, chown, mv, rm, cp) as the invoking user, inside
+# a case directory and nowhere else, and logs every call as the stub does; the
+# rest (useradd, runuser, systemctl, the unit file) stays the stub's. chown
+# -R is executed with the invoking user's own uid and a SECOND group of
+# theirs, so a re-own that went through a symlink is visible as a changed
+# group on the file outside — no privilege needed. The tarball is real, and
+# like the runner's except that externals/ has no entry of its own.
+GHR116_ALT_GID="$(id -G | tr ' ' '\n' | grep -vx "$(id -g)" | head -n 1 || true)"
+
+ghr116_config() { # PATH CASE-DIR
+  {
+    echo ". $PWD/$STUB"
+    printf 'GHR116_DIR=%q\nGHR116_GID=%q\n' "$2" "${GHR116_ALT_GID:-$(id -g)}"
+    cat <<'CFG'
+eval "stub_run_priv() $(declare -f run_priv | tail -n +2)"
+ghr116_inside() { case "$1" in "$GHR116_DIR"/rr|"$GHR116_DIR"/rr/*) return 0 ;; esac; return 1; }
+run_priv() {
+  case "$1" in
+    mktemp|mkdir|tar|chown|mv|rm|cp)
+      printf '%s\n' "$*" >>"$RUNNERCTL_TEST_LOG"
+      local a
+      if [ "$1" = tar ]; then
+        ghr116_inside "${5:-}" || { echo "ghr116: refusing '$*': not inside the case's runner root" >&2; return 99; }
+      else
+        for a in "${@:2}"; do
+          case "$a" in /*) ghr116_inside "$a" || { echo "ghr116: refusing '$*': not inside the case's runner root" >&2; return 99; } ;; esac
+        done
+      fi
+      if [ "$1" = chown ]; then command chown -R "$(id -u):$GHR116_GID" "${@:4}"; else command "$@"; fi
+      ;;
+    *) stub_run_priv "$@" ;;
+  esac
+}
+runner_fetch_tarball() {
+  printf 'fetch: %s -> %s\n' "$1" "$2" >>"$RUNNERCTL_TEST_LOG"
+  if [ "${GHR116_BAD_TARBALL:-0}" = 1 ]; then printf 'not a tarball\n' >"$2"; else cp -- "$GHR116_DIR/runner.tgz" "$2"; fi
+}
+CFG
+  } >"$1"
+}
+
+# Everything under DIR — names, types, groups, modes, contents — one line each.
+ghr116_snapshot() { # DIR
+  (cd "$1" && find . -printf '%p %y %g %m %l\n' | LC_ALL=C sort && find . -type f -exec cksum {} + | LC_ALL=C sort)
+}
+
+case_provision_replace_never_writes_through_a_runner_tree() {
+  local d="$TMP/ghr116" before after
+  rm -rf "$d"
+  mkdir -p "$d/src/bin" "$d/src/externals/node/bin" "$d/rr/slot-1" "$d/outside/dir" "$d/outside/ext"
+  printf 'listener\n' >"$d/src/bin/Runner.Listener"
+  printf 'run\n' >"$d/src/run.sh"
+  printf 'config\n' >"$d/src/config.sh"
+  printf 'node\n' >"$d/src/externals/node/bin/node"
+  tar -czf "$d/runner.tgz" -C "$d/src" --no-recursion ./bin ./bin/Runner.Listener ./run.sh ./config.sh ./externals/node/bin/node
+  # Outside the runner's directory: what a job would aim its symlinks at.
+  printf 'ORIGINAL\n' >"$d/outside/file"
+  printf 'ORIGINAL\n' >"$d/outside/dir/Runner.Listener"
+  # The old slot, as a job could leave it: a symlinked file member, a
+  # symlinked directory member with an entry in the archive, one without, and
+  # the old registration — itself a symlink, which root must not follow.
+  # ABSOLUTE targets: the old tree is moved one level down before it is
+  # removed, and a relative link would dangle there — so a removal that
+  # follows links would find nothing to follow, and stay green.
+  ln -s "$d/outside/file" "$d/rr/slot-1/run.sh"
+  ln -s "$d/outside/dir" "$d/rr/slot-1/bin"
+  ln -s "$d/outside/ext" "$d/rr/slot-1/externals"
+  ln -s "$d/outside/file" "$d/rr/slot-1/.runner"
+  printf 'OLD\n' >"$d/rr/slot-1/.credentials"
+  # A staging name that could have been guessed, planted: never followed.
+  ln -s "$d/outside/dir" "$d/rr/.slot-1.provision"
+  before="$(ghr116_snapshot "$d/outside")"
+  local cfg="$TMP/ghr116.config" r; ghr116_config "$cfg" "$d"
+  r="$(ere_quote "$d/rr")"
+  local st="$r/\\.slot-1\\.provision\\.[A-Za-z0-9]{8}"
+
+  # --dry-run says the directory will be replaced, and touches nothing.
+  RUNNERCTL_STUB_NO_UNITS=1 run_cfg "$cfg" provision 1 --url "$PROV_URL" --name-prefix slot \
+    --token "$PROV_TOKEN" --runner-root "$d/rr" --replace --dry-run
+  expect_rc 0
+  expect_out "^would replace:  $r/slot-1 \\(unpacked fresh beside it; the old directory is deleted, nothing in it is kept\\)\$"
+  expect_no_log '^(mktemp|mkdir|tar|chown|mv|rm) '
+
+  # An unpack that fails leaves the old directory exactly where it was, and
+  # no staging directory behind.
+  GHR116_BAD_TARBALL=1 RUNNERCTL_STUB_NO_UNITS=1 run_cfg "$cfg" provision 1 --url "$PROV_URL" \
+    --name-prefix slot --token "$PROV_TOKEN" --runner-root "$d/rr" --replace
+  expect_rc 1
+  expect_out '^  \[FAILED\] unpack$'
+  expect_no_log '^mv '
+  expect_no_log 'config\.sh '
+  expect_text "the old slot after a failed unpack" "$d/rr/slot-1/bin -> $d/outside/dir" \
+    "$(find "$d/rr/slot-1/bin" -maxdepth 0 -printf '%p -> %l'; true)"
+  expect_text "staging directories left after a failed unpack" "" \
+    "$(find "$d/rr" -maxdepth 1 -name '.slot-1.provision.*'; true)"
+
+  # The replace itself.
+  RUNNERCTL_STUB_NO_UNITS=1 run_cfg "$cfg" provision 1 --url "$PROV_URL" --name-prefix slot \
+    --token "$PROV_TOKEN" --runner-root "$d/rr" --replace
+  expect_rc 0
+  expect_out "^\\[slot-1\\] replacing $r/slot-1 — unpacked fresh beside it; the old directory is deleted, nothing in it is kept\$"
+  expect_out '^Provisioned 1 runner\(s\): slot-1$'
+  # The acceptance: nothing outside the runner's directory was written,
+  # created, removed or re-owned.
+  after="$(ghr116_snapshot "$d/outside")"
+  expect_text "the tree outside the runner directory" "$before" "$after"
+  # (a) unpacked into a directory root had just created, never the old slot.
+  expect_log "^tar -xzf [^ ]+ -C $st/new\$"
+  expect_no_log "^tar .* -C $r/slot-1/?\$"
+  expect_no_path "$d/outside/ext/node"
+  # (b) re-owned there, never the old slot.
+  expect_log "^chown -R github-runner:github-runner $st/new\$"
+  expect_no_log "^chown .* $r/slot-1/?\$"
+  # (c) the staging directory is mktemp's: random, created exclusively — the
+  # planted guessable name is not used, and nothing went through it.
+  expect_log "^mktemp -d $r/\\.slot-1\\.provision\\.XXXXXXXX\$"
+  expect_no_path "$d/outside/dir/new"
+  # (d) nothing of the old tree is read, copied or kept by root.
+  expect_no_path "$d/rr/slot-1/.runner"
+  expect_no_path "$d/rr/slot-1/.credentials"
+  # (e) the old tree is gone, and removing it followed none of its symlinks.
+  expect_cfg "$d/outside/dir/Runner.Listener" '^ORIGINAL$'
+  expect_text "staging directories left" "" "$(find "$d/rr" -maxdepth 1 -name '.slot-1.provision.*'; true)"
+  # The order: unpack and own in the stage, move the old aside, the new into
+  # place, delete the stage — and only then register, in the slot's own path.
+  expect_log_order \
+    "^mktemp -d $r/\\.slot-1\\.provision\\.XXXXXXXX\$" \
+    "^mkdir -m 0755 $st/new\$" \
+    "^tar -xzf [^ ]+ -C $st/new\$" \
+    "^chown -R [^ ]+ $st/new\$" \
+    "^mv -T -- $r/slot-1 $st/old\$" \
+    "^mv -T -- $st/new $r/slot-1\$" \
+    "^rm -rf -- $st\$" \
+    "^runuser -u github-runner -- .* $r/slot-1 \\./config\\.sh "
+  # The new slot is the archive's, as real files, re-owned to the runner.
+  expect_text "the new slot" "$(printf '%s\n' ./bin d ./bin/Runner.Listener f ./config.sh f ./externals d ./externals/node d ./externals/node/bin d ./externals/node/bin/node f ./run.sh f)" \
+    "$(cd "$d/rr/slot-1" && find . -mindepth 1 -printf '%p\n%y\n' | paste - - | LC_ALL=C sort | tr '\t' '\n'; true)"
+  expect_cfg "$d/rr/slot-1/run.sh" '^run$'
+  if [ -n "$GHR116_ALT_GID" ]; then
+    expect_text "the new slot's group" "$GHR116_ALT_GID" "$(stat -c %g "$d/rr/slot-1/externals/node/bin/node")"
+  else
+    skip "GHR-116: the invoking user has one group, so a re-own through a symlink is not observable here"
+  fi
+  expect_no_root_exec_in_runner_dirs "$d/rr"
+}
+
+# The audit itself (GHR-110, narrowed by GHR-116): each shape of a root call
+# into a runner directory is reported, and a real provision's log is not.
+case_runner_dir_audit_catches_root_writes() {
+  local line n0 st=/opt/actions-runner/.slot-1.provision.Ab3dE6gH
+  local -a bad=(
+    'tar -xzf /tmp/x/runner.tar.gz -C /opt/actions-runner/slot-1'
+    'chown -R github-runner:github-runner /opt/actions-runner/slot-1'
+    'mkdir -p /opt/actions-runner/slot-1'
+    "cp -a /opt/actions-runner/slot-1/.runner $st/new/.runner"
+    'mktemp -d /opt/actions-runner/.slot-1.provision'
+    'mkdir -p /opt/actions-runner/.slot-1.provision/new'
+    "tar -xzf /tmp/x/runner.tar.gz -C $st/new/../../slot-1"
+    "mv -T -- /opt/actions-runner/.. $st/old"
+    'rm -rf /opt/actions-runner/slot-1/'
+    '/opt/actions-runner/slot-1/svc.sh install github-runner'
+  )
+  for line in "${bad[@]}"; do
+    printf '%s\n' "$line" >"$LOG"
+    n0=${#FAILS[@]}
+    expect_no_root_exec_in_runner_dirs
+    if [ "${#FAILS[@]}" -gt "$n0" ]; then FAILS=("${FAILS[@]:0:$n0}"); else FAILS+=("the audit let through: $line"); fi
+  done
+  printf '%s\n' "mktemp -d /opt/actions-runner/.slot-1.provision.XXXXXXXX" "mkdir -m 0755 $st/new" \
+    "tar -xzf /tmp/x/runner.tar.gz -C $st/new" "chown -R github-runner:github-runner $st/new" \
+    "mv -T -- /opt/actions-runner/slot-1 $st/old" "mv -T -- $st/new /opt/actions-runner/slot-1" \
+    "rm -rf -- $st" "rm -rf -- /opt/actions-runner/slot-2" >"$LOG"
+  expect_no_root_exec_in_runner_dirs
+  : >"$LOG"
 }
 
 # --- GHR-48: the REAL discover(), against a fake systemctl -------------------
@@ -8650,6 +8862,8 @@ t "GHR-110: the unit file is 0644 root:root, and never overwritten"     case_run
 t "GHR-110: runner_exec and runner_exec_with_token refuse root"         case_runner_exec_refuses_root
 t "GHR-110: deprovision removes a unit svc.sh installed, by name"       case_deprovision_removes_a_unit_svc_sh_installed
 t "GHR-110: provision/deprovision run nothing in a runner dir as root"  case_provision_deprovision_run_nothing_as_root_in_runner_dirs
+t "GHR-116: provision --replace never writes through a runner's tree"   case_provision_replace_never_writes_through_a_runner_tree
+t "GHR-116: the runner-dir audit reports each root write into one"      case_runner_dir_audit_catches_root_writes
 
 # --- GHR-48: the real discover(), not the stub's stand-in -------------------
 t "discover: no matching units is empty and exit 0, not a failure"     case_discover_no_matching_units_is_empty_not_a_failure

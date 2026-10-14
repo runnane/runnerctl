@@ -9893,6 +9893,66 @@ runner_unit_install() { # UNIT DIR USER
   runner_exec "$dir" "$user" bash -c 'printf "%s\n" "$1" >.service' runnerctl "$unit" || return 1
 }
 
+# Put a freshly unpacked runner at ROOT/NAME (GHR-116). Root unpacks and
+# re-owns ONLY a tree it has just created inside a staging directory of its
+# own, never a directory the runner user has owned:
+#
+#   ROOT/.NAME.provision.XXXXXXXX   mktemp -d: random name, created
+#                                   exclusively, mode 0700 root — so no other
+#                                   account can reach anything under it
+#   STAGE/new                       mkdir (not -p): fails rather than reuse
+#                                   anything already there
+#   tar -C STAGE/new, chown -R STAGE/new
+#   mv -T ROOT/NAME STAGE/old       only when ROOT/NAME exists (--replace)
+#   mv -T STAGE/new ROOT/NAME
+#   rm -rf -- STAGE                 the old tree, if any, with it
+#
+# Why: a slot directory --replace reuses belongs to the runner user, the
+# account every job runs as, so it may hold symlinks a job left. GNU tar
+# extracts THROUGH a symlink standing where a member's parent directory goes
+# when the archive has no entry for that directory (measured, tar 1.35), so
+# unpacking over such a tree writes outside it as root. chown -R and rm -rf
+# do not follow symlinks below their argument (-P is chown -R's default), but
+# nothing here relies on that for the unpack: the tree tar and chown see was
+# created a moment ago by root, under a directory only root can enter. The
+# old tree is only renamed (one directory entry, in root-owned ROOT) and then
+# removed with rm -rf, which unlinks a symlink rather than following it.
+# Nothing in the old tree is read, copied or kept: `config.sh --replace` takes
+# the runner NAME over on GitHub's side and needs none of the old .runner,
+# .credentials or _work.
+#
+# ROOT must be root-owned and not writable by the runner user, as provision's
+# own `mkdir -p` leaves it; that is what keeps ROOT/NAME itself from being
+# swapped. Prints nothing; returns non-zero with STAGE removed (and an old
+# tree moved aside put back) on failure.
+runner_unpack_slot() { # TARBALL ROOT NAME USER GROUP
+  local tarball="$1" root="$2" name="$3" user="$4" group="$5"
+  local dir="$2/$3" stage old=false
+  stage="$(run_priv mktemp -d "$root/.$name.provision.XXXXXXXX")" || return 1
+  # Exactly the template with its X's filled in, or nothing is touched.
+  { [ "${stage%.*}" = "$root/.$name.provision" ] && [[ "${stage##*.}" =~ ^[A-Za-z0-9]{8}$ ]]; } || {
+    echo "  mktemp answered '$stage', not a directory under $root — not unpacking" >&2; return 1
+  }
+  if ! { run_priv mkdir -m 0755 "$stage/new" \
+         && run_priv tar -xzf "$tarball" -C "$stage/new" \
+         && run_priv chown -R "$user:$group" "$stage/new"; }; then
+    run_priv rm -rf -- "$stage" || true
+    return 1
+  fi
+  if [ -e "$dir" ] || [ -L "$dir" ]; then
+    run_priv mv -T -- "$dir" "$stage/old" || { run_priv rm -rf -- "$stage" || true; return 1; }
+    old=true
+  fi
+  if ! run_priv mv -T -- "$stage/new" "$dir"; then
+    if $old && ! run_priv mv -T -- "$stage/old" "$dir"; then
+      echo "  the old $dir could not be put back; it is at $stage/old" >&2; return 1
+    fi
+    run_priv rm -rf -- "$stage" || true
+    return 1
+  fi
+  run_priv rm -rf -- "$stage" || echo "  warning: could not remove $stage" >&2
+}
+
 # The three questions provision asks the host about accounts and tooling,
 # each its own function so a config can answer them without the test box's
 # own /etc/passwd or $PATH deciding what the fixture sees.
@@ -9990,7 +10050,9 @@ deregistered — removing a runner for good is `runnerctl deprovision`.
                          published with the release
   --no-verify-checksum   install even when no published checksum can be found
   --work DIR             the runner's _work directory, relative to its own
-  --replace              re-register a runner name GitHub already knows
+  --replace              re-register a runner name GitHub already knows; a
+                         directory left for that name is deleted and unpacked
+                         afresh, not reused (nothing in it is kept)
   --dry-run              print what would happen; download and change nothing
 
 Every value above except --token/--pat has a config-file default — see
@@ -10124,6 +10186,9 @@ cmd_provision() {
     echo "would create:   $user (if missing), $root/$prefix-<n> for n in ${slots[*]}"
     local s
     for s in "${slots[@]}"; do
+      if [ -e "$root/$prefix-$s" ] || [ -L "$root/$prefix-$s" ]; then
+        echo "would replace:  $root/$prefix-$s (unpacked fresh beside it; the old directory is deleted, nothing in it is kept)"
+      fi
       echo "would register: $prefix-$s via config.sh --unattended --url $url --token *** --name $prefix-$s${labels:+ --labels $labels}${rgroup:+ --runnergroup $rgroup}"
       echo "would install:  $SYSTEMD_DIR/${slot_unit[$s]}   (runs $root/$prefix-$s/runsvc.sh as $user), then enable and start it"
     done
@@ -10154,10 +10219,12 @@ cmd_provision() {
   local s name dir made=() failed=()
   for s in "${slots[@]}"; do
     name="$prefix-$s"; dir="$root/$name"
-    echo "[$name] unpacking into $dir"
-    run_priv mkdir -p "$dir"
-    run_priv tar -xzf "$tarball" -C "$dir" || { failed+=("$name"); echo "  [FAILED] unpack"; continue; }
-    run_priv chown -R "$user:$group" "$dir"
+    if [ -e "$dir" ] || [ -L "$dir" ]; then
+      echo "[$name] replacing $dir — unpacked fresh beside it; the old directory is deleted, nothing in it is kept"
+    else
+      echo "[$name] unpacking into $dir"
+    fi
+    runner_unpack_slot "$tarball" "$root" "$name" "$user" "$group" || { failed+=("$name"); echo "  [FAILED] unpack"; continue; }
     echo "[$name] registering with GitHub"
     local cfg_args=(./config.sh --unattended --url "$url" --token "$token" --name "$name" --work "$work")
     [ -z "$labels" ] || cfg_args+=(--labels "$labels")

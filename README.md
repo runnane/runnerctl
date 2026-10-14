@@ -94,7 +94,12 @@ owned by the runner user, which is the account every job runs as, so a script
 there run as root would be a job's code run as root. runnerctl therefore does
 not run the runner's `svc.sh` (which also sources `./env.sh`) at all: as root
 it only creates, unpacks into, `chown`s and deletes the directory, writes the
-root-owned unit (`0644 root:root`) and runs `systemctl`; `config.sh`, and the
+root-owned unit (`0644 root:root`) and runs `systemctl`; and it unpacks and
+`chown`s only a tree it has just created, inside a staging directory under
+the runner root that only root can enter, which it then renames into place.
+`--replace` does not unpack over a directory a runner already had (a job may
+have left symlinks in it, and `tar` extracts through one): the old directory
+is renamed aside and deleted, and nothing in it is kept. `config.sh`, and the
 two files `svc.sh` would have put in the directory (`runsvc.sh` and the
 `.service` marker), are run and written as the runner user. The unit runs
 `runsvc.sh` as that user too (`User=`), with no `ExecStartPre`/`ExecStop` or
