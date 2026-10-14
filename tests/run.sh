@@ -3037,13 +3037,18 @@ case_fleet_upgrade_check_reports_each_host_and_counts() {
 # its shadow but could not write the system copy must NOT read as `upgraded`.
 case_fleet_upgrade_classifies_a_self_healing_host_not_as_unrecognised() {
   RUNNERCTL_STUB_FLEET_HOSTS="box-relocating box-retireonly" run fleet upgrade
-  expect_rc 0
+  # GHR-97: the retire-only host still has work outstanding that only someone
+  # with sudo can finish, so the run is not a success.
+  expect_rc 1
   expect_out '^box-relocating +0\.0\.1 -> 9\.9\.9 +upgraded$'
   expect_out '^box-retireonly +1\.0\.0 -> 9\.9\.9 +update available$'
   expect_no_out 'unrecognised'
   # 0 unclear is the assertion that matters: an unclassified host is counted
   # as bad and would fail the whole fan-out.
-  expect_out '^2 host\(s\): 0 already level, 2 upgraded, 0 unreachable or unclear$'
+  expect_out '^2 host\(s\): 0 already level, 1 upgraded, 0 unreachable or unclear, 1 still behind$'
+  # --check keeps its wording: there `update available` means "would change"
+  RUNNERCTL_STUB_FLEET_HOSTS="box-relocating box-retireonly" run fleet upgrade --check
+  expect_out '^2 host\(s\): 0 up to date, 2 would change, 0 unreachable or unclear$'
 }
 
 case_fleet_upgrade_applies_and_says_what_changed() {
@@ -3375,6 +3380,16 @@ case_fleet_upgrade_stop_on_failure_halts_and_names_the_rest() {
   expect_no_log '^probe:ssh_run build-4-oldver -- runnerctl upgrade$'
   expect_out '^build-4-oldver +0\.0\.1 -> 9\.9\.9 +not attempted$'
   expect_out '^stopped at box-shadowed — not attempted: build-4-oldver$'
+  # GHR-97: a host that only said `Update available.` (retire-only) is not a
+  # failed row, but it is not upgraded either, and stops the walk as a canary
+  # that did not end upgraded does.
+  RUNNERCTL_STUB_FLEET_HOSTS="box-retireonly build-3-oldver" run fleet upgrade --stop-on-failure
+  expect_rc 1
+  expect_out '^box-retireonly +1\.0\.0 -> 9\.9\.9 +update available$'
+  expect_no_log '^probe:ssh_run build-3-oldver -- runnerctl upgrade$'
+  expect_out '^build-3-oldver +— +not attempted$'
+  expect_out '^2 host\(s\): 0 already level, 0 upgraded, 0 unreachable or unclear, 1 still behind, 1 not attempted$'
+  expect_out '^stopped at box-retireonly — not attempted: build-3-oldver$'
 }
 
 # The two parsers the read-back rests on, against lines the stub did not

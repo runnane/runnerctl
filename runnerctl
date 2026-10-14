@@ -315,7 +315,9 @@
 # --canary [H] upgrades one host first — unnamed, the first that would
 # actually change — and continues only if it ends `upgraded`; --serial goes
 # one host at a time; --stop-on-failure also halts at the first failed row
-# and names the hosts it did not attempt.
+# or still-behind host and names the hosts it did not attempt. A write counts
+# a host that only said `Update available.` (GHR-52's retire-only path) as
+# `still behind`, not upgraded, and exits non-zero (GHR-97).
 # `fleet upgrade --push` (GHR-83) sends THIS node's own runnerctl over ssh
 # instead: each host checks the bytes against this node's sha256, installs
 # them with `sudo -n bash <file> install`, and is `upgraded` only when its
@@ -8136,8 +8138,9 @@ fleet_run_report() { # SUBCOMMAND [STREAMED]
 #                      nothing about the release being rolled out.
 #   --serial           one host at a time, each written and read back before
 #                      the next is dialled; every host still attempted.
-#   --stop-on-failure  --serial that halts at the first failed row and names
-#                      the hosts it did not attempt.
+#   --stop-on-failure  --serial that halts at the first failed row, or at a
+#                      host still behind (GHR-97), and names the hosts it
+#                      did not attempt.
 #
 # And `upgraded` is no longer the remote's word alone. A host that says it
 # wrote is asked for `version` through FLEET_RUNNERCTL — the exact path the
@@ -8289,7 +8292,9 @@ cmd_fleet_upgrade() { # [--check] [--push] [--ref REF] [--sha256 SUM] [--rollbac
       for n in "${!rest[@]}"; do
         k="${rest[$n]}"
         fleet_upgrade_stage false "$k"
-        if $stop && [ "${FLEET_UP_KIND[$k]}" = bad ]; then
+        # `changed` after a write is a host still behind (GHR-97): as much a
+        # stop as a failed row, as it is for a canary.
+        if $stop && { [ "${FLEET_UP_KIND[$k]}" = bad ] || [ "${FLEET_UP_KIND[$k]}" = changed ]; }; then
           halted="stopped at ${FLEET_UP_HOSTS[$k]}"
           left=("${rest[@]:$((n + 1))}")
           break
@@ -8530,12 +8535,19 @@ fleet_upgrade_verify() { # J K
 # run stopped short, so the count line of an unstaged run reads as it always
 # has.
 fleet_upgrade_report() { # CHECK
-  local check="$1" k host level=0 changed=0 bad=0 skipped=0 hostw=4 versw=7 tail=""
+  local check="$1" k host level=0 changed=0 behind=0 bad=0 skipped=0 hostw=4 versw=7 tail=""
   for k in "${!FLEET_UP_HOSTS[@]}"; do
     host="${FLEET_UP_HOSTS[$k]}"
     case "${FLEET_UP_KIND[$k]}" in
       level)                  level=$((level + 1)) ;;
-      changed|wrote|upgraded) changed=$((changed + 1)) ;;
+      # `changed` is "would change" in a --check and "still behind" in a
+      # write (GHR-97): there it is the retire-only path of `upgrade`
+      # (GHR-52), which printed `Update available.` because it could not
+      # write the system copy. It is not an upgrade, so a write counts it
+      # on its own and it fails the run.
+      changed)
+        if $check; then changed=$((changed + 1)); else behind=$((behind + 1)); fi ;;
+      wrote|upgraded)         changed=$((changed + 1)) ;;
       skipped)                skipped=$((skipped + 1)) ;;
       *)                      bad=$((bad + 1)) ;;
     esac
@@ -8547,6 +8559,7 @@ fleet_upgrade_report() { # CHECK
       "$(fleet_pad "$versw" "${FLEET_UP_VERS[$k]}")" "${FLEET_UP_STATE[$k]}"
   done
   [ "$skipped" -eq 0 ] || tail=", $skipped not attempted"
+  [ "$behind" -eq 0 ] || tail=", $behind still behind$tail"
   if $check; then
     echo "${#FLEET_UP_HOSTS[@]} host(s): $level up to date, $changed would change, $bad unreachable or unclear"
   elif $FLEET_UP_ROLLBACK; then
@@ -8555,7 +8568,7 @@ fleet_upgrade_report() { # CHECK
   else
     echo "${#FLEET_UP_HOSTS[@]} host(s): $level already level, $changed upgraded, $bad unreachable or unclear$tail"
   fi
-  [ "$bad" -eq 0 ] && [ "$skipped" -eq 0 ]
+  [ "$bad" -eq 0 ] && [ "$skipped" -eq 0 ] && [ "$behind" -eq 0 ]
 }
 
 # Where the fleet ended up, as the last line of a write: `N host(s) on X` when
