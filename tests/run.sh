@@ -9529,12 +9529,13 @@ case_fleet_watch_question_mark_lists_every_key() {
   # a line per key, and the list short enough for a 24-row terminal: its 17
   # lines (GHR-78 added O, GHR-76 Enter and what the pane's own keys are), the
   # header, the summary and the three lines under it
-  for k in '!' 'b i' '/' 'a' 's' 'c' 'Enter' 'K R S T P L' 'D W E X' 'O' 'q \?' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
+  for k in '!' 'b i' '/' 'a' 's' 'c' 'Enter' 'K R S T P L' 'D W E X U' 'O' 'q \?' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
     expect_frame 2 "^  $k   +[a-z]"
   done
   expect_frame 2 '^  K R S T P L   kill job, restart, stop, start, reap, logs; R S: w = when idle$'
   # GHR-127: the host keys took the line `?` had; `?` folded into q's
-  expect_frame 2 "^  D W E X   the row's host: drain, restart when idle, enable, disable\$"
+  # GHR-128: U joined them, in the same line
+  expect_frame 2 "^  D W E X U   the row's host: drain, restart when idle, enable, disable, upgrade\$"
   expect_frame 2 '^  q \?   quit, this list; Esc stops following a running action, which carries on$'
   expect_frame 2 '^          host that is not answering: that host\)\. There q Esc Enter go back, h$'
   expect_frame_lines 2 23
@@ -14470,9 +14471,153 @@ t "GHR-127: a host key runs in the background"                                ca
 t "GHR-127: a drain is on a budget of a wait per slot"                        case_ghr127_a_drain_is_on_a_budget_of_a_wait_per_slot
 t "GHR-127: host keys carry FLEET_SUDO and --origin"                          case_ghr127_host_keys_carry_sudo_and_origin
 
+# --- GHR-128: U upgrades the cursor's host ------------------------------------
+# `upgrade --check` on the host first (a read, as the login), a confirm line with
+# FROM -> TO, then plain `upgrade` in the background and a read-back. The stub's
+# *oldver* host is 0.0.1 and takes 9.9.9; *shadowed* says it wrote 9.9.9 and
+# goes on answering 0.0.1; *verifydown* cannot be reached for the read-back.
+GHR128_PROMPT='^build-2-oldver: upgrade 0\.0\.1 -> 9\.9\.9\? runs on build-2-oldver: runnerctl upgrade — the host downloads the release and replaces its runnerctl, then its version is read back  \[y/n\]$'
+GHR128_UPGRADE='^probe:ssh_run [^ ]+ -- (sudo -n )?runnerctl upgrade$'
+
+# The acceptance case: from the third row of build-2-oldver (the cursor walks
+# off build-1's three), U shows the versions, y issues exactly one upgrade to
+# that host and the notice reports the read-back. Nothing reaches build-1.
+case_ghr128_U_upgrades_the_cursors_host_once() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjUyq' RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "$GHR128_PROMPT" 1
+  expect_out_count '^build-2-oldver: upgraded 0\.0\.1 -> 9\.9\.9, read back 9\.9\.9$' 1
+  expect_log_count '^probe:ssh_run build-2-oldver -- runnerctl upgrade --check$' 1
+  expect_log_count '^probe:ssh_run build-2-oldver -- runnerctl upgrade$' 1
+  expect_log_count '^probe:ssh_run build-2-oldver -- runnerctl version$' 1
+  expect_log_count "$GHR128_UPGRADE" 1
+  expect_log_order '^probe:ssh_run build-2-oldver -- runnerctl upgrade --check$' '^probe:ssh_run build-2-oldver -- runnerctl upgrade$' \
+                   '^probe:ssh_run build-2-oldver -- runnerctl version$'
+  expect_no_log '^probe:ssh_run build-1 -- runnerctl (upgrade|version)'
+  expect_cfg_count "$WRITES/fleet.log" '.' 1
+  expect_cfg "$WRITES/fleet.log" "^$GHR88_TS $ME fleet upgrade --host build-2-oldver \\(fleet watch\\) — build-2-oldver=0\$"
+  # Anything but y cancels: the check ran, nothing was written.
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjUnq' RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "$GHR128_PROMPT" 1
+  expect_out_count '^cancelled — nothing run$' 1
+  expect_log_count '^probe:ssh_run build-2-oldver -- runnerctl upgrade --check$' 1
+  expect_no_log "$GHR128_UPGRADE"
+}
+
+# A read-back that does not match what the host said it wrote is not `upgraded`
+# (*shadowed*: the write landed where the fleet path does not run), nor is one
+# that did not answer (*verifydown*). Both are recorded as unconfirmed.
+case_ghr128_a_read_back_that_differs_is_not_reported_upgraded() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Uyq' RUNNERCTL_STUB_FLEET_HOSTS="build-2-shadowed" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^build-2-shadowed: upgrade wrote 9\.9\.9 but the read-back answers 0\.0\.1 — not confirmed \(the write landed where the fleet path does not run\)$' 1
+  expect_no_out 'upgraded'
+  expect_log_count '^probe:ssh_run build-2-shadowed -- runnerctl version$' 1
+  expect_cfg "$WRITES/fleet.log" '— build-2-shadowed=unconfirmed$'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Uyq' RUNNERCTL_STUB_FLEET_HOSTS="build-3-oldver-verifydown" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^build-3-oldver-verifydown: upgrade wrote 9\.9\.9 but the read-back did not answer: .* — not confirmed$' 1
+  expect_no_out 'upgraded'
+  expect_cfg "$WRITES/fleet.log" '— build-3-oldver-verifydown=unconfirmed$'
+}
+
+# A host that is already current issues nothing after the check; one ahead of
+# its source and one whose answer is not understood likewise.
+case_ghr128_a_current_host_issues_nothing() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Uyq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^build-1: already current \(1\.0\.0\) — nothing to upgrade, nothing issued$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl upgrade --check$' 1
+  expect_no_out '\[y/n\]'
+  expect_no_log "$GHR128_UPGRADE"
+  expect_no_log '^probe:ssh_run build-1 -- runnerctl version$'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Uyq' RUNNERCTL_STUB_FLEET_HOSTS="box-ahead" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^box-ahead: runs 9\.9\.9, ahead of the source — left alone, nothing issued$' 1
+  expect_no_log "$GHR128_UPGRADE"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Uyq' RUNNERCTL_STUB_FLEET_HOSTS="box-weird" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^box-weird: upgrade --check answered something unrecognised \(something this tool has never said before\) — nothing issued$' 1
+  expect_no_log "$GHR128_UPGRADE"
+}
+
+# A version the host sends that is no X.Y.Z never reaches the screen, in the
+# check (no confirm line, nothing issued) or in the write's own sentence (no
+# read-back, not confirmed).
+case_ghr128_a_version_that_is_not_x_y_z_is_not_drawn() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Uyq' RUNNERCTL_STUB_FLEET_HOSTS="build-2-badver" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^build-2-badver: upgrade --check named a version that is not X\.Y\.Z — nothing issued$' 1
+  expect_no_out '\[y/n\]'
+  expect_no_out 'rc1|owned'
+  expect_no_log "$GHR128_UPGRADE"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Uyq' RUNNERCTL_STUB_FLEET_HOSTS="build-2-badwrote" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^build-2-badwrote: upgrade said it wrote a version that is not X\.Y\.Z, so it was not read back — not confirmed$' 1
+  expect_no_out 'rc1'
+  expect_no_out 'upgraded'
+  expect_no_log '^probe:ssh_run build-2-badwrote -- runnerctl version$'
+}
+
+# A host that is not answering is refused in words of its own; nothing is dialled
+# for the check.
+case_ghr128_an_unreachable_host_refuses_U() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjUq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_DOWN="build-2:1,2,3" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^build-2: not answering — U decides on what the host says, and it says nothing; nothing issued$' 1
+  expect_no_out '\[y/n\]'
+  expect_no_log '^probe:ssh_run build-2 -- runnerctl upgrade'
+}
+
+# One action per host: with the upgrade held, a second U is refused before the
+# check is run, and the j after it is read while the action runs.
+case_ghr128_U_runs_in_the_background_one_per_host() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD=build-2-oldver RUNNERCTL_STUB_KEYS="UyjU${REL}q" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" run fleet watch --color never
+  expect_rc 0
+  expect_out "^build-2-oldver: upgrade running — ${GHR125_PROGRESS}\$"
+  expect_out_count '^build-2-oldver: busy — upgrade of build-2-oldver is still running there; one action per host at a time, nothing issued$' 1
+  expect_out_count '^build-2-oldver: upgraded 0\.0\.1 -> 9\.9\.9, read back 9\.9\.9$' 1
+  expect_log_order '^probe:tty_read_char 5 y$' '^probe:ssh_run build-2-oldver -- runnerctl upgrade$' '^probe:remote_held build-2-oldver$' \
+                   '^probe:act_poll landed=0 held=1$' '^probe:tty_read_char 0\.2 j$' '^probe:release$' '^probe:remote_released build-2-oldver$'
+  expect_log_count '^probe:ssh_run build-2-oldver -- runnerctl upgrade --check$' 1
+  expect_log_count "$GHR128_UPGRADE" 1
+}
+
+# FLEET_SUDO and --origin apply to the write; the check and the read-back are
+# reads and run as the login.
+case_ghr128_U_carries_sudo_and_origin() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_KEYS='Uyq' RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^build-2-oldver: upgrade 0\.0\.1 -> 9\.9\.9\? runs on build-2-oldver: sudo -n runnerctl upgrade — ' 1
+  expect_log_count '^probe:ssh_run build-2-oldver -- runnerctl upgrade --check$' 1
+  expect_log_count '^probe:ssh_run build-2-oldver -- sudo -n runnerctl upgrade$' 1
+  expect_log_count '^probe:ssh_run build-2-oldver -- runnerctl version$' 1
+  expect_log_count "^probe:ssh_origin build-2-oldver $GHR88_ORIGIN\$" 1
+}
+
+# The help lists U and still has seventeen lines.
+case_ghr128_the_help_lists_U() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='?qq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^  D W E X U   the row's host: drain, restart when idle, enable, disable, upgrade\$" 1
+  expect_no_out '^  D W E X   '
+}
+
+t "GHR-128: U upgrades the cursor's host, once, after a check; the confirm names the versions" case_ghr128_U_upgrades_the_cursors_host_once
+t "GHR-128: a read-back that differs or is missing is not reported upgraded"                 case_ghr128_a_read_back_that_differs_is_not_reported_upgraded
+t "GHR-128: a current, ahead or unrecognised host issues nothing after the check"            case_ghr128_a_current_host_issues_nothing
+t "GHR-128: a version that is not X.Y.Z is never drawn"                                       case_ghr128_a_version_that_is_not_x_y_z_is_not_drawn
+t "GHR-128: an unreachable host refuses U"                                                    case_ghr128_an_unreachable_host_refuses_U
+t "GHR-128: U runs in the background, one action per host"                                    case_ghr128_U_runs_in_the_background_one_per_host
+t "GHR-128: U carries FLEET_SUDO and --origin on the write alone"                             case_ghr128_U_carries_sudo_and_origin
+t "GHR-128: the help lists U (the line count is pinned by the help case)"                     case_ghr128_the_help_lists_U
+
 # --- Summary ------------------------------------------------------------------
 echo
-echo "sim: $npass ok, $nxfail xfail (${XFAIL_KEYS# }), $nfail failed"
+echo "sim:$npass ok, $nxfail xfail (${XFAIL_KEYS# }), $nfail failed"
 if [ "$nfail" -gt 0 ]; then
   printf '  FAIL %s\n' "${FAILED[@]}"
   exit 1
