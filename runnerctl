@@ -333,6 +333,19 @@
 # a percentage, never rounded down to a deadlocking 0. Each flag is refused
 # on the commands it cannot help rather than quietly ignored. Both walk one
 # SLOT per call, since a per-host call would take a whole host out in a step.
+# The sudo contract (GHR-89): by default each host's runnerctl asks sudo for
+# the systemctl, tee, rm, kill, cp and mv it needs, and a sudoers grant of
+# those with no arguments is root for the ssh login. FLEET_SUDO=1 instead
+# runs every call that changes a host as `sudo -n FLEET_RUNNERCTL <verb> …`,
+# so one sudoers line naming runnerctl is enough; reads never use sudo. A
+# host with that line sets SUDO_CONTRACT=narrow in /etc/runnerctl/config,
+# and then under sudo runnerctl refuses what would widen the grant back to
+# root: a config other than /etc/runnerctl/config, a script or directory
+# others can write, `fleet`, and each flag that picks what root runs, sources
+# or installs, where it writes, or what it removes beyond the host's policy
+# (`apply --env-file`, `--save`, `upgrade --prefix`, a non-release `--ref`,
+# ...). Without the opt-in nothing is refused. Under any sudo it pins PATH
+# and HOME and drops the caller's pager and RUNNERCTL_* variables.
 #
 # `provision N` (GHR-45) is what makes the units exist in the first place. On
 # a box with no runners every other command used to dead-end in "no
@@ -388,7 +401,31 @@ DROPIN_NAME="$BUILTIN_DROPIN_NAME"
 UNIT_GLOB="$BUILTIN_UNIT_GLOB"
 DEFAULT_PROFILE="$BUILTIN_DEFAULT_PROFILE"
 UPGRADE_URL="https://github.com/runnane/runnerctl/releases/latest/download/runnerctl"
-CONFIG_FILE="${RUNNERCTL_CONFIG:-/etc/runnerctl/config}"
+CONFIG_DEFAULT="/etc/runnerctl/config"
+# Test hook (GHR-89): the sim's stand-in for /etc/runnerctl/config, so a case
+# can hold the opt-in below without a root-owned file. Read only by a process
+# that is NOT root, so under real sudo it is never consulted.
+if [ -n "${RUNNERCTL_TEST_CONFIG_DEFAULT:-}" ] && [ "$(id -u)" != 0 ]; then
+  CONFIG_DEFAULT="$RUNNERCTL_TEST_CONFIG_DEFAULT"
+fi
+CONFIG_FILE="${RUNNERCTL_CONFIG:-$CONFIG_DEFAULT}"
+# Who picked CONFIG_FILE when it is not CONFIG_DEFAULT: `RUNNERCTL_CONFIG` or
+# `--config` (main), empty for the default. A config is sourced as bash, so
+# under sudo one the caller picked is refused outright (GHR-89).
+CONFIG_CHOSEN=""
+if [ -n "${RUNNERCTL_CONFIG:-}" ] && [ "$RUNNERCTL_CONFIG" != "$CONFIG_DEFAULT" ]; then
+  CONFIG_CHOSEN=RUNNERCTL_CONFIG
+fi
+# The host's sudo contract (GHR-89). `narrow` = this host's sudoers grants a
+# login runnerctl itself (the README's narrow contract), so under sudo
+# runnerctl refuses what would widen that grant back to root. `full` (the
+# default) = whoever runs it under sudo is root anyway, and nothing is
+# refused. Only /etc/runnerctl/config decides it: under sudo it is read from
+# there before any --config or RUNNERCTL_CONFIG is looked at, so a config the
+# caller picks can neither turn it on nor off. SUDO_NARROW is the decision,
+# set once in main.
+SUDO_CONTRACT="full"
+SUDO_NARROW=false
 # Where unit drop-ins live. A test config points this at a fixture tree.
 SYSTEMD_DIR="/etc/systemd/system"
 # --when-idle: seconds between idle polls, and the default --timeout. The
@@ -470,6 +507,12 @@ FLEET_MUTATE_TIMEOUT="900"
 # (see the fleet section of the README for why); point this at an absolute
 # path where it is not on the ssh user's PATH.
 FLEET_RUNNERCTL="runnerctl"
+# 1 = every call that CHANGES a host runs `sudo -n FLEET_RUNNERCTL <verb> …`
+# there instead of `FLEET_RUNNERCTL <verb> …` (GHR-89): for hosts whose
+# sudoers grants the ssh login runnerctl itself rather than the systemctl,
+# tee, rm, kill, cp and mv it calls — the narrow contract in the README.
+# Read-only calls never go through sudo either way. 0 = off.
+FLEET_SUDO="0"
 
 # Provisioning (GHR-45): where `provision` puts a runner and who it runs as.
 # RUNNER_URL is the only one that is genuinely site data (the org or repo the
@@ -525,6 +568,184 @@ die() { echo "runnerctl: $*" >&2; exit 1; }
 # "$2" expansion under `set -u` crash with a raw bash diagnostic.
 need_val() { [ $# -ge 2 ] || die "$1 needs a value"; }
 
+# --- Running under sudo (GHR-89) -----------------------------------------------
+# The narrow sudoers contract grants a login runnerctl itself instead of the
+# primitives run_priv calls, so under it every word of the command line
+# reaches a root process: the grant is exactly as narrow as what this script
+# lets a caller say. These are the checks that keep it that narrow — on a host
+# that says it has that grant (SUDO_CONTRACT=narrow in the default config);
+# elsewhere a caller under sudo is root anyway, and only the environment is
+# pinned. run_priv
+# needs no change for it — under sudo the uid is already 0, so it never
+# prefixes sudo again.
+#
+# Detection. sudo sets SUDO_UID to the uid of the user who ran it, after its
+# env_reset, so a caller can neither set nor clear it — only a SETENV grant
+# could, and SETENV also hands BASH_ENV to bash, which runs it before the
+# first line of this file (the README says never). So the signal is "root,
+# with SUDO_UID a non-zero uid". It is WIDER than the narrow grant — a root
+# shell from `sudo -i` inherits SUDO_UID — and that is the safe direction: a
+# false positive only refuses, while a root login (no SUDO_UID) or root
+# running sudo (SUDO_UID=0) escalated nothing. SUDO_USER is not the signal:
+# it is a name, and what was escalated from is a uid.
+#
+# RUNNERCTL_TEST_SUDO_UID is the sim's stand-in for sudo, without root. It is
+# read only by a process that is NOT root, so under real sudo — always root —
+# it is never consulted, and all it can do anywhere is turn the refusals on.
+under_sudo() {
+  if [ "$(id -u)" = 0 ]; then
+    [[ "${SUDO_UID:-}" =~ ^[1-9][0-9]*$ ]]
+    return
+  fi
+  [[ "${RUNNERCTL_TEST_SUDO_UID:-}" =~ ^[1-9][0-9]*$ ]]
+}
+
+# What a root run keeps of the caller's environment. sudo's env_reset keeps
+# PATH unless sudoers sets secure_path, and some versions keep HOME: either
+# lets the caller choose the systemctl, curl or tar run as root, or the
+# ~/.curlrc and gh config they read. So both are pinned; the variables that
+# name a program or a config file are dropped; a pager cannot run a shell
+# (LESSSECURE, SYSTEMD_PAGERSECURE); and every RUNNERCTL_* variable is unset,
+# which is what makes the test hooks — RUNNERCTL_TEST_*, and the stub's
+# RUNNERCTL_STUB_* knobs — inert under sudo by construction, a hook added
+# later included. RUNNERCTL_CONFIG has been read by then, into CONFIG_CHOSEN.
+SUDO_SAFE_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+sudo_env_harden() {
+  local v home
+  export PATH="$SUDO_SAFE_PATH"
+  home="$(getent passwd 0 2>/dev/null | cut -d: -f6 || true)"
+  export HOME="${home:-/root}"
+  unset TMPDIR PAGER SYSTEMD_PAGER LESSOPEN LESSCLOSE LESSKEY CURL_HOME \
+        XDG_CONFIG_HOME GH_CONFIG_DIR GIT_CONFIG_GLOBAL BASH_ENV ENV
+  export LESSSECURE=1 SYSTEMD_PAGERSECURE=1
+  for v in $(compgen -e); do
+    case "$v" in RUNNERCTL_VERSION) ;; RUNNERCTL_*) unset "$v" ;; esac
+  done
+}
+
+# The first argument COMMAND may not take under sudo: sets SUDO_FLAG and
+# SUDO_WHY and returns 0, or returns 1 when it may take all of them. The rule:
+# a value that decides what root runs or sources, where root writes, whose
+# account a runner runs as, or what root removes beyond the host's own policy
+# comes from the root-owned config, never from the command line. A flag that
+# only names, narrows, waits, or pins a digest the download must still match
+# is taken. `--flag=value` is the same flag; a value that happens to look like
+# a refused flag is refused too, which costs nothing (the command's own parser
+# would reject it).
+SUDO_FLAG="" SUDO_WHY=""
+sudo_flag_problem() { # COMMAND ARGS...
+  local cmd="${1:-status}" f val
+  shift || true
+  SUDO_FLAG="" SUDO_WHY=""
+  if [ "$cmd" = fleet ]; then
+    SUDO_FLAG=fleet
+    SUDO_WHY="a fleet command dials other hosts with this host's ssh identity, which under sudo is root's — run it as the user whose key reaches the fleet"
+    return 0
+  fi
+  while [ $# -gt 0 ]; do
+    f="${1%%=*}"
+    if [ "$f" != "$1" ]; then val="${1#*=}"; else val="${2:-}"; fi
+    case "$cmd:$f" in
+      apply:--env-file|scale:--env-file)
+        SUDO_WHY="the path is written into each slot's drop-in as EnvironmentFile=, which systemd reads as root into every job's environment, and a newline in it writes any other directive there" ;;
+      env-init:--env-file)
+        SUDO_WHY="it creates a root-owned file, and the directories above it, wherever it points" ;;
+      apply:--save|scale:--save)
+        SUDO_WHY="it rewrites $CONFIG_DEFAULT, which every root run sources" ;;
+      provision:--url|deprovision:--url)
+        SUDO_WHY="it chooses which GitHub account this host's runners take jobs from, or which one a credential is sent to — and a job is code run on this host" ;;
+      provision:--runner-user)
+        SUDO_WHY="it chooses the account that owns each runner's directory, whose scripts provision then runs as root" ;;
+      provision:--runner-root|provision:--work)
+        SUDO_WHY="it chooses where root unpacks, chowns and writes" ;;
+      provision:--runner-version|provision:--no-verify-checksum)
+        SUDO_WHY="it chooses what root installs" ;;
+      compose-reap:--standalone|compose-reap:--max-age-hours|compose-reap:--grace-minutes)
+        SUDO_WHY="it widens what root removes beyond the host's COMPOSE_REAP_* policy" ;;
+      install:--prefix|upgrade:--prefix)
+        SUDO_WHY="it chooses the directory root writes runnerctl into" ;;
+      install:--ref|upgrade:--ref)
+        # A version maps to a release asset of UPGRADE_URL's repository, with
+        # its digest beside it. A branch or a commit is whatever bytes that
+        # name reaches — on GitHub a fork's commit is reachable through the
+        # parent repository's raw URL.
+        [[ "$val" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+          || SUDO_WHY="a branch or commit is whatever bytes that name reaches, so under sudo only a release version (vX.Y.Z) is taken" ;;
+      migrate:--from)
+        SUDO_WHY="migrate sources that file as bash" ;;
+      migrate:--output)
+        SUDO_WHY="it chooses where root writes a config, which root runs then source" ;;
+    esac
+    if [ -n "$SUDO_WHY" ]; then SUDO_FLAG="$f"; return 0; fi
+    shift
+  done
+  return 1
+}
+
+# The host's sudo contract, from CONFIG_DEFAULT and nothing else — never from
+# CONFIG_FILE, which --config or RUNNERCTL_CONFIG may have pointed elsewhere.
+# Sourced in a subshell, only when load_config would trust the file (GHR-7's
+# rule), and only the one value kept. Anything but exactly `full` reads as
+# narrow: a typo on a host that meant to opt in must not open it back up (a
+# loaded default config with a bad value is refused by load_config anyway).
+# A file that cannot be trusted, or none, is `full`: whoever can write the
+# default config is root on that host whatever this says.
+sudo_contract_of_default() {
+  local f="$CONFIG_DEFAULT" v=""
+  if [ ! -f "$f" ] || [ -n "$(config_trust_problem "$f")" ]; then echo full; return 0; fi
+  # shellcheck disable=SC1090
+  v="$(set +eu; . "$f" >/dev/null 2>&1; printf '%s' "${SUDO_CONTRACT:-full}")" || true
+  if [ "$v" = full ]; then echo full; else echo narrow; fi
+}
+
+# Everything a run under sudo on a host with SUDO_CONTRACT=narrow checks
+# before it sources a config or acts on the host. Each refusal says what to
+# do instead; none of them is reachable without sudo, nor on a `full` host —
+# where the caller is root anyway, and refusing would only break the admin's
+# `sudo runnerctl …`.
+sudo_preflight() { # COMMAND ARGS...
+  if sudo_flag_problem "$@"; then
+    die "refusing $SUDO_FLAG under sudo: $SUDO_WHY. This host's SUDO_CONTRACT is narrow: run it without sudo (runnerctl asks sudo for each privileged step itself), or set the value in $CONFIG_DEFAULT where it has a setting there"
+  fi
+  sudo_config_check
+  sudo_self_check "${1:-status}"
+}
+
+sudo_config_check() {
+  local problem cfgdir
+  # GHR-7's ownership check in load_config already refuses a config the
+  # caller OWNS here (under sudo the invoking uid is 0, so only root's
+  # passes). That is not enough: a root-owned file can carry text the caller
+  # wrote — /etc/passwd holds a GECOS field any user sets with chfn, and it
+  # is sourced as bash. So the path itself may not be the caller's choice.
+  if [ -n "$CONFIG_CHOSEN" ]; then
+    die "refusing the config $CONFIG_FILE from $CONFIG_CHOSEN under sudo: a config is sourced as bash, so one the caller picks is code run as root — and root-owned is not enough, since a root-owned file can hold text the caller wrote. This host's SUDO_CONTRACT is narrow, so under sudo only $CONFIG_DEFAULT is read; run without sudo to use another config"
+  fi
+  if [ -e "$CONFIG_FILE" ]; then
+    cfgdir="$(dirname "$CONFIG_FILE")"
+    problem="$(root_exec_problem "$cfgdir")"
+    [ -z "$problem" ] || die "refusing to source $CONFIG_FILE as root under sudo: $problem, so whoever can write there can replace the config (fix: chown root:root $cfgdir; chmod 755 $cfgdir)"
+  fi
+}
+
+sudo_self_check() { # COMMAND
+  local problem self
+  # This file, and the directory it is in, as compose-reap-timer install
+  # requires of a root timer's script: a grant of runnerctl is only as narrow
+  # as the file it names. This runs inside that file, so it cannot stop
+  # someone who has already rewritten it — it is the tripwire that refuses to
+  # serve a grant that is open to that, before anyone does.
+  # `install` is exempt: it is the command that puts a root-owned copy in
+  # place, and `sudo bash ./runnerctl install` from a download the admin owns
+  # is how a host is bootstrapped. A piped script has no file to check.
+  if [ "$1" != install ] && ! is_piped; then
+    self="$(readlink -f "${BASH_SOURCE[0]}")"
+    problem="$(root_exec_problem "$self")"
+    [ -n "$problem" ] || problem="$(root_exec_problem "$(dirname "$self")")"
+    [ -z "$problem" ] || die "refusing to run as root under sudo: $problem — a sudoers grant of runnerctl is only as narrow as the file it names, and one its login can rewrite grants anything (fix: chown root:root $self; chmod 755 $self, in a directory only root can write)"
+  fi
+}
+
 # --- Config file --------------------------------------------------------------
 # The config file is plain bash and is sourced. It may set any of the defaults
 # above and define profiles as functions:
@@ -533,17 +754,31 @@ need_val() { [ $# -ge 2 ] || die "$1 needs a value"; }
 #   env_template_<name>() prints the EnvironmentFile template for env-init
 #
 # A config-defined profile shadows a built-in one of the same name.
+# Why FILE may not be sourced, or nothing when it may (GHR-7): a config anyone
+# could edit is executed, sometimes under sudo. Shared by load_config and the
+# read of the sudo contract (GHR-89), which must trust exactly what
+# load_config would.
+config_trust_problem() { # FILE
+  local f="$1" mode owner group
+  mode="$(stat -c '%a' "$f" 2>/dev/null || echo 0)"
+  if [ $((8#$mode & 8#002)) -ne 0 ]; then echo "$f is world-writable — refusing to source it"; return 0; fi
+  owner="$(stat -c '%u' "$f" 2>/dev/null || echo -1)"
+  if [ "$owner" != "0" ] && [ "$owner" != "$(id -u)" ]; then
+    echo "$f is owned by uid $owner, not root or the invoking user (uid $(id -u)) — refusing to source it (fix: chown root:root $f; chmod 644 $f)"; return 0
+  fi
+  group="$(stat -c '%g' "$f" 2>/dev/null || echo -1)"
+  if [ $((8#$mode & 8#020)) -ne 0 ] && [ "$group" != "0" ]; then
+    echo "$f is group-writable by group $group, not root — refusing to source it (fix: chown root:root $f; chmod 644 $f)"
+  fi
+}
+
 load_config() {
   [ -f "$CONFIG_FILE" ] || return 0
-  # Refuse a config anyone could edit — it is executed, sometimes under sudo.
-  local mode; mode="$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null || echo 0)"
-  [ $((8#$mode & 8#002)) -eq 0 ] || die "$CONFIG_FILE is world-writable — refusing to source it"
-  local owner; owner="$(stat -c '%u' "$CONFIG_FILE" 2>/dev/null || echo -1)"
-  [ "$owner" = "0" ] || [ "$owner" = "$(id -u)" ] || die "$CONFIG_FILE is owned by uid $owner, not root or the invoking user (uid $(id -u)) — refusing to source it (fix: chown root:root $CONFIG_FILE; chmod 644 $CONFIG_FILE)"
-  local group; group="$(stat -c '%g' "$CONFIG_FILE" 2>/dev/null || echo -1)"
-  [ $((8#$mode & 8#020)) -eq 0 ] || [ "$group" = "0" ] || die "$CONFIG_FILE is group-writable by group $group, not root — refusing to source it (fix: chown root:root $CONFIG_FILE; chmod 644 $CONFIG_FILE)"
+  local problem; problem="$(config_trust_problem "$CONFIG_FILE")"
+  [ -z "$problem" ] || die "$problem"
   # shellcheck disable=SC1090
   . "$CONFIG_FILE"
+  [[ "$SUDO_CONTRACT" =~ ^(full|narrow)$ ]] || die "SUDO_CONTRACT '$SUDO_CONTRACT' set in $CONFIG_FILE is invalid — want full or narrow"
   [[ "$DROPIN_NAME" =~ ^[A-Za-z0-9_-]+\.conf$ ]] || die "DROPIN_NAME '$DROPIN_NAME' set in $CONFIG_FILE is invalid — must match ^[A-Za-z0-9_-]+\\.conf\$"
   [[ -n "$UNIT_GLOB" && "$UNIT_GLOB" != */* ]] || die "UNIT_GLOB '$UNIT_GLOB' set in $CONFIG_FILE is invalid — must be non-empty and contain no '/'"
   [[ "$DEFAULT_PROFILE" =~ ^[A-Za-z0-9_]+$ ]] || die "DEFAULT_PROFILE '$DEFAULT_PROFILE' set in $CONFIG_FILE is invalid — must match ^[A-Za-z0-9_]+\$"
@@ -563,6 +798,7 @@ load_config() {
   [[ "$FLEET_MUTATE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "FLEET_MUTATE_TIMEOUT '$FLEET_MUTATE_TIMEOUT' set in $CONFIG_FILE is invalid — want a whole number of seconds, 1 or more"
   [[ "$FLEET_WATCH_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "FLEET_WATCH_TIMEOUT '$FLEET_WATCH_TIMEOUT' set in $CONFIG_FILE is invalid — want a whole number of seconds, 1 or more"
   [ -n "$FLEET_RUNNERCTL" ] || die "FLEET_RUNNERCTL set in $CONFIG_FILE is empty — want the remote command name or an absolute path"
+  [[ "$FLEET_SUDO" =~ ^[01]$ ]] || die "FLEET_SUDO '$FLEET_SUDO' set in $CONFIG_FILE is invalid — want 0 or 1"
   # Provisioning settings (GHR-45). Checked here so a typo fails before a
   # download, a useradd or a registration — not half way through slot 3.
   [[ "$RUNNER_ROOT" == /* ]] || die "RUNNER_ROOT '$RUNNER_ROOT' set in $CONFIG_FILE is invalid — want an absolute path"
@@ -5111,6 +5347,25 @@ ssh_control() { # HOST OPERATION
     -O "$2" -- "$1" >/dev/null 2>&1 || true
 }
 
+# The words a call that CHANGES a host starts with (GHR-89): `sudo -n
+# FLEET_RUNNERCTL` under FLEET_SUDO=1, else FLEET_RUNNERCTL alone — into
+# FLEET_PRIV, rebuilt from the settings as they are at each call. -n because a
+# password prompt is a hang, which BatchMode=yes already refuses on the ssh
+# side. A READ never uses it: `status`, `health`, the summary's and the facts'
+# `status --json`, `version` and `upgrade --check` run as the login itself,
+# whatever this says, so the narrow grant is only exercised by what needs it.
+# `logs` (fleet watch's L) is the one read that does: the host's `logs` reads
+# the journal through run_priv, which under the narrow grant has nothing to
+# call.
+FLEET_PRIV=()
+fleet_priv_cmd() {
+  if [ "$FLEET_SUDO" = 1 ]; then
+    FLEET_PRIV=(sudo -n "$FLEET_RUNNERCTL")
+  else
+    FLEET_PRIV=("$FLEET_RUNNERCTL")
+  fi
+}
+
 require_fleet() {
   [ "${#FLEET_HOSTS[@]}" -gt 0 ] || die "fleet mode is not configured — set FLEET_HOSTS=(host1 host2 ...) in $CONFIG_FILE ('runnerctl config-example' shows the block). An empty fleet is a missing config, not an empty table."
 }
@@ -5293,7 +5548,17 @@ fleet_error_text() { # RC ERRFILE [BUDGET [MUTATING]]
       # The single most likely failure of a mutating fan-out. BatchMode=yes is
       # what makes this a failure to report at all rather than a fan-out hung
       # on a password prompt.
-      hint=" — the ssh login needs passwordless sudo on that host; see the fleet section of the README for the exact sudoers line" ;;
+      #
+      # GHR-89: under FLEET_SUDO=1 the only sudo in the call is the `sudo -n`
+      # in front of runnerctl (a remote running as root never asks for
+      # another), so a refusal here is the sudoers line not granting that
+      # path — usually because it names a different one than FLEET_RUNNERCTL
+      # resolves to. sudo says only "a password is required" for that.
+      if [ "$FLEET_SUDO" = 1 ]; then
+        hint=" — FLEET_SUDO=1 runs 'sudo -n $FLEET_RUNNERCTL …' there and sudo refused it: that host's sudoers line must grant NOPASSWD the exact absolute path sudo resolves '$FLEET_RUNNERCTL' to (set FLEET_RUNNERCTL to that path); see 'The narrow sudo contract' in the README"
+      else
+        hint=" — the ssh login needs passwordless sudo on that host; see the fleet section of the README for the exact sudoers line"
+      fi ;;
   esac
   case "$rc" in
     0)   echo "" ;;
@@ -6033,7 +6298,7 @@ fleet_resolve_budget() { # VALUE TOTAL
 # same reason FLEET_DIR (above) is global rather than local to fleet_fanout.
 FLEET_BUDGET_TMP=""
 fleet_budget_cleanup() {
-  [ -z "$FLEET_BUDGET_TMP" ] || rm -f "$FLEET_BUDGET_TMP"
+  [ -z "$FLEET_BUDGET_TMP" ] || rm -f "$FLEET_BUDGET_TMP" "$FLEET_BUDGET_TMP.err"
   FLEET_BUDGET_TMP=""
 }
 
@@ -6092,7 +6357,11 @@ fleet_budget_walk() { # SUBCOMMAND MODE BUDGET [REMOTE-ARGS...]
     # this call only: the fleet_slots re-reads above stay on FLEET_TIMEOUT.
     local rc1=0 budget1
     budget1="$(fleet_mutate_budget "$sub" 1 "$@")"
-    FLEET_CALL_TIMEOUT="$budget1" ssh_run "$host" "$FLEET_RUNNERCTL" "$sub" "$idx" "$@" >/dev/null 2>&1 || rc1=$?
+    fleet_priv_cmd
+    # stderr is kept (GHR-89) so a failed slot says why — a sudo refusal under
+    # FLEET_SUDO=1 most of all — and relayed like any fan-out's (GHR-101).
+    FLEET_CALL_TIMEOUT="$budget1" ssh_run "$host" "${FLEET_PRIV[@]}" "$sub" "$idx" "$@" >/dev/null 2>"$FLEET_BUDGET_TMP.err" || rc1=$?
+    relay_file "$FLEET_BUDGET_TMP.err"
     if [ "$rc1" = 0 ]; then
       acted=$((acted + 1)); echo "$host slot $idx: $sub ok"
     elif [ "$rc1" = 124 ]; then
@@ -6100,7 +6369,7 @@ fleet_budget_walk() { # SUBCOMMAND MODE BUDGET [REMOTE-ARGS...]
       # to have finished, and the walk is about to move on past it.
       nbad=$((nbad + 1)); echo "$host slot $idx: $sub FAILED ($(fleet_error_text 124 /dev/null "$budget1" mutating))"
     else
-      nbad=$((nbad + 1)); echo "$host slot $idx: $sub FAILED (exit $rc1)"
+      nbad=$((nbad + 1)); echo "$host slot $idx: $sub FAILED ($(fleet_error_text "$rc1" "$FLEET_BUDGET_TMP.err" "$budget1" mutating))"
     fi
   done <<<"$slots"
   fleet_budget_cleanup
@@ -6239,7 +6508,8 @@ cmd_fleet_run() { # SUBCOMMAND [--host H]... [--all-hosts] [REMOTE-ARGS...]
   # waiting command needs is read-only, and has no reason to queue.
   fleet_set_budgets "$sub" ${fwd[@]+"${fwd[@]}"}
   FLEET_PARALLEL=1
-  fleet_fanout "$FLEET_RUNNERCTL" "$sub" ${fwd[@]+"${fwd[@]}"}
+  fleet_priv_cmd
+  fleet_fanout "${FLEET_PRIV[@]}" "$sub" ${fwd[@]+"${fwd[@]}"}
   fleet_run_report "$sub" || rc=$?
   fleet_cleanup
   return "$rc"
@@ -6513,7 +6783,11 @@ fleet_upgrade_stage() { # CHECK INDEX...
     FLEET_HOSTS+=("${FLEET_UP_HOSTS[$k]}")
     FLEET_BUDGETS+=("$(fleet_mutate_budget upgrade 1)")
   done
-  fleet_fanout "$FLEET_RUNNERCTL" "${args[@]}"
+  # GHR-89: the write (and a rollback) changes the host; --check writes
+  # nothing and runs as the login, as the read-back below does.
+  FLEET_PRIV=("$FLEET_RUNNERCTL")
+  $check || fleet_priv_cmd
+  fleet_fanout "${FLEET_PRIV[@]}" "${args[@]}"
   for j in "${!idx[@]}"; do
     k="${idx[$j]}"
     fleet_upgrade_classify "$check" "$j" "$k"
@@ -6762,7 +7036,10 @@ cmd_fleet_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart
   if [ -n "$FLEET_HEALTH_MUTATING" ]; then
     for i in "${!FLEET_HOSTS[@]}"; do FLEET_BUDGETS[i]="$(fleet_mutate_budget restart 1)"; done
   fi
-  fleet_fanout "$FLEET_RUNNERCTL" health ${fwd[@]+"${fwd[@]}"}
+  # GHR-89: through sudo only when it may restart something.
+  FLEET_PRIV=("$FLEET_RUNNERCTL")
+  [ -z "$FLEET_HEALTH_MUTATING" ] || fleet_priv_cmd
+  fleet_fanout "${FLEET_PRIV[@]}" health ${fwd[@]+"${fwd[@]}"}
   fleet_health_report "$quiet" || rc=$?
   fleet_cleanup
   return "$rc"
@@ -7592,8 +7869,9 @@ fleet_watch_slot_action() { # KEY HOST NAME
   local host="$2" name="$3" lbl rc=0 runs
   FW_NOTICE="" FW_PROMPT="" FW_ACTION="" FW_ACT_HOST="$host" FW_ACT_NAME="$name"
   lbl="$name on $host"
+  fleet_priv_cmd
   if [ "$1" = L ]; then
-    (ssh_run "$host" "$FLEET_RUNNERCTL" logs "$(printf %q "$name")" -n 50) >"$FW_TMP/logs" 2>"$FW_TMP/err" || rc=$?
+    (ssh_run "$host" "${FLEET_PRIV[@]}" logs "$(printf %q "$name")" -n 50) >"$FW_TMP/logs" 2>"$FW_TMP/err" || rc=$?
     # GHR-101: a journal line is whatever a job printed, and the pager may be
     # `less -R` (or LESS=-R), which passes control bytes through: the lines
     # are relayed like a table's, SGR kept for a pager that draws it.
@@ -7614,7 +7892,7 @@ fleet_watch_slot_action() { # KEY HOST NAME
     return 0
   fi
   fleet_watch_facts "$host" "$name" || return 0
-  runs="runs on $host: $FLEET_RUNNERCTL"
+  runs="runs on $host: ${FLEET_PRIV[*]}"
   case "$1" in
     K)
       if [ "${FF[active]}" = deactivating ]; then
@@ -7680,8 +7958,9 @@ fleet_watch_slot_action() { # KEY HOST NAME
 fleet_watch_run_action() {
   local rc=0 last budget
   budget="$(fleet_mutate_budget "$FW_ACTION" 1)"
-  printf '\nrunning on %s: %s %s %s\n' "$FW_ACT_HOST" "$FLEET_RUNNERCTL" "$FW_ACTION" "$FW_ACT_NAME"
-  (FLEET_CALL_TIMEOUT="$budget" ssh_run "$FW_ACT_HOST" "$FLEET_RUNNERCTL" "$FW_ACTION" "$(printf %q "$FW_ACT_NAME")") >"$FW_TMP/out" 2>"$FW_TMP/err" || rc=$?
+  fleet_priv_cmd
+  printf '\nrunning on %s: %s %s %s\n' "$FW_ACT_HOST" "${FLEET_PRIV[*]}" "$FW_ACTION" "$FW_ACT_NAME"
+  (FLEET_CALL_TIMEOUT="$budget" ssh_run "$FW_ACT_HOST" "${FLEET_PRIV[@]}" "$FW_ACTION" "$(printf %q "$FW_ACT_NAME")") >"$FW_TMP/out" 2>"$FW_TMP/err" || rc=$?
   # GHR-101: either one becomes the next frame's notice.
   relay_file "$FW_TMP/out"
   relay_file "$FW_TMP/err"
@@ -9279,6 +9558,25 @@ cmd_config_example() {
 # The remote command, for hosts where runnerctl is not on the ssh user's PATH.
 #FLEET_RUNNERCTL="runnerctl"
 
+# 1 = every call that changes a host runs `sudo -n FLEET_RUNNERCTL <verb> …`
+# there, for hosts whose sudoers grants the ssh login runnerctl itself (one
+# line, the narrow contract in the README) instead of the systemctl/tee/rm/
+# kill/cp/mv it calls — a grant of those is root for that login. Reads never
+# use sudo. The sudoers line must name the exact absolute path sudo resolves
+# FLEET_RUNNERCTL to, so set FLEET_RUNNERCTL to that path.
+#FLEET_SUDO="0"
+
+# --- sudo contract (on each runner host) ------------------------------------
+# narrow = this host's sudoers grants a login runnerctl itself (the narrow
+# contract in the README). Under sudo runnerctl then refuses whatever would
+# widen that grant back to root: any config but this file, a script or config
+# directory others can write, `fleet`, and the flags that choose what root
+# runs, sources, installs, writes or removes. Required with that sudoers
+# line, which without it is root for the login through --config alone. Read
+# from this file only — a --config or RUNNERCTL_CONFIG cannot set it.
+# full (default) = nothing is refused; whoever runs sudo here is root anyway.
+#SUDO_CONTRACT="full"
+
 # A profile is a function that sets these variables. Defining profile_ci or
 # profile_deploy replaces the built-in of the same name.
 #
@@ -9421,6 +9719,15 @@ cmd_migrate() {
   fi
   [ -f "$from" ] || die "$from: no such file"
   looks_like_runnerctl "$from" || die "$from does not look like a runnerctl script (no bash shebang / load_profile / render_dropin) — refusing to source it"
+  # GHR-89: --from is refused under the narrow contract, but `install` reaches
+  # here with a pre-config copy it found — in $SUDO_USER's home, where it is
+  # not on secure_path. Under sudo that copy is the caller's file, and
+  # sourcing it is running it as root; on a `full` host the caller is root
+  # anyway, so only a `narrow` one refuses.
+  if $SUDO_NARROW; then
+    local problem; problem="$(root_exec_problem "$from")"
+    [ -z "$problem" ] || die "refusing to source $from as root under sudo: $problem — run the same command without sudo (runnerctl asks sudo for each privileged step itself), or 'runnerctl install --no-migrate' and migrate it later"
+  fi
   is_legacy_script "$from" \
     || die "$from is not a pre-config runnerctl (it carries $(grep -m1 '^RUNNERCTL_VERSION=' "$from")) — nothing to migrate"
   [ -n "$out" ] || out="$CONFIG_FILE"
@@ -9875,6 +10182,12 @@ upgrade_rollback() { # TARGET
      || ! looks_like_runnerctl "$prev" || ! bash -n "$prev" 2>/dev/null; then
     die "$prev is not a runnerctl with a valid version — not rolling back to it"
   fi
+  # GHR-89: under the narrow contract the file put back is the one every later
+  # sudo run executes, so it is held to the rule this run's own file was.
+  if $SUDO_NARROW; then
+    local problem; problem="$(root_exec_problem "$prev")"
+    [ -z "$problem" ] || die "refusing to roll back to $prev under sudo: $problem — the script a sudoers grant names must be writable by root alone"
+  fi
   echo "installed: $RUNNERCTL_VERSION ($target)"
   echo "rollback: $prev_ver ($prev)"
   dir="$(dirname "$target")"
@@ -10219,11 +10532,23 @@ main() {
   if [ $# -gt 0 ]; then
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
   fi
+  local cfg_flag=false
   if [ "${1:-}" = "--config" ]; then
     need_val "$@"
-    CONFIG_FILE="$2"; shift 2
-    [ -f "$CONFIG_FILE" ] || die "config file $CONFIG_FILE not found"
+    CONFIG_FILE="$2"; shift 2; cfg_flag=true
+    CONFIG_CHOSEN=""; [ "$CONFIG_FILE" = "$CONFIG_DEFAULT" ] || CONFIG_CHOSEN=--config
   fi
+  # GHR-89: before the config is looked at — even whether it exists, which
+  # under sudo would answer for a path the caller cannot see.
+  # The environment is pinned under every sudo (harmless where the caller is
+  # root anyway); the refusals only where the host opted in, a decision read
+  # from the default config alone.
+  if under_sudo; then
+    sudo_env_harden
+    [ "$(sudo_contract_of_default)" = full ] || SUDO_NARROW=true
+    ! $SUDO_NARROW || sudo_preflight "$@"
+  fi
+  ! $cfg_flag || [ -f "$CONFIG_FILE" ] || die "config file $CONFIG_FILE not found"
   load_config
   local cmd="${1:-status}"; shift || true
   if is_piped; then
@@ -10264,4 +10589,6 @@ main() {
 
 # RUNNERCTL_NO_MAIN=1 lets tests/run.sh source the script and call a helper
 # (fmt_dur, ...) directly without running a command. Not a user-facing knob.
+# Under sudo it can only make a run do nothing at all, which is no lever
+# (GHR-89); every other RUNNERCTL_* hook is unset by sudo_env_harden.
 if [ "${RUNNERCTL_NO_MAIN:-}" != 1 ]; then main "$@"; fi

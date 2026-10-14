@@ -1515,7 +1515,9 @@ is what sends someone to the wrong box.
 
 `upgrade` writes the installed script, which on a normal host needs root, so
 **this is the first fan-out that needs passwordless sudo on each runner
-host.** Grant it for the write only, e.g.:
+host.** [The narrow sudo contract](#the-narrow-sudo-contract) below grants it
+with one line naming `runnerctl`; the lines here are the compatible option,
+for hosts that cannot change yet. They name the binaries the write uses:
 
 ```
 # /etc/sudoers.d/runnerctl  (on each runner host)
@@ -1524,6 +1526,11 @@ host.** Grant it for the write only, e.g.:
 # distribution before pasting this — they are not the same everywhere.
 %runnerctl ALL=(root) NOPASSWD: /usr/bin/cp, /usr/bin/chown, /usr/bin/chmod, /usr/bin/mv
 ```
+
+**This line is equivalent to root for that login.** A sudoers entry that
+names a binary with no arguments grants it with *any* arguments, and root
+`cp`, `chown`, `chmod` or `mv` can each replace any file on the host. Give
+the fleet a dedicated login and key, used for nothing else, if you grant it.
 
 Without it the call **fails fast and names the host** rather than hanging —
 the fan-out runs ssh with `BatchMode=yes` precisely so a password prompt
@@ -1604,7 +1611,9 @@ GitHub first.
 ##### sudo for the mutating commands
 
 These run privileged commands on each host, so the ssh login needs
-passwordless sudo for them. The set the fan-out actually uses:
+passwordless sudo for them — through [the narrow sudo
+contract](#the-narrow-sudo-contract) below, or, as the compatible option for
+hosts that cannot change yet, a grant of the binaries the fan-out uses:
 
 ```
 # /etc/sudoers.d/runnerctl  (on each runner host)
@@ -1619,6 +1628,12 @@ passwordless sudo for them. The set the fan-out actually uses:
 Add the `upgrade` set from the previous section if you also run `fleet
 upgrade`.
 
+**This line is equivalent to root for that login, too.** Unrestricted root
+`tee` or `rm` writes or deletes any file, and unrestricted `systemctl` and
+`kill` reach every service and process on the host, not only runner units —
+on a CI host that runs code from pull requests. Give the fleet a dedicated
+login and key, used for nothing else, if you grant it.
+
 Without it the fan-out **fails fast and names the host**, with the remedy
 appended to the row — it never hangs, because ssh runs with `BatchMode=yes`:
 
@@ -1626,6 +1641,117 @@ appended to the row — it never hangs, because ssh runs with `BatchMode=yes`:
 box-2: remote exit 1 — sudo: a password is required — the ssh login needs
 passwordless sudo on that host; see the fleet section of the README for the
 exact sudoers line
+```
+
+##### The narrow sudo contract
+
+Grant the login **runnerctl itself** rather than the primitives it calls,
+**opt the host in**, and set `FLEET_SUDO=1` in the central node's config.
+Every call that changes a host then runs as `sudo -n <FLEET_RUNNERCTL> <verb>
+…` there, so runnerctl runs as root from the start and asks sudo for nothing
+more. On each runner host, both of these:
+
+```
+# /etc/sudoers.d/runnerctl  (on each runner host)
+# One command, the exact absolute path runnerctl is installed at.
+%runnerctl ALL=(root) NOPASSWD: /usr/local/bin/runnerctl
+```
+
+```
+# /etc/runnerctl/config  (on each runner host — root:root, 0644)
+SUDO_CONTRACT="narrow"
+```
+
+**The opt-in is part of the contract.** The sudoers line alone, without
+`SUDO_CONTRACT="narrow"`, is **still root-equivalent**: `sudo runnerctl
+--config <a file the login wrote>` runs that file as root, and `apply
+--env-file`, `--save` and the other flags below each widen it again. With the
+opt-in, runnerctl refuses all of them under sudo (below). It is read only
+from `/etc/runnerctl/config` — never from a `--config` or `RUNNERCTL_CONFIG`,
+which can neither set it nor clear it — and a value other than exactly `full`
+counts as `narrow`. Without it (`full`, the default) nothing is refused, so
+an admin's own `sudo runnerctl …` on a host with a full sudo grant works as
+it always has: there the caller is root anyway.
+
+And on the central node:
+
+```
+# /etc/runnerctl/config  (on the central node)
+FLEET_SUDO="1"
+FLEET_RUNNERCTL="/usr/local/bin/runnerctl"   # the path the sudoers line names
+```
+
+**What goes through sudo:** the mutating fan-outs (`fleet apply`, `scale`,
+`start`, `stop`, `restart`, `drain`, `kill`, `reap`, `remove-limits`,
+`enable`, `disable`, with or without a budget), `fleet health
+--restart-stalled`, `fleet upgrade` and `fleet upgrade --rollback`, and
+`fleet watch`'s action keys and `L` (the host's `logs` reads the journal
+through sudo). **What does not:** `fleet status`, `fleet health`, `fleet
+watch`'s ticks and the reads its keys make first, the summary's `status
+--json`, `fleet upgrade --check` and the read-back after an upgrade. Those
+still run as the plain login.
+
+**What it bounds.** As root, the login can do what runnerctl's verbs do —
+units matching `UNIT_GLOB`, the managed drop-in, runnerctl's own file — and
+not more, because on an opted-in host runnerctl refuses under sudo
+everything that would widen that back to root:
+
+- a config other than `/etc/runnerctl/config` (`--config`, `RUNNERCTL_CONFIG`):
+  a config is sourced as bash, and a root-owned file can still hold text the
+  caller wrote;
+- that config in a directory, or runnerctl itself (and its directory), that
+  is not root-owned or is writable by group or others;
+- every flag that picks what root runs, sources or installs, where it
+  writes, whose account a runner runs as, or what it removes beyond the
+  host's own policy — `apply`/`scale --env-file` and `--save`, `env-init
+  --env-file`, `upgrade`/`install --prefix`, an `upgrade`/`install --ref`
+  that is not a release version, `migrate --from`/`--output`, `provision
+  --url`/`--runner-user`/`--runner-root`/`--work`/`--runner-version`/
+  `--no-verify-checksum`, `deprovision --url`, `compose-reap
+  --standalone`/`--max-age-hours`/`--grace-minutes` — each refused by name;
+- `fleet` itself, which would dial out with root's ssh identity.
+
+Under any sudo, opted in or not, it also pins `PATH` and `HOME`, drops the
+caller's pager and every `RUNNERCTL_*` variable, and runs a pager in secure
+mode. Sudo is detected as uid 0 with a non-zero `SUDO_UID`, which a root
+shell from `sudo -i` also has: on an opted-in host the refusals apply there
+too. To use a refused flag there, run the command without `sudo` (runnerctl
+asks sudo for each privileged step itself) or set the value in the config.
+
+**The central node cannot check either half for you.** It cannot read a
+host's sudoers, so it cannot tell the narrow line from a full grant, and a
+host with the narrow line but without the opt-in answers every fan-out
+exactly as an opted-in one does — the difference only shows when someone
+passes a flag the opt-in would refuse. Check each host yourself, e.g. `ssh
+<host> grep SUDO_CONTRACT /etc/runnerctl/config`.
+
+**What it does not bound.** The verbs themselves: the login can stop,
+restart, kill, reap, provision and deprovision runners, roll the script back
+to its `.prev`, and upgrade to any published release. `provision` and
+`deprovision` run the runner's own `svc.sh` as root from the runner's
+directory, which the runner account — the one jobs run as — can write; that
+holds with or without sudo, and is a known gap. And it holds only
+while sudo keeps its defaults: `env_reset` on, no `SETENV` or `env_keep` for
+this command, `NOPASSWD` alone — a grant that lets the caller set the
+environment hands `BASH_ENV` to bash before runnerctl's first line runs.
+
+**File ownership is part of the contract.** The path the sudoers line names
+must be root-owned and writable by root alone, in a directory only root can
+write, or the grant is a grant to rewrite it: `runnerctl install` puts it at
+`/usr/local/bin/runnerctl` as `root:root 0755`, and on an opted-in host
+runnerctl refuses to run under sudo otherwise. `/etc/runnerctl` and its
+`config` the same — that file is also where the opt-in lives.
+
+A sudoers line that names a different path from the one `FLEET_RUNNERCTL`
+resolves to answers only `sudo: a password is required`. Under `FLEET_SUDO=1`
+the row says what that means:
+
+```
+box-2: remote exit 1 — sudo: a password is required — FLEET_SUDO=1 runs
+'sudo -n /usr/local/bin/runnerctl …' there and sudo refused it: that host's
+sudoers line must grant NOPASSWD the exact absolute path sudo resolves
+'/usr/local/bin/runnerctl' to (set FLEET_RUNNERCTL to that path); see 'The
+narrow sudo contract' in the README
 ```
 
 ##### What does not fan out

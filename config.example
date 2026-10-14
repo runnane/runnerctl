@@ -166,6 +166,25 @@
 # The remote command, for hosts where runnerctl is not on the ssh user's PATH.
 #FLEET_RUNNERCTL="runnerctl"
 
+# 1 = every call that changes a host runs `sudo -n FLEET_RUNNERCTL <verb> …`
+# there, for hosts whose sudoers grants the ssh login runnerctl itself (one
+# line, the narrow contract in the README) instead of the systemctl/tee/rm/
+# kill/cp/mv it calls — a grant of those is root for that login. Reads never
+# use sudo. The sudoers line must name the exact absolute path sudo resolves
+# FLEET_RUNNERCTL to, so set FLEET_RUNNERCTL to that path.
+#FLEET_SUDO="0"
+
+# --- sudo contract (on each runner host) ------------------------------------
+# narrow = this host's sudoers grants a login runnerctl itself (the narrow
+# contract in the README). Under sudo runnerctl then refuses whatever would
+# widen that grant back to root: any config but this file, a script or config
+# directory others can write, `fleet`, and the flags that choose what root
+# runs, sources, installs, writes or removes. Required with that sudoers
+# line, which without it is root for the login through --config alone. Read
+# from this file only — a --config or RUNNERCTL_CONFIG cannot set it.
+# full (default) = nothing is refused; whoever runs sudo here is root anyway.
+#SUDO_CONTRACT="full"
+
 # A profile is a function that sets these variables. Defining profile_ci or
 # profile_deploy replaces the built-in of the same name.
 #

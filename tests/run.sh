@@ -10140,6 +10140,554 @@ t "GHR-109: a skipped project's name is drawn safely"                  case_ghr1
 t "GHR-109: --standalone reads one record per container"               case_ghr109_standalone_reads_one_record_per_container
 t "GHR-109: compose_record holds a line to its shape"                  case_ghr109_compose_record_shapes
 
+# --- GHR-89: the narrow sudo contract ------------------------------------------
+# Central node: FLEET_SUDO=1 (the stub's RUNNERCTL_STUB_FLEET_SUDO) puts
+# `sudo -n` in front of every call that changes a host, and of nothing else.
+# The stub logs such a call twice: as `probe:ssh_run HOST -- sudo -n …` (the
+# command line handed to ssh) and as `probe:remote_sudo HOST -- …` (the call
+# it then answered, as root).
+#
+# Host side: no case here runs as root or calls a real sudo. Two stand-ins:
+# RUNNERCTL_TEST_SUDO_UID, which the script honours only in a process that is
+# NOT root, for whole command lines; and, through run_fn, an `id` that says 0
+# with SUDO_UID set — the production detection path, which is how the cases
+# that would catch its removal reach it.
+
+# The script with no config at all (RUNNERCTL_CONFIG unset), for the refusals
+# decided before a config is looked at. Every use of it either refuses before
+# any command runs, or names a config that sources the stub.
+run_bare() { # ARGS...
+  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
+  rm -rf "$WRITES"; mkdir -p "$WRITES"
+  RC=0
+  OUT="$(env -u RUNNERCTL_CONFIG RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
+         timeout "$RUN_TIMEOUT" "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
+  ERR="$(cat "$TMP/err")"
+}
+
+# `id -u` answering $GHR89_UID, for run_fn: the rest of `id` is the real one.
+# shellcheck disable=SC2016  # expanded by run_fn's child
+GHR89_ID='id() { if [ "$*" = -u ]; then echo "$GHR89_UID"; else command id "$@"; fi; }'
+
+# The refusals apply only on a host whose DEFAULT config says
+# SUDO_CONTRACT=narrow. RUNNERCTL_TEST_CONFIG_DEFAULT stands in for
+# /etc/runnerctl/config (read, like RUNNERCTL_TEST_SUDO_UID, only by a process
+# that is not root): one file opts in, one says full, one is absent.
+GHR89_NARROW="$TMP/ghr89-default-narrow.config"
+GHR89_FULL="$TMP/ghr89-default-full.config"
+GHR89_NONE="$TMP/ghr89-default-absent.config"
+ghr89_defaults() {
+  printf 'SUDO_CONTRACT=narrow\n' >"$GHR89_NARROW"
+  printf 'SUDO_CONTRACT=full\n' >"$GHR89_FULL"
+  rm -f "$GHR89_NONE"
+}
+
+# A config of the case's own for a run under sudo that is let through: by the
+# time a config is sourced there every RUNNERCTL_* variable is gone (the hooks
+# are inert under sudo — that is the point), so the config hands the stub its
+# log, its writes tree and any knob as plain shell variables. BODY lines go
+# before the stub is sourced.
+ghr89_cfg() { # PATH [BODY-LINE...]
+  local f="$1"; shift
+  { echo "RUNNERCTL_TEST_LOG=$LOG"; echo "RUNNERCTL_TEST_WRITES=$WRITES"
+    [ $# -eq 0 ] || printf '%s\n' "$@"
+    echo ". $PWD/$STUB"; } >"$f"
+}
+
+# Acceptance: every mutating fan-out is `sudo -n <path> <verb> …` on the host.
+case_ghr89_fleet_sudo_mutating_calls_go_through_sudo() {
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet restart
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-[12] -- sudo -n runnerctl restart$' 2
+  expect_log_count '^probe:remote_sudo build-[12] -- runnerctl restart$' 2
+  expect_out '^fleet restart: 2 host\(s\) ok, 0 failed$'
+  # a host whose login has no grant for the primitives still acts: under the
+  # narrow contract runnerctl is root there and asks sudo for nothing
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_NOSUDO=build-2 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    run fleet stop --host build-2
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-2 -- sudo -n runnerctl stop$' 1
+  expect_out '^build-2: stop done\.$'
+  # the budget walk: one call per slot through sudo, its re-reads not
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_SLOTS=2 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    run fleet restart --max-unavailable 1
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-[12] -- sudo -n runnerctl restart [01]$' 4
+  expect_log '^probe:ssh_run build-1 -- runnerctl status --json$'
+  expect_no_log '^probe:ssh_run [^ ]+ -- sudo -n runnerctl status'
+  expect_out '^fleet restart: 4 slot\(s\) done, 0 failed$'
+  # health only when it may restart
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet health --restart-stalled
+  expect_log_count '^probe:ssh_run build-1 -- sudo -n runnerctl health --restart-stalled$' 1
+  # upgrade: the write through sudo, the read-back as the login
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" run fleet upgrade --ref v9.9.9
+  expect_rc 0
+  expect_out '^build-2-oldver +0\.0\.1 -> 9\.9\.9 +upgraded$'
+  expect_log_count '^probe:ssh_run build-2-oldver -- sudo -n runnerctl upgrade --ref v9\.9\.9$' 1
+  expect_log_count '^probe:ssh_run build-2-oldver -- runnerctl version$' 1
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet upgrade --rollback
+  expect_log_count '^probe:ssh_run build-1 -- sudo -n runnerctl upgrade --rollback$' 1
+  # fleet watch: the confirm line names the command it will run, and runs it
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jRy-q' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out 'Restart example\.slot-2 on build-1\? runs on build-1: sudo -n runnerctl restart example\.slot-2  \[y/n\]'
+  expect_log_count '^probe:ssh_run build-1 -- sudo -n runnerctl restart example\.slot-2$' 1
+  expect_out '^example\.slot-2 on build-1: restart done\.$'
+  # and L, whose host reads the journal through run_priv
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_NOSUDO=build-2 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjLq' \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-2 -- sudo -n runnerctl logs example\.slot-1 -n 50$' 1
+  expect_log '^probe:page$'
+  # FLEET_SUDO=0, the default: no sudo in front of anything
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet restart
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-[12] -- runnerctl restart$' 2
+  expect_no_log ' -- sudo'
+}
+
+# Acceptance, the negative control: the reads never go through sudo, whatever
+# FLEET_SUDO says. Each run also asserts the read it made, so the absence of
+# sudo is not the absence of a call.
+case_ghr89_fleet_sudo_reads_never_use_sudo() {
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status
+  expect_rc 0
+  expect_log '^probe:ssh_run build-1 -- runnerctl status --color never$'
+  expect_log '^probe:ssh_run build-1 -- runnerctl status --json$'
+  expect_no_log ' -- sudo'
+  expect_no_log '^probe:remote_sudo '
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status --json
+  expect_rc 0
+  expect_log '^probe:ssh_run build-2 -- runnerctl status --json$'
+  expect_no_log ' -- sudo'
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet health
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-[12] -- runnerctl health$' 2
+  expect_no_log ' -- sudo'
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver" run fleet upgrade --check
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl upgrade --check$' 2
+  expect_no_log ' -- sudo'
+  # a tick, and the facts read a key makes before it asks (declined)
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jRn-q' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_log '^probe:ssh_run build-1 -- runnerctl status --color never$'
+  expect_log '^probe:ssh_run build-1 -- runnerctl status --json$'
+  expect_no_log ' -- sudo'
+}
+
+# Care-needed: a sudoers line naming another path answers only "a password is
+# required". Under FLEET_SUDO=1 the row says what that means and where the fix
+# is — the fan-out's row, the budget walk's line and the watch's notice.
+case_ghr89_sudoers_path_mismatch_names_the_remedy() {
+  local want="sudo: a password is required — FLEET_SUDO=1 runs 'sudo -n runnerctl …' there and sudo refused it: that host's sudoers line must grant NOPASSWD the exact absolute path sudo resolves 'runnerctl' to \\(set FLEET_RUNNERCTL to that path\\); see 'The narrow sudo contract' in the README"
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-sudopath" run fleet restart
+  expect_rc 1
+  expect_out "^box-sudopath: remote exit 1 — $want\$"
+  expect_out '^build-1: restart done\.$'
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_SLOTS=1 RUNNERCTL_STUB_FLEET_HOSTS="box-sudopath" \
+    run fleet restart --max-unavailable 1
+  expect_rc 1
+  expect_out "^box-sudopath slot 0: restart FAILED \\(remote exit 1 — $want\\)\$"
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jRy-q' RUNNERCTL_STUB_FLEET_HOSTS="box-sudopath" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out "^example\\.slot-2 on box-sudopath: restart failed — remote exit 1 — $want\$"
+  # without FLEET_SUDO the same refusal is the primitive grant's, as before
+  RUNNERCTL_STUB_FLEET_HOSTS="box-nosudo" run fleet restart
+  expect_rc 1
+  expect_out '^box-nosudo: remote exit 1 — sudo: a password is required — the ssh login needs passwordless sudo on that host; see the fleet section of the README for the exact sudoers line$'
+  # the section the remedy names exists, under that name
+  expect_cfg README.md '^#+ The narrow sudo contract$'
+}
+
+case_ghr89_fleet_sudo_is_validated() {
+  RUNNERCTL_STUB_FLEET_SUDO=yes RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet restart
+  expect_rc 1
+  expect_err "^runnerctl: FLEET_SUDO 'yes' set in .* is invalid — want 0 or 1$"
+  expect_no_log '^probe:ssh_run '
+}
+
+# The detection itself, through the production path: under_sudo with `id -u`
+# saying 0 or not, and SUDO_UID and the test hook set or not.
+case_ghr89_under_sudo_detection() {
+  # shellcheck disable=SC2016
+  run_fn eval "$GHR89_ID"'
+    probe() { if under_sudo; then echo "$1 yes"; else echo "$1 no"; fi; }
+    unset RUNNERCTL_TEST_SUDO_UID
+    GHR89_UID=0;    export SUDO_UID=1000; probe sudo
+    GHR89_UID=0;    unset SUDO_UID;       probe root-login
+    GHR89_UID=0;    export SUDO_UID=0;    probe root-ran-sudo
+    GHR89_UID=0;    export SUDO_UID=x;    probe junk
+    GHR89_UID=1000; export SUDO_UID=1000; probe not-root
+    GHR89_UID=0;    unset SUDO_UID; export RUNNERCTL_TEST_SUDO_UID=1000; probe root-with-hook
+    GHR89_UID=1000; probe hook'
+  expect_rc 0
+  expect_text "under_sudo for each" 'sudo yes
+root-login no
+root-ran-sudo no
+junk no
+not-root no
+root-with-hook no
+hook yes' "$OUT"
+}
+
+# Under sudo the caller's environment cannot choose a program, a config file
+# or a pager's shell, and no RUNNERCTL_* hook survives into the root run.
+case_ghr89_env_is_hardened_under_sudo() {
+  local roothome; roothome="$(getent passwd 0 | cut -d: -f6)"
+  # shellcheck disable=SC2016
+  run_fn eval 'export PATH="/caller/bin:$PATH" HOME=/home/caller TMPDIR=/caller/tmp PAGER="sh -c x" \
+      CURL_HOME=/caller XDG_CONFIG_HOME=/caller/.config RUNNERCTL_STUB_ROOT_EXEC_OK=1 RUNNERCTL_TEST_LOG=/caller/log
+    sudo_env_harden
+    echo "PATH=$PATH"; echo "HOME=$HOME"
+    echo "TMPDIR=${TMPDIR-unset} PAGER=${PAGER-unset} CURL_HOME=${CURL_HOME-unset} XDG_CONFIG_HOME=${XDG_CONFIG_HOME-unset}"
+    echo "LESSSECURE=$LESSSECURE SYSTEMD_PAGERSECURE=$SYSTEMD_PAGERSECURE"
+    env | grep "^RUNNERCTL_" || echo "no RUNNERCTL_ variable"
+    echo "version=$RUNNERCTL_VERSION"'
+  expect_rc 0
+  expect_out '^PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin$'
+  expect_out "^HOME=$roothome\$"
+  expect_out '^TMPDIR=unset PAGER=unset CURL_HOME=unset XDG_CONFIG_HOME=unset$'
+  expect_out '^LESSSECURE=1 SYSTEMD_PAGERSECURE=1$'
+  expect_out '^no RUNNERCTL_ variable$'
+  expect_out '^version=[0-9]+\.[0-9]+\.[0-9]+$'
+}
+
+# Each flag decided against, by the real table, and the ones decided for.
+case_ghr89_flags_refused_under_sudo() {
+  local sha; sha="$(printf '%064d' 0)"
+  # shellcheck disable=SC2016
+  GHR89_SHA="$sha" run_fn eval 'for c in "apply --env-file /x" "apply 1 --env-file=/x" "scale 2 --env-file /x" \
+      "env-init --env-file /x" "apply --save" "scale 2 --save" "provision 2 --url https://github.com/x" \
+      "deprovision 1 --url https://github.com/x" "provision 2 --runner-user u" "provision 2 --runner-root /x" \
+      "provision 2 --work ../x" "provision 2 --runner-version 2.300.0" "provision 2 --no-verify-checksum" \
+      "compose-reap --apply --standalone" "compose-reap --max-age-hours 0" "compose-reap --grace-minutes=0" \
+      "install --prefix /x" "upgrade --prefix /x" "install --ref main" "upgrade --ref main" "upgrade --ref=0123abc" \
+      "upgrade --ref" "migrate --from /x" "migrate --output /x" "fleet status" \
+      "apply --profile ci --max 26G --high 25G --restart-sec 5 --restart --when-idle --timeout 60 1" \
+      "scale 2 --profile ci --restart" "restart --if-stalled --stall-after 600" "kill --dry-run 0" "reap 1" \
+      "logs 1 -n 50 --since today -g x" "compose-reap --apply --project p" "env-init --profile deploy" \
+      "provision 2 --token t --labels a,b --name-prefix p --runner-group g --sha256 $GHR89_SHA --replace --dry-run" \
+      "deprovision 1 --token t --local-only --when-idle --yes" "upgrade --ref v1.2.3" "upgrade --ref=1.2.3" \
+      "install --ref v0.20.0 --no-migrate --dry-run" "upgrade --check --sha256 $GHR89_SHA --no-relocate" \
+      "upgrade --rollback" "migrate --dry-run" "health --restart-stalled" "status --json" \
+      "compose-reap-timer install" "version"; do
+      read -ra a <<<"$c"
+      if sudo_flag_problem "${a[@]}"; then echo "${a[0]}: $SUDO_FLAG"; else echo "${a[0]}: taken"; fi
+    done'
+  expect_rc 0
+  expect_text "the decision for each command line" 'apply: --env-file
+apply: --env-file
+scale: --env-file
+env-init: --env-file
+apply: --save
+scale: --save
+provision: --url
+deprovision: --url
+provision: --runner-user
+provision: --runner-root
+provision: --work
+provision: --runner-version
+provision: --no-verify-checksum
+compose-reap: --standalone
+compose-reap: --max-age-hours
+compose-reap: --grace-minutes
+install: --prefix
+upgrade: --prefix
+install: --ref
+upgrade: --ref
+upgrade: --ref
+upgrade: --ref
+migrate: --from
+migrate: --output
+fleet: fleet
+apply: taken
+scale: taken
+restart: taken
+kill: taken
+reap: taken
+logs: taken
+compose-reap: taken
+env-init: taken
+provision: taken
+deprovision: taken
+upgrade: taken
+upgrade: taken
+install: taken
+upgrade: taken
+upgrade: taken
+migrate: taken
+health: taken
+status: taken
+compose-reap-timer: taken
+version: taken' "$OUT"
+  # wired in, on a host that opted in: a whole command line, refused before
+  # anything runs
+  ghr89_defaults
+  RUNNERCTL_TEST_SUDO_UID=1000 RUNNERCTL_TEST_CONFIG_DEFAULT="$GHR89_NARROW" run apply --env-file /tmp/x
+  expect_rc 1
+  expect_err "^runnerctl: refusing --env-file under sudo: the path is written into each slot's drop-in as EnvironmentFile=, .* This host's SUDO_CONTRACT is narrow: run it without sudo \\(runnerctl asks sudo for each privileged step itself\\)"
+  expect_log_count . 0
+  RUNNERCTL_TEST_SUDO_UID=1000 RUNNERCTL_TEST_CONFIG_DEFAULT="$GHR89_NARROW" run fleet restart
+  expect_rc 1
+  expect_err "^runnerctl: refusing fleet under sudo: a fleet command dials other hosts with this host's ssh identity"
+  expect_log_count . 0
+  # without sudo the same flag is taken as ever
+  RUNNERCTL_STUB_ENV_FILE_EXISTS=1 run apply --env-file /tmp/x
+  expect_rc 0
+  expect_file "$DROPIN_DIR/$U1.d/10-runnerctl.conf" '^EnvironmentFile=/tmp/x$'
+}
+
+# Acceptance: under sudo, on a host that opted in, a config the caller picked
+# is refused — the stub (every sim run names it in RUNNERCTL_CONFIG), and one
+# the caller owns named with --config — while the default path is read.
+case_ghr89_config_chosen_by_the_caller_is_refused() {
+  ghr89_defaults
+  RUNNERCTL_TEST_SUDO_UID=1000 RUNNERCTL_TEST_CONFIG_DEFAULT="$GHR89_NARROW" run status
+  expect_rc 1
+  expect_err "^runnerctl: refusing the config $STUB from RUNNERCTL_CONFIG under sudo: a config is sourced as bash, so one the caller picks is code run as root"
+  expect_log_count . 0
+  local cfg="$TMP/ghr89.config"
+  save_config "$cfg" </dev/null
+  RUNNERCTL_TEST_SUDO_UID=1000 RUNNERCTL_TEST_CONFIG_DEFAULT="$GHR89_NARROW" run_bare --config "$cfg" apply
+  expect_rc 1
+  expect_err "^runnerctl: refusing the config $cfg from --config under sudo"
+  expect_log_count . 0
+  # whether a path exists is not answered for the caller either
+  RUNNERCTL_TEST_SUDO_UID=1000 RUNNERCTL_TEST_CONFIG_DEFAULT="$GHR89_NARROW" run_bare --config /nonexistent/ghr89 status
+  expect_rc 1
+  expect_err '^runnerctl: refusing the config /nonexistent/ghr89 from --config under sudo'
+  # without sudo the same --config is read
+  run_bare --config "$cfg" profiles
+  expect_rc 0
+  expect_out '^ci'
+  rm -f "$cfg"
+  # The discriminating pair: the SAME root-owned file is refused when the
+  # caller names it, and sourced when it is the default — so it is the choice
+  # that is refused, not the ownership GHR-7 already checks. os-release is a
+  # root-owned file of shell assignments on any systemd host.
+  local os=""
+  for os in /usr/lib/os-release /etc/os-release ""; do
+    [ -z "$os" ] || { [ -f "$os" ] && [ ! -L "$os" ] && [ "$(stat -c %u "$os")" = 0 ]; } && break
+  done
+  if [ -z "$os" ]; then
+    skip "no root-owned os-release file: the default-path half not exercised"
+    return 0
+  fi
+  # shellcheck disable=SC2016
+  GHR89_UID=0 GHR89_OS="$os" run_fn eval "$GHR89_ID"'
+    export SUDO_UID=1000
+    CONFIG_DEFAULT="$GHR89_OS" CONFIG_FILE="$GHR89_OS" CONFIG_CHOSEN=""
+    ( sudo_config_check && load_config && echo "default: sourced" ) 2>&1 || true
+    CONFIG_CHOSEN=--config
+    ( sudo_config_check && load_config && echo "chosen: sourced" ) 2>&1 || true'
+  expect_out '^default: sourced$'
+  expect_out "^runnerctl: refusing the config $os from --config under sudo"
+  expect_no_out '^chosen: sourced$'
+  # and the default path in a directory someone else can write is refused
+  local d="$TMP/ghr89-cfgdir"; mkdir -p "$d"; : >"$d/config"
+  # shellcheck disable=SC2016
+  GHR89_UID=0 GHR89_D="$d" run_fn eval "$GHR89_ID"'
+    export SUDO_UID=1000; CONFIG_FILE="$GHR89_D/config" CONFIG_CHOSEN=""; sudo_config_check'
+  expect_rc 1
+  expect_err "^runnerctl: refusing to source $d/config as root under sudo: $d is owned by uid $(id -u), not root"
+  rm -rf "$d"
+}
+
+# Acceptance: under sudo, a script others can write refuses — through main,
+# the production detection, the real root_exec_problem; only stat's answer
+# for this script and its directory is pinned, since no sim file is
+# root-owned. 755 is the control that reaches the command.
+case_ghr89_writable_script_refuses_under_sudo() {
+  local self; self="$(readlink -f "$RUNNERCTL")"
+  # shellcheck disable=SC2016
+  GHR89_UID=0 GHR89_SELF="$self" run_fn eval "$GHR89_ID"'
+    stat() {
+      if [ "${3:-}" = "$GHR89_SELF" ] || [ "${3:-}" = "${GHR89_SELF%/*}" ]; then
+        case "$2" in %u) echo 0 ;; %a) [ "$3" = "$GHR89_SELF" ] && echo "$GHR89_MODE" || echo 755 ;; esac
+      else command stat "$@"; fi
+    }
+    cmd_apply() { echo "apply ran"; }
+    export SUDO_UID=1000; CONFIG_FILE=/nonexistent/ghr89/config; CONFIG_CHOSEN=""
+    # the contract reader is pinned here (the CLI cases run the real one): a
+    # file only root may own cannot be made under a uid that is not 0
+    sudo_contract_of_default() { echo narrow; }
+    for GHR89_MODE in 775 757 2755 755; do ( main apply ) 2>&1 || true; done
+    echo "-- full:"
+    sudo_contract_of_default() { echo full; }
+    GHR89_MODE=777; ( main apply ) 2>&1 || true
+    echo "-- the real owner:"
+    sudo_contract_of_default() { echo narrow; }
+    stat() { command stat "$@"; }
+    ( main apply ) 2>&1 || true'
+  expect_rc 0
+  expect_text "main apply under sudo for each mode" "runnerctl: refusing to run as root under sudo: $self is group- or world-writable (mode 775) — a sudoers grant of runnerctl is only as narrow as the file it names, and one its login can rewrite grants anything (fix: chown root:root $self; chmod 755 $self, in a directory only root can write)
+runnerctl: refusing to run as root under sudo: $self is group- or world-writable (mode 757) — a sudoers grant of runnerctl is only as narrow as the file it names, and one its login can rewrite grants anything (fix: chown root:root $self; chmod 755 $self, in a directory only root can write)
+apply ran
+apply ran
+-- full:
+apply ran
+-- the real owner:
+runnerctl: refusing to run as root under sudo: $self is owned by uid $(id -u), not root — a sudoers grant of runnerctl is only as narrow as the file it names, and one its login can rewrite grants anything (fix: chown root:root $self; chmod 755 $self, in a directory only root can write)" "$OUT"
+  # End to end through the real contract reader: the opted-in default config
+  # is read and trusted, and then — the sim's stand-in living in a directory
+  # the sim owns — its directory is refused, before the script is looked at.
+  ghr89_defaults
+  RUNNERCTL_TEST_SUDO_UID=1000 RUNNERCTL_TEST_CONFIG_DEFAULT="$GHR89_NARROW" run_bare status
+  expect_rc 1
+  expect_err "^runnerctl: refusing to source $GHR89_NARROW as root under sudo: $TMP is owned by uid $(id -u), not root"
+}
+
+# run_priv under sudo runs the command itself: the uid is already 0, and a
+# second sudo would ask the grant for a primitive it does not name. The
+# control, without sudo, shows the shadowed sudo is the one it would reach.
+case_ghr89_run_priv_does_not_sudo_again_under_sudo() {
+  # shellcheck disable=SC2016
+  GHR89_UID=0 run_fn eval "$GHR89_ID"'
+    sudo() { echo "sudo $*"; }
+    export SUDO_UID=1000; SUDO_NARROW=true
+    run_priv echo "ran as root"'
+  expect_rc 0
+  expect_out '^ran as root$'
+  expect_no_out '^sudo '
+  # shellcheck disable=SC2016
+  GHR89_UID=1000 run_fn eval "$GHR89_ID"'
+    sudo() { echo "sudo $*"; }
+    run_priv echo "ran as root"'
+  expect_out '^sudo echo ran as root$'
+}
+
+# install reaches migrate with a pre-config copy it found in $SUDO_USER's
+# home, which --from's refusal does not cover: under sudo that copy is the
+# caller's file, and sourcing it would run it as root.
+case_ghr89_migrate_sources_no_caller_file_under_sudo() {
+  local f=tests/fixtures/runnerctl-legacy
+  # shellcheck disable=SC2016
+  GHR89_F="$f" run_fn eval 'SUDO_NARROW=true; cmd_migrate --from "$GHR89_F" --dry-run'
+  expect_rc 1
+  expect_err "^runnerctl: refusing to source $f as root under sudo: $f is owned by uid $(id -u), not root"
+  expect_no_out 'profile'
+}
+
+# upgrade --rollback under sudo puts back only a file root alone can write.
+case_ghr89_rollback_under_sudo_needs_a_root_owned_prev() {
+  local d="$TMP/ghr89-rb"
+  mkdir -p "$d"; cp "$RUNNERCTL" "$d/runnerctl"; cp "$RUNNERCTL" "$d/runnerctl.prev"
+  # shellcheck disable=SC2016
+  GHR89_D="$d" run_fn eval 'SUDO_NARROW=true; upgrade_rollback "$GHR89_D/runnerctl"'
+  expect_rc 1
+  expect_err "^runnerctl: refusing to roll back to $d/runnerctl.prev under sudo: $d/runnerctl.prev is owned by uid $(id -u), not root"
+  expect_same_file "$d/runnerctl.prev" "$RUNNERCTL"
+  # on a host that did not opt in the same rollback goes ahead, as before
+  # shellcheck disable=SC2016
+  GHR89_D="$d" run_fn eval 'SUDO_NARROW=false; upgrade_rollback "$GHR89_D/runnerctl"'
+  expect_rc 0
+  expect_out "^Rolled back [0-9.]+ -> [0-9.]+ at $d/runnerctl\$"
+  expect_no_path "$d/runnerctl.prev"
+  rm -rf "$d"
+}
+
+# The opt-in, read from the DEFAULT config alone (GHR-89): under simulated
+# sudo with no SUDO_CONTRACT=narrow there — absent, or `full` — the same
+# invocations the cases above refuse run as they always did. Each run names a
+# config of its own (so --config / RUNNERCTL_CONFIG is exercised too), which
+# re-supplies the stub's variables the sudo run has dropped.
+case_ghr89_no_opt_in_changes_nothing_under_sudo() {
+  ghr89_defaults
+  local cfg="$TMP/ghr89-own.config" def
+  for def in "$GHR89_NONE" "$GHR89_FULL"; do
+    ghr89_cfg "$cfg" RUNNERCTL_STUB_ENV_FILE_EXISTS=1
+    RUNNERCTL_TEST_SUDO_UID=1000 RUNNERCTL_TEST_CONFIG_DEFAULT="$def" run_cfg "$cfg" apply --env-file /tmp/x
+    expect_rc 0
+    expect_no_err 'refusing'
+    expect_file "$DROPIN_DIR/$U1.d/10-runnerctl.conf" '^EnvironmentFile=/tmp/x$'
+    ghr89_cfg "$cfg" RUNNERCTL_STUB_NO_UNITS=1
+    RUNNERCTL_TEST_SUDO_UID=1000 RUNNERCTL_TEST_CONFIG_DEFAULT="$def" run_bare --config "$cfg" provision 2 --url https://github.com/example --dry-run
+    expect_rc 0
+    expect_no_err 'refusing'
+    expect_out ' — https://github\.com/example$'
+    expect_out '^would register: '
+    RUNNERCTL_TEST_SUDO_UID=1000 RUNNERCTL_TEST_CONFIG_DEFAULT="$def" run_bare --config "$cfg" compose-reap --standalone
+    expect_rc 0
+    expect_no_err 'refusing'
+    expect_out '^compose-reap: mode=dry-run '
+    ghr89_cfg "$cfg" RUNNERCTL_STUB_FLEET_HOSTS=build-1
+    RUNNERCTL_TEST_SUDO_UID=1000 RUNNERCTL_TEST_CONFIG_DEFAULT="$def" run_cfg "$cfg" fleet restart
+    expect_rc 0
+    expect_no_err 'refusing'
+    expect_log_count '^probe:ssh_run build-1 -- runnerctl restart$' 1
+  done
+  # ...while the environment is pinned under every sudo: the stub's knob only
+  # reached it because this config wrote it out, not through the environment
+  ghr89_cfg "$cfg"
+  RUNNERCTL_STUB_ENV_FILE_EXISTS=1 RUNNERCTL_TEST_SUDO_UID=1000 RUNNERCTL_TEST_CONFIG_DEFAULT="$GHR89_NONE" \
+    run_cfg "$cfg" apply --env-file /tmp/x
+  expect_rc 1
+  expect_err 'EnvironmentFile /tmp/x missing'
+  rm -f "$cfg"
+}
+
+# A config the caller picks can neither switch the opt-in on nor off: only the
+# default config is read for it, before any other is looked at.
+case_ghr89_caller_config_cannot_set_the_opt_in() {
+  ghr89_defaults
+  local cfg="$TMP/ghr89-own.config"
+  # it says narrow, the host says full: still taken
+  ghr89_cfg "$cfg" RUNNERCTL_STUB_ENV_FILE_EXISTS=1 SUDO_CONTRACT=narrow
+  RUNNERCTL_TEST_SUDO_UID=1000 RUNNERCTL_TEST_CONFIG_DEFAULT="$GHR89_FULL" run_cfg "$cfg" apply --env-file /tmp/x
+  expect_rc 0
+  expect_no_err 'refusing'
+  expect_file "$DROPIN_DIR/$U1.d/10-runnerctl.conf" '^EnvironmentFile=/tmp/x$'
+  # it says full, the host says narrow: still refused, the flag first
+  ghr89_cfg "$cfg" RUNNERCTL_STUB_ENV_FILE_EXISTS=1 SUDO_CONTRACT=full
+  RUNNERCTL_TEST_SUDO_UID=1000 RUNNERCTL_TEST_CONFIG_DEFAULT="$GHR89_NARROW" run_cfg "$cfg" apply --env-file /tmp/x
+  expect_rc 1
+  expect_err '^runnerctl: refusing --env-file under sudo: '
+  # ...and with no refused flag, the config itself
+  RUNNERCTL_TEST_SUDO_UID=1000 RUNNERCTL_TEST_CONFIG_DEFAULT="$GHR89_NARROW" run_bare --config "$cfg" status
+  expect_rc 1
+  expect_err "^runnerctl: refusing the config $cfg from --config under sudo"
+  expect_log_count . 0
+  # the reader itself: the default decides, whatever CONFIG_FILE names; a
+  # value that is not exactly `full` reads as narrow; no file is full
+  local odd="$TMP/ghr89-odd.config"
+  printf 'SUDO_CONTRACT=Narrow\n' >"$odd"
+  # shellcheck disable=SC2016
+  GHR89_N="$GHR89_NARROW" GHR89_F="$GHR89_FULL" GHR89_O="$odd" GHR89_A="$GHR89_NONE" run_fn eval '
+    CONFIG_FILE="$GHR89_F"; CONFIG_DEFAULT="$GHR89_N"; echo "default narrow, file full: $(sudo_contract_of_default)"
+    CONFIG_FILE="$GHR89_N"; CONFIG_DEFAULT="$GHR89_F"; echo "default full, file narrow: $(sudo_contract_of_default)"
+    CONFIG_DEFAULT="$GHR89_O"; echo "typo: $(sudo_contract_of_default)"
+    CONFIG_DEFAULT="$GHR89_A"; echo "absent: $(sudo_contract_of_default)"'
+  expect_rc 0
+  expect_text "the contract for each default" 'default narrow, file full: narrow
+default full, file narrow: full
+typo: narrow
+absent: full' "$OUT"
+  # the knob is validated wherever it is read from a loaded config
+  ghr89_cfg "$cfg" SUDO_CONTRACT=strict
+  run_cfg "$cfg" status
+  expect_rc 1
+  expect_err "^runnerctl: SUDO_CONTRACT 'strict' set in $cfg is invalid — want full or narrow$"
+  rm -f "$cfg" "$odd"
+}
+
+t "GHR-89: FLEET_SUDO=1 sends every mutating fan-out through sudo -n"        case_ghr89_fleet_sudo_mutating_calls_go_through_sudo
+t "GHR-89: FLEET_SUDO=1 leaves every read without sudo"                       case_ghr89_fleet_sudo_reads_never_use_sudo
+t "GHR-89: a sudoers path mismatch names the narrow contract's remedy"        case_ghr89_sudoers_path_mismatch_names_the_remedy
+t "GHR-89: FLEET_SUDO is validated before anything is dialled"                case_ghr89_fleet_sudo_is_validated
+t "GHR-89: under_sudo is root with a non-zero SUDO_UID, the hook non-root only" case_ghr89_under_sudo_detection
+t "GHR-89: under sudo PATH and HOME are pinned and no RUNNERCTL_ hook survives" case_ghr89_env_is_hardened_under_sudo
+t "GHR-89: under sudo each flag that widens the grant is refused, by name"    case_ghr89_flags_refused_under_sudo
+t "GHR-89: under sudo a config the caller picked is refused, the default read" case_ghr89_config_chosen_by_the_caller_is_refused
+t "GHR-89: under sudo a script others can write refuses to run"               case_ghr89_writable_script_refuses_under_sudo
+t "GHR-89: under sudo run_priv does not sudo again"                            case_ghr89_run_priv_does_not_sudo_again_under_sudo
+t "GHR-89: under sudo migrate sources no file the caller can write"           case_ghr89_migrate_sources_no_caller_file_under_sudo
+t "GHR-89: under sudo --rollback needs a .prev root alone can write"           case_ghr89_rollback_under_sudo_needs_a_root_owned_prev
+t "GHR-89: without SUDO_CONTRACT=narrow nothing is refused under sudo"        case_ghr89_no_opt_in_changes_nothing_under_sudo
+t "GHR-89: a caller-chosen config can neither set nor unset the opt-in"       case_ghr89_caller_config_cannot_set_the_opt_in
+
 # --- Summary ------------------------------------------------------------------
 echo
 echo "sim: $npass ok, $nxfail xfail (${XFAIL_KEYS# }), $nfail failed"
