@@ -49,6 +49,25 @@ the old one is renamed `runnerctl.legacy` (pre-config) or `runnerctl.retired`
 (versioned) so it cannot keep shadowing the new one. `--dry-run` shows the
 found path and what would happen to it.
 
+A write is several calls on names in one directory (stage, chmod, chown,
+rename), and as root those calls are only safe where nobody else can write the
+directory: whoever can swaps a name for a symlink between two calls, and the
+next one acts on whatever it points at. So before its first write, `install`
+(and `upgrade`) reads the chain of every directory it will write in — the
+prefix, the config's, a home copy's — and, running as root:
+
+| the directory's chain | what it does |
+| --- | --- |
+| root-owned, writable by root alone (`/usr/local/bin`, `/etc/runnerctl`) | writes as root, as always |
+| one user's, not group- or world-writable, holding only that user's files (a home copy's `~/.local/bin` under `sudo`) | every call on a name there runs **as that user** (`runuser -u USER --`), with no `chown`: retiring a home copy as `.retired` or `.legacy`, an in-place `--prefix ~/bin`, its `.prev` |
+| anything else — group- or world-writable, two owners, a file root or someone else owns in a user's directory | refuses before writing anything, naming the directory |
+
+The refusal reads `refusing to install /srv/tools/runnerctl as root:
+/srv/tools is group- or world-writable (mode 775) — …`, and the way on is to
+move the copy to a directory only root can write, such as `/usr/local/bin`, or
+to run the command as the user who owns that directory, without `sudo`. A run
+that is not root and writes only where it already can is not judged at all.
+
 Prefer to read before you run? Same thing in two steps:
 
 ```sh
@@ -2546,6 +2565,13 @@ include `~/.local/bin` — so a bare `sudo runnerctl ...` is exactly the thing
 that fails on the hosts these messages are about.
 
 `--no-relocate` keeps a deliberately personal copy where it is.
+
+Under `sudo`, a home copy is the invoking user's, and so is everything
+`upgrade` does to it: retiring it as `.retired`, or, with `--no-relocate`,
+replacing it in place and keeping `.prev` beside it — each call runs as that
+user, never as root, and `upgrade --rollback` renames `.prev` back the same
+way. A directory others can write is refused before anything is written. The
+rule is the one [`install`](#install) states.
 
 ### What it writes
 

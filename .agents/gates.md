@@ -365,6 +365,20 @@ Traps:
   helper is also run unfaked over real directories: `/tmp` (sticky 1777) must
   be refused. `deprovision N` counts from 0 in the stub: `deprovision 1` is
   `example.slot-2`.
+- **A root run of `install`/`upgrade` is `RUNNERCTL_STUB_AS_ROOT=1` (GHR-117).**
+  `write_as` judges a directory only when the write is privileged, and as
+  root `[ -w ]` is always true — so the script asks the `as_root` hook, which
+  the stub answers no unless that knob is set. Under it every write of a judged
+  directory goes through `run_priv`, which is what puts root's calls in the
+  log. `install-test` and `upgrade-test` never run as root, so none of their
+  cases reaches the trust check at all: the GHR-117 sim cases are its only
+  coverage. They source `ghr117_overrides` after the stub (in the snippet, or
+  in a config that sources the stub first — never a config that sources the
+  stub a second time, which would capture the stub's `root_exec_problem` as
+  the "real" one): the real `root_exec_problem`, `stat` faked from
+  `GHR117_TABLE` like GHR-121's, and a `run_priv` that logs each call and then
+  makes it for real as this user, dropping a `runuser -u USER --` prefix, and
+  refuses any path outside the case directory.
 - **The record (GHR-88) never reaches the real journal or the real fleet
   log.** Three nets, because each covers a path the others miss: the stub
   shadows the record's hook `audit_logger` (each record is a
