@@ -976,6 +976,98 @@ example.slot-2: killed 2 process(es): 4100/Runner.Worker, 4101/node — the runn
 kill done (1 stalled slot(s)).
 ```
 
+### Who changed what: `history` and `fleet history`
+
+Every command that changes the host leaves **one line in the journal**,
+tagged `runnerctl`, when it ends:
+
+```
+restart example.slot-2 (--when-idle) by deploy via fleet from alice@central-1 — ok
+```
+
+The verb; the slots it acted on (`all` when it was given none); the few flags
+that change what it did (`--when-idle`, `--profile NAME`, `--restart`,
+`--if-stalled`, …); who ran it — the sudo caller, else the login; for a call
+that came through `fleet`, the operator and central node it says it came
+from; and how it ended — `ok`, `failed (exit N)`, or a count the command
+keeps (`health --restart-stalled`: `restarted 2, 1 failed`; `compose-reap
+--apply`: `ok (removed=8 failed=0 images-removed=0)`).
+
+- **The set:** `apply`, `scale`, `env-init`, `start`, `stop`, `restart`,
+  `drain`, `enable`, `disable`, `remove-limits`, `reap`, `kill` (with
+  `--if-stalled` too), `health --restart-stalled`, `compose-reap --apply`
+  (`--standalone` too), `compose-reap-timer install`/`remove`, `upgrade`
+  (`--rollback` too), `install`, `migrate`, `provision`, `deprovision`, and
+  each confirmed action key of `watch`. Reads record nothing — `status`,
+  `watch` without an action, `health`, `logs`, `profiles`, `version`,
+  `history`, `upgrade --check`, `compose-reap` without `--apply` — and neither
+  does a `--dry-run`.
+- **When:** once the command is about to change something. A usage error or
+  a refusal before that point records nothing; a failure after it — a
+  `--when-idle` wait that gives up after the drop-ins were written, say — is
+  recorded as `failed (exit 1)`. The three that run from a timer or cron
+  (`health --restart-stalled`, `compose-reap --apply`, `--if-stalled`) record
+  only when they act, naming the slots they took, so a quiet hour writes
+  nothing.
+- **Never a secret.** The line is built from chosen parts, never the command
+  line, so a token or PAT handed to `provision` or `deprovision` — as a flag
+  or in the environment — has no way in. Every part is cleaned of control
+  bytes and escape sequences, so nothing can end the line early and forge a
+  second record.
+- **Never in the way.** No `logger`, a `logger` that fails or a journal that
+  will not take the line is silence: the command's output and exit status are
+  its own.
+
+**The origin is a claim.** Every fleet action reaches a host as the one
+shared ssh login, so the central node passes `--origin OPERATOR@HOST` — its
+operator (the sudo caller or the login) and its own host name — in front of
+the verb, and the record says `via fleet from alice@central-1`. It is exactly
+as trustworthy as that ssh login: anyone who holds the login can claim any
+name. It is checked against a conservative shape and used for nothing but
+the record; one that fails the check is dropped and the record says `via
+fleet, origin invalid`, and the command runs either way. A host whose
+runnerctl predates the flag refuses it as an unknown command, and the central
+node asks it again without, so the action still happens there — unrecorded,
+as on any older host.
+
+**Reading it back.** `runnerctl history [-n N]` (default 20) prints the last N
+records, oldest first, each led by its UTC time:
+
+```
+$ runnerctl history -n 2
+2026-10-14T09:00:01.000100Z restart example.slot-2 by deploy via fleet from alice@central-1 — ok
+2026-10-14T09:00:09.000500Z stop example.slot-1 by deploy — ok
+```
+
+It reads `journalctl -t runnerctl` as the user running it. A record written
+under sudo is root's, and a login outside the `systemd-journal` (or `adm`)
+group sees only its own — with no record visible it says so on stderr. Any
+local user can write a line with the `runnerctl` tag (`logger` needs no
+privilege), so this is an account of what the tool did, not a tamper-proof
+audit log.
+
+**The central node's own record.** Each fleet command that changes a host,
+and each `fleet watch` action key, appends one line to `FLEET_LOG` (config;
+default `${XDG_STATE_HOME:-~/.local/state}/runnerctl/fleet.log` of the user
+running it — under sudo, root's): UTC time, operator, the command as typed (a
+key is written as the command line it stands for), then each host it reached
+with that host's exit status, or each slot for a budget walk:
+
+```
+2026-10-14T09:12:03Z alice fleet restart --when-idle --host build-1 — build-1=0
+2026-10-14T09:14:40Z alice fleet restart --max-unavailable 1 — build-1/0=0 build-1/1=0 build-2/0=0
+2026-10-14T09:20:11Z alice fleet restart --host build-2 example.slot-1 (fleet watch) — build-2=0
+```
+
+The file is created `0600` and its directory `0700`. Reads and refusals
+write nothing; a file that cannot be written is silence.
+
+**Across the fleet.** `runnerctl fleet history [-n N] [--host H]...` asks
+every host for its `history -n N` (a read: `FLEET_TIMEOUT`, no sudo), merges
+the records by time with each host's name after the time, and prints the
+last N. A host that does not answer is a line under the list and makes the
+exit status 1; one too old for `history` says so.
+
 ### Several hosts from one place: `fleet status`
 
 Everything above is one host. `fleet` runs the same tool from a central node
@@ -1777,6 +1869,15 @@ everything that would widen that back to root:
   `--no-verify-checksum`, `deprovision --url`, `compose-reap
   --standalone`/`--max-age-hours`/`--grace-minutes` — each refused by name;
 - `fleet` itself, which would dial out with root's ssh identity.
+
+Taken as given, and validated: the global `--origin OPERATOR@HOST` that
+`fleet` puts in front of every verb that changes a host (GHR-88, see [Who
+changed what](#who-changed-what-history-and-fleet-history)). It is checked
+against a conservative shape — one `@`, and on each side letters, digits,
+`.`, `_` and `-` only — written into the host's journal record, and read by
+nothing else: no path, config, command or decision depends on it, so it
+cannot widen the grant. One that fails the check is dropped and the record
+says `origin invalid`.
 
 Under any sudo, opted in or not, it also pins `PATH` and `HOME`, drops the
 caller's pager and every `RUNNERCTL_*` variable, and runs a pager in secure

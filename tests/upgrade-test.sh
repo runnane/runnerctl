@@ -18,6 +18,10 @@ tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/nosudo"
 printf '#!/bin/sh\necho "TEST TRIED TO SUDO: $*" >&2; exit 97\n' >"$tmp/nosudo/sudo"
 chmod +x "$tmp/nosudo/sudo"
+# GHR-88: upgrade records itself in the journal through `logger`; a fake one
+# first on PATH keeps the test out of the real journal.
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>"%s/logger.calls"\n' "$tmp" >"$tmp/nosudo/logger"
+chmod +x "$tmp/nosudo/logger"
 export PATH="$tmp/nosudo:/usr/bin:/bin"
 export HOME="$tmp/home"; mkdir -p "$HOME"; unset SUDO_USER
 [ -z "$(command -v runnerctl || true)" ] || fail "a runnerctl is on the pinned PATH: $(command -v runnerctl)"
@@ -79,6 +83,9 @@ grep -q "^Upgraded 0.0.1 -> $ver at $tmp/sys1/runnerctl$" "$tmp/o1" || fail "1: 
 grep -q "^note:" "$tmp/o1" && fail "1: a copy outside a home got a placement note: $(cat "$tmp/o1")"
 grep -qE "^(relocated|retired):" "$tmp/o1" && fail "1: a copy outside a home moved: $(cat "$tmp/o1")"
 cmp -s runnerctl "$tmp/sys1/runnerctl" || fail "1: new bytes did not land"
+# GHR-88: the upgrade left one journal record, through the fake logger.
+[ "$(grep -cE "^-t runnerctl -- upgrade to $ver by [^ ]+ — ok\$" "$tmp/logger.calls" 2>/dev/null || true)" = 1 ] \
+  || fail "1: want one upgrade record: $(cat "$tmp/logger.calls" 2>/dev/null)"
 # GHR-84: the checkout carries no runnerctl.sha256 beside it, which for a
 # file:// source is that source's 404 — so this installs, and says it did not
 # verify. Exactly one verdict line either way.

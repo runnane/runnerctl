@@ -80,11 +80,39 @@ export NO_COLOR=1
 unset GITHUB_TOKEN
 RUNNERCTL="${RUNNERCTL:-./runnerctl}"
 STUB="tests/stub.config"
+# GHR-88: who a record says ran a command outside sudo — this login, which
+# differs between a developer box and CI, so it is read, never written in.
+ME="$(id -un)"
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 LOG="$TMP/log"
 WRITES="$TMP/writes"
+
+# GHR-88: no case may write to the real journal. The stub shadows the record's
+# hook (audit_logger), but the real one runs `logger` through `timeout`, which
+# no shell function can shadow — and run_fn, run_bare and a pinned PATH are
+# all ways past the stub. So a fake `logger` BINARY is first on PATH for the
+# whole run. By default it is the safety net: it logs `direct:logger …` to the
+# case's log, which fails the case. FAKE_LOGGER=record makes it the logger a
+# case asked for — argc, then each argument on a line of its own, appended to
+# $TMP/logger.calls — and FAKE_LOGGER=fail one that refuses, loudly.
+mkdir -p "$TMP/bin"
+cat >"$TMP/bin/logger" <<'FAKE'
+#!/bin/sh
+d="$(dirname "$0")/.."
+case "${FAKE_LOGGER:-}" in
+  record) { echo "argc=$#"; printf 'arg=%s\n' "$@"; } >>"$d/logger.calls"; exit 0 ;;
+  fail)   echo "logger: socket /dev/log: Connection refused" >&2; exit 1 ;;
+  *)      echo "direct:logger $*" >>"$d/log"; exit 0 ;;
+esac
+FAKE
+chmod +x "$TMP/bin/logger"
+export PATH="$TMP/bin:$PATH"
+# And no case may append to this box's own fleet log (GHR-88): the stub points
+# FLEET_LOG into each run's writes tree, and a run past the stub that falls
+# back to the default path lands under this temp directory instead.
+export XDG_STATE_HOME="$TMP/xdg-state"
 
 # --- Harness state -----------------------------------------------------------
 OUT="" ERR="" RC=0
@@ -688,23 +716,24 @@ case_restart_by_index() {
   run restart 1
   expect_rc 0
   expect_out '^restart done\.$'
-  expect_log_count '.' 1
-  expect_log "^systemctl restart $U2\$"
+  # GHR-88: the call, and the record of it after it
+  expect_log_count '.' 2
+  expect_log_order "^systemctl restart $U2\$" "^probe:audit restart example\\.slot-2 by $ME — ok\$"
 }
 
 case_stop_all() {
   run stop
   expect_rc 0
   expect_out '^stop done\.$'
-  expect_log_order "^systemctl stop $U1\$" "^systemctl stop $U2\$" "^systemctl stop $U3\$"
-  expect_log_count '.' 3
+  expect_log_order "^systemctl stop $U1\$" "^systemctl stop $U2\$" "^systemctl stop $U3\$" "^probe:audit stop all by $ME — ok\$"
+  expect_log_count '.' 4
 }
 
 case_enable_by_unit_name() {
   run enable "$U3"
   expect_rc 0
-  expect_log_count '.' 1
-  expect_log "^systemctl enable --now $U3\$"
+  expect_log_count '.' 2
+  expect_log_order "^systemctl enable --now $U3\$" "^probe:audit enable example\\.slot-3 by $ME — ok\$"
 }
 
 case_logs_by_index() {
@@ -732,8 +761,9 @@ case_restart_by_short_name() {
   run restart example.slot-2
   expect_rc 0
   expect_out '^restart done\.$'
-  expect_log_count '.' 1
+  expect_log_count '.' 2
   expect_log "^systemctl restart $U2\$"
+  expect_log "^probe:audit restart example\\.slot-2 by $ME — ok\$"
 }
 
 # Substring match on the short name, unambiguous (only slot-3 contains it).
@@ -750,8 +780,9 @@ case_logs_by_substring() {
 case_enable_by_short_name_with_service_suffix() {
   run enable example.slot-1.service
   expect_rc 0
-  expect_log_count '.' 1
+  expect_log_count '.' 2
   expect_log "^systemctl enable --now $U1\$"
+  expect_log "^probe:audit enable example\\.slot-1 by $ME — ok\$"
 }
 
 case_restart_ambiguous_target() {
@@ -1171,7 +1202,9 @@ case_start_ignores_when_idle() {
   run start --when-idle
   expect_rc 0
   expect_out '^start done\.$'
-  expect_no_log '^probe:'
+  # GHR-88: the one probe is the record, and it says no --when-idle either
+  expect_log_count '^probe:' 1
+  expect_log "^probe:audit start all by $ME — ok\$"
   expect_log_count '^systemctl start ' 3
 }
 
@@ -11273,6 +11306,544 @@ t "GHR-79: the real loadavg / cpu.stat / cpu.pressure readers"               cas
 t "GHR-79: fleet host lines carry load; the summary counts overloaded hosts" case_ghr79_fleet_host_line_load_and_overloaded_count
 t "GHR-79: a host's load and cores are held to numbers the node takes"       case_ghr79_fleet_load_is_held_to_numbers_the_node_takes
 t "GHR-79: a mixed fleet keeps each host under its own header"               case_ghr79_mixed_fleet_each_host_under_its_own_header
+
+# --- GHR-88: who ran what — the record of every mutation -----------------------
+# The stub shadows the record's hook: each record is a `probe:audit <line>` in
+# the log, so a case pins the whole line and that there is exactly one. The
+# login a record names outside sudo is this box's ($ME); a call that came
+# through the stub's fleet claims `$ME@stub-host-1` (host_name is pinned).
+GHR88_ORIGIN="$ME@stub-host-1"
+GHR88_HIST="$TMP/ghr88-history"
+# Exactly one record, and it is the line PATTERN (anchored here).
+expect_one_record() { # PATTERN
+  expect_log_count '^probe:audit ' 1
+  expect_log "^probe:audit $1\$"
+}
+# The central node's record, under the run's writes tree (the stub's FLEET_LOG).
+GHR88_TS='[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z'
+
+# Acceptance: each mutating command emits exactly one record — verb, targets,
+# the flags that matter, actor, outcome.
+case_ghr88_each_mutating_command_records_once() {
+  run apply --restart 1
+  expect_rc 0
+  expect_one_record "apply example\\.slot-2 \\(--profile ci, --restart\\) by $ME — ok"
+  run apply
+  expect_rc 0
+  expect_one_record "apply all \\(--profile ci\\) by $ME — ok"
+  run scale 2
+  expect_rc 0
+  expect_one_record "scale to 2 of 3 \\(--profile ci\\) by $ME — ok"
+  run env-init --profile deploy
+  expect_rc 0
+  expect_one_record "env-init /etc/runnerctl/deploy\\.env \\(--profile deploy\\) by $ME — ok"
+  run start 2
+  expect_one_record "start example\\.slot-3 by $ME — ok"
+  run stop 0
+  expect_one_record "stop example\\.slot-1 by $ME — ok"
+  run restart 1 --when-idle
+  expect_one_record "restart example\\.slot-2 \\(--when-idle\\) by $ME — ok"
+  run drain 1
+  expect_one_record "drain example\\.slot-2 by $ME — ok"
+  run enable 2
+  expect_one_record "enable example\\.slot-3 by $ME — ok"
+  run disable 2
+  expect_one_record "disable example\\.slot-3 by $ME — ok"
+  run remove-limits
+  expect_one_record "remove-limits all by $ME — ok"
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 run reap 1
+  expect_rc 0
+  expect_one_record "reap example\\.slot-2 by $ME — ok"
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_BUSY_POLLS=1 run kill 0
+  expect_rc 0
+  expect_one_record "kill example\\.slot-1 by $ME — ok"
+  # the stall-driven ones name the slots they took, and only those
+  run restart --if-stalled --stall-after 600
+  expect_one_record "restart example\\.slot-1 \\(--if-stalled\\) by $ME — ok"
+  run stop --if-stalled --stall-after 600
+  expect_one_record "stop example\\.slot-1 \\(--if-stalled\\) by $ME — ok"
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_BUSY_POLLS=1 run kill --if-stalled --stall-after 600
+  expect_one_record "kill example\\.slot-1 \\(--if-stalled\\) by $ME — ok"
+  # health exits 1 for the problem it found; the record is the restart's
+  run health --restart-stalled --stall-after 600
+  expect_rc 1
+  expect_one_record "health example\\.slot-1 \\(--restart-stalled\\) by $ME — restarted 1"
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_WORKER=1 run compose-reap --apply
+  expect_rc 0
+  expect_one_record "compose-reap \\(--apply\\) by $ME — ok \\(removed=8 failed=0 images-removed=0\\)"
+  RUNNERCTL_STUB_ROOT_EXEC_OK=1 run compose-reap-timer install
+  expect_rc 0
+  expect_one_record "compose-reap-timer install by $ME — ok"
+  run compose-reap-timer remove
+  expect_one_record "compose-reap-timer remove by $ME — ok"
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 2 --url "$PROV_URL" --name-prefix slot --token "$PROV_TOKEN"
+  expect_rc 0
+  expect_one_record "provision slot-1 slot-2 by $ME — ok"
+  run deprovision 1 --token "$DEPROV_TOKEN" --yes
+  expect_rc 0
+  expect_one_record "deprovision example\\.slot-2 by $ME — ok"
+  # the local watch's keys: each confirmed action is a record of its own
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='RyjRyjRq' run watch
+  expect_rc 0
+  expect_log_count '^probe:audit ' 2
+  expect_log_order "^probe:audit restart example\\.slot-1 by $ME — ok\$" "^probe:audit restart example\\.slot-2 by $ME — ok\$"
+}
+
+# Acceptance, the negative control: a read records nothing — and neither does
+# a mutating command with nothing to do on a timer's schedule, or a dry run.
+# Each run asserts what it did read, so the absence of a record is not the
+# absence of a run.
+case_ghr88_reads_and_dry_runs_record_nothing() {
+  run status
+  expect_rc 0
+  expect_log '^probe:unit_props '
+  expect_no_log '^probe:audit'
+  run status --json
+  expect_rc 0
+  expect_no_log '^probe:audit'
+  run health
+  expect_log '^probe:unit_props '
+  expect_no_log '^probe:audit'
+  # nothing stalled under the default hour: health, restart and kill with the
+  # stall flags are a quiet cron tick
+  run health --restart-stalled
+  expect_no_log '^systemctl restart'
+  expect_no_log '^probe:audit'
+  run restart --if-stalled
+  expect_rc 0
+  expect_out '^no stalled slot — nothing restarted\.$'
+  expect_no_log '^probe:audit'
+  RUNNERCTL_STUB_CGROUP_READABLE=1 run kill --if-stalled
+  expect_out '^no stalled slot — nothing killed\.$'
+  expect_no_log '^probe:audit'
+  run logs 1
+  expect_log "^journalctl -u $U2 -n 100 --no-pager\$"
+  expect_no_log '^probe:audit'
+  run profiles
+  expect_rc 0
+  expect_no_log '^probe:audit'
+  run version
+  expect_rc 0
+  expect_no_log '^probe:audit'
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 run reap --dry-run
+  expect_out '^example\.slot-2: would kill 2 leaked process\(es\)'
+  expect_no_log '^probe:audit'
+  RUNNERCTL_STUB_CGROUP_READABLE=1 run kill --dry-run 0
+  expect_out '^example\.slot-1: would kill '
+  expect_no_log '^probe:audit'
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_WORKER=1 run compose-reap
+  expect_out '^compose-reap: mode=dry-run '
+  expect_no_log '^probe:audit'
+  # --apply with nothing to reap: the hourly timer's quiet run
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_WORKER=1 run compose-reap --apply --project pinned
+  expect_out '^compose-reap: mode=apply .* removed=0 failed=0 '
+  expect_no_log '^probe:audit'
+  run compose-reap-timer status
+  expect_no_log '^probe:audit'
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 2 --url "$PROV_URL" --token "$PROV_TOKEN" --dry-run
+  expect_out '^\(dry run — nothing downloaded, nothing changed\)$'
+  expect_no_log '^probe:audit'
+  run deprovision 1 --token "$DEPROV_TOKEN" --dry-run
+  expect_out '^\(dry run — no token minted, nothing changed\)$'
+  expect_no_log '^probe:audit'
+  run history
+  expect_log '^probe:journal_history_lines 20$'
+  expect_no_log '^probe:audit'
+  RUNNERCTL_STUB_TTY=1 run watch --iterations 2
+  expect_rc 0
+  expect_no_log '^probe:audit'
+  RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet status
+  expect_log '^probe:ssh_run build-1 -- runnerctl status --color never$'
+  expect_no_log '^probe:(audit|ssh_origin)'
+  expect_no_file /fleet.log
+}
+
+# A refusal before anything is changed records nothing; a failure part way
+# through records the failure.
+case_ghr88_refusals_record_nothing_failures_are_recorded() {
+  run restart nope
+  expect_rc 1
+  expect_no_log '^probe:audit'
+  run apply --max lots
+  expect_rc 1
+  expect_no_log '^probe:audit'
+  run kill
+  expect_rc 1
+  expect_no_log '^probe:audit'
+  run scale 9
+  expect_rc 1
+  expect_no_log '^probe:audit'
+  run deprovision 1 --token "$DEPROV_TOKEN"
+  expect_rc 1
+  expect_err 'refusing to deprovision without confirmation'
+  expect_no_log '^probe:audit'
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_NO_UNITS=1 run compose-reap --apply
+  expect_rc 1
+  expect_no_log '^probe:audit'
+  # the drop-in is written, then the idle wait gives up: recorded as failed
+  RUNNERCTL_STUB_BUSY_POLLS=99 run apply --restart --when-idle --timeout 10 0
+  expect_rc 1
+  expect_log "^tee $DROPIN_DIR/$U1\\.d/10-runnerctl\\.conf\$"
+  expect_one_record "apply example\\.slot-1 \\(--profile ci, --restart, --when-idle\\) by $ME — failed \\(exit 1\\)"
+  expect_log_order "^tee $DROPIN_DIR/$U1\\.d/10-runnerctl\\.conf\$" '^probe:audit '
+}
+
+# Care-needed: never a secret. provision's and deprovision's credentials, by
+# every way in — argv, `=` form, and the environment — reach no record, and
+# the record is there (so its absence is not why the token is).
+case_ghr88_no_credential_reaches_a_record() {
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 2 --url "$PROV_URL" --name-prefix slot --token "$PROV_TOKEN"
+  expect_one_record "provision slot-1 slot-2 by $ME — ok"
+  expect_no_log "^probe:audit .*$PROV_TOKEN"
+  RUNNERCTL_STUB_NO_UNITS=1 run provision 2 --url "$PROV_URL" --name-prefix slot --pat ghp_EXAMPLE_PAT
+  expect_one_record "provision slot-1 slot-2 by $ME — ok"
+  expect_no_log '^probe:audit .*ghp_EXAMPLE_PAT'
+  GITHUB_TOKEN=ghp_FROM_ENV RUNNERCTL_STUB_NO_UNITS=1 run provision 2 --url "$PROV_URL" --name-prefix slot
+  expect_one_record "provision slot-1 slot-2 by $ME — ok"
+  expect_no_log '^probe:audit .*ghp_FROM_ENV'
+  run deprovision 1 --token="$DEPROV_TOKEN" --yes
+  expect_one_record "deprovision example\\.slot-2 by $ME — ok"
+  expect_no_log "^probe:audit .*$DEPROV_TOKEN"
+  run deprovision 1 --url "$PROV_URL" --pat ghp_EXAMPLE_PAT --yes
+  expect_one_record "deprovision example\\.slot-2 by $ME — ok"
+  expect_no_log '^probe:audit .*(ghp_EXAMPLE_PAT|STUB-REMOVAL-TOKEN)'
+}
+
+# Care-needed: no part can end the line and start a forged second record — a
+# newline or a sequence in a target, a flag or the outcome is removed, and an
+# origin that is not one plain OPERATOR@HOST is not written at all.
+case_ghr88_a_record_cannot_be_forged() {
+  # shellcheck disable=SC2016  # run_fn's child expands these
+  run_fn eval 'id() { if [ "$*" = -un ]; then echo alice; else command id "$@"; fi; }
+    audit_begin restart "slot-1"$'"'"'\nrunnerctl: forged — ok'"'"' --when-idle$'"'"'\e[2J'"'"'
+    audit_message "ok"$'"'"'\nrunnerctl: also forged'"'"''
+  expect_rc 0
+  expect_out_count '.' 1
+  expect_out '^restart slot-1runnerctl: forged — ok \(--when-idle\) by alice — okrunnerctl: also forged$'
+  expect_no_control_bytes
+  # on the command line: the origin is refused whole, never cleaned and kept
+  run --origin $'alice@central-1\nrunnerctl: forged' restart 1
+  expect_rc 0
+  expect_one_record "restart example\\.slot-2 by $ME via fleet, origin invalid — ok"
+  expect_no_log 'forged'
+}
+
+# The origin a host is handed: kept when it is OPERATOR@HOST, dropped and
+# said so when it is not, never fatal, and nothing at all for a read.
+case_ghr88_origin_is_a_validated_claim() {
+  run --origin=alice@central-1 restart 1
+  expect_rc 0
+  expect_one_record "restart example\\.slot-2 by $ME via fleet from alice@central-1 — ok"
+  run --origin alice@central-1.example.org restart 1
+  expect_one_record "restart example\\.slot-2 by $ME via fleet from alice@central-1\\.example\\.org — ok"
+  local bad
+  for bad in 'bob smith@central-1' 'alice' '@central-1' 'alice@' 'alice@central-1@x' 'alice@../../etc' \
+             'al;ice@central-1' "alice@central-1'" '-alice@central-1' "$(printf 'a%.0s' {1..33})@central-1" ''; do
+    run --origin="$bad" restart 1
+    expect_rc 0
+    expect_one_record "restart example\\.slot-2 by $ME via fleet, origin invalid — ok"
+  done
+  run --origin=alice@central-1 status
+  expect_rc 0
+  expect_no_log '^probe:audit'
+  run --origin
+  expect_rc 1
+  expect_err '^runnerctl: --origin needs a value$'
+}
+
+# Under GHR-89's narrow contract --origin is taken as given (the README's
+# per-flag table): it reaches the record and nothing else, and under sudo the
+# actor is the sudo caller.
+case_ghr88_origin_under_the_narrow_sudo_contract() {
+  local self rec="$TMP/ghr88-sudo-records"; self="$(readlink -f "$RUNNERCTL")"
+  rm -f "$rec"
+  # Through main, the production detection and the real preflight, as
+  # GHR-89's writable-script case runs it: only stat's answer for this script
+  # is pinned (no sim file is root-owned), and the command and the journal
+  # write are stand-ins that show what reached them (the record's own output
+  # is discarded by design, so it goes to a file).
+  # shellcheck disable=SC2016
+  GHR89_UID=0 GHR89_SELF="$self" GHR88_REC="$rec" run_fn eval "$GHR89_ID"'
+    stat() {
+      if [ "${3:-}" = "$GHR89_SELF" ] || [ "${3:-}" = "${GHR89_SELF%/*}" ]; then
+        case "$2" in %u) echo 0 ;; %a) echo 755 ;; esac
+      else command stat "$@"; fi
+    }
+    sudo_contract_of_default() { echo narrow; }
+    cmd_ctl() { audit_begin "$1" slot-x; echo "$1 ran"; }
+    cmd_apply() { echo "apply ran"; }
+    audit_logger() { echo "record: $1" >>"$GHR88_REC"; }
+    export SUDO_UID=1000 SUDO_USER=deploy; CONFIG_FILE=/nonexistent/ghr88/config; CONFIG_CHOSEN=""
+    ( main --origin=alice@central-1 restart 1 ) 2>&1 || true
+    ( main --origin ../../etc/passwd restart 1 ) 2>&1 || true
+    ( main --origin=alice@central-1 apply --env-file /x ) 2>&1 || true'
+  expect_rc 0
+  expect_out_count '^restart ran$' 2
+  expect_text "records under sudo" 'record: restart slot-x by deploy via fleet from alice@central-1 — ok
+record: restart slot-x by deploy via fleet, origin invalid — ok' "$(cat "$rec" 2>/dev/null; true)"
+  # the preflight still reads the command's own flags behind the origin
+  expect_out '^runnerctl: refusing --env-file under sudo: '
+  expect_no_out '^apply ran$'
+  # not a flag the table refuses, and the README's table says so
+  # shellcheck disable=SC2016
+  run_fn eval 'if sudo_flag_problem restart --origin=alice@central-1 1; then echo "refused $SUDO_FLAG"; else echo taken; fi'
+  expect_out '^taken$'
+  expect_cfg README.md "^Taken as given, and validated: the global \`--origin OPERATOR@HOST\` that\$"
+}
+
+# Care-needed: recording never changes what the command does. The real
+# audit_logger, over a logger that refuses: the exit status is the command's,
+# success or failure, and nothing reaches stderr.
+case_ghr88_a_failing_logger_changes_nothing() {
+  RUNNERCTL_STUB_AUDIT=real FAKE_LOGGER=fail run restart 1
+  expect_rc 0
+  expect_out '^restart done\.$'
+  expect_no_err 'logger|Connection refused'
+  expect_no_log '^probe:audit'
+  RUNNERCTL_STUB_AUDIT=real FAKE_LOGGER=fail RUNNERCTL_STUB_BUSY_POLLS=99 run apply --restart --when-idle --timeout 10 0
+  expect_rc 1
+  expect_no_err 'logger|Connection refused'
+  RUNNERCTL_STUB_AUDIT=real FAKE_LOGGER=fail run health --restart-stalled --stall-after 600
+  expect_rc 1
+  expect_no_err 'logger|Connection refused'
+}
+
+# The real journal write: `logger -t runnerctl -- <line>`, the line ONE
+# argument, never through a shell; and no logger at all is silence.
+case_ghr88_the_real_logger_call() {
+  rm -f "$TMP/logger.calls"
+  RUNNERCTL_STUB_AUDIT=real FAKE_LOGGER=record run --origin=alice@central-1 restart 1
+  expect_rc 0
+  expect_text "logger argv" "argc=4
+arg=-t
+arg=runnerctl
+arg=--
+arg=restart example.slot-2 by $ME via fleet from alice@central-1 — ok" "$(cat "$TMP/logger.calls" 2>/dev/null; true)"
+  rm -f "$TMP/logger.calls"
+  # shellcheck disable=SC2016
+  run_fn eval 'PATH=/nonexistent-ghr88; audit_logger "a record"; echo "rc=$?"'
+  expect_rc 0
+  expect_out '^rc=0$'
+  expect_text "stderr with no logger" "" "$ERR"
+}
+
+# Acceptance: a fleet action carries the origin, and a host too old for it
+# still acts — asked again without it, once, and remembered.
+case_ghr88_fleet_carries_the_origin_and_older_hosts_still_act() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-preorigin" run fleet restart
+  expect_rc 0
+  expect_out '^build-1: restart done\.$'
+  expect_out '^gw-preorigin: restart done\.$'
+  expect_out '^fleet restart: 2 host\(s\) ok, 0 failed$'
+  expect_log_count "^probe:ssh_origin build-1 $GHR88_ORIGIN\$" 1
+  expect_log_count "^probe:ssh_origin gw-preorigin $GHR88_ORIGIN\$" 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart$' 1
+  expect_log_count '^probe:ssh_run gw-preorigin -- runnerctl restart$' 2
+  expect_log_order "^probe:ssh_origin gw-preorigin " '^probe:ssh_run gw-preorigin -- runnerctl restart$' \
+                   '^probe:ssh_run gw-preorigin -- runnerctl restart$'
+  # FLEET_SUDO=1: the origin after `sudo -n runnerctl`, before the verb
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-preorigin" run fleet restart
+  expect_rc 0
+  expect_log_count "^probe:ssh_origin build-1 $GHR88_ORIGIN\$" 1
+  expect_log_count '^probe:ssh_run gw-preorigin -- sudo -n runnerctl restart$' 2
+  # a budget walk: per slot, and the older host asked with it only once
+  RUNNERCTL_STUB_FLEET_SLOTS=2 RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-preorigin" run fleet restart --max-unavailable 1
+  expect_rc 0
+  expect_out '^fleet restart: 4 slot\(s\) done, 0 failed$'
+  expect_log_count "^probe:ssh_origin build-1 $GHR88_ORIGIN\$" 2
+  expect_log_count "^probe:ssh_origin gw-preorigin $GHR88_ORIGIN\$" 1
+  expect_log_count '^probe:ssh_run gw-preorigin -- runnerctl restart [01]$' 3
+  # a fleet watch key
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jRy-q' RUNNERCTL_STUB_FLEET_HOSTS="gw-preorigin" run fleet watch --color never
+  expect_rc 0
+  expect_out '^example\.slot-2 on gw-preorigin: restart done\.$'
+  expect_log_count "^probe:ssh_origin gw-preorigin $GHR88_ORIGIN\$" 1
+  expect_log_count '^probe:ssh_run gw-preorigin -- runnerctl restart example\.slot-2$' 2
+  # upgrade, and health --restart-stalled, whose remote runs real code and so
+  # records the claim it was handed
+  RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" run fleet upgrade
+  expect_log_count "^probe:ssh_origin build-2-oldver $GHR88_ORIGIN\$" 1
+  expect_log_count '^probe:ssh_run build-2-oldver -- runnerctl upgrade$' 1
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet health --restart-stalled --stall-after 600
+  expect_rc 1
+  expect_log_count "^probe:ssh_origin build-1 $GHR88_ORIGIN\$" 1
+  expect_one_record "health example\\.slot-1 \\(--restart-stalled\\) by $ME via fleet from $GHR88_ORIGIN — restarted 1"
+  # the reads carry none: status, health, the upgrade's check and read-back
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver" run fleet upgrade --check
+  expect_no_log '^probe:ssh_origin'
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet health
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl health$' 1
+  expect_no_log '^probe:ssh_origin'
+}
+
+# The central node's record: one line per fleet mutation, each host's exit
+# status, in a file born 0600 in a directory born 0700 — and nothing for a
+# read or a refusal.
+case_ghr88_central_node_records_each_fleet_mutation() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-nosudo" run fleet restart --when-idle --timeout 60
+  expect_rc 1
+  expect_cfg_count "$WRITES/fleet.log" '.' 1
+  expect_cfg "$WRITES/fleet.log" "^$GHR88_TS $ME fleet restart --when-idle --timeout 60 — build-1=0 box-nosudo=1\$"
+  RUNNERCTL_STUB_FLEET_SLOTS=1 RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet restart --max-unavailable 1
+  expect_rc 0
+  expect_cfg "$WRITES/fleet.log" "^$GHR88_TS $ME fleet restart --max-unavailable 1 — build-1/0=0 build-2/0=0\$"
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet health --restart-stalled --stall-after 600
+  expect_cfg "$WRITES/fleet.log" "^$GHR88_TS $ME fleet health --restart-stalled --stall-after 600 — build-1=1\$"
+  RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" run fleet upgrade --ref v9.9.9
+  expect_cfg_count "$WRITES/fleet.log" '.' 1
+  expect_cfg "$WRITES/fleet.log" "^$GHR88_TS $ME fleet upgrade --ref v9\\.9\\.9 — build-2-oldver=0\$"
+  # a fleet watch key: the command line it stands for
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jRy-q' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_cfg_count "$WRITES/fleet.log" '.' 1
+  expect_cfg "$WRITES/fleet.log" "^$GHR88_TS $ME fleet restart --host build-1 example\\.slot-2 \\(fleet watch\\) — build-1=0\$"
+  # a read, a declined key and a refusal write nothing
+  RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet status
+  expect_no_path "$WRITES/fleet.log"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jRn-q' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_no_path "$WRITES/fleet.log"
+  RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet stop
+  expect_rc 1
+  expect_no_path "$WRITES/fleet.log"
+  RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet upgrade --check
+  expect_no_path "$WRITES/fleet.log"
+  # the default path: the invoking user's state directory, created private
+  local home="$TMP/ghr88-home"
+  rm -rf "$home"; mkdir -p "$home"
+  HOME="$home" XDG_STATE_HOME='' RUNNERCTL_STUB_FLEET_LOG=default RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet restart
+  expect_rc 0
+  expect_cfg "$home/.local/state/runnerctl/fleet.log" "^$GHR88_TS $ME fleet restart — build-1=0\$"
+  expect_mode "$home/.local/state/runnerctl/fleet.log" 600
+  expect_mode "$home/.local/state/runnerctl" 700
+  # XDG_STATE_HOME when it is absolute, and an unwritable log is silence
+  HOME="$home" XDG_STATE_HOME="$home/xdg" RUNNERCTL_STUB_FLEET_LOG=default RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet restart
+  expect_cfg "$home/xdg/runnerctl/fleet.log" "fleet restart — build-1=0\$"
+  RUNNERCTL_STUB_FLEET_LOG=/nonexistent-ghr88/fleet.log RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet restart
+  expect_rc 0
+  expect_text "stderr with an unwritable FLEET_LOG" "" "$ERR"
+}
+
+case_ghr88_fleet_log_is_a_validated_knob() {
+  RUNNERCTL_STUB_FLEET_LOG=relative/fleet.log RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet restart
+  expect_rc 1
+  expect_err "^runnerctl: FLEET_LOG 'relative/fleet\\.log' set in .* is invalid — want an absolute path"
+  expect_no_log '^probe:ssh_run'
+  expect_cfg config.example '^#FLEET_LOG=""$'
+}
+
+# `history`: the journal's records, parsed to `<UTC time>Z <record>`; a line
+# of another tag or shape is dropped, and a hostile one drawn safely.
+case_ghr88_history_reads_the_records_back() {
+  printf '%s\n' '-- Boot 0123456789abcdef --' \
+    '2026-10-14T09:00:01.000100+00:00 build-1 runnerctl[101]: restart example.slot-2 by deploy via fleet from alice@central-1 — ok' \
+    '2026-10-14T09:00:05.000300+00:00 build-1 sshd[55]: not ours' \
+    "2026-10-14T09:00:07.000400+00:00 build-1 runnerctl[102]: kill ${ESC}[2Jexample.slot-1 by deploy — ok" \
+    '2026-10-14T09:00:09.000500+00:00 build-1 runnerctl[103]: stop example.slot-1 by deploy — ok' >"$GHR88_HIST"
+  RUNNERCTL_STUB_HISTORY="$GHR88_HIST" run history
+  expect_rc 0
+  expect_text "history" '2026-10-14T09:00:01.000100Z restart example.slot-2 by deploy via fleet from alice@central-1 — ok
+2026-10-14T09:00:07.000400Z kill example.slot-1 by deploy — ok
+2026-10-14T09:00:09.000500Z stop example.slot-1 by deploy — ok' "$OUT"
+  expect_log '^probe:journal_history_lines 20$'
+  RUNNERCTL_STUB_HISTORY="$GHR88_HIST" run history -n 1
+  expect_log '^probe:journal_history_lines 1$'
+  expect_out_count '.' 1
+  run history
+  expect_rc 0
+  expect_text "history with no record" "" "$OUT"
+  expect_err '^no runnerctl records in the journal this login can read'
+  RUNNERCTL_STUB_HISTORY_RC=1 run history
+  expect_rc 1
+  expect_err '^runnerctl: could not read the journal: journalctl exited 1$'
+  run history -n 0
+  expect_rc 1
+  expect_err "^runnerctl: -n value '0' is invalid"
+}
+
+# The real reader, over a fake journalctl on PATH: -t (never -g, GHR-65), UTC,
+# quiet; nothing found is exit 0 and no lines; journalctl failing is a failure.
+case_ghr88_the_real_history_reader() {
+  local d="$TMP/ghr88-journal"
+  mkdir -p "$d"
+  cat >"$d/journalctl" <<'FAKE'
+#!/bin/sh
+echo "TZ=$TZ $*" >>"$(dirname "$0")/argv"
+case "$FAKE_JOURNAL" in
+  lines) echo '2026-10-14T09:00:01.000100+00:00 build-1 runnerctl[101]: stop example.slot-1 by deploy — ok' ;;
+  none)  ;;
+  fail)  echo "Failed to open journal" >&2; exit 1 ;;
+esac
+FAKE
+  chmod +x "$d/journalctl"
+  rm -f "$d/argv"
+  PATH="$d:$PATH" FAKE_JOURNAL=lines run_fn cmd_history -n 5
+  expect_rc 0
+  expect_text "history over the real reader" '2026-10-14T09:00:01.000100Z stop example.slot-1 by deploy — ok' "$OUT"
+  expect_cfg "$d/argv" '^TZ=UTC -t runnerctl -o short-iso-precise --no-pager -q -n 5$'
+  PATH="$d:$PATH" FAKE_JOURNAL=none run_fn cmd_history
+  expect_rc 0
+  expect_text "history, nothing found" "" "$OUT"
+  expect_err '^no runnerctl records in the journal this login can read'
+  PATH="$d:$PATH" FAKE_JOURNAL=fail run_fn cmd_history
+  expect_rc 1
+  expect_err '^runnerctl: could not read the journal: journalctl exited 1$'
+}
+
+# Acceptance: `fleet history` merges the hosts' records in time order — the
+# hosts' lines interleave — and a host that cannot answer says why.
+case_ghr88_fleet_history_merges_by_time() {
+  printf '%s\n' \
+    '2026-10-14T09:00:01.000100+00:00 build-1 runnerctl[101]: restart example.slot-2 by deploy via fleet from alice@central-1 — ok' \
+    '2026-10-14T09:00:09.000500+00:00 build-1 runnerctl[103]: stop example.slot-1 by deploy — ok' >"$GHR88_HIST.build-1"
+  printf '%s\n' \
+    '2026-10-14T09:00:03.000200+00:00 build-2 runnerctl[201]: kill example.slot-1 by deploy — ok' \
+    '2026-10-14T09:00:07.000400+00:00 build-2 runnerctl[202]: drain all by deploy — failed (exit 1)' >"$GHR88_HIST.build-2"
+  RUNNERCTL_STUB_HISTORY="$GHR88_HIST" RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet history
+  expect_rc 0
+  expect_text "fleet history" '2026-10-14T09:00:01.000100Z build-1 restart example.slot-2 by deploy via fleet from alice@central-1 — ok
+2026-10-14T09:00:03.000200Z build-2 kill example.slot-1 by deploy — ok
+2026-10-14T09:00:07.000400Z build-2 drain all by deploy — failed (exit 1)
+2026-10-14T09:00:09.000500Z build-1 stop example.slot-1 by deploy — ok' "$OUT"
+  expect_log_count '^probe:ssh_run build-[12] -- runnerctl history -n 20$' 2
+  expect_no_log '^probe:ssh_origin'
+  expect_no_log ' -- sudo'
+  # the last N of the merge, and --host
+  RUNNERCTL_STUB_HISTORY="$GHR88_HIST" RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet history -n 2
+  expect_text "fleet history -n 2" '2026-10-14T09:00:07.000400Z build-2 drain all by deploy — failed (exit 1)
+2026-10-14T09:00:09.000500Z build-1 stop example.slot-1 by deploy — ok' "$OUT"
+  RUNNERCTL_STUB_HISTORY="$GHR88_HIST" RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet history --host build-2
+  expect_out_count '.' 2
+  expect_out_count ' build-2 ' 2
+  # a host that does not answer, and one too old for history
+  RUNNERCTL_STUB_HISTORY="$GHR88_HIST" RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-unreachable box-oldhistory" \
+    RUNNERCTL_STUB_FLEET_NOHISTORY=box-oldhistory run fleet history
+  expect_rc 1
+  expect_out_count ' build-1 ' 2
+  expect_out '^gw-unreachable: unreachable — ssh: connect to host gw-unreachable port 22: No route to host$'
+  expect_out "^box-oldhistory: its runnerctl predates history — 'runnerctl fleet upgrade' brings it up to date\$"
+  # a hostile host's lines are relayed (GHR-101) before they are merged
+  cp "$GHR88_HIST.build-1" "$GHR88_HIST.box-hostile"
+  RUNNERCTL_STUB_HISTORY="$GHR88_HIST" RUNNERCTL_STUB_FLEET_HOSTS="box-hostile" run fleet history
+  expect_rc 0
+  expect_out_count ' box-hostile ' 2
+  expect_no_hostile_rest
+}
+
+t "GHR-88: each mutating command records exactly one line"                case_ghr88_each_mutating_command_records_once
+t "GHR-88: reads, dry runs and quiet timer runs record nothing"            case_ghr88_reads_and_dry_runs_record_nothing
+t "GHR-88: a refusal records nothing, a failure part way is recorded"      case_ghr88_refusals_record_nothing_failures_are_recorded
+t "GHR-88: no credential reaches a record"                                 case_ghr88_no_credential_reaches_a_record
+t "GHR-88: a record cannot be forged into two"                             case_ghr88_a_record_cannot_be_forged
+t "GHR-88: --origin is a validated claim, never fatal"                     case_ghr88_origin_is_a_validated_claim
+t "GHR-88: --origin under the narrow sudo contract"                        case_ghr88_origin_under_the_narrow_sudo_contract
+t "GHR-88: a failing logger changes no exit status"                        case_ghr88_a_failing_logger_changes_nothing
+t "GHR-88: the real logger call, and no logger at all"                     case_ghr88_the_real_logger_call
+t "GHR-88: fleet sends the origin; an older host still acts"               case_ghr88_fleet_carries_the_origin_and_older_hosts_still_act
+t "GHR-88: the central node records each fleet mutation, privately"        case_ghr88_central_node_records_each_fleet_mutation
+t "GHR-88: FLEET_LOG is a validated config knob"                           case_ghr88_fleet_log_is_a_validated_knob
+t "GHR-88: history reads the records back"                                 case_ghr88_history_reads_the_records_back
+t "GHR-88: the real history reader over journalctl"                        case_ghr88_the_real_history_reader
+t "GHR-88: fleet history merges the hosts' records by time"                case_ghr88_fleet_history_merges_by_time
 
 # --- Summary ------------------------------------------------------------------
 echo

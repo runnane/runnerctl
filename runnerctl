@@ -24,7 +24,7 @@
 # so this runs on any runner host. Privileged operations re-exec via sudo.
 #
 # Usage:
-#   runnerctl [--config PATH] <command> [args]
+#   runnerctl [--config PATH] [--origin OPERATOR@HOST] <command> [args]
 #
 #   runnerctl provision N [--url URL] [--token TOK | --pat TOK] [--labels a,b] \
 #                         [--name-prefix P] [--runner-user U] [--runner-root DIR] \
@@ -58,6 +58,8 @@
 #                          [--max-age-hours N] [--grace-minutes N]
 #   runnerctl compose-reap-timer install|status|remove
 #   runnerctl health [--quiet] [--max-restarts N] [--stall-after N] [--restart-stalled]
+#   runnerctl history [-n N]
+#   runnerctl fleet history [-n N] [--host H]...
 #   runnerctl fleet status [--json] [--color auto|always|never] [--stall-after N] \
 #                          [--narrow]
 #   runnerctl fleet watch  [--interval N] [--host H]... \
@@ -377,6 +379,17 @@
 # GitHub already forgot still gets cleaned up locally. The removal token
 # reaches config.sh through its environment, never argv.
 #
+# Every command that changes the host (GHR-88) leaves one journal line tagged
+# `runnerctl` when it ends — verb, targets, the flags that matter, who ran it
+# (the sudo caller, else the login) and how it ended — and `history [-n N]`
+# prints them back. Never the command line itself, so never a token. A call
+# from `fleet` carries `--origin OPERATOR@HOST`, which the line repeats as `via
+# fleet from …`: a claim made by whoever holds the fleet's ssh login, written
+# down and trusted for nothing. The central node keeps its own record in
+# FLEET_LOG, one line per fleet command or `fleet watch` action key with each
+# host's exit code, and `fleet history` merges every host's journal lines by
+# time. A record that cannot be written changes nothing about the command.
+#
 # Recommended baselines:
 #   New host:     runnerctl provision 2 --url https://github.com/<org>
 #   CI host:      runnerctl scale 2 --max 26G --high 25G
@@ -528,6 +541,11 @@ FLEET_RUNNERCTL="runnerctl"
 # tee, rm, kill, cp and mv it calls — the narrow contract in the README.
 # Read-only calls never go through sudo either way. 0 = off.
 FLEET_SUDO="0"
+# The central node's own record of what it changed (GHR-88): one line per
+# fleet mutation — time, operator, the command, each host's exit code. Empty =
+# ${XDG_STATE_HOME:-~/.local/state}/runnerctl/fleet.log of the invoking user
+# (under sudo, root's ~/.local/state: sudo pins HOME). Absolute path otherwise.
+FLEET_LOG=""
 
 # Provisioning (GHR-45): where `provision` puts a runner and who it runs as.
 # RUNNER_URL is the only one that is genuinely site data (the org or repo the
@@ -582,6 +600,253 @@ die() { echo "runnerctl: $*" >&2; exit 1; }
 # "$1 needs a value" if no $2 is there to take it, instead of letting a bare
 # "$2" expansion under `set -u` crash with a raw bash diagnostic.
 need_val() { [ $# -ge 2 ] || die "$1 needs a value"; }
+
+# --- The record of what changed (GHR-88) ----------------------------------------
+# Every command that changes the host leaves ONE line in the journal, tagged
+# `runnerctl`, written when it ends and saying how it ended:
+#
+#   restart slot-2 (--when-idle) by deploy via fleet from alice@central-1 — ok
+#
+# verb, targets, the few flags that change what it did, who ran it — the sudo
+# caller, else the login — and, for a call that came through `fleet`, the
+# operator and central node it says it came from, then `ok`, `failed (exit N)`
+# or a count the command keeps itself. `history` reads them back.
+#
+# What goes in is chosen, never copied: no argv, so a token handed to
+# `provision` or `deprovision` has no way in. Each part is a value the command
+# already validated, and every part is still cleaned (audit_clean) so nothing
+# can end the line early and forge a second record. `--origin` is a CLAIM made
+# by whoever holds the ssh login — exactly as trustworthy as that login, and
+# labelled that way: it is checked against a conservative shape, written into
+# this line and used for nothing else. One that fails the check is dropped and
+# the line says `origin invalid`.
+#
+# Recording never changes what the command does: no logger, a logger that
+# fails or a journal that will not take the line is silence, and the exit
+# status is the command's own. A command arms the record (audit_begin) once it
+# is about to change something — a usage error, a refusal or a dry run before
+# that point records nothing — and the EXIT trap writes it with the real
+# outcome, so a `die` half way through is recorded as the failure it is. The
+# commands a timer or cron runs (`health --restart-stalled`, `compose-reap
+# --apply`, `--if-stalled`) arm only when they act, so a quiet hour writes
+# nothing.
+AUDIT_VERB="" AUDIT_PID="" AUDIT_RESULT="" AUDIT_NOTE="" AUDIT_AS=""
+AUDIT_TARGETS=() AUDIT_FLAGS=()
+AUDIT_ORIGIN="" AUDIT_ORIGIN_BAD=false
+# One word of a login or an operator name, and a host name: letters, digits
+# and `.`, `_`, `-` only, so the claim cannot carry a space, a quote, a
+# newline or a sequence into the line it is written into.
+AUDIT_RE_WORD='^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$'
+AUDIT_RE_HOST='^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$'
+# OPERATOR@HOST, each to its own pattern.
+origin_valid() { # TEXT
+  local op="${1%%@*}" h="${1#*@}"
+  [[ "$1" == *@* && "$op" =~ $AUDIT_RE_WORD && "$h" =~ $AUDIT_RE_HOST ]]
+}
+# The --origin a host was handed: kept when it has the shape, else dropped
+# and remembered as invalid. Never fatal — an older central node, or a typo
+# in someone's wrapper, must not stop the command it rides on.
+audit_origin_take() { # TEXT
+  if origin_valid "$1"; then AUDIT_ORIGIN="$1" AUDIT_ORIGIN_BAD=false; else AUDIT_ORIGIN="" AUDIT_ORIGIN_BAD=true; fi
+}
+# Who is running this: the sudo caller (SUDO_USER is set by sudo itself, after
+# its env_reset), else the login. A name that is not one plain word is the uid.
+audit_actor() {
+  local who
+  if under_sudo; then who="${SUDO_USER:-}"; else who="$(id -un 2>/dev/null || true)"; fi
+  if [[ "$who" =~ $AUDIT_RE_WORD ]]; then
+    printf '%s\n' "$who"
+  elif under_sudo; then
+    printf 'uid %s\n' "${SUDO_UID:-$(id -u)}"
+  else
+    printf 'uid %s\n' "$(id -u)"
+  fi
+}
+# The slots a command acts on, as record targets: each unit's short name when
+# the command was given targets (COUNT > 0), `all` when it was given none.
+audit_slots() { # COUNT UNIT...
+  local n="$1" u
+  shift
+  if [ "$n" -eq 0 ]; then AUDIT_TARGETS+=(all); return 0; fi
+  for u in "$@"; do AUDIT_TARGETS+=("$(short_name "$u")"); done
+}
+# TEXT as one line of a record, into AUDIT_CLEAN: a sequence removed whole
+# (relay_safe's plain form), then every control byte left — a newline among
+# them — removed too, and cut to MAX characters (200).
+AUDIT_CLEAN=""
+audit_clean() { # TEXT [MAX]
+  local LC_ALL=C s
+  relay_safe "${1-}" plain
+  s="${RELAY_SAFE//[$'\001'-$'\037'$'\177']/}"
+  AUDIT_CLEAN="${s:0:${2:-200}}"
+}
+# Arm the record for this process: VERB, then targets and flags (a word
+# starting `--` is a flag; an empty word is skipped). A second call in the same
+# process adds targets and flags to the first — `health` arms once per slot it
+# restarts. A subshell arms a record of its own: the local `watch` runs its
+# actions in one, and each is a record.
+audit_begin() { # VERB [TARGET|--FLAG ...]
+  local a
+  if [ -z "$AUDIT_VERB" ] || [ "$AUDIT_PID" != "$BASHPID" ]; then
+    AUDIT_VERB="$1" AUDIT_PID="$BASHPID" AUDIT_RESULT="" AUDIT_NOTE=""
+    AUDIT_TARGETS=() AUDIT_FLAGS=()
+    builtin trap exit_run EXIT
+  fi
+  shift
+  for a in "$@"; do
+    case "$a" in
+      '') ;;
+      --*) audit_has "$a" ${AUDIT_FLAGS[@]+"${AUDIT_FLAGS[@]}"} || AUDIT_FLAGS+=("$a") ;;
+      *)   audit_has "$a" ${AUDIT_TARGETS[@]+"${AUDIT_TARGETS[@]}"} || AUDIT_TARGETS+=("$a") ;;
+    esac
+  done
+}
+# Whether WORD is among the rest — a re-arm names a flag or a slot once.
+audit_has() { # WORD LIST...
+  local w="$1" x
+  shift
+  for x in "$@"; do [ "$x" != "$w" ] || return 0; done
+  return 1
+}
+# The line itself, for OUTCOME. Every part cleaned; the parts the script
+# produces itself (the verb, the labels) are fixed text.
+audit_message() { # OUTCOME
+  local msg t f="" n=0
+  audit_clean "$AUDIT_VERB"; msg="$AUDIT_CLEAN"
+  for t in ${AUDIT_TARGETS[@]+"${AUDIT_TARGETS[@]}"}; do
+    n=$((n + 1))
+    if [ "$n" -gt 8 ]; then msg+=" … (+$(( ${#AUDIT_TARGETS[@]} - 8 )) more)"; break; fi
+    audit_clean "$t"; msg+=" $AUDIT_CLEAN"
+  done
+  for t in ${AUDIT_FLAGS[@]+"${AUDIT_FLAGS[@]}"}; do
+    audit_clean "$t"; f+="${f:+, }$AUDIT_CLEAN"
+  done
+  [ -z "$f" ] || msg+=" ($f)"
+  msg+=" by $(audit_actor)"
+  if [ -n "$AUDIT_ORIGIN" ]; then
+    # Validated when it was taken; cleaned all the same, as every part is.
+    audit_clean "$AUDIT_ORIGIN"; msg+=" via fleet from $AUDIT_CLEAN"
+  elif $AUDIT_ORIGIN_BAD; then
+    msg+=" via fleet, origin invalid"
+  fi
+  audit_clean "$1"
+  printf '%s — %s\n' "$msg" "$AUDIT_CLEAN"
+}
+# Write the armed record, once, with RC as the outcome unless the command set
+# AUDIT_RESULT itself. Never fails and never prints: the record is a side
+# channel, and the command's own exit status is what the caller sees.
+audit_finish() { # RC
+  local rc="$1" outcome msg
+  [ -n "$AUDIT_VERB" ] && [ "$AUDIT_PID" = "$BASHPID" ] || return 0
+  if [ -n "$AUDIT_RESULT" ]; then
+    outcome="$AUDIT_RESULT"
+  elif [ "$rc" = 0 ]; then
+    outcome=ok
+  else
+    outcome="failed (exit $rc)"
+  fi
+  [ -z "$AUDIT_NOTE" ] || outcome+=" ($AUDIT_NOTE)"
+  msg="$(audit_message "$outcome" 2>/dev/null)" || msg=""
+  AUDIT_VERB=""
+  [ -z "$msg" ] || audit_logger "$msg" >/dev/null 2>&1 || true
+  return 0
+}
+# The journal write, as ONE argument after `--` — never through a shell, so
+# nothing in the line is read as an option or a word. A hook, like the
+# journal readers: tests/stub.config shadows it, and the real one is covered
+# over a fake `logger` on PATH. Bounded, so a journald that has stopped
+# answering cannot hold the command's exit.
+audit_logger() { # MESSAGE
+  command -v logger >/dev/null 2>&1 || return 0
+  timeout 5 logger -t runnerctl -- "$1"
+}
+
+# --- Exit handlers (GHR-88) -------------------------------------------------------
+# The record is written from the EXIT trap, and several commands arm an EXIT
+# trap of their own for their temp files (provision, upgrade, install, every
+# fan-out). A plain `trap CMD EXIT` replaces whatever was there, so the first
+# command to clean up after itself would silently drop its record. Rather than
+# every such site having to know about the record, `trap` is wrapped: the
+# two-argument EXIT form keeps CMD in EXIT_CMD and installs exit_run, which
+# writes the record first and then runs CMD exactly as the builtin would have.
+# Every other form — signals, `trap - WINCH` — is the builtin, untouched.
+#
+# EXIT_PID: a subshell inherits EXIT_CMD but not the trap (bash resets traps in
+# one), so a subshell that arms a record of its own must not also run its
+# parent's cleanup — the local watch's teardown, say — on its way out.
+EXIT_CMD="" EXIT_PID=""
+trap() {
+  if [ $# -eq 2 ] && [ "$2" = EXIT ]; then
+    EXIT_CMD="$1" EXIT_PID="$BASHPID"
+    builtin trap exit_run EXIT
+    return 0
+  fi
+  builtin trap -- "$@"
+}
+exit_run() {
+  local rc=$?
+  audit_finish "$rc"
+  fleet_log_finish
+  if [ "$EXIT_PID" = "$BASHPID" ] && [ -n "$EXIT_CMD" ] && [ "$EXIT_CMD" != - ]; then
+    eval "$EXIT_CMD"
+  fi
+}
+
+# --- The central node's record (GHR-88) -----------------------------------------
+# One line per fleet mutation in FLEET_LOG, appended:
+#
+#   2026-10-14T09:12:03Z alice fleet restart --when-idle --host build-1 — build-1=0
+#
+# the time (UTC), the operator, the fleet command as typed — or, for a `fleet
+# watch` key, the command line that key stands for — then each host the
+# command reached and that host's exit status (124 timed out, 255 unreachable,
+# a budget walk names the slot: build-1/0=0). Armed at the first remote call
+# that changes something, so a refusal before it writes nothing; written on
+# exit, so a fan-out that dies half way still says how far it got. The file is
+# created 0600 in a directory created 0700: it says who did what where. A log
+# that cannot be written is silence — the fleet command's outcome is the
+# hosts', not this file's.
+FLEET_LOG_CMD="" FLEET_LOG_RESULTS="" FLEET_LOG_PID=""
+FLEET_ARGV=()
+fleet_log_path() {
+  local base
+  if [ -n "$FLEET_LOG" ]; then printf '%s\n' "$FLEET_LOG"; return 0; fi
+  base="${XDG_STATE_HOME:-}"
+  # The XDG spec ignores a relative XDG_STATE_HOME, and under sudo it is the
+  # caller's variable naming the caller's directory: root's HOME decides.
+  if under_sudo || [[ "$base" != /* ]]; then base="$HOME/.local/state"; fi
+  printf '%s\n' "$base/runnerctl/fleet.log"
+}
+# Arm it for COMMAND-TEXT (once; a later call keeps the first text).
+fleet_log_begin() { # COMMAND-TEXT
+  if [ -z "$FLEET_LOG_CMD" ] || [ "$FLEET_LOG_PID" != "$BASHPID" ]; then
+    FLEET_LOG_CMD="$1" FLEET_LOG_RESULTS="" FLEET_LOG_PID="$BASHPID"
+    builtin trap exit_run EXIT
+  fi
+}
+# The fleet command as typed, for fleet_log_begin: `fleet` and its words.
+fleet_log_argv() {
+  local t="fleet" a
+  for a in ${FLEET_ARGV[@]+"${FLEET_ARGV[@]}"}; do t+=" $a"; done
+  printf '%s\n' "$t"
+}
+fleet_log_result() { # HOST[/SLOT] RC
+  [ -n "$FLEET_LOG_CMD" ] || return 0
+  FLEET_LOG_RESULTS+="${FLEET_LOG_RESULTS:+ }$1=$2"
+}
+fleet_log_finish() {
+  local f line cmd
+  [ -n "$FLEET_LOG_CMD" ] && [ "$FLEET_LOG_PID" = "$BASHPID" ] || return 0
+  audit_clean "$FLEET_LOG_CMD" 1000; cmd="$AUDIT_CLEAN"
+  audit_clean "${FLEET_LOG_RESULTS:-no host answered}" 4000
+  line="$(date -u +%Y-%m-%dT%H:%M:%SZ) $(audit_actor) $cmd — $AUDIT_CLEAN"
+  FLEET_LOG_CMD="" FLEET_LOG_RESULTS=""
+  f="$(fleet_log_path)"
+  # umask in a subshell: the directory and the file are born private, and
+  # nothing about an existing one is changed.
+  ( umask 077; mkdir -p -- "$(dirname -- "$f")" && printf '%s\n' "$line" >>"$f" ) 2>/dev/null || true
+  return 0
+}
 
 # --- Running under sudo (GHR-89) -----------------------------------------------
 # The narrow sudoers contract grants a login runnerctl itself instead of the
@@ -818,6 +1083,7 @@ load_config() {
   [[ "$FLEET_WATCH_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "FLEET_WATCH_TIMEOUT '$FLEET_WATCH_TIMEOUT' set in $CONFIG_FILE is invalid — want a whole number of seconds, 1 or more"
   [ -n "$FLEET_RUNNERCTL" ] || die "FLEET_RUNNERCTL set in $CONFIG_FILE is empty — want the remote command name or an absolute path"
   [[ "$FLEET_SUDO" =~ ^[01]$ ]] || die "FLEET_SUDO '$FLEET_SUDO' set in $CONFIG_FILE is invalid — want 0 or 1"
+  [ -z "$FLEET_LOG" ] || [[ "$FLEET_LOG" == /?* ]] || die "FLEET_LOG '$FLEET_LOG' set in $CONFIG_FILE is invalid — want an absolute path (empty = ~/.local/state/runnerctl/fleet.log)"
   # Provisioning settings (GHR-45). Checked here so a typo fails before a
   # download, a useradd or a registration — not half way through slot 3.
   [[ "$RUNNER_ROOT" == /* ]] || die "RUNNER_ROOT '$RUNNER_ROOT' set in $CONFIG_FILE is invalid — want an absolute path"
@@ -3415,6 +3681,8 @@ cmd_apply() {
   else
     mapfile -t units < <(discover)
   fi
+  audit_begin apply "--profile $PROFILE" "$($do_restart && echo --restart)" "$($when_idle && echo --when-idle)" "$($do_save && echo --save)"
+  audit_slots "${#TARGETS[@]}" "${units[@]}"
   for u in "${units[@]}"; do apply_to "$u"; echo "  wrote drop-in for $u"; done
   run_priv systemctl daemon-reload
   if [ "${#TARGETS[@]}" -gt 0 ]; then
@@ -3456,6 +3724,7 @@ cmd_scale() {
   mapfile -t units < <(discover)
   local total=${#units[@]}
   { [ "$n" -ge 1 ] && [ "$n" -le "$total" ]; } || die "N must be 1..$total"
+  audit_begin scale "to $n of $total" "--profile $PROFILE" "$($do_restart && echo --restart)" "$($when_idle && echo --when-idle)" "$($do_save && echo --save)"
   local i u
   # Write every drop-in that will be needed, THEN reload, THEN start/stop —
   # otherwise the first `enable --now` on a stopped slot races systemd's own
@@ -3506,6 +3775,7 @@ cmd_env_init() {
     echo "$ENV_FILE already exists — leaving it untouched (won't clobber secrets)."
     return 0
   fi
+  audit_begin env-init "$ENV_FILE" "--profile $PROFILE"
   run_priv mkdir -p "$(dirname "$ENV_FILE")"
   render_env_template | run_priv tee "$ENV_FILE" >/dev/null
   run_priv chown root:root "$ENV_FILE"
@@ -3546,11 +3816,18 @@ cmd_ctl() { # start|stop|restart [--when-idle] [--timeout N] [--if-stalled] [--s
     mapfile -t units < <(discover)
   fi
   case "$action" in stop) verb=stopped ;; *) verb="${action}ed" ;; esac
+  # The record (GHR-88): `drain` is recorded as itself. --if-stalled runs from
+  # cron, so it arms only for a slot it actually takes, and names those.
+  if ! $if_stalled; then
+    audit_begin "${AUDIT_AS:-$action}" "$($when_idle && [ -z "$AUDIT_AS" ] && echo --when-idle)"
+    audit_slots "${#targets[@]}" "${units[@]}"
+  fi
   for i in "${!units[@]}"; do
     u="${units[$i]}"
     if $if_stalled; then
       stalled_gate "$u" "${verb%ed}ing" || continue
       acted=$((acted + 1))
+      audit_begin "$action" --if-stalled "$(short_name "$u")"
     else
       idle_gate "$u" "$verb" "${units[*]:0:$i}" "${units[*]:$((i + 1))}"
     fi
@@ -3569,6 +3846,7 @@ cmd_toggle() { # enable|disable <target>
   local action="$1"; shift || true
   [ $# -ge 1 ] || die "$action needs a <unit|slot-index|name>"
   local u; u="$(resolve "$1")"
+  audit_begin "$action" "$(short_name "$u")"
   run_priv systemctl "$action" --now "$u"
   echo "$action done."
 }
@@ -4680,6 +4958,8 @@ cmd_remove_limits() {
   else
     mapfile -t units < <(discover)
   fi
+  audit_begin remove-limits
+  audit_slots "${#TARGETS[@]}" "${units[@]}"
   for u in "${units[@]}"; do
     run_priv rm -f "$SYSTEMD_DIR/$u.d/$DROPIN_NAME"
     echo "  removed drop-in for $u"
@@ -4721,6 +5001,10 @@ cmd_reap() { # [--dry-run] [target ...] (default: all)
     done
   else
     mapfile -t units < <(discover)
+  fi
+  if ! $dry_run; then
+    audit_begin reap
+    audit_slots "${#targets[@]}" "${units[@]}"
   fi
   for u in "${units[@]}"; do
     short="$(short_name "$u")"
@@ -4815,10 +5099,15 @@ cmd_kill() { # [--dry-run] [--if-stalled] [--stall-after N] [target ...]
     $if_stalled || die "kill needs a target (a unit, slot index or name) — or --if-stalled to take every stalled slot"
     mapfile -t units < <(discover)
   fi
+  if ! $dry_run && ! $if_stalled; then
+    audit_begin kill
+    audit_slots "${#targets[@]}" "${units[@]}"
+  fi
   for u in "${units[@]}"; do
     short="$(short_name "$u")"
     if $if_stalled; then
       stalled_gate "$u" killing || continue
+      $dry_run || audit_begin kill --if-stalled "$short"
     else
       slot_job_facts "$u"
       kill_gate "$short" || continue
@@ -5219,6 +5508,9 @@ cmd_compose_reap() { # [--apply] [--standalone] [--project NAME] [--max-age-hour
     if [ "$action" != reap ]; then kept=$((kept + 1)); continue; fi
     reaped=$((reaped + 1))
     $apply || continue
+    # GHR-88: a timer runs this hourly, so the record is armed by the first
+    # removal, not by --apply: an hour with nothing to reap writes nothing.
+    audit_begin compose-reap --apply "$($standalone && echo --standalone)"
     ok=0 bad=0
     for kind in container network volume; do
       case "$kind" in
@@ -5273,6 +5565,7 @@ cmd_compose_reap() { # [--apply] [--standalone] [--project NAME] [--max-age-hour
       if [ "$action" != reap ]; then kept=$((kept + 1)); continue; fi
       reaped=$((reaped + 1))
       $apply || continue
+      audit_begin compose-reap --apply --standalone
       if compose_rm container "$cid"; then
         n_removed=$((n_removed + 1)); freed_images[$img]="$image"
       else
@@ -5293,6 +5586,7 @@ cmd_compose_reap() { # [--apply] [--standalone] [--project NAME] [--max-age-hour
   local running composed
   read -r running composed <<<"$(compose_running_counts)"
   echo "compose-reap: mode=$mode projects=${#projects[@]} reap=$reaped keep=$kept removed=$n_removed failed=$n_failed slots=${#slot_start[@]} standalone=$n_standalone images-removed=$n_images non-compose-running=$(( ${running:-0} - ${composed:-0} )) skipped=$n_skipped"
+  [ "$AUDIT_VERB" != compose-reap ] || AUDIT_NOTE="removed=$n_removed failed=$n_failed images-removed=$n_images"
   [ "$n_failed" -eq 0 ]
 }
 
@@ -5356,6 +5650,7 @@ cmd_compose_reap_timer() { # install|status|remove
       self="$(readlink -f "$0")"
       problem="$(root_exec_problem "$self")"
       [ -z "$problem" ] || die "refusing to install a root timer that runs $self: $problem. Install runnerctl system-wide first ('runnerctl install'), then run compose-reap-timer install from that copy."
+      audit_begin "compose-reap-timer install"
       render_compose_reap_service "$self" | run_priv tee "$SYSTEMD_DIR/$COMPOSE_REAP_UNIT.service" >/dev/null
       render_compose_reap_timer | run_priv tee "$SYSTEMD_DIR/$COMPOSE_REAP_UNIT.timer" >/dev/null
       run_priv systemctl daemon-reload
@@ -5369,6 +5664,7 @@ cmd_compose_reap_timer() { # install|status|remove
       run_priv journalctl -u "$COMPOSE_REAP_UNIT.service" -n 40 --no-pager
       ;;
     remove)
+      audit_begin "compose-reap-timer remove"
       run_priv systemctl disable --now "$COMPOSE_REAP_UNIT.timer" || true
       run_priv rm -f "$SYSTEMD_DIR/$COMPOSE_REAP_UNIT.service" "$SYSTEMD_DIR/$COMPOSE_REAP_UNIT.timer"
       run_priv systemctl daemon-reload
@@ -5495,7 +5791,7 @@ cmd_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart-stall
     esac
   done
   require_runners
-  local u short n=0 problems=() nrestarts reason line repo name
+  local u short n=0 problems=() nrestarts reason line repo name h_ok=0 h_bad=0
   while read -r u; do
     [ -n "$u" ] || continue
     collect_slot "$u" "$n"
@@ -5525,7 +5821,17 @@ cmd_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart-stall
       ! pressure_at_least "${SLOT[mem_pressure_full_avg10]}" "$PRESSURE_WARN_PCT" || line+=" — under memory pressure $(status_press_cell "${SLOT[mem_pressure_full_avg10]}"), throttled rather than hung"
       # GHR-30: the only privileged call health ever makes, and only here.
       if $restart_stalled; then
-        if run_priv systemctl restart "$u"; then line+=" — restarted"; else line+=" — restart FAILED"; fi
+        # GHR-88: run from cron, so armed per slot it restarts — a clean run
+        # records nothing — and the outcome is the restarts', not health's
+        # exit status, which is 1 whenever there was a problem to report.
+        audit_begin health --restart-stalled "$short"
+        if run_priv systemctl restart "$u"; then
+          line+=" — restarted"; h_ok=$((h_ok + 1))
+        else
+          line+=" — restart FAILED"; h_bad=$((h_bad + 1))
+        fi
+        AUDIT_RESULT="restarted $h_ok"
+        [ "$h_bad" -eq 0 ] || AUDIT_RESULT+=", $h_bad failed"
       fi
       problems+=("$line")
     fi
@@ -5549,6 +5855,53 @@ cmd_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart-stall
   fi
   $quiet || printf '%s\n' "${problems[@]}"
   return 1
+}
+
+# --- history: the records read back (GHR-88) ------------------------------------
+# The journal's `runnerctl` lines, newest last, one per line as
+# `<UTC time, microseconds>Z <record>` — a shape `fleet history` can merge
+# across hosts by sorting on the first field.
+#
+# A hook, like journal_job_lines: tests/stub.config shadows it, and the real
+# one is covered over a fake `journalctl` on PATH. -t, never -g: `journalctl
+# -g` exits 1 when nothing matches (GHR-65), while -t with nothing to show
+# exits 0 and prints nothing under -q — so a non-zero exit here is journalctl
+# failing, and is reported as that, never as "no records". TZ=UTC because the
+# merge compares the text.
+journal_history_lines() { # N
+  TZ=UTC journalctl -t runnerctl -o short-iso-precise --no-pager -q -n "$1"
+}
+# journalctl's short-iso-precise lines on stdin → `<time>Z <message>`. A line
+# of another shape (a `-- Boot …` marker, another tag) is dropped. Anyone on
+# the host can write a line with this tag (logger needs no privilege), so the
+# message is drawn through relay_safe like any other text this script did not
+# write.
+history_parse() {
+  local line ts re='^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?)\+00:00 [^ ]+ runnerctl(\[[0-9]+\])?: (.*)$'
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ $re ]] || continue
+    # The time first: relay_safe matches regexes of its own.
+    ts="${BASH_REMATCH[1]}"
+    relay_safe "${BASH_REMATCH[4]}" plain
+    printf '%sZ %s\n' "$ts" "$RELAY_SAFE"
+  done
+}
+HISTORY_NONE="no runnerctl records in the journal this login can read — a record written under sudo is root's, and reading it needs the systemd-journal or adm group"
+cmd_history() { # [-n N]
+  local n=20 raw rc=0 out
+  while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    case "$1" in
+      -n|--lines) need_val "$@"; n="$2"; shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ "$n" =~ ^[1-9][0-9]{0,4}$ ]] || die "-n value '$n' is invalid — want a whole number from 1 to 99999"
+  raw="$(journal_history_lines "$n")" || rc=$?
+  [ "$rc" = 0 ] || die "could not read the journal: journalctl exited $rc"
+  out="$(history_parse <<<"$raw")"
+  if [ -z "$out" ]; then echo "$HISTORY_NONE" >&2; return 0; fi
+  printf '%s\n' "$out"
 }
 
 # --- Fleet mode (GHR-39) ------------------------------------------------------
@@ -5683,6 +6036,48 @@ fleet_priv_cmd() {
   fi
 }
 
+# The origin every call that changes a host carries (GHR-88): `--origin=
+# OPERATOR@HOST`, right after the FLEET_PRIV words and before the verb, into
+# FLEET_ORIGIN (and FLEET_ORIGIN_WORD, its one word). The operator is who runs
+# this — the sudo caller or the login — and HOST this node's name, so the
+# host's record says who at which central node pressed the key; the host
+# itself only ever sees the shared ssh login. Checked here as the host checks
+# it, and not sent at all when it would not pass: an operator whose name is
+# not one plain word is still recorded here, in FLEET_LOG. Reads never carry
+# it — nothing is recorded for a read.
+FLEET_ORIGIN=() FLEET_ORIGIN_WORD=""
+fleet_origin() {
+  local o
+  o="$(audit_actor)@$(host_name)"
+  if origin_valid "$o"; then
+    FLEET_ORIGIN_WORD="--origin=$o" FLEET_ORIGIN=("--origin=$o")
+  else
+    FLEET_ORIGIN_WORD="" FLEET_ORIGIN=()
+  fi
+}
+# One call that changes HOST, outside a fan-out — a budget walk's slot, a
+# `fleet watch` key: FLEET_PRIV, the origin, SUBCOMMAND and ARGS, stdout into
+# OUT and stderr into ERR (each relayed, GHR-101), on BUDGET seconds. A host
+# too old for --origin is asked again without it, as a fan-out asks it, and
+# remembered. The exit status is left in FLEET_CALL_RC.
+FLEET_CALL_RC=0
+fleet_call_mutating() { # HOST OUT ERR BUDGET SUBCOMMAND [ARGS...]
+  local host="$1" out="$2" err="$3" budget="$4" rc=0
+  shift 4
+  local -a origin=(${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"})
+  fleet_priv_cmd
+  if [ "${#origin[@]}" -gt 0 ] && fleet_optional_skip "$host" "${origin[0]}"; then origin=(); fi
+  (FLEET_CALL_TIMEOUT="$budget" ssh_run "$host" "${FLEET_PRIV[@]}" ${origin[@]+"${origin[@]}"} "$@") >"$out" 2>"$err" || rc=$?
+  if [ "$rc" = 1 ] && [ "${#origin[@]}" -gt 0 ] && fleet_optional_rejects "$err" "${origin[0]}"; then
+    FLEET_OPTIONAL_REJECTED+="$host=--origin "
+    rc=0
+    (FLEET_CALL_TIMEOUT="$budget" ssh_run "$host" "${FLEET_PRIV[@]}" "$@") >"$out" 2>"$err" || rc=$?
+  fi
+  relay_file "$out"
+  relay_file "$err"
+  FLEET_CALL_RC="$rc"
+}
+
 require_fleet() {
   [ "${#FLEET_HOSTS[@]}" -gt 0 ] || die "fleet mode is not configured — set FLEET_HOSTS=(host1 host2 ...) in $CONFIG_FILE ('runnerctl config-example' shows the block). An empty fleet is a missing config, not an empty table."
 }
@@ -5742,38 +6137,77 @@ fleet_fanout() { # REMOTE-ARGS...
   # under `fleet watch` a host's background fetch may still be out, and a
   # bare wait would sit through that one's budget as well.
   wait "${pids[@]}" 2>/dev/null || true
-  [ -n "$FLEET_OPTIONAL_ARG" ] || return 0
-  for i in "${!FLEET_HOSTS[@]}"; do
-    host="${FLEET_HOSTS[$i]}"
-    [ "$(fleet_rc "$i")" = 1 ] || continue
-    grep -qF -- "unknown option: $FLEET_OPTIONAL_ARG" "$FLEET_DIR/$i.err" 2>/dev/null || continue
-    FLEET_OPTIONAL_REJECTED+="$host "
-    retry+=("$i")
+  # GHR-88: one optional word per round, at most two rounds — the view flag
+  # and the origin — since a host can refuse one, be asked again, and only
+  # then refuse the other.
+  local round a
+  for round in 1 2; do
+    fleet_optional_any "$@" || return 0
+    retry=()
+    for i in "${!FLEET_HOSTS[@]}"; do
+      host="${FLEET_HOSTS[$i]}"
+      [ "$(fleet_rc "$i")" = 1 ] || continue
+      for a in "$@"; do
+        fleet_optional_is "$a" || continue
+        ! fleet_optional_skip "$host" "$a" || continue
+        fleet_optional_rejects "$FLEET_DIR/$i.err" "$a" || continue
+        FLEET_OPTIONAL_REJECTED+="$host=${a%%=*} "
+        retry+=("$i")
+        break
+      done
+    done
+    [ "${#retry[@]}" -gt 0 ] || return 0
+    running=0 pids=()
+    for i in "${retry[@]}"; do
+      fleet_fanout_one "$i" "$@" &
+      pids+=("$!")
+      running=$((running + 1))
+      if [ "$running" -ge "$FLEET_PARALLEL" ]; then
+        wait -n 2>/dev/null || true
+        running=$((running - 1))
+      fi
+    done
+    wait "${pids[@]}" 2>/dev/null || true
+    : "$round"
   done
-  running=0 pids=()
-  for i in ${retry[@]+"${retry[@]}"}; do
-    fleet_fanout_one "$i" "$@" &
-    pids+=("$!")
-    running=$((running + 1))
-    if [ "$running" -ge "$FLEET_PARALLEL" ]; then
-      wait -n 2>/dev/null || true
-      running=$((running - 1))
-    fi
-  done
-  [ "${#pids[@]}" -eq 0 ] || wait "${pids[@]}" 2>/dev/null || true
+}
+# The optional words (GHR-56, generalised for GHR-88): FLEET_OPTIONAL_ARG, the
+# view flag a read would like (`--narrow`), and FLEET_ORIGIN_WORD, the
+# `--origin=OPERATOR@HOST` every call that changes a host carries. A host too
+# old for one rejects it the way every runnerctl rejects what it does not
+# know — `unknown option: --narrow` from a command's parser, `unknown command
+# '--origin…'` from main, where a global flag lands — and is asked again
+# without it. Only these two are ever dropped: a word a host refuses for any
+# other reason is that host's answer.
+fleet_optional_is() { # WORD
+  [ -n "$1" ] && { [ "$1" = "$FLEET_OPTIONAL_ARG" ] || [ "$1" = "$FLEET_ORIGIN_WORD" ]; }
+}
+fleet_optional_any() { # WORDS...
+  local a
+  for a in "$@"; do ! fleet_optional_is "$a" || return 0; done
+  return 1
+}
+# Whether HOST is already known to refuse WORD (by its flag name), in which
+# case it is not offered again — a watch pays the second round trip once.
+fleet_optional_skip() { # HOST WORD
+  [[ "$FLEET_OPTIONAL_REJECTED" == *" $1=${2%%=*} "* ]]
+}
+fleet_optional_rejects() { # ERRFILE WORD
+  local name="${2%%=*}"
+  grep -qF -e "unknown option: $name" -e "unknown command '$name" -- "$1" 2>/dev/null
 }
 # One host's call into its three files. Runs in the background, so nothing it
-# sets survives; FLEET_OPTIONAL_ARG is left out of the argv of a host already
+# sets survives; an optional word is left out of the argv of a host already
 # known to reject it.
 fleet_fanout_one() { # INDEX REMOTE-ARGS...
   local i="$1" host a hrc=0
   shift
   host="${FLEET_HOSTS[$i]}"
-  local -a args=("$@")
-  if [ -n "$FLEET_OPTIONAL_ARG" ] && [[ "$FLEET_OPTIONAL_REJECTED" == *" $host "* ]]; then
-    args=()
-    for a in "$@"; do [ "$a" = "$FLEET_OPTIONAL_ARG" ] || args+=("$a"); done
-  fi
+  local -a args=()
+  for a in "$@"; do
+    if fleet_optional_is "$a" && fleet_optional_skip "$host" "$a"; then continue; fi
+    args+=("$a")
+  done
   # `|| hrc=$?` rather than a bare call plus `echo $?`: under `set -e` a
   # non-zero ssh_run kills this subshell before the status can be
   # recorded, so every failure would read as the missing-file fallback
@@ -6489,10 +6923,13 @@ fleet_summary_line() {
 cmd_fleet() {
   local sub="${1:-status}"
   shift || true
+  # GHR-88: the command as typed, for the central node's record.
+  FLEET_ARGV=("$sub" "$@")
   case "$sub" in
     status)  cmd_fleet_status "$@" ;;
     watch)   cmd_fleet_watch "$@" ;;
     health)  cmd_fleet_health "$@" ;;
+    history) cmd_fleet_history "$@" ;;
     upgrade) cmd_fleet_upgrade "$@" ;;
     apply|scale|start|stop|restart|drain|kill|reap|remove-limits|enable|disable)
              cmd_fleet_run "$sub" "$@" ;;
@@ -6517,7 +6954,7 @@ cmd_fleet() {
              die "fleet deprovision is not supported: it takes a removal token (fanning it out copies a credential to every host), it is irreversible, and a slot index or name means a different runner on each host. Run 'runnerctl deprovision <slot>' on the host." ;;
     logs)
              die "fleet logs is not supported: logs streams from one journal and only makes sense against one host. In 'runnerctl fleet watch', L on a slot pages its recent journal from its host; or ssh to the host." ;;
-    *)       die "unknown fleet command '$sub' (status watch health upgrade apply scale start stop restart drain kill reap remove-limits enable disable)" ;;
+    *)       die "unknown fleet command '$sub' (status watch health history upgrade apply scale start stop restart drain kill reap remove-limits enable disable)" ;;
   esac
 }
 
@@ -6701,11 +7138,13 @@ fleet_budget_walk() { # SUBCOMMAND MODE BUDGET [REMOTE-ARGS...]
     # this call only: the fleet_slots re-reads above stay on FLEET_TIMEOUT.
     local rc1=0 budget1
     budget1="$(fleet_mutate_budget "$sub" 1 "$@")"
-    fleet_priv_cmd
     # stderr is kept (GHR-89) so a failed slot says why — a sudo refusal under
     # FLEET_SUDO=1 most of all — and relayed like any fan-out's (GHR-101).
-    FLEET_CALL_TIMEOUT="$budget1" ssh_run "$host" "${FLEET_PRIV[@]}" "$sub" "$idx" "$@" >/dev/null 2>"$FLEET_BUDGET_TMP.err" || rc1=$?
-    relay_file "$FLEET_BUDGET_TMP.err"
+    # GHR-88: with the origin, and recorded per slot on this node.
+    fleet_log_begin "$(fleet_log_argv)"
+    fleet_call_mutating "$host" /dev/null "$FLEET_BUDGET_TMP.err" "$budget1" "$sub" "$idx" "$@"
+    rc1="$FLEET_CALL_RC"
+    fleet_log_result "$host/$idx" "$rc1"
     if [ "$rc1" = 0 ]; then
       acted=$((acted + 1)); echo "$host slot $idx: $sub ok"
     elif [ "$rc1" = 124 ]; then
@@ -6833,12 +7272,15 @@ cmd_fleet_run() { # SUBCOMMAND [--host H]... [--all-hosts] [REMOTE-ARGS...]
       *) die "--min-available applies to stop, drain and disable, not '$sub': it is a floor under capacity that is being taken away, and '$sub' returns what it takes. Use --max-unavailable N to throttle the roll instead." ;;
     esac
   fi
+  fleet_origin
   if [ -n "$max_unavail" ]; then
     fleet_budget_walk "$sub" ceiling "$max_unavail" ${fwd[@]+"${fwd[@]}"} || rc=$?
+    fleet_log_finish
     return "$rc"
   fi
   if [ -n "$min_avail" ]; then
     fleet_budget_walk "$sub" floor "$min_avail" ${fwd[@]+"${fwd[@]}"} || rc=$?
+    fleet_log_finish
     return "$rc"
   fi
   fleet_capacity_gate "$sub" "${#hosts[@]}" "$all_hosts"
@@ -6853,10 +7295,18 @@ cmd_fleet_run() { # SUBCOMMAND [--host H]... [--all-hosts] [REMOTE-ARGS...]
   fleet_set_budgets "$sub" ${fwd[@]+"${fwd[@]}"}
   FLEET_PARALLEL=1
   fleet_priv_cmd
-  fleet_fanout "${FLEET_PRIV[@]}" "$sub" ${fwd[@]+"${fwd[@]}"}
+  fleet_log_begin "$(fleet_log_argv)"
+  fleet_fanout "${FLEET_PRIV[@]}" ${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"} "$sub" ${fwd[@]+"${fwd[@]}"}
+  fleet_log_results
   fleet_run_report "$sub" || rc=$?
   fleet_cleanup
+  fleet_log_finish
   return "$rc"
+}
+# Every host of the fan-out just made, with its exit status, into the record.
+fleet_log_results() {
+  local i
+  for i in "${!FLEET_HOSTS[@]}"; do fleet_log_result "${FLEET_HOSTS[$i]}" "$(fleet_rc "$i")"; done
 }
 
 # One block per host: whatever that host said, prefixed, then a count. A
@@ -7070,6 +7520,7 @@ cmd_fleet_upgrade() { # [--check] [--ref REF] [--sha256 SUM] [--rollback] [--hos
     [ -n "${FLEET_UP_NOW[$k]:-}" ] || FLEET_UP_NOW[k]=""
   done
   fleet_upgrade_report false || rc=$?
+  fleet_log_finish
   if [ -n "$halted" ]; then
     names=""
     for k in ${left[@]+"${left[@]}"}; do names+="${names:+ }${FLEET_UP_HOSTS[$k]}"; done
@@ -7129,9 +7580,15 @@ fleet_upgrade_stage() { # CHECK INDEX...
   done
   # GHR-89: the write (and a rollback) changes the host; --check writes
   # nothing and runs as the login, as the read-back below does.
-  FLEET_PRIV=("$FLEET_RUNNERCTL")
-  $check || fleet_priv_cmd
-  fleet_fanout "${FLEET_PRIV[@]}" "${args[@]}"
+  FLEET_PRIV=("$FLEET_RUNNERCTL") FLEET_ORIGIN=() FLEET_ORIGIN_WORD=""
+  if ! $check; then
+    fleet_priv_cmd
+    # GHR-88: the write carries the origin and is recorded here, per stage.
+    fleet_origin
+    fleet_log_begin "$(fleet_log_argv)"
+  fi
+  fleet_fanout "${FLEET_PRIV[@]}" ${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"} "${args[@]}"
+  $check || fleet_log_results
   for j in "${!idx[@]}"; do
     k="${idx[$j]}"
     fleet_upgrade_classify "$check" "$j" "$k"
@@ -7382,10 +7839,18 @@ cmd_fleet_health() { # [--quiet] [--max-restarts N] [--stall-after N] [--restart
   fi
   # GHR-89: through sudo only when it may restart something.
   FLEET_PRIV=("$FLEET_RUNNERCTL")
-  [ -z "$FLEET_HEALTH_MUTATING" ] || fleet_priv_cmd
-  fleet_fanout "${FLEET_PRIV[@]}" health ${fwd[@]+"${fwd[@]}"}
+  if [ -n "$FLEET_HEALTH_MUTATING" ]; then
+    fleet_priv_cmd
+    # GHR-88: it may restart something, so it carries the origin and is
+    # recorded — each host's own exit status, 1 being "had problems".
+    fleet_origin
+    fleet_log_begin "$(fleet_log_argv)"
+  fi
+  fleet_fanout "${FLEET_PRIV[@]}" ${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"} health ${fwd[@]+"${fwd[@]}"}
+  [ -z "$FLEET_HEALTH_MUTATING" ] || fleet_log_results
   fleet_health_report "$quiet" || rc=$?
   fleet_cleanup
+  fleet_log_finish
   return "$rc"
 }
 
@@ -7447,6 +7912,55 @@ fleet_health_report() { # QUIET
   fi
   $quiet || printf '%s\n' "${problems[@]}"
   return 1
+}
+
+# `fleet history` (GHR-88): every host's `history -n N`, merged by time into
+# one list, each line `<time> <host> <record>`, and the last N of it. A read:
+# FLEET_TIMEOUT, FLEET_PARALLEL, no sudo. Each host's lines were relayed where
+# they landed (GHR-101); a line that does not start with a record's UTC time
+# is not merged. A host that did not answer is a line under the list, and the
+# exit status is 1, as `fleet status` does for one.
+FLEET_HISTORY_RE='^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,9})?Z) (.*)$'
+cmd_fleet_history() { # [-n N] [--host H]...
+  local n=20 rc=0 i host line err ts
+  local -a hosts=()
+  while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    case "$1" in
+      -n|--lines) need_val "$@"; n="$2"; shift 2 ;;
+      --host)     need_val "$@"; hosts+=("$2"); shift 2 ;;
+      *) die "unknown option: $1" ;;
+    esac
+  done
+  [[ "$n" =~ ^[1-9][0-9]{0,4}$ ]] || die "-n value '$n' is invalid — want a whole number from 1 to 99999"
+  require_fleet
+  [ "${#hosts[@]}" -eq 0 ] || fleet_select_hosts "${hosts[@]}"
+  fleet_fanout "$FLEET_RUNNERCTL" history -n "$n"
+  for i in "${!FLEET_HOSTS[@]}"; do
+    host="${FLEET_HOSTS[$i]}"
+    [ "$(fleet_rc "$i")" = 0 ] || continue
+    while IFS= read -r line || [ -n "$line" ]; do
+      [[ "$line" =~ $FLEET_HISTORY_RE ]] || continue
+      # A record is never painted: no SGR is kept either. The time is taken
+      # first — relay_safe matches regexes of its own.
+      ts="${BASH_REMATCH[1]}"
+      relay_safe "${BASH_REMATCH[3]}" plain
+      printf '%s %s %s\n' "$ts" "$host" "$RELAY_SAFE"
+    done <"$FLEET_DIR/$i.out"
+  done | LC_ALL=C sort -s -k1,1 | tail -n "$n"
+  for i in "${!FLEET_HOSTS[@]}"; do
+    host="${FLEET_HOSTS[$i]}"
+    [ "$(fleet_rc "$i")" != 0 ] || continue
+    rc=1
+    if grep -qF "unknown command 'history'" "$FLEET_DIR/$i.err" 2>/dev/null; then
+      err="its runnerctl predates history — 'runnerctl fleet upgrade' brings it up to date"
+    else
+      err="$(fleet_error_text "$(fleet_rc "$i")" "$FLEET_DIR/$i.err")"
+    fi
+    printf '%s: %s\n' "$host" "$err"
+  done
+  fleet_cleanup
+  return "$rc"
 }
 
 cmd_fleet_status() { # [--json] [--color WHEN] [--stall-after N] [--narrow]
@@ -8304,10 +8818,15 @@ fleet_watch_run_action() {
   budget="$(fleet_mutate_budget "$FW_ACTION" 1)"
   fleet_priv_cmd
   printf '\nrunning on %s: %s %s %s\n' "$FW_ACT_HOST" "${FLEET_PRIV[*]}" "$FW_ACTION" "$FW_ACT_NAME"
-  (FLEET_CALL_TIMEOUT="$budget" ssh_run "$FW_ACT_HOST" "${FLEET_PRIV[@]}" "$FW_ACTION" "$(printf %q "$FW_ACT_NAME")") >"$FW_TMP/out" 2>"$FW_TMP/err" || rc=$?
-  # GHR-101: either one becomes the next frame's notice.
-  relay_file "$FW_TMP/out"
-  relay_file "$FW_TMP/err"
+  # GHR-88: with the origin, and recorded on this node as the command line
+  # the key stands for. GHR-101: out and err are relayed — either one becomes
+  # the next frame's notice.
+  fleet_origin
+  fleet_log_begin "fleet $FW_ACTION --host $FW_ACT_HOST $FW_ACT_NAME (fleet watch)"
+  fleet_call_mutating "$FW_ACT_HOST" "$FW_TMP/out" "$FW_TMP/err" "$budget" "$FW_ACTION" "$(printf %q "$FW_ACT_NAME")"
+  rc="$FLEET_CALL_RC"
+  fleet_log_result "$FW_ACT_HOST" "$rc"
+  fleet_log_finish
   if [ "$rc" = 0 ]; then
     last="$(grep . "$FW_TMP/out" | tail -1 || true)"
     FW_NOTICE="$FW_ACT_NAME on $FW_ACT_HOST: ${last:-$FW_ACTION done}"
@@ -9610,6 +10129,7 @@ cmd_provision() {
     done
     return 0
   fi
+  audit_begin provision "${slots[@]/#/$prefix-}" "$($replace && echo --replace)" # GHR-88: names only — never a token
 
   # Only now, with everything resolved, is a credential needed — a dry run and
   # every refusal above get there without one.
@@ -9872,6 +10392,7 @@ cmd_deprovision() {
       *) die "not confirmed — nothing was changed." ;;
     esac
   fi
+  audit_begin deprovision "$(join_short "${units[*]}")" "$($local_only && echo --local-only)" "$($when_idle && echo --when-idle)" # GHR-88: names only — never a token
 
   # Only now, confirmed and with every target validated, is a credential used.
   if ! $local_only && [ -z "$token" ]; then
@@ -10121,6 +10642,14 @@ cmd_config_example() {
 # FLEET_RUNNERCTL to, so set FLEET_RUNNERCTL to that path.
 #FLEET_SUDO="0"
 
+# This node's record of every fleet command that changed a host (and every
+# fleet watch action key): one line each — UTC time, operator, the command,
+# each host's exit code. Created 0600 in a 0700 directory. Empty = the
+# invoking user's ${XDG_STATE_HOME:-~/.local/state}/runnerctl/fleet.log;
+# otherwise an absolute path. Each host keeps its own record in its journal
+# (`runnerctl history`; `runnerctl fleet history` merges them).
+#FLEET_LOG=""
+
 # --- sudo contract (on each runner host) ------------------------------------
 # narrow = this host's sudoers grants a login runnerctl itself (the narrow
 # contract in the README). Under sudo runnerctl then refuses whatever would
@@ -10286,6 +10815,9 @@ cmd_migrate() {
   is_legacy_script "$from" \
     || die "$from is not a pre-config runnerctl (it carries $(grep -m1 '^RUNNERCTL_VERSION=' "$from")) — nothing to migrate"
   [ -n "$out" ] || out="$CONFIG_FILE"
+  # GHR-88: it writes a config. Reached from `install` too, whose record this
+  # already is.
+  $dry_run || [ -n "$AUDIT_VERB" ] || audit_begin migrate "$out"
 
   # 1. What the old script says.
   declare -A DESC MAX HIGH RS ENV
@@ -10787,6 +11319,7 @@ cmd_upgrade() {
     if $check || [ -n "$ref$sha_pin$prefix" ] || ! $relocate; then
       die "--rollback takes no other option — it downloads nothing and moves nothing, it puts $self.prev back ('runnerctl upgrade --check' names the rollback copy)"
     fi
+    audit_begin upgrade --rollback
     upgrade_rollback "$self"
     return 0
   fi
@@ -10796,6 +11329,7 @@ cmd_upgrade() {
   DOWNLOAD_TMP="$(mktemp)"; trap 'rm -f "$DOWNLOAD_TMP"' EXIT
   fetch_script "$url" "$DOWNLOAD_TMP" "$sha_pin"
   new_ver="$(remote_version "$DOWNLOAD_TMP")"
+  $check || audit_begin upgrade "${new_ver:+to $new_ver}" "${ref:+--ref $ref}"
 
   # --- placement -------------------------------------------------------------
   # target  = the file to write, empty when this call must not write one
@@ -10984,6 +11518,7 @@ cmd_install() {
     echo "source: $url"
   fi
   new_ver="$(remote_version "$src")"
+  $dry_run || audit_begin install "$new_ver" "${ref:+--ref $ref}" "$($migrate || echo --no-migrate)"
 
   # Target: where runnerctl already is, else /usr/local/bin. A copy in the
   # invoking user's home that PATH does not reach never moves the target —
@@ -11103,6 +11638,18 @@ main() {
     CONFIG_FILE="$2"; shift 2; cfg_flag=true
     CONFIG_CHOSEN=""; [ "$CONFIG_FILE" = "$CONFIG_DEFAULT" ] || CONFIG_CHOSEN=--config
   fi
+  # GHR-88: `--origin OPERATOR@HOST`, which `fleet` puts in front of every
+  # verb that changes a host. Taken off before anything reads the command line
+  # — sudo's preflight included — and kept as a string: it is checked against
+  # origin_valid once the environment is settled, written into the record, and
+  # reaches no path, config, command or decision. Under the narrow sudo
+  # contract it is therefore taken as given (README, the per-flag table).
+  local origin_arg="" have_origin=false
+  if [[ "${1:-}" == --origin=* ]]; then set -- --origin "${1#--origin=}" "${@:2}"; fi
+  if [ "${1:-}" = --origin ]; then
+    need_val "$@"
+    origin_arg="$2" have_origin=true; shift 2
+  fi
   # GHR-89: before the config is looked at — even whether it exists, which
   # under sudo would answer for a path the caller cannot see.
   # The environment is pinned under every sudo (harmless where the caller is
@@ -11115,6 +11662,7 @@ main() {
   fi
   ! $cfg_flag || [ -f "$CONFIG_FILE" ] || die "config file $CONFIG_FILE not found"
   load_config
+  ! $have_origin || audit_origin_take "$origin_arg"
   local cmd="${1:-status}"; shift || true
   if is_piped; then
     case "$cmd" in
@@ -11132,7 +11680,7 @@ main() {
     scale)              cmd_scale "$@" ;;
     env-init)           cmd_env_init "$@" ;;
     start|stop|restart) cmd_ctl "$cmd" "$@" ;;
-    drain)              cmd_ctl stop --when-idle "$@" ;;
+    drain)              AUDIT_AS=drain cmd_ctl stop --when-idle "$@" ;;
     enable|disable)     cmd_toggle "$cmd" "$@" ;;
     logs)               cmd_logs "$@" ;;
     remove-limits)      cmd_remove_limits "$@" ;;
@@ -11141,6 +11689,7 @@ main() {
     compose-reap)       cmd_compose_reap "$@" ;;
     compose-reap-timer) cmd_compose_reap_timer "$@" ;;
     health)             cmd_health "$@" ;;
+    history)            cmd_history "$@" ;;
     fleet)              cmd_fleet "$@" ;;
     profiles)           cmd_profiles "$@" ;;
     config-example)     cmd_config_example ;;
@@ -11148,7 +11697,7 @@ main() {
     upgrade)            cmd_upgrade "$@" ;;
     version|--version)  echo "runnerctl $RUNNERCTL_VERSION" ;;
     -h|--help|help)     usage ;;
-    *) die "unknown command '$cmd' (status watch health fleet provision deprovision apply scale env-init start stop restart drain enable disable logs remove-limits reap kill compose-reap compose-reap-timer profiles config-example migrate install upgrade version)" ;;
+    *) die "unknown command '$cmd' (status watch health history fleet provision deprovision apply scale env-init start stop restart drain enable disable logs remove-limits reap kill compose-reap compose-reap-timer profiles config-example migrate install upgrade version)" ;;
   esac
 }
 
