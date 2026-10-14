@@ -393,7 +393,14 @@ Traps:
   the "real" one): the real `root_exec_problem`, `stat` faked from
   `GHR117_TABLE` like GHR-121's, and a `run_priv` that logs each call and then
   makes it for real as this user, dropping a `runuser -u USER --` prefix, and
-  refuses any path outside the case directory.
+  refuses any path outside the case directory. That `run_priv` replaces the
+  stub's, so a whole `apply`/`scale` run under it would hand `systemctl
+  daemon-reload` to the real binary: the GHR-135 `--save` cases build their
+  config with `ghr135_config`, which keeps both and routes each call by
+  whether its argv names the case directory (the config write is GHR-117's,
+  the drop-ins and systemd calls stay the stub's). Their "no root call"
+  assertion is `ghr135_root_call DIR`, not `GHR117_ROOT_CALL`, because the
+  stub's drop-in `mkdir`/`tee` match the latter.
 - **The record (GHR-88) never reaches the real journal or the real fleet
   log.** Three nets, because each covers a path the others miss: the stub
   shadows the record's hook `audit_logger` (each record is a

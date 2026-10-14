@@ -2497,6 +2497,13 @@ out byte-identical to the one just written, or nothing is saved at all. The
 previous file is kept at `<config>.bak`. `scale N --save` saves the same way,
 and without the flag the config is never written.
 
+Under sudo, the save follows the directory rule `install` does: in a config
+directory only root can write, root writes the file as before; in one a single
+user owns (a `--config` under a home), every call is made as that user, so a
+new config there is theirs, `644`; and a directory anyone else can write — or a
+config or `.bak` in it that someone other than its owner holds — is refused
+before the first drop-in is written, naming the directory.
+
 ### Migrating from an inline-configured runnerctl
 
 Earlier versions of this script carried the site values inline — the drop-in
