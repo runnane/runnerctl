@@ -9753,17 +9753,28 @@ fleet_watch_idle_line() { # RUNS VERB NAME
 # (FLEET_EXIT_OWNED) and waits for its own children only.
 FW_CAPACITY=""
 fleet_watch_floor() { # HOST NAME ACTIVE-STATE
-  local slots total avail after note=""
+  fleet_watch_floor_set "$2 on $1: not stopped" "run 'runnerctl stop $2' on $1" "$3"
+}
+# GHR-127: the same floor for a SET of slots taken out together — a host key
+# (D, X) removes every slot of its host at once. Each ACTIVE-STATE that is
+# `active` is one slot of capacity gone, and they are subtracted TOGETHER:
+# checked one at a time, each slot of a host can pass the floor on its own
+# while all of them taken at once cross it. 0 with FW_CAPACITY; 1 with
+# FW_NOTICE (`WHAT — it would leave …; restart --min-available lower …, or
+# REMEDY`) when the set would cross --min-available.
+fleet_watch_floor_set() { # WHAT REMEDY ACTIVE-STATE...
+  local slots total avail after s removed=0 note="" what="$1" remedy="$2"
+  shift 2
+  for s in "$@"; do [ "$s" != active ] || removed=$((removed + 1)); done
   fleet_slots >"$FW_TMP/slots"
   slots="$(cat "$FW_TMP/slots")"
   total="$(printf '%s\n' "$slots" | grep -c . || true)"
   avail="$(fleet_count_available "$slots")"
-  after="$avail"
-  [ "$3" != active ] || after=$((avail - 1))
+  after=$((avail - removed))
   [ "$after" -ge 0 ] || after=0
   [ "$FLEET_SLOTS_SKIPPED" -eq 0 ] || note=", $FLEET_SLOTS_SKIPPED host(s) not answering and not counted"
   if [ "$after" -lt "$FLEET_WATCH_MIN_AVAILABLE" ]; then
-    FW_NOTICE="$2 on $1: not stopped — it would leave $after of $total slot(s) active across the watched hosts$note, under --min-available $FLEET_WATCH_MIN_AVAILABLE; restart --min-available lower (0 turns the floor off), or run 'runnerctl stop $2' on $1"
+    FW_NOTICE="$what — it would leave $after of $total slot(s) active across the watched hosts$note, under --min-available $FLEET_WATCH_MIN_AVAILABLE; restart --min-available lower (0 turns the floor off), or $remedy"
     return 1
   fi
   FW_CAPACITY="leaves $after of $total slot(s) active across the watched hosts$note"
@@ -9794,7 +9805,7 @@ fleet_watch_key_action() { # KEY
 # of the rows since it was opened.
 fleet_watch_slot_action() { # KEY HOST NAME
   local host="$2" name="$3" lbl rc=0 runs
-  FW_NOTICE="" FW_PROMPT="" FW_ACTION="" FW_ACT_HOST="$host" FW_ACT_NAME="$name"
+  FW_NOTICE="" FW_PROMPT="" FW_ACTION="" FW_ACT_HOST="$host" FW_ACT_NAME="$name" FW_ACT_SCOPE=slot
   lbl="$name on $host"
   fleet_priv_cmd
   if [ "$1" = L ]; then
@@ -9900,6 +9911,157 @@ fleet_watch_run_action() { # [--when-idle]
   FW_ACTION="" FW_PROMPT=""
 }
 
+# --- Fleet watch: host keys (GHR-127) -------------------------------------------
+# D W E X act on the HOST of the row the cursor is on — any of its slot rows,
+# its folded line (GHR-75), its error row — and on every slot it has:
+#
+#   D  drain                ONE call, `drain NAME...`: each slot stopped once
+#                           its job is done, one slot at a time
+#   W  restart --when-idle  ONE call, `restart --when-idle NAME...`: rolling,
+#                           each slot restarted once its job is done
+#   E  enable               `enable NAME`, one call per slot, in turn
+#   X  disable              `disable NAME`, one call per slot, in turn
+#
+# E and X are a call per slot because a host's `enable` / `disable` takes ONE
+# target and has always ignored any after it: a list handed to a host would
+# enable its first slot and say `done`. D and W name the slots too, rather than
+# leaning on `drain`'s "no target is every slot": the confirm line then names
+# exactly what runs, and a slot the host gains after the keypress is not
+# touched by a command nobody read. The calls of E and X run in turn in ONE
+# background action, which stops at the first that fails.
+#
+# The contract is the slot keys': the host's slots are read fresh at the
+# keypress (its `status --json`), the confirm line names the exact remote
+# command and the slots it touches, `y` runs it and anything else cancels —
+# `w` included, which means something only at R and S. One action per host
+# (GHR-125), in the background, labelled with the host, on the mutating budget
+# its command earns (a drain or a rolling restart waits up to WAIT_TIMEOUT per
+# slot), with FLEET_SUDO and --origin as for the slot keys.
+#
+# THE FLOOR. D and X take a whole host's capacity away, so the floor is checked
+# for the host's active slots AS A SET (fleet_watch_floor_set): each slot of a
+# host can pass it alone while all of them together cross it. W takes none, as
+# R takes none — a rolling restart puts each slot back before it takes the
+# next; E gives capacity back.
+#
+# Where the cursor is. A host line (Disk/OOM, version) stays a line the cursor
+# passes over (FLEET_INFO_RE): it belongs to the host, and so does every row
+# under it, from any of which the host keys act on that host. A host that is
+# not answering has only its error row; a host key there is refused in words
+# of its own (there are no facts to decide on), and a slot key there still
+# says there is no slot.
+FW_ACT_SCOPE=slot FW_ACT_SLOTS=() FW_ACT_EACH=()
+HF_NAMES=() HF_ACTIVE=() HF_JOBS=()
+# A slot name a host key puts on a command line and in a confirm line: a unit's
+# short name, systemd's `\x2d` escapes included. Anything else is refused.
+FW_HOST_SLOT_RE='^[-A-Za-z0-9_.@:\]+$'
+
+# HOST's slots, fresh from the host, into HF_NAMES / HF_ACTIVE / HF_JOBS (the
+# job a busy slot is running, made safe; empty for an idle one). 1 with
+# FW_NOTICE when the host did not answer, or named a slot as no runner is named.
+# On the watch's budget, as fleet_watch_facts reads one slot.
+fleet_watch_host_facts() { # HOST
+  local rc=0 line name job
+  HF_NAMES=() HF_ACTIVE=() HF_JOBS=()
+  (FLEET_CALL_TIMEOUT="$FLEET_WATCH_TIMEOUT" ssh_run "$1" "$FLEET_RUNNERCTL" status --json) >"$FW_TMP/facts" 2>"$FW_TMP/err" || rc=$?
+  relay_file "$FW_TMP/err"
+  if [ "$rc" != 0 ]; then
+    FW_NOTICE="$1: could not read its current state — $(fleet_error_text "$rc" "$FW_TMP/err" "$FLEET_WATCH_TIMEOUT")"
+    return 1
+  fi
+  while IFS= read -r line; do
+    [[ "$line" == '  {"idx":'* ]] || continue
+    fleet_slot_classify "$line"
+    json_unescape "$SC_NAME"; name="$JSON_TEXT"
+    if [[ ! "$name" =~ $FW_HOST_SLOT_RE ]]; then
+      FW_NOTICE="$1: a slot there is not named as a runner is — nothing issued; act on its slots one at a time"
+      return 1
+    fi
+    job=null
+    [[ ! "$line" =~ \"job\":(.*),\"idle_since\": ]] || job="${BASH_REMATCH[1]}"
+    json_line_get "$line" active
+    relay_safe "$JF" plain
+    HF_NAMES+=("$name") HF_ACTIVE+=("$RELAY_SAFE")
+    if [ "$job" = null ]; then
+      HF_JOBS+=("")
+    else
+      json_unescape "$SC_JOB"; relay_safe "${JSON_TEXT:-(starting)}" plain
+      HF_JOBS+=("$RELAY_SAFE")
+    fi
+  done <"$FW_TMP/facts"
+}
+
+# D W E X on the cursor's host: FW_NOTICE (a refusal, nothing runs) or
+# FW_PROMPT + FW_ACTION with FW_ACT_SCOPE=host and the slots in FW_ACT_SLOTS.
+fleet_watch_host_key() { # D|W|E|X
+  local host="$FW_HOST" verb i names="" each="" busy=""
+  FW_NOTICE="" FW_PROMPT="" FW_ACTION="" FW_ACT_HOST="$host" FW_ACT_NAME="" FW_ACT_SCOPE=host FW_ACT_SLOTS=()
+  if [ "$FW_POS" -lt 0 ]; then FW_NOTICE="no host to act on"; return 0; fi
+  case "$1" in D) verb=drain ;; W) verb=restart ;; E) verb=enable ;; *) verb=disable ;; esac
+  # The error row of a host that is not answering (a folded line is the
+  # host's own, and acts).
+  if [ "${FW_KIND[$FW_POS]:-}" != host ] && [ -z "${FW_ROWS[$FW_POS]#*$'\t'}" ]; then
+    FW_NOTICE="$host: not answering — $1 decides on what the host says, and it says nothing; nothing issued"
+    return 0
+  fi
+  ! fleet_watch_act_refuse "$host" || return 0
+  fleet_watch_host_facts "$host" || return 0
+  if [ "${#HF_NAMES[@]}" -eq 0 ]; then
+    FW_NOTICE="$host: no slots there — nothing to $verb"
+    return 0
+  fi
+  fleet_priv_cmd
+  for i in "${!HF_NAMES[@]}"; do
+    names+="${names:+ }${HF_NAMES[$i]}"
+    each+="${each:+; }${FLEET_PRIV[*]} $verb ${HF_NAMES[$i]}"
+    [ -z "${HF_JOBS[$i]}" ] || busy+="${busy:+, }${HF_NAMES[$i]} (${HF_JOBS[$i]})"
+  done
+  case "$1" in
+    D)
+      fleet_watch_floor_set "$host: not drained" "run 'runnerctl drain' on $host" "${HF_ACTIVE[@]}" || return 0
+      FW_PROMPT="Drain $host? runs on $host: ${FLEET_PRIV[*]} drain $names — each slot stopped once its job is done, one at a time; $FW_CAPACITY  [y/n]" ;;
+    W)
+      FW_PROMPT="Restart $host when idle? runs on $host: ${FLEET_PRIV[*]} restart --when-idle $names — each slot restarted once its job is done, one at a time  [y/n]" ;;
+    E)
+      FW_PROMPT="Enable $host's slots? runs on $host, one call per slot: $each  [y/n]" ;;
+    X)
+      fleet_watch_floor_set "$host: not disabled" "disable its slots one at a time with 'runnerctl disable' on $host" "${HF_ACTIVE[@]}" || return 0
+      FW_PROMPT="Disable $host's slots? runs on $host, one call per slot: $each — $FW_CAPACITY  [y/n]"
+      [ -z "$busy" ] || FW_PROMPT+=$'\n'"warning: a job is running ($busy) — disable stops its slot now and GitHub marks the job failed; D drains instead" ;;
+  esac
+  FW_ACTION="$verb" FW_ACT_SLOTS=("${HF_NAMES[@]}")
+}
+
+# The confirmed host key, in the background (GHR-125) with the host as its
+# label. E and X hand the job their slots in FW_ACT_EACH: one call each.
+fleet_watch_run_host_action() {
+  local budget n="${#FW_ACT_SLOTS[@]}" verb="$FW_ACTION" host="$FW_ACT_HOST" s shown="" flag=""
+  local -a q=() args=()
+  for s in "${FW_ACT_SLOTS[@]}"; do q+=("$(printf %q "$s")"); done
+  fleet_priv_cmd
+  case "$verb" in
+    drain)
+      budget="$(fleet_mutate_budget drain "$n")"
+      args=(drain "${q[@]}")
+      shown="${FLEET_PRIV[*]} drain ${FW_ACT_SLOTS[*]}" ;;
+    restart)
+      flag=" --when-idle"
+      budget="$(fleet_mutate_budget restart "$n" --when-idle)"
+      args=(restart --when-idle "${q[@]}")
+      shown="${FLEET_PRIV[*]} restart --when-idle ${FW_ACT_SLOTS[*]}" ;;
+    *)
+      budget="$(fleet_mutate_budget "$verb" 1)"
+      args=("$verb")
+      FW_ACT_EACH=("${q[@]}")
+      for s in "${FW_ACT_SLOTS[@]}"; do shown+="${shown:+; }${FLEET_PRIV[*]} $verb $s"; done ;;
+  esac
+  printf '\nrunning on %s: %s\n' "$host" "$shown"
+  # GHR-88: recorded on this node as the command line the key stands for.
+  fleet_watch_act_start "$host" "$host" "$verb" \
+    "fleet $verb$flag --host $host ${FW_ACT_SLOTS[*]} (fleet watch)" "$budget" "${args[@]}" || true
+  FW_ACT_EACH=() FW_ACT_SLOTS=() FW_ACTION="" FW_PROMPT="" FW_ACT_SCOPE=slot
+}
+
 # --- Fleet watch: an action in the background (GHR-125) -------------------------
 # A confirmed action used to run in the foreground, and the frame froze until
 # the remote returned — for a --when-idle restart or a drain, up to
@@ -9991,9 +10153,18 @@ fleet_watch_act_start() { # HOST LABEL VERB LOG-TEXT BUDGET REMOTE-ARGS...
   FW_ACT_LAUNCHED=true
 }
 fleet_watch_act_job() { # INDEX BUDGET REMOTE-ARGS...
-  local i="$1" d="$FW_TMP/act.$1"
+  local i="$1" d="$FW_TMP/act.$1" s
   shift
-  fleet_call_mutating "${FLEET_HOSTS[$i]}" "$d/out" "$d/err" "$@"
+  if [ "${#FW_ACT_EACH[@]}" -eq 0 ]; then
+    fleet_call_mutating "${FLEET_HOSTS[$i]}" "$d/out" "$d/err" "$@"
+  else
+    # GHR-127: one call per slot (E, X), in turn, each slot's name after the
+    # args; the first that fails ends the action with its own answer.
+    for s in "${FW_ACT_EACH[@]}"; do
+      fleet_call_mutating "${FLEET_HOSTS[$i]}" "$d/out" "$d/err" "$@" "$s"
+      [ "$FLEET_CALL_RC" = 0 ] || break
+    done
+  fi
   echo "$FLEET_CALL_RC" >"$d/rc.new"
   mv -f "$d/rc.new" "$d/rc"
 }
@@ -10224,9 +10395,9 @@ FLEET_WATCH_HELP="fleet watch — keys
           host that is not answering: that host). There q Esc Enter go back, h
           shows the host alone, ↑ ↓ PgUp PgDn scroll, K R S T P L O act on it
   K R S T P L   kill job, restart, stop, start, reap, logs; R S: w = when idle
+  D W E X   the row's host: drain, restart when idle, enable, disable
   O     print the run URL of the cursor's job — nothing is opened
-  ?     this list
-  q     quit; Esc stops following a running action, which carries on
+  q ?   quit, this list; Esc stops following a running action, which carries on
 ! b i / a s c ask no host anything, and the summary counts the whole fleet."
 
 # Whether nothing is chosen — the frame as fleet_status_table drew it.
@@ -10662,10 +10833,12 @@ fleet_watch_handle_key() { # KEY
   if [ -n "$FW_ACTION" ]; then
     FW_ACT_NOTICE=false
     case "$1" in
-      y|Y) FW_NOTICE=""; fleet_watch_run_action ;;
-      # GHR-126: the graceful form, offered by R and S alone.
-      w)   case "$FW_ACTION" in
-             restart|stop) FW_NOTICE=""; fleet_watch_run_action --when-idle ;;
+      y|Y) FW_NOTICE=""
+           if [ "$FW_ACT_SCOPE" = host ]; then fleet_watch_run_host_action; else fleet_watch_run_action; fi ;;
+      # GHR-126: the graceful form, offered by R and S alone — not by a host
+      # key (GHR-127), whose W is already the graceful restart.
+      w)   case "$FW_ACT_SCOPE:$FW_ACTION" in
+             slot:restart|slot:stop) FW_NOTICE=""; fleet_watch_run_action --when-idle ;;
              *)            FW_NOTICE="cancelled — nothing run"; FW_ACTION="" FW_PROMPT="" ;;
            esac ;;
       *)   FW_NOTICE="cancelled — nothing run"; FW_ACTION="" FW_PROMPT="" ;;
@@ -10686,6 +10859,8 @@ fleet_watch_handle_key() { # KEY
     up|k)   [ "$FW_POS" -le 0 ] || fleet_watch_select $((FW_POS - 1)) ;;
     pgdn|pgup|g|G|home|end) fleet_watch_page "$1" ;;
     K|R|S|T|P|L|O) fleet_watch_key_action "$1" ;;
+    # GHR-127: the host keys, on the host of whatever row the cursor is on.
+    D|W|E|X) fleet_watch_host_key "$1" ;;
     # GHR-125: Esc stops following an action; it never cancels one.
     esc) fleet_watch_act_detach ;;
     '!') FW_FILTER=problems ;;
