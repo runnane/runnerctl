@@ -123,6 +123,40 @@ grep -q '^RUNNERCTL_VERSION="0.0.1"' "$HOME/.local/bin/runnerctl.retired" || fai
 no_sudo "$tmp/o2" "2"
 rm -f "$HOME/.local/bin/runnerctl.retired"
 
+# 2b. GHR-111: the retirement is a rename inside the invoking user's home, so
+#     the destination name is theirs to plant. A `.retired` that is a symlink to
+#     a DIRECTORY has to be replaced, not entered — `mv -f SRC DST` would move
+#     SRC into the directory, which for root under sudo is a user-owned file
+#     dropped into a root directory. Nothing may appear in the decoy.
+mkdir -p "$tmp/decoy2b"
+old_at "$HOME/.local/bin/runnerctl" 0.0.1
+ln -s "$tmp/decoy2b" "$HOME/.local/bin/runnerctl.retired"
+"$HOME/.local/bin/runnerctl" --config "$cfg" upgrade --prefix "$tmp/ulb2b" >"$tmp/o2b" 2>&1 \
+  || fail "2b: upgrade over a symlinked .retired exited $? — $(cat "$tmp/o2b")"
+[ -z "$(ls -A "$tmp/decoy2b")" ] || fail "2b: the retirement followed a symlinked .retired into its directory: $(ls -A "$tmp/decoy2b")"
+[ -f "$HOME/.local/bin/runnerctl.retired" ] && [ ! -L "$HOME/.local/bin/runnerctl.retired" ] || fail "2b: .retired is still the planted symlink, not the retired copy"
+grep -q '^RUNNERCTL_VERSION="0.0.1"' "$HOME/.local/bin/runnerctl.retired" || fail "2b: home copy not retired over the symlink"
+[ ! -e "$HOME/.local/bin/runnerctl" ] || fail "2b: home copy was left in place"
+cmp -s runnerctl "$tmp/ulb2b/runnerctl" || fail "2b: new bytes did not land at the prefix"
+no_sudo "$tmp/o2b" "2b"
+rm -f "$HOME/.local/bin/runnerctl.retired"
+
+# 2c. GHR-111: the same for the in-place path, where the rollback copy is
+#     written beside a script that lives in a directory its user owns:
+#     `<target>.prev` as a symlink to a directory is replaced, not entered.
+#     (A symlink planted at the staging name is install-test case 13c, which
+#     can name the pid.)
+mkdir -p "$tmp/decoy2c"
+old_at "$HOME/.local/bin/runnerctl" 0.0.1
+ln -s "$tmp/decoy2c" "$HOME/.local/bin/runnerctl.prev"
+"$HOME/.local/bin/runnerctl" --config "$cfg" upgrade --prefix "$tmp/ulb2c" --no-relocate >"$tmp/o2c" 2>&1 \
+  || fail "2c: in-place upgrade over a symlinked .prev exited $? — $(cat "$tmp/o2c")"
+[ -z "$(ls -A "$tmp/decoy2c")" ] || fail "2c: the rollback copy was moved into the directory a symlinked .prev named: $(ls -A "$tmp/decoy2c")"
+[ -f "$HOME/.local/bin/runnerctl.prev" ] && [ ! -L "$HOME/.local/bin/runnerctl.prev" ] || fail "2c: .prev is still the planted symlink"
+grep -q '^RUNNERCTL_VERSION="0.0.1"' "$HOME/.local/bin/runnerctl.prev" || fail "2c: .prev does not hold the replaced script"
+no_sudo "$tmp/o2c" "2c"
+rm -f "$HOME/.local/bin/runnerctl.prev" "$HOME/.local/bin/runnerctl"
+
 # 3. Placement is healed even when the VERSION is already current — the case
 #    a version-only upgrade can never fix, and the one a fleet stays broken
 #    on indefinitely. The final sentence must still be the parseable one.

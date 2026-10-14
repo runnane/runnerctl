@@ -175,6 +175,49 @@ grep -q "not downgrading" "$tmp/out15" || fail "newer home copy was not refused:
 [ -e "$HOME/bin/runnerctl" ] && [ ! -e "$tmp/ulb13b" ] || fail "refused downgrade still moved something"
 rm -f "$HOME/bin/runnerctl"
 
+# 13b. GHR-111: the home directory is the invoking user's, so every name in it
+#      is theirs to plant. A `.retired` that is a symlink to a DIRECTORY must be
+#      replaced by the rename, not followed: `mv -f SRC DST` moves SRC *into*
+#      the directory DST points at, which for root renaming under sudo is a
+#      user-owned file dropped into a root directory (/etc/sudoers.d, say).
+#      The decoy is an empty temp directory; nothing may appear in it.
+mkdir -p "$tmp/decoy13"; rm -f "$HOME/bin/runnerctl.retired"
+sed 's/^RUNNERCTL_VERSION=.*/RUNNERCTL_VERSION="0.0.1"/' runnerctl >"$HOME/bin/runnerctl"
+ln -s "$tmp/decoy13" "$HOME/bin/runnerctl.retired"
+RUNNERCTL_CONFIG="$tmp/home/etc/config" ./runnerctl install --prefix "$tmp/ulb13c" >"$tmp/out15c" 2>&1 \
+  || fail "13b: install over a symlinked .retired exited $? — $(cat "$tmp/out15c")"
+[ -z "$(ls -A "$tmp/decoy13")" ] || fail "13b: the rename followed a symlinked .retired into its directory: $(ls -A "$tmp/decoy13")"
+[ -f "$HOME/bin/runnerctl.retired" ] && [ ! -L "$HOME/bin/runnerctl.retired" ] || fail "13b: .retired is still the planted symlink, not the retired copy"
+grep -q '^RUNNERCTL_VERSION="0.0.1"' "$HOME/bin/runnerctl.retired" || fail "13b: the home copy was not retired over the symlink"
+[ ! -e "$HOME/bin/runnerctl" ] || fail "13b: the home copy was left in place"
+rm -f "$HOME/bin/runnerctl.retired"
+# The same for a legacy copy's `.legacy`, the other name this rename takes.
+mkdir -p "$tmp/decoy13l"
+cp "$legacy" "$HOME/bin/runnerctl"; chmod 755 "$HOME/bin/runnerctl"
+ln -s "$tmp/decoy13l" "$HOME/bin/runnerctl.legacy"
+RUNNERCTL_CONFIG="$tmp/home/etc/config" ./runnerctl install --prefix "$tmp/ulb13d" --no-migrate >"$tmp/out15d" 2>&1 \
+  || fail "13b: legacy install over a symlinked .legacy exited $? — $(cat "$tmp/out15d")"
+[ -z "$(ls -A "$tmp/decoy13l")" ] || fail "13b: the rename followed a symlinked .legacy into its directory: $(ls -A "$tmp/decoy13l")"
+cmp -s "$legacy" "$HOME/bin/runnerctl.legacy" && [ ! -L "$HOME/bin/runnerctl.legacy" ] || fail "13b: the legacy copy was not retired over the symlink"
+rm -f "$HOME/bin/runnerctl.legacy"
+
+# 13c. GHR-111: install_file stages at `<dir>/.<name>.new.<pid>`, a name the
+#      directory's owner can predict. A symlink planted there must not be
+#      written through (that is an arbitrary-file overwrite as root when the
+#      directory is a user's), and a symlinked DEST that points at a directory
+#      is replaced, not entered. Run through install_file itself: `$$` is the
+#      one pid the plant can name, so the plant is made by the shell that runs it.
+mkdir -p "$tmp/stg13" "$tmp/decoy13s"
+printf 'precious\n' >"$tmp/victim13"
+ln -s "$tmp/decoy13s" "$tmp/stg13/runnerctl.prev"
+RUNNERCTL_NO_MAIN=1 bash -c '. "$0" && ln -s "$2" "$1/.runnerctl.new.$$" && install_file "$3" "$1/runnerctl" && install_file "$3" "$1/runnerctl.prev"' \
+  "$PWD/runnerctl" "$tmp/stg13" "$tmp/victim13" "$PWD/runnerctl" >"$tmp/out15e" 2>&1 \
+  || fail "13c: install_file exited $? — $(cat "$tmp/out15e")"
+[ "$(cat "$tmp/victim13")" = precious ] || fail "13c: install_file wrote through a planted staging symlink (victim now $(wc -c <"$tmp/victim13") bytes, was 9)"
+cmp -s runnerctl "$tmp/stg13/runnerctl" || fail "13c: the staged file did not land"
+[ -z "$(ls -A "$tmp/decoy13s")" ] || fail "13c: a symlinked DEST was entered, not replaced: $(ls -A "$tmp/decoy13s")"
+cmp -s runnerctl "$tmp/stg13/runnerctl.prev" && [ ! -L "$tmp/stg13/runnerctl.prev" ] || fail "13c: the symlinked DEST was not replaced by the file"
+
 # 14. Under a restrictive umask everything created still comes out a+rx. This
 #     is the regression guard for GHR-47: a symbolic `chmod +x` is masked by
 #     the umask, and `cp` masks the copied mode too, so at umask 077 the file
