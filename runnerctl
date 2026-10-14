@@ -70,6 +70,8 @@
 #                          [--restart-stalled]
 #   runnerctl fleet upgrade [--check] [--ref <branch|tag>] [--sha256 SUM] \
 #                           [--host H]... [--canary [H]] [--serial] [--stop-on-failure]
+#   runnerctl fleet upgrade --push [--check] [--host H]... [--canary [H]] [--serial] \
+#                           [--stop-on-failure]
 #   runnerctl fleet upgrade --rollback [--host H]... [--serial] [--stop-on-failure]
 #   runnerctl fleet <apply|scale|start|stop|restart|drain|kill|reap| \
 #                    remove-limits|enable|disable> [--host H]... \
@@ -312,6 +314,13 @@
 # actually change — and continues only if it ends `upgraded`; --serial goes
 # one host at a time; --stop-on-failure also halts at the first failed row
 # and names the hosts it did not attempt.
+# `fleet upgrade --push` (GHR-83) sends THIS node's own runnerctl over ssh
+# instead: each host checks the bytes against this node's sha256, installs
+# them with `sudo -n bash <file> install`, and is `upgraded` only when its
+# checksum read back matches — so hosts need no outbound access, all land on
+# identical bytes, and a host with no runnerctl gets one. A host newer than
+# this node is left alone. `--push --check` writes nothing and reports each
+# host as same, differs, absent or newer.
 # The MUTATING commands fan out too (GHR-43), and differ from the read-only
 # ones in three ways. They go ONE HOST AT A TIME (FLEET_PARALLEL is ignored),
 # so with the per-host --when-idle the blast radius is a single host at any
@@ -6021,7 +6030,8 @@ cmd_history() { # [-n N]
 # everything but `install` deliberately, and version skew is better solved
 # once by a fleet-wide upgrade than by paying a transfer on every command.
 
-# Every ssh call goes through here — nothing else in this script may invoke
+# Every ssh call goes through here (or ssh_run_stdin below, its twin that
+# feeds a file, or ssh_control) — nothing else in this script may invoke
 # ssh. That is what lets tests/stub.config shadow the transport the way it
 # already shadows systemctl and journalctl, and the harness fails any call
 # that bypasses the stub. The exit status is the remote command's, except
@@ -6056,6 +6066,25 @@ ssh_run() { # HOST COMMAND...
     ${FLEET_SSH_CONTROL_OPTS+"${FLEET_SSH_CONTROL_OPTS[@]}"} \
     ${FLEET_SSH_OPTS+"${FLEET_SSH_OPTS[@]}"} \
     -- "$host" "$@"
+}
+
+# The same call with FILE on the remote command's stdin (GHR-83) — the THIRD
+# sanctioned ssh path, and ssh_run in every other respect: the same options,
+# the same control-socket options, the same budget, the same exit statuses.
+# It exists for `fleet upgrade --push`, which streams this node's own script
+# to each host; ssh_run's stdin is whatever the caller's is, which a fan-out
+# must never hand to a remote. A function for the same reason ssh_run is one:
+# tests/stub.config shadows it, and anything reaching `ssh` itself fails a case.
+ssh_run_stdin() { # HOST FILE -- COMMAND...
+  local host="$1" file="$2"
+  shift 2
+  [ "${1:-}" != -- ] || shift
+  timeout "${FLEET_CALL_TIMEOUT:-$FLEET_TIMEOUT}" ssh \
+    -o BatchMode=yes \
+    -o ConnectTimeout=10 \
+    ${FLEET_SSH_CONTROL_OPTS+"${FLEET_SSH_CONTROL_OPTS[@]}"} \
+    ${FLEET_SSH_OPTS+"${FLEET_SSH_OPTS[@]}"} \
+    -- "$host" "$@" <"$file"
 }
 
 # --- Persistent ssh for a polling loop (GHR-54) -------------------------------
@@ -6110,7 +6139,8 @@ fleet_ssh_control_close() {
   FLEET_SSH_CONTROL_OPTS=()
 }
 
-# The SECOND sanctioned ssh path, and the only other one: control-socket
+# The SECOND sanctioned ssh path (ssh_run_stdin, ssh_run with a file on
+# stdin, is the third, and there is no fourth): control-socket
 # administration (`ssh -O`), which carries no remote command and so cannot go
 # through ssh_run. Like ssh_run it is a function precisely so tests/stub.config
 # can shadow it — anything that reaches `ssh` itself has bypassed the
@@ -6223,6 +6253,9 @@ FLEET_BUDGETS=()
 # it — S's capacity floor — must not replace that with the removal of one
 # directory. Its trap removes this fan-out's FLEET_DIR as well.
 FLEET_EXIT_OWNED=false
+# GHR-83: the file every host of the fan-out in flight gets on stdin, empty for
+# none. Set around one fan-out by fleet_push_stage and emptied straight after.
+FLEET_STDIN_FILE=""
 fleet_fanout() { # REMOTE-ARGS...
   local i host running=0
   local -a retry=() pids=()
@@ -6319,7 +6352,14 @@ fleet_fanout_one() { # INDEX REMOTE-ARGS...
   # GHR-80: timed around the call alone, for `duration_ms` — a host asked
   # twice (the skew retry) reports the call whose answer it is.
   t0="$(now_ms)"
-  FLEET_CALL_TIMEOUT="${FLEET_BUDGETS[$i]:-}" ssh_run "$host" "${args[@]}" >"$FLEET_DIR/$i.out" 2>"$FLEET_DIR/$i.err" || hrc=$?
+  # GHR-83: a fan-out that feeds every host the same file (FLEET_STDIN_FILE,
+  # `fleet upgrade --push`) goes through ssh_run_stdin; every other one has
+  # nothing on stdin to give.
+  if [ -n "$FLEET_STDIN_FILE" ]; then
+    FLEET_CALL_TIMEOUT="${FLEET_BUDGETS[$i]:-}" ssh_run_stdin "$host" "$FLEET_STDIN_FILE" -- "${args[@]}" >"$FLEET_DIR/$i.out" 2>"$FLEET_DIR/$i.err" || hrc=$?
+  else
+    FLEET_CALL_TIMEOUT="${FLEET_BUDGETS[$i]:-}" ssh_run "$host" "${args[@]}" >"$FLEET_DIR/$i.out" 2>"$FLEET_DIR/$i.err" || hrc=$?
+  fi
   echo $(($(now_ms) - t0)) >"$FLEET_DIR/$i.ms"
   # GHR-101: the one place a fan-out's answer lands, so every reader after it
   # — the table, the reports, the error rows — has relayable text and none
@@ -7566,15 +7606,16 @@ FLEET_UP_FWD=()
 # the version its `Rolled back A -> B` sentence names is what the read-back
 # must answer. Same stages, same rows, its own words.
 FLEET_UP_ROLLBACK=false
-cmd_fleet_upgrade() { # [--check] [--ref REF] [--sha256 SUM] [--rollback] [--host H]... [--canary [H]] [--serial] [--stop-on-failure]
+cmd_fleet_upgrade() { # [--check] [--push] [--ref REF] [--sha256 SUM] [--rollback] [--host H]... [--canary [H]] [--serial] [--stop-on-failure]
   local check=false canary=false canary_host="" serial=false stop=false
   local rc=0 k n c="" halted="" names=""
   local -a hosts=() all=() rest=() left=() would=()
-  FLEET_UP_FWD=() FLEET_UP_ROLLBACK=false
+  FLEET_UP_FWD=() FLEET_UP_ROLLBACK=false FLEET_UP_PUSH=false
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     case "$1" in
       --check) check=true; shift ;;
+      --push)  FLEET_UP_PUSH=true; shift ;;
       --ref)   need_val "$@"; FLEET_UP_FWD+=(--ref "$2"); shift 2 ;;
       # Validated here as the host would, so a typo fails once, before any
       # host is dialled, rather than once per host.
@@ -7621,6 +7662,18 @@ cmd_fleet_upgrade() { # [--check] [--ref REF] [--sha256 SUM] [--rollback] [--hos
     if [ "${#FLEET_UP_FWD[@]}" -gt 0 ]; then
       die "--rollback downloads nothing, so --ref and --sha256 do not apply to it"
     fi
+  fi
+  # GHR-83: --push sends THIS node's script, so there is nothing to pick a
+  # release with (--ref) or to pin a download to (--sha256): the checksum it
+  # installs against is this file's own. And a rollback sends nothing at all.
+  if $FLEET_UP_PUSH; then
+    if $FLEET_UP_ROLLBACK; then
+      die "--push and --rollback do not combine: a rollback puts back each host's own .prev and sends nothing"
+    fi
+    if [ "${#FLEET_UP_FWD[@]}" -gt 0 ]; then
+      die "--push sends this node's own runnerctl and downloads nothing, so --ref and --sha256 do not apply to it (upgrade this node first to push another version)"
+    fi
+    fleet_push_source
   fi
   require_fleet
   [ "${#hosts[@]}" -eq 0 ] || fleet_select_hosts "${hosts[@]}"
@@ -7750,6 +7803,7 @@ fleet_upgrade_stage() { # CHECK INDEX...
   local check="$1" j k
   shift
   local -a idx=("$@") wrote=() args=(upgrade)
+  if $FLEET_UP_PUSH; then fleet_push_stage "$check" "${idx[@]}"; return 0; fi
   ! $check || args+=(--check)
   ! $FLEET_UP_ROLLBACK || args+=(--rollback)
   args+=(${FLEET_UP_FWD[@]+"${FLEET_UP_FWD[@]}"})
@@ -7971,6 +8025,240 @@ fleet_upgrade_state_line() {
   done
   [ -z "$unknown" ] || out+="${out:+; }unknown: $unknown"
   echo "not on one version — $out"
+}
+
+# --- fleet upgrade --push (GHR-83) ----------------------------------------------
+# `fleet upgrade` has each host download its own copy: every host needs
+# outbound HTTPS to UPGRADE_URL, `latest` is resolved per host at a different
+# moment on each, and a host with no usable runnerctl cannot be reached at
+# all. --push sends THIS node's script over the ssh connection instead, so
+# every host lands on the same bytes, verified by checksum, with no outbound
+# access and no runnerctl needed beforehand.
+#
+# Not the excluded category. `env-init` and `provision` stay off the fan-out
+# because they move secrets and credentials; what this moves is the script,
+# which is public code, and nothing else — no config, no token.
+#
+# Per host, three calls, each built here as FIXED TEXT from this node's own
+# values (FLEET_RUNNERCTL, checked below; the checksum; the origin word, which
+# origin_valid already holds to a plain shape). Nothing a host sends back is
+# ever put into a command:
+#   probe     read-only, as the login: the sha256 of whatever FLEET_RUNNERCTL
+#             resolves to and its RUNNERCTL_VERSION line; exit 127 when it
+#             resolves to nothing — absent.
+#   install   (a write, only for a host that differs or is absent) through
+#             ssh_run_stdin: the bytes land in a fresh mktemp file, are checked
+#             against this node's sha256 and refused on a mismatch, and only
+#             then installed with `sudo -n bash FILE install` — an ordinary
+#             FILE install, so cmd_install takes this very file as its source
+#             (is_piped is false: BASH_SOURCE is the file) rather than the
+#             piped branch, which downloads. That is also what keeps
+#             cmd_migrate in the path for a pre-config host. The temp file is
+#             removed on every exit, a hang-up included.
+#   read-back the probe again, and `upgraded` only when the checksum the fleet
+#             path now answers is this node's.
+#
+# FLEET_SUDO does not change it. The install needs root to write the script,
+# and under the narrow contract the host's grant covers `sudo -n
+# FLEET_RUNNERCTL …` alone, which a host without runnerctl cannot have; so
+# --push always asks `sudo -n bash`, and a host that does not grant it is a
+# named row (-n: never a prompt, never a hang).
+#
+# A host NEWER than this node is left alone — upgrade's `not downgrading` rule,
+# and with no flag to override it: to push an older script, run it from a node
+# that has it on purpose. A host whose checksum already matches is `same`, and
+# nothing is sent to it.
+FLEET_UP_PUSH=false
+FLEET_PUSH_SRC="" FLEET_PUSH_SHA="" FLEET_PUSH_VER=""
+# What a probe answered, from fleet_push_probe_read.
+PUSH_SHA="" PUSH_VER=""
+
+# This node's script as a file, its sha256 and version, into FLEET_PUSH_*.
+# Piped (`curl … | bash -s -- fleet upgrade --push`) there is no file to send,
+# and a download would defeat the point. FLEET_RUNNERCTL goes into the remote
+# commands, so it is held to a plain path shape first.
+fleet_push_source() {
+  is_piped && die "--push sends this node's own runnerctl as a file, and this one is being read from a pipe — install it first ('runnerctl install'), then push from the installed copy"
+  FLEET_PUSH_SRC="$(readlink -f "${BASH_SOURCE[0]}")"
+  { [ -f "$FLEET_PUSH_SRC" ] && [ -r "$FLEET_PUSH_SRC" ]; } || die "--push cannot read this node's runnerctl at $FLEET_PUSH_SRC"
+  FLEET_PUSH_VER="$(remote_version "$FLEET_PUSH_SRC" 2>/dev/null || true)"
+  valid_runner_version "$FLEET_PUSH_VER" || die "--push: $FLEET_PUSH_SRC carries no valid RUNNERCTL_VERSION — not sending it"
+  FLEET_PUSH_SHA="$(script_sha256 "$FLEET_PUSH_SRC")"
+  [[ "$FLEET_PUSH_SHA" =~ ^[0-9a-f]{64}$ ]] || die "--push could not compute the sha256 of $FLEET_PUSH_SRC"
+  [[ "$FLEET_RUNNERCTL" =~ ^[A-Za-z0-9_./+][A-Za-z0-9_./+-]*$ ]] \
+    || die "--push builds the remote commands with FLEET_RUNNERCTL '$FLEET_RUNNERCTL' in them, and it is not a plain path (letters, digits and _ . / + -)"
+}
+
+# The probe, as the one word ssh hands the login shell. /bin/sh is named so
+# the text means one thing whatever the login's own shell is.
+fleet_push_probe_cmd() {
+  local s
+  # shellcheck disable=SC2016  # the remote shell expands these, not this one
+  s='p=$(command -v '"$FLEET_RUNNERCTL"') || exit 127; sha256sum <"$p" || exit 3; grep -m1 "^RUNNERCTL_VERSION=" "$p" || true'
+  printf "exec /bin/sh -c '%s'\n" "$s"
+}
+
+# The install, as one word: ORIGIN-WORD is `--origin=…` or empty. An absolute
+# FLEET_RUNNERCTL named runnerctl is installed where it points (--prefix);
+# anything else lands where `install` decides, and the read-back says whether
+# the fleet path then runs it.
+fleet_push_install_cmd() { # [ORIGIN-WORD]
+  local s extra="" prefix=""
+  [ -z "${1:-}" ] || extra=" $1"
+  case "$FLEET_RUNNERCTL" in /*/runnerctl) prefix=" --prefix ${FLEET_RUNNERCTL%/runnerctl}" ;; esac
+  # shellcheck disable=SC2016  # the remote shell expands these, not this one
+  s='t=$(mktemp) || exit 3; trap "rm -f -- \"\$t\"" EXIT; trap "exit 129" HUP INT TERM; cat >"$t" || exit 3; s=$(sha256sum <"$t") || exit 3; s=${s%% *}; if [ "$s" != "'"$FLEET_PUSH_SHA"'" ]; then echo "runnerctl push: the bytes received have sha256 $s, not '"$FLEET_PUSH_SHA"' - refusing to install them" >&2; exit 4; fi; sudo -n bash "$t"'"$extra"' install'"$prefix"
+  printf "exec /bin/sh -c '%s'\n" "$s"
+}
+
+# A probe's answer in FILE, into PUSH_SHA / PUSH_VER: the first line must be
+# sha256sum's own (`<64 hex>  -`), the second is the version line or absent
+# (a pre-config script has none). Strict matches only — this is a remote's
+# text, so anything else is not an answer and nothing of it is kept.
+fleet_push_probe_read() { # FILE
+  local l1="" l2=""
+  PUSH_SHA="" PUSH_VER=""
+  { IFS= read -r l1 || true; IFS= read -r l2 || true; } <"$1"
+  [[ "$l1" =~ ^([0-9a-f]{64})\ \ -$ ]] || return 1
+  PUSH_SHA="${BASH_REMATCH[1]}"
+  if [[ "$l2" =~ ^RUNNERCTL_VERSION=\"([0-9]+\.[0-9]+\.[0-9]+)\" ]]; then
+    PUSH_VER="${BASH_REMATCH[1]}"
+  fi
+  return 0
+}
+
+# One push stage over INDEX... of FLEET_UP_HOSTS, into the same rows
+# fleet_upgrade_stage fills, so --host, --canary, --serial and
+# --stop-on-failure stage a push exactly as they stage an upgrade. With CHECK
+# it is the probe alone: `same`, `differs`, `absent`, `newer`, and nothing
+# written.
+fleet_push_stage() { # CHECK INDEX...
+  local check="$1" j k oword=""
+  shift
+  local -a idx=("$@") send=() wrote=()
+  FLEET_HOSTS=() FLEET_BUDGETS=()
+  for k in "${idx[@]}"; do FLEET_HOSTS+=("${FLEET_UP_HOSTS[$k]}"); done
+  # The probe is a read: the login, FLEET_TIMEOUT, no origin.
+  FLEET_ORIGIN=() FLEET_ORIGIN_WORD=""
+  fleet_fanout "$(fleet_push_probe_cmd)"
+  for j in "${!idx[@]}"; do
+    k="${idx[$j]}"
+    fleet_push_classify "$j" "$k"
+    if ! $check && [ "${FLEET_UP_KIND[$k]}" = changed ]; then send+=("$k"); fi
+  done
+  fleet_cleanup
+  if [ "${#send[@]}" -gt 0 ]; then
+    FLEET_HOSTS=() FLEET_BUDGETS=()
+    for k in "${send[@]}"; do
+      FLEET_HOSTS+=("${FLEET_UP_HOSTS[$k]}")
+      FLEET_BUDGETS+=("$(fleet_mutate_budget upgrade 1)")
+    done
+    # The origin rides INSIDE the install text, after `bash FILE`, where the
+    # pushed script's own main reads it — so it is not a word fleet_fanout
+    # could drop and retry, and FLEET_ORIGIN stays empty for the fan-out.
+    fleet_origin
+    oword="$FLEET_ORIGIN_WORD"
+    FLEET_ORIGIN=() FLEET_ORIGIN_WORD=""
+    # GHR-88: the record says this was a push, and of which bytes.
+    fleet_log_begin "$(fleet_log_argv) (push sha256 $FLEET_PUSH_SHA)"
+    FLEET_STDIN_FILE="$FLEET_PUSH_SRC"
+    fleet_fanout "$(fleet_push_install_cmd "$oword")"
+    FLEET_STDIN_FILE=""
+    fleet_log_results
+    for j in "${!send[@]}"; do
+      k="${send[$j]}"
+      fleet_push_sent "$j" "$k"
+      [ "${FLEET_UP_KIND[$k]}" != wrote ] || wrote+=("$k")
+    done
+    fleet_cleanup
+    FLEET_BUDGETS=()
+  fi
+  if [ "${#wrote[@]}" -gt 0 ]; then
+    FLEET_HOSTS=()
+    for k in "${wrote[@]}"; do FLEET_HOSTS+=("${FLEET_UP_HOSTS[$k]}"); done
+    fleet_fanout "$(fleet_push_probe_cmd)"
+    for j in "${!wrote[@]}"; do
+      fleet_push_verify "$j" "${wrote[$j]}"
+    done
+    fleet_cleanup
+  fi
+  FLEET_HOSTS=("${FLEET_UP_HOSTS[@]}")
+}
+
+# What host J's probe answered, into row K.
+fleet_push_classify() { # J K
+  local j="$1" k="$2" rc
+  rc="$(fleet_rc "$j")"
+  FLEET_UP_NOW[k]="" FLEET_UP_WANT[k]="$FLEET_PUSH_VER"
+  if [ "$rc" = 127 ]; then
+    FLEET_UP_KIND[k]=changed FLEET_UP_STATE[k]="absent" FLEET_UP_VERS[k]="none -> $FLEET_PUSH_VER"
+    return 0
+  fi
+  if [ "$rc" != 0 ]; then
+    FLEET_UP_KIND[k]=bad FLEET_UP_VERS[k]="—"
+    FLEET_UP_STATE[k]="$(fleet_error_text "$rc" "$FLEET_DIR/$j.err")"
+    return 0
+  fi
+  if ! fleet_push_probe_read "$FLEET_DIR/$j.out"; then
+    FLEET_UP_KIND[k]=bad FLEET_UP_VERS[k]="—"
+    FLEET_UP_STATE[k]="unrecognised: its answer to the checksum read is not a sha256sum line"
+    return 0
+  fi
+  FLEET_UP_NOW[k]="$PUSH_VER"
+  if [ "$PUSH_SHA" = "$FLEET_PUSH_SHA" ]; then
+    FLEET_UP_KIND[k]=level FLEET_UP_STATE[k]="same" FLEET_UP_VERS[k]="${PUSH_VER:-?}"
+  elif [ -n "$PUSH_VER" ] && version_lt "$FLEET_PUSH_VER" "$PUSH_VER"; then
+    FLEET_UP_KIND[k]=level FLEET_UP_STATE[k]="newer than this node — left alone"
+    FLEET_UP_VERS[k]="$PUSH_VER -> $FLEET_PUSH_VER"
+  else
+    FLEET_UP_KIND[k]=changed FLEET_UP_STATE[k]="differs"
+    FLEET_UP_VERS[k]="${PUSH_VER:-pre-config} -> $FLEET_PUSH_VER"
+  fi
+}
+
+# What host J of the install fan-out did, into row K. Exit 0 is the host's
+# word only: `wrote`, until the read-back has its say.
+fleet_push_sent() { # J K
+  local j="$1" k="$2" rc err=""
+  rc="$(fleet_rc "$j")"
+  if [ "$rc" = 0 ]; then
+    FLEET_UP_KIND[k]=wrote FLEET_UP_STATE[k]="pushed"
+    return 0
+  fi
+  FLEET_UP_KIND[k]=bad
+  [ ! -s "$FLEET_DIR/$j.err" ] || err="$(head -1 "$FLEET_DIR/$j.err")"
+  case "$rc:$err" in
+    1:*sudo:*|1:*"a password is required"*|1:*"may not run"*|1:*"no tty present"*)
+      FLEET_UP_STATE[k]="remote exit 1 — $err — --push installs with 'sudo -n bash <the pushed file> install', so the ssh login needs passwordless sudo for that on this host (FLEET_SUDO=1's grant for runnerctl alone does not cover it)" ;;
+    *)
+      FLEET_UP_STATE[k]="$(fleet_error_text "$rc" "$FLEET_DIR/$j.err" "${FLEET_BUDGETS[$j]:-}" mutating)" ;;
+  esac
+}
+
+# What host J's read-back answered, into row K: `upgraded` only when the fleet
+# path's checksum is this node's.
+fleet_push_verify() { # J K
+  local j="$1" k="$2" rc
+  rc="$(fleet_rc "$j")"
+  FLEET_UP_NOW[k]="" FLEET_UP_KIND[k]=bad
+  if [ "$rc" = 127 ]; then
+    FLEET_UP_STATE[k]="pushed, but $FLEET_RUNNERCTL still resolves to nothing for the ssh login"
+    return 0
+  fi
+  if [ "$rc" != 0 ]; then
+    FLEET_UP_STATE[k]="pushed but the read-back did not answer: $(fleet_error_text "$rc" "$FLEET_DIR/$j.err")"
+    return 0
+  fi
+  if ! fleet_push_probe_read "$FLEET_DIR/$j.out"; then
+    FLEET_UP_STATE[k]="pushed but the read-back's answer is not a sha256sum line"
+    return 0
+  fi
+  FLEET_UP_NOW[k]="$PUSH_VER"
+  if [ "$PUSH_SHA" = "$FLEET_PUSH_SHA" ]; then
+    FLEET_UP_KIND[k]=upgraded FLEET_UP_STATE[k]="upgraded"
+  else
+    FLEET_UP_STATE[k]="pushed, but the fleet path's runnerctl has sha256 ${PUSH_SHA:0:12}…, not this node's ${FLEET_PUSH_SHA:0:12}…"
+  fi
 }
 
 # `fleet health`: one exit code for the whole fleet, so a central node needs

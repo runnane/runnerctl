@@ -1769,6 +1769,64 @@ An answer this does not recognise is shown verbatim rather than folded into
 "up to date" — quietly reporting a host as level when it said something else
 is what sends someone to the wrong box.
 
+##### Sending this node's own copy: `--push`
+
+A plain `fleet upgrade` has each host download the release itself, so every
+host needs outbound HTTPS to `UPGRADE_URL`, `latest` is resolved on each host
+at a slightly different moment, and a host with no working `runnerctl` cannot
+be reached at all. `--push` sends **this node's own installed script** over
+the ssh connection instead:
+
+```
+$ runnerctl fleet upgrade --push --check
+build-1  0.8.1 -> 0.8.2  differs
+build-2  0.8.2           same
+build-3  none -> 0.8.2   absent
+build-4  0.9.0 -> 0.8.2  newer than this node — left alone
+4 host(s): 2 up to date, 2 would change, 0 unreachable or unclear
+
+$ runnerctl fleet upgrade --push
+build-1  0.8.1 -> 0.8.2  upgraded
+build-2  0.8.2           same
+build-3  none -> 0.8.2   upgraded
+build-4  0.9.0 -> 0.8.2  newer than this node — left alone
+4 host(s): 2 already level, 2 upgraded, 0 unreachable or unclear
+not on one version — 0.8.2: build-1 build-2 build-3; 0.9.0: build-4
+```
+
+For each host it first reads the sha256 and `RUNNERCTL_VERSION` of whatever
+`FLEET_RUNNERCTL` resolves to for the ssh login:
+
+- **`same`** — the checksum is this node's. Nothing is sent.
+- **`newer than this node — left alone`** — `upgrade`'s `not downgrading`
+  rule. Nothing is sent, and there is no flag to override it: push an older
+  script from a node that runs it.
+- **`differs`** — another version, or the same version with other bytes, or a
+  pre-config script with no version. The script is pushed.
+- **`absent`** — `FLEET_RUNNERCTL` resolves to nothing (exit 127). The script
+  is pushed, which bootstraps the host from the central node in one command.
+
+A pushed host lands the bytes in a fresh `mktemp` file, checks them against
+this node's sha256 and refuses on a mismatch, then runs `sudo -n bash <that
+file> install` — an ordinary file install, so `install`'s own rules apply:
+a pre-config script is migrated first, a newer one is never overwritten. The
+temp file is removed on every path. The row says `upgraded` only when the
+checksum read back through `FLEET_RUNNERCTL` afterwards is this node's.
+
+`--push --check` writes nothing and sends nothing; its exit code is non-zero
+only for a host that could not be read, as for `--check`. `--host`,
+`--canary`, `--serial` and `--stop-on-failure` stage a push exactly as they
+stage an upgrade. `--ref`, `--sha256` and `--rollback` are refused: a push
+downloads nothing and sends what this node runs — to push a different version,
+upgrade this node first. The central record (`fleet history`) names the
+push and the sha256 that was sent.
+
+A push needs **passwordless `sudo bash` for the ssh login** on each host
+(`sudo -n`, so a host without it is a named row, never a hang). That is wider
+than either sudoers shape below, `FLEET_SUDO=1` does not change it, and it is
+root for that login — use it where the fleet login already has full sudo, or
+for bootstrap.
+
 ##### The sudo requirement
 
 `upgrade` writes the installed script, which on a normal host needs root, so

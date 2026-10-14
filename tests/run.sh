@@ -3422,6 +3422,239 @@ case_fleet_upgrade_sha256_is_validated_and_forwarded() {
   expect_no_log '^probe:ssh_run '
 }
 
+# --- GHR-83: fleet upgrade --push ------------------------------------------------
+# A push host is a directory under $WRITES/remote/<host>/ (tests/stub.config,
+# stub_push_host): bin/runnerctl is what FLEET_RUNNERCTL resolves to, `before`
+# a copy of it as the case began, tmp/ its TMPDIR, and its `sudo` runs the
+# REAL install of the file it is handed into bin/. The remote text the script
+# builds is run for real by /bin/sh there, so the sha256 check, the temp file
+# and the `bash FILE` are the script's own, not a model of them. By name:
+# *absent* has no runnerctl, *pushsame* has this node's bytes, *ahead* is
+# stamped 9.9.9, anything else 0.0.1; *mangle* receives the bytes with one
+# changed, *pushcorrupt* installs other bytes than it was handed, *nosudo* has
+# no passwordless sudo.
+PUSH_PROBE_RE='exec /bin/sh -c .p=\$\(command -v runnerctl\)'
+PUSH_INSTALL_RE='exec /bin/sh -c .t=\$\(mktemp\)'
+push_ver() { grep -m1 '^RUNNERCTL_VERSION=' "$RUNNERCTL" | cut -d'"' -f2; }
+push_sha() { sha256sum "$RUNNERCTL" | cut -d' ' -f1; }
+push_dir() { echo "$WRITES/remote/$1"; }
+# A host's temp directory is empty: the pushed file is removed on every path.
+expect_push_tmp_clean() { # HOST
+  expect_text "files left in $1's TMPDIR" "" "$(ls -A "$(push_dir "$1")/tmp" 2>&1)"
+}
+
+# THE ACCEPTANCE: each host's installed file is this node's bytes — asserted on
+# the bytes, not on a sentence. A host with no runnerctl gets one; a host that
+# already has these bytes is sent nothing.
+case_fleet_upgrade_push_installs_the_central_bytes() {
+  local v sha
+  v="$(push_ver)" sha="$(push_sha)"
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-absent box-pushsame" run fleet upgrade --push
+  expect_rc 0
+  # what each host received, and what each host now has in place
+  expect_same_file "$(push_dir build-1).received" "$RUNNERCTL"
+  expect_same_file "$(push_dir build-1)/bin/runnerctl" "$RUNNERCTL"
+  expect_same_file "$(push_dir box-absent).received" "$RUNNERCTL"
+  expect_same_file "$(push_dir box-absent)/bin/runnerctl" "$RUNNERCTL"
+  expect_same_file "$(push_dir box-pushsame)/bin/runnerctl" "$RUNNERCTL"
+  expect_no_path "$(push_dir box-pushsame).received"
+  expect_out "^build-1 +0\\.0\\.1 -> ${v//./\\.} +upgraded\$"
+  expect_out "^box-absent +none -> ${v//./\\.} +upgraded\$"
+  expect_out "^box-pushsame +${v//./\\.} +same\$"
+  expect_out '^3 host\(s\): 1 already level, 2 upgraded, 0 unreachable or unclear$'
+  expect_out "^3 host\\(s\\) on ${v//./\\.}\$"
+  # probe, push, read-back for the two that changed; the probe alone for the
+  # one that did not
+  expect_log_count "^probe:ssh_run [^ ]+ -- $PUSH_PROBE_RE" 5
+  expect_log_count "^probe:ssh_run_stdin [^ ]+ -- $PUSH_INSTALL_RE" 2
+  expect_no_log '^probe:ssh_run_stdin box-pushsame '
+  expect_log_order "^probe:ssh_run build-1 -- $PUSH_PROBE_RE" \
+                   "^probe:ssh_run_stdin build-1 -- $PUSH_INSTALL_RE" \
+                   "^probe:ssh_run build-1 -- $PUSH_PROBE_RE"
+  # the install is an ordinary FILE install of the pushed temp file, with this
+  # node's origin — never `bash -s`, the piped branch that downloads
+  expect_log "^probe:remote_push_sudo build-1 -- -n bash $(push_dir build-1)/tmp/tmp\\.[A-Za-z0-9]+ --origin=$ME@stub-host-1 install\$"
+  expect_log "^probe:remote_push_sudo box-absent -- -n bash $(push_dir box-absent)/tmp/tmp\\.[A-Za-z0-9]+ --origin=$ME@stub-host-1 install\$"
+  expect_no_log '^probe:remote_push_piped '
+  expect_no_log '^probe:remote_push_curl '
+  expect_same_file "$(push_dir build-1)/sudo-saw" "$RUNNERCTL"
+  # the host's own install wrote its own record, through the host's logger
+  expect_log "^probe:remote_push_logger build-1 -- .*install"
+  expect_push_tmp_clean build-1
+  expect_push_tmp_clean box-absent
+  # GHR-88: the central record says it was a push, and of which bytes
+  expect_cfg_count "$WRITES/fleet.log" '.' 1
+  expect_cfg "$WRITES/fleet.log" "^[0-9T:-]+Z $ME fleet upgrade --push \\(push sha256 $sha\\) — build-1=0 box-absent=0\$"
+}
+
+# --push --check: the probe and nothing else. Every state it can report, and
+# no byte sent, no sudo asked, no record written.
+case_fleet_upgrade_push_check_writes_nothing() {
+  local v
+  v="$(push_ver)"
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-absent box-pushsame box-ahead box-hostile" run fleet upgrade --push --check
+  expect_rc 1
+  expect_out "^build-1 +0\\.0\\.1 -> ${v//./\\.} +differs\$"
+  expect_out "^box-absent +none -> ${v//./\\.} +absent\$"
+  expect_out "^box-pushsame +${v//./\\.} +same\$"
+  expect_out "^box-ahead +9\\.9\\.9 -> ${v//./\\.} +newer than this node — left alone\$"
+  # a remote's text is not an answer unless it is one: shown as such, not relayed
+  expect_out '^box-hostile +— +unrecognised: its answer to the checksum read is not a sha256sum line$'
+  expect_out '^5 host\(s\): 2 up to date, 2 would change, 1 unreachable or unclear$'
+  expect_log_count "^probe:ssh_run [^ ]+ -- $PUSH_PROBE_RE" 5
+  expect_no_log '^probe:ssh_run_stdin '
+  expect_no_log '^probe:remote_push_'
+  expect_no_path "$(push_dir box-absent)/bin/runnerctl"
+  expect_same_file "$(push_dir build-1)/bin/runnerctl" "$(push_dir build-1)/before"
+  expect_same_file "$(push_dir box-ahead)/bin/runnerctl" "$(push_dir box-ahead)/before"
+  expect_push_tmp_clean build-1
+  expect_no_path "$WRITES/fleet.log"
+  expect_no_out '^[0-9]+ host\(s\) on '
+  # the existing --check exit convention: 0 when every host answered
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-absent" run fleet upgrade --push --check
+  expect_rc 0
+  expect_out '^2 host\(s\): 0 up to date, 2 would change, 0 unreachable or unclear$'
+  expect_no_log '^probe:ssh_run_stdin '
+}
+
+# A host ahead of this node is left alone, and says so: no byte is sent to it,
+# and its file is what it was. The host's own install would refuse a downgrade
+# too — so the assertions are on what was SENT, which only this node decides.
+case_fleet_upgrade_push_leaves_a_newer_host_alone() {
+  local v
+  v="$(push_ver)"
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-ahead" run fleet upgrade --push
+  expect_rc 0
+  expect_out "^box-ahead +9\\.9\\.9 -> ${v//./\\.} +newer than this node — left alone\$"
+  expect_out "^build-1 +0\\.0\\.1 -> ${v//./\\.} +upgraded\$"
+  expect_no_log '^probe:ssh_run_stdin box-ahead '
+  expect_log_count '^probe:ssh_run box-ahead ' 1
+  expect_same_file "$(push_dir box-ahead)/bin/runnerctl" "$(push_dir box-ahead)/before"
+  expect_out '^2 host\(s\): 1 already level, 1 upgraded, 0 unreachable or unclear$'
+  expect_out "^not on one version — ${v//./\\.}: build-1; 9\\.9\\.9: box-ahead\$"
+}
+
+# The bytes that arrive are checked ON THE HOST before anything runs: a byte
+# changed in transit is refused, nothing is installed, the temp file is gone,
+# and there is nothing to read back. The read-back would also catch a wrong
+# install — so what pins the host's check is that the file in place is
+# UNCHANGED, which only a refusal before the install leaves.
+case_fleet_upgrade_push_host_refuses_bytes_that_do_not_match() {
+  local sha
+  sha="$(push_sha)"
+  RUNNERCTL_STUB_FLEET_HOSTS="box-mangle build-1" run fleet upgrade --push
+  expect_rc 1
+  expect_text "the bytes box-mangle received differ from this node's" "1" \
+    "$(cmp -s "$(push_dir box-mangle).received" "$RUNNERCTL"; echo $?)"
+  expect_out "^box-mangle +0\\.0\\.1 -> [^ ]+ +remote exit 4 — runnerctl push: the bytes received have sha256 [0-9a-f]{64}, not $sha - refusing to install them\$"
+  expect_same_file "$(push_dir box-mangle)/bin/runnerctl" "$(push_dir box-mangle)/before"
+  expect_no_log '^probe:remote_push_sudo box-mangle '
+  expect_log_count '^probe:ssh_run box-mangle ' 1
+  expect_push_tmp_clean box-mangle
+  # the host beside it is unaffected
+  expect_same_file "$(push_dir build-1)/bin/runnerctl" "$RUNNERCTL"
+  expect_out '^2 host\(s\): 0 already level, 1 upgraded, 1 unreachable or unclear$'
+  # it still runs what it ran, and the state line says so
+  expect_out "^not on one version — 0\\.0\\.1: box-mangle; "
+}
+
+# THE READ-BACK. A host whose install said it worked but left other bytes in
+# place is not upgraded.
+case_fleet_upgrade_push_read_back_decides() {
+  local sha
+  sha="$(push_sha)"
+  RUNNERCTL_STUB_FLEET_HOSTS="box-pushcorrupt" run fleet upgrade --push
+  expect_rc 1
+  expect_log '^probe:remote_push_sudo box-pushcorrupt '
+  expect_out "^box-pushcorrupt +0\\.0\\.1 -> [^ ]+ +pushed, but the fleet path's runnerctl has sha256 [0-9a-f]{12}…, not this node's ${sha:0:12}…\$"
+  expect_no_out 'upgraded$'
+  expect_out '^1 host\(s\): 0 already level, 0 upgraded, 1 unreachable or unclear$'
+  expect_push_tmp_clean box-pushcorrupt
+}
+
+# A host without passwordless sudo is a named row, not a hang, and its temp
+# file is still removed; an unreachable host is a row too. The rest upgrade.
+case_fleet_upgrade_push_failures_are_rows() {
+  RUNNERCTL_STUB_FLEET_HOSTS="box-nosudo gw-unreachable build-1" run fleet upgrade --push
+  expect_rc 1
+  expect_out "^box-nosudo +0\\.0\\.1 -> [^ ]+ +remote exit 1 — sudo: a password is required — --push installs with 'sudo -n bash <the pushed file> install', so the ssh login needs passwordless sudo for that on this host \\(FLEET_SUDO=1's grant for runnerctl alone does not cover it\\)\$"
+  expect_log "^probe:remote_push_sudo box-nosudo -- -n bash "
+  expect_same_file "$(push_dir box-nosudo)/bin/runnerctl" "$(push_dir box-nosudo)/before"
+  expect_push_tmp_clean box-nosudo
+  expect_out '^gw-unreachable +— +unreachable — ssh: connect to host gw-unreachable port 22: No route to host$'
+  expect_no_log '^probe:ssh_run_stdin gw-unreachable '
+  expect_same_file "$(push_dir build-1)/bin/runnerctl" "$RUNNERCTL"
+  expect_out '^3 host\(s\): 0 already level, 1 upgraded, 2 unreachable or unclear$'
+  expect_cfg "$WRITES/fleet.log" " — box-nosudo=1 build-1=0\$"
+}
+
+# GHR-82's staging flags compose with --push unchanged. --canary: the first
+# host that would change goes first, is pushed and read back, and only then
+# is anyone else sent a byte. --serial: one host at a time. And the flags
+# that make no sense with a push are refused before anything is dialled.
+case_fleet_upgrade_push_canary_serial_and_refusals() {
+  local v
+  v="$(push_ver)"
+  RUNNERCTL_STUB_FLEET_HOSTS="box-pushsame build-2 build-3" run fleet upgrade --push --canary
+  expect_rc 0
+  expect_out "^canary build-2: upgraded 0\\.0\\.1 -> ${v//./\\.} and the fleet path answers ${v//./\\.} — continuing with 2 other host\\(s\\)\$"
+  expect_log_order "^probe:ssh_run build-3 -- $PUSH_PROBE_RE" \
+                   "^probe:ssh_run_stdin build-2 -- $PUSH_INSTALL_RE" \
+                   "^probe:ssh_run build-2 -- $PUSH_PROBE_RE" \
+                   "^probe:ssh_run_done build-2\$" \
+                   "^probe:ssh_run_stdin build-3 -- $PUSH_INSTALL_RE"
+  expect_log_count '^probe:ssh_run_stdin ' 2
+  expect_same_file "$(push_dir build-3)/bin/runnerctl" "$RUNNERCTL"
+  expect_out "^3 host\\(s\\) on ${v//./\\.}\$"
+  # a canary that does not end upgraded stops it: nobody else is sent a byte
+  RUNNERCTL_STUB_FLEET_HOSTS="box-mangle build-3" run fleet upgrade --push --canary
+  expect_rc 1
+  expect_no_log '^probe:ssh_run_stdin build-3 '
+  expect_out '^canary box-mangle did not end upgraded — not attempted: build-3$'
+  expect_same_file "$(push_dir build-3)/bin/runnerctl" "$(push_dir build-3)/before"
+  RUNNERCTL_STUB_DETECT_OVERLAP=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 build-3" run fleet upgrade --push --serial
+  expect_rc 0
+  expect_no_log '^probe:ssh_run_overlap '
+  expect_log_order "^probe:ssh_run_stdin build-1 " "^probe:ssh_run build-1 -- $PUSH_PROBE_RE" \
+                   "^probe:ssh_run_done build-1\$" "^probe:ssh_run build-2 -- $PUSH_PROBE_RE" \
+                   "^probe:ssh_run_stdin build-2 "
+  expect_out "^3 host\\(s\\) on ${v//./\\.}\$"
+  RUNNERCTL_STUB_FLEET_HOSTS="box-nosudo build-2" run fleet upgrade --push --stop-on-failure
+  expect_rc 1
+  expect_out '^stopped at box-nosudo — not attempted: build-2$'
+  expect_no_log '^probe:ssh_run[a-z_]* build-2 '
+  local a
+  for a in "--ref v1.2.3" "--sha256 $(printf 'a%.0s' {1..64})" "--rollback" "--check --canary"; do
+    # shellcheck disable=SC2086  # one or two words on purpose
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet upgrade --push $a
+    expect_rc 1
+    expect_err '(downloads nothing|do not combine|stage a write)'
+    expect_no_log '^probe:ssh_run'
+  done
+}
+
+# The probe's parser holds a remote's answer to the exact sha256sum shape:
+# trailing bytes, an uppercase digest, a second field that is not stdin's.
+case_fleet_upgrade_push_probe_parser() {
+  local h f got
+  h="$(printf 'a%.0s' {1..64})"
+  for f in "$h  -" "$h  -x" "${h^^}  -" "$h  /etc/passwd" " $h  -"; do
+    printf '%s\nRUNNERCTL_VERSION="1.2.3"  # x-release-please-version\n' "$f" >"$TMP/probe.out"
+    # shellcheck disable=SC2016  # the child expands these
+    got="$(RUNNERCTL_NO_MAIN=1 bash -c '. "$0"; if fleet_push_probe_read "$1"; then echo "ok $PUSH_SHA $PUSH_VER"; else echo "no [$PUSH_SHA]"; fi' "$RUNNERCTL" "$TMP/probe.out")"
+    if [ "$f" = "$h  -" ]; then
+      expect_text "a sha256sum line" "ok $h 1.2.3" "$got"
+    else
+      expect_text "not a sha256sum line: $f" "no []" "$got"
+    fi
+  done
+  # a script with no version line (a pre-config install) is still an answer
+  printf '%s  -\n' "$h" >"$TMP/probe.out"
+  # shellcheck disable=SC2016  # the child expands these
+  got="$(RUNNERCTL_NO_MAIN=1 bash -c '. "$0"; fleet_push_probe_read "$1" && echo "ok $PUSH_SHA [$PUSH_VER]"' "$RUNNERCTL" "$TMP/probe.out")"
+  expect_text "a checksum with no version line" "ok $h []" "$got"
+}
+
 # The digest URL rule, on the URLs resolve_url produces and a few it does not.
 case_upgrade_digest_url_rule() {
   run_fn script_digest_url "https://github.com/o/r/releases/latest/download/runnerctl"
@@ -8948,6 +9181,14 @@ t "fleet upgrade --rollback: per-host rows, counts and the read-back"   case_fle
 t "fleet upgrade --rollback: any other answer is unrecognised"          case_fleet_upgrade_rollback_other_answer_is_unrecognised
 t "fleet upgrade --rollback: --host/--serial/--stop-on-failure; refusals" case_fleet_upgrade_rollback_flags
 t "fleet upgrade --sha256: validated once, forwarded as given"          case_fleet_upgrade_sha256_is_validated_and_forwarded
+t "GHR-83: fleet upgrade --push installs this node's bytes, bootstraps an absent host" case_fleet_upgrade_push_installs_the_central_bytes
+t "GHR-83: fleet upgrade --push --check: same/differs/absent/newer, writes nothing" case_fleet_upgrade_push_check_writes_nothing
+t "GHR-83: fleet upgrade --push leaves a host newer than this node alone" case_fleet_upgrade_push_leaves_a_newer_host_alone
+t "GHR-83: fleet upgrade --push: the host refuses bytes that do not match" case_fleet_upgrade_push_host_refuses_bytes_that_do_not_match
+t "GHR-83: fleet upgrade --push: the checksum read-back decides upgraded" case_fleet_upgrade_push_read_back_decides
+t "GHR-83: fleet upgrade --push: no sudo, unreachable are rows"          case_fleet_upgrade_push_failures_are_rows
+t "GHR-83: fleet upgrade --push with --canary/--serial/--stop-on-failure; refusals" case_fleet_upgrade_push_canary_serial_and_refusals
+t "GHR-83: fleet upgrade --push: the probe parser is strict"            case_fleet_upgrade_push_probe_parser
 t "upgrade: the digest URL rule"                                        case_upgrade_digest_url_rule
 t "fleet <mutating>: fans out and forwards the remote's own flags"     case_fleet_mutating_fans_out_and_forwards_flags
 t "fleet <mutating>: serial one host at a time; status stays parallel" case_fleet_mutating_is_serial_while_status_is_parallel
