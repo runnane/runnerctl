@@ -10087,7 +10087,7 @@ fleet_watch_run_host_action() {
 FW_UP_FROM="" FW_UP_TO="" FW_ACT_FROM=() FW_ACT_TO=()
 
 fleet_watch_upgrade_key() {
-  local host="$FW_HOST" rc=0 budget cur avail
+  local host="$FW_HOST"
   FW_NOTICE="" FW_PROMPT="" FW_ACTION="" FW_ACT_HOST="$host" FW_ACT_NAME="" FW_ACT_SLOTS=()
   if [ "$FW_POS" -lt 0 ]; then FW_NOTICE="no host to act on"; return 0; fi
   if [ "${FW_KIND[$FW_POS]:-}" != host ] && [ -z "${FW_ROWS[$FW_POS]#*$'\t'}" ]; then
@@ -10095,24 +10095,35 @@ fleet_watch_upgrade_key() {
     return 0
   fi
   ! fleet_watch_act_refuse "$host" || return 0
+  fleet_watch_upgrade_check "$host" || return 0
+  fleet_priv_cmd
+  FW_ACTION=upgrade FW_ACT_SCOPE=upgrade
+  FW_PROMPT="$host: upgrade $FW_UP_FROM -> $FW_UP_TO? runs on $host: ${FLEET_PRIV[*]} upgrade — the host downloads the release and replaces its runnerctl, then its version is read back  [y/n]"
+}
+
+# HOST's `upgrade --check`: 0 with FW_UP_FROM / FW_UP_TO when it says an update
+# is available with two X.Y.Z versions; 1 with FW_NOTICE saying why not (each
+# ending `nothing issued`). U on the cursor's host and U over the marked rows
+# (GHR-129) both decide on this.
+fleet_watch_upgrade_check() { # HOST
+  local host="$1" rc=0 budget cur avail
   budget="$(fleet_mutate_budget upgrade 1)"
   (FLEET_CALL_TIMEOUT="$budget" ssh_run "$host" "$FLEET_RUNNERCTL" upgrade --check) >"$FW_TMP/up" 2>"$FW_TMP/err" || rc=$?
   relay_file "$FW_TMP/up"
   relay_file "$FW_TMP/err"
   if [ "$rc" != 0 ]; then
     FW_NOTICE="$host: could not check for an upgrade — $(fleet_error_text "$rc" "$FW_TMP/err" "$budget"); nothing issued"
-    return 0
+    return 1
   fi
   cur="$(fleet_upgrade_field_of "$FW_TMP/up" installed)"
   avail="$(fleet_upgrade_field_of "$FW_TMP/up" available)"
   if grep -q '^Update available\.' "$FW_TMP/up"; then
     if ! fleet_watch_version_ok "$cur" || ! fleet_watch_version_ok "$avail"; then
       FW_NOTICE="$host: upgrade --check named a version that is not X.Y.Z — nothing issued"
-      return 0
+      return 1
     fi
-    fleet_priv_cmd
-    FW_UP_FROM="$cur" FW_UP_TO="$avail" FW_ACTION=upgrade FW_ACT_SCOPE=upgrade
-    FW_PROMPT="$host: upgrade $cur -> $avail? runs on $host: ${FLEET_PRIV[*]} upgrade — the host downloads the release and replaces its runnerctl, then its version is read back  [y/n]"
+    FW_UP_FROM="$cur" FW_UP_TO="$avail"
+    return 0
   elif grep -q '^Already up to date\.' "$FW_TMP/up"; then
     fleet_ver "$cur"
     FW_NOTICE="$host: already current ($FLEET_VER) — nothing to upgrade, nothing issued"
@@ -10123,6 +10134,7 @@ fleet_watch_upgrade_key() {
     fleet_watch_act_last "$FW_TMP/up" plain
     FW_NOTICE="$host: upgrade --check answered something unrecognised (${ACT_LAST:-nothing}) — nothing issued"
   fi
+  return 1
 }
 
 # Whether TEXT is a version this watch may draw: X.Y.Z, and short.
@@ -10447,6 +10459,424 @@ fleet_watch_act_quit() {
   done
 }
 
+# --- Fleet watch: marked rows (GHR-129) -----------------------------------------
+# Space marks the cursor's slot row (on a marked one: unmarks it), * marks every
+# slot row the view shows — so `!` then `*` marks exactly the problem rows — and
+# u clears every mark. A mark is the row's IDENTITY, the (host, slot) pair the
+# cursor already is (fleet_watch_mark_id), never its position: a sort, a filter
+# or a refresh that reorders the rows moves the mark with its slot, and a row a
+# view hides keeps its mark. Only a slot row is marked; a host's error row and a
+# folded host are not slots.
+#
+# Marks are drawn in a two-column gutter in front of every line of the table
+# (`* ` on a marked row), and only while there are marks: with none the frame
+# is byte for byte what it was. The legend counts them.
+#
+# A marked slot its host stops reporting — the host ANSWERED, and the slot is not
+# in its table — is dropped from the set when that frame arrives, and the notice
+# says so. A host that is not answering keeps its marks as it keeps its rows:
+# nothing says its slots are gone.
+#
+# WITH MARKS, AN ACTION KEY ACTS ON THE SET, not on the cursor's row:
+#
+#   K R S T P   each marked slot, decided on that slot's own facts read afresh
+#               at the keypress (fleet_watch_facts, a read per slot). A slot
+#               the key does not apply to (T on an active one) is skipped and
+#               named under the confirm line. R and S still take w.
+#   D W E X U   the HOSTS of the marked rows, each once, in config order: all
+#               of each host's slots, as the host keys always take them; U after
+#               each host's own `upgrade --check`.
+#   L O         the cursor's row only, as without marks: neither changes a host.
+#
+# ONE confirm line lists every target and its exact command, cut with a count
+# where the terminal is too narrow for all of it; y runs them, anything else
+# cancels. They run as ONE ACTION PER HOST (GHR-125's rule), every host's
+# started at once: a host's marked slots are a call each, in turn, inside its
+# one action (FW_ACT_EACH, as E and X run), so each host's result is a notice
+# of its own. A marked host with an action already out refuses the whole set
+# before any facts are read. The marks stay until u.
+#
+# THE FLOOR is the set's: S (y or w), D and X take every target's active slots
+# out TOGETHER (fleet_watch_floor_set), so three slots that each pass
+# --min-available alone are refused when the three would cross it.
+#
+# fleet_watch_marked is the set as pairs, for anything else that acts on "the
+# marked rows" (GHR-86's `:` prompt).
+declare -A FW_MARK=()
+FW_MARKS=() FW_MARKED=() MARK_ID="" SET_LINE="" SET_HOSTS=()
+FW_SET_HOSTS=() FW_SET_SLOTS=() FW_SET_FROM=() FW_SET_TO=()
+
+# The identity of row POS of the view, into MARK_ID: its (host, slot) pair.
+fleet_watch_mark_id() { # POS
+  MARK_ID="${FW_ROWS[$1]}"
+}
+fleet_watch_marks_on() { [ "${#FW_MARKS[@]}" -gt 0 ]; }
+
+# The marked set as "HOST<TAB>NAME" pairs, into FW_MARKED: hosts in config
+# order, each host's slots in the order they were marked.
+fleet_watch_marked() {
+  local h id
+  FW_MARKED=()
+  for h in "${FLEET_HOSTS[@]}"; do
+    for id in ${FW_MARKS[@]+"${FW_MARKS[@]}"}; do
+      [ "${id%%$'\t'*}" != "$h" ] || FW_MARKED+=("$id")
+    done
+  done
+}
+# The hosts of the marked rows, each once, in config order, into SET_HOSTS.
+fleet_watch_marked_hosts() {
+  local h id
+  SET_HOSTS=()
+  for h in "${FLEET_HOSTS[@]}"; do
+    for id in ${FW_MARKS[@]+"${FW_MARKS[@]}"}; do
+      if [ "${id%%$'\t'*}" = "$h" ]; then SET_HOSTS+=("$h"); break; fi
+    done
+  done
+}
+
+# Mark ID (on) or unmark it (off). FW_MARKS keeps the order; FW_MARK is the
+# lookup, rebuilt from it.
+fleet_watch_mark_set() { # ID on|off
+  local id
+  local -a kept=()
+  if [ "$2" = on ]; then
+    [ -n "${FW_MARK[$1]:-}" ] && return 0
+    FW_MARK[$1]=1 FW_MARKS+=("$1")
+    return 0
+  fi
+  for id in ${FW_MARKS[@]+"${FW_MARKS[@]}"}; do [ "$id" = "$1" ] || kept+=("$id"); done
+  fleet_watch_marks_keep ${kept[@]+"${kept[@]}"}
+}
+fleet_watch_marks_keep() { # ID...
+  local id
+  FW_MARKS=("$@") FW_MARK=()
+  for id in "$@"; do FW_MARK[$id]=1; done
+}
+
+# Space, * and u. See the block above.
+fleet_watch_mark_key() { # ' '|*|u
+  local j n=0 was="${#FW_MARKS[@]}"
+  case "$1" in
+    u)
+      if [ "$was" -eq 0 ]; then
+        FW_NOTICE="no marks to clear"
+      else
+        fleet_watch_marks_keep
+        FW_NOTICE="marks cleared — $was slot(s) unmarked; keys act on the cursor's row again"
+      fi ;;
+    '*')
+      for j in "${!FW_ROWS[@]}"; do
+        [ "${FW_KIND[$j]:-}" = slot ] || continue
+        fleet_watch_mark_id "$j"
+        [ -z "${FW_MARK[$MARK_ID]:-}" ] || continue
+        fleet_watch_mark_set "$MARK_ID" on
+        n=$((n + 1))
+      done
+      FW_NOTICE="marked $n slot(s) the view shows — ${#FW_MARKS[@]} marked in all" ;;
+    *)
+      if [ "$FW_POS" -lt 0 ]; then FW_NOTICE="no row to mark"; return 0; fi
+      case "${FW_KIND[$FW_POS]:-}" in
+        host) FW_NOTICE="$FW_HOST: folded to one line — c or Enter opens it, then mark its slots"; return 0 ;;
+        down) FW_NOTICE="$FW_HOST: not answering — no slot there to mark"; return 0 ;;
+      esac
+      fleet_watch_mark_id "$FW_POS"
+      if [ -n "${FW_MARK[$MARK_ID]:-}" ]; then
+        fleet_watch_mark_set "$MARK_ID" off
+      else
+        fleet_watch_mark_set "$MARK_ID" on
+      fi ;;
+  esac
+}
+
+# A new frame: every mark whose host answered without that slot is dropped, and
+# said so. FRAME is the whole frame, not the view — a slot a filter hides is
+# still there. The view's rows are put back as they were.
+fleet_watch_mark_prune() { # FRAME
+  local id h rc gone=""
+  local -a was_rows=() was_lines=() kept=()
+  local -A here=()
+  fleet_watch_marks_on || return 0
+  was_rows=(${FW_ROWS[@]+"${FW_ROWS[@]}"}) was_lines=(${FW_LINES[@]+"${FW_LINES[@]}"})
+  fleet_watch_rows "$1"
+  for id in ${FW_ROWS[@]+"${FW_ROWS[@]}"}; do here[$id]=1; done
+  FW_ROWS=(${was_rows[@]+"${was_rows[@]}"}) FW_LINES=(${was_lines[@]+"${was_lines[@]}"})
+  for id in "${FW_MARKS[@]}"; do
+    h="${id%%$'\t'*}"
+    if [ -z "${here[$id]:-}" ] && fleet_host_index "$h"; then
+      rc="$(cat "$FW_STATE/$FLEET_HOST_I.rc" 2>/dev/null || true)"
+      if [ "$rc" = 0 ]; then
+        gone+="${gone:+, }${id#*$'\t'} on $h"
+        continue
+      fi
+    fi
+    kept+=("$id")
+  done
+  [ -n "$gone" ] || return 0
+  fleet_watch_marks_keep ${kept[@]+"${kept[@]}"}
+  fleet_watch_act_notice "mark dropped: $gone — no longer on that host"
+}
+
+# The view with its gutter: `* ` in front of a marked row, two spaces in front
+# of every other line. Nothing at all while nothing is marked.
+fleet_watch_gutter() {
+  local line n=0 j out=""
+  local -A marked_line=()
+  fleet_watch_marks_on || return 0
+  for j in "${!FW_LINES[@]}"; do
+    fleet_watch_mark_id "$j"
+    [ -z "${FW_MARK[$MARK_ID]:-}" ] || marked_line[${FW_LINES[$j]}]=1
+  done
+  while IFS= read -r line; do
+    n=$((n + 1))
+    if [ -n "${marked_line[$n]:-}" ]; then out+="* $line"$'\n'; else out+="  $line"$'\n'; fi
+  done <<<"$FW_VIEW"
+  FW_VIEW="${out%$'\n'}"
+}
+
+# HEAD, then the ITEMs joined with `; `, then TAIL — into SET_LINE, cut to the
+# terminal's width where it is known: as many items as fit, then `; … and N
+# more`. The first item is always there.
+fleet_watch_set_line() { # HEAD TAIL ITEM...
+  local head="$1" tail="$2" cols line i item more
+  shift 2
+  cols="$(term_cols)"
+  [[ "$cols" =~ ^[0-9]+$ ]] || cols=0
+  line="$head${1-}"
+  for ((i = 2; i <= $#; i++)); do
+    item="${!i}" more=""
+    [ "$i" -eq "$#" ] || more="; … and $(($# - i)) more"
+    if [ "$cols" -gt 0 ] && [ $((${#line} + 2 + ${#item} + ${#more} + ${#tail})) -gt "$cols" ]; then
+      SET_LINE="$line; … and $(($# - i + 1)) more$tail"
+      return 0
+    fi
+    line+="; $item"
+  done
+  SET_LINE="$line$tail"
+}
+
+# One action per host: 1, with FW_NOTICE naming the host, when a host of the
+# marked set has an action out — the set is refused whole.
+fleet_watch_set_free() {
+  local h
+  fleet_watch_marked_hosts
+  for h in ${SET_HOSTS[@]+"${SET_HOSTS[@]}"}; do
+    ! fleet_watch_act_refuse "$h" || return 1
+  done
+}
+fleet_watch_set_active() {
+  case "${FF[active]}" in active|activating|reloading) return 0 ;; esac
+  return 1
+}
+fleet_watch_set_done() {
+  FW_SET_HOSTS=() FW_SET_SLOTS=() FW_SET_FROM=() FW_SET_TO=() FW_ACT_EACH=()
+  FW_ACTION="" FW_PROMPT="" FW_ACT_SCOPE=slot
+}
+
+# K R S T P over the marked set: FW_NOTICE (nothing runs) or FW_PROMPT +
+# FW_ACTION with FW_ACT_SCOPE=set, each host's slots in FW_SET_HOSTS /
+# FW_SET_SLOTS (space-separated: a RUNNER cell is one word).
+fleet_watch_set_slot_key() { # K|R|S|T|P
+  local key="$1" verb pair host name lbl why k n=0 busy="" head tail=""
+  local -a items=() active=() skipped=()
+  local -A slot_of=()
+  FW_NOTICE="" FW_PROMPT="" FW_ACTION="" FW_ACT_SCOPE=set FW_SET_HOSTS=() FW_SET_SLOTS=()
+  case "$key" in K) verb='kill' ;; R) verb=restart ;; S) verb=stop ;; T) verb=start ;; *) verb=reap ;; esac
+  fleet_watch_set_free || return 0
+  fleet_watch_marked
+  fleet_priv_cmd
+  for pair in "${FW_MARKED[@]}"; do
+    host="${pair%%$'\t'*}" name="${pair#*$'\t'}" lbl="${pair#*$'\t'} on ${pair%%$'\t'*}" why=""
+    if ! fleet_watch_facts "$host" "$name"; then
+      skipped+=("$FW_NOTICE") FW_NOTICE=""
+      continue
+    fi
+    case "$key" in
+      K) if [ "${FF[active]}" != deactivating ] && [ -z "${FF[job]}" ]; then
+           if [ "${FF[access]}" = no-access ]; then why="cannot tell whether a job is running"; else why="no job running"; fi
+         fi ;;
+      R) fleet_watch_set_active || why="not active (${FF[active]:-unknown})" ;;
+      S) fleet_watch_set_active || why="already stopped (${FF[active]:-unknown})" ;;
+      T) ! fleet_watch_set_active || why="already active" ;;
+      *) if ! [[ "${FF[leaked]}" =~ ^[0-9]+$ ]] || [ "${FF[leaked]}" -eq 0 ]; then
+           if [ -n "${FF[job]}" ]; then why="busy — a running job's processes are not leaks"; else why="no leaked processes shown"; fi
+         fi ;;
+    esac
+    if [ -n "$why" ]; then skipped+=("$lbl: $why"); continue; fi
+    if [ -z "${slot_of[$host]:-}" ]; then
+      slot_of[$host]="${#FW_SET_HOSTS[@]}"
+      FW_SET_HOSTS+=("$host") FW_SET_SLOTS+=("")
+    fi
+    k="${slot_of[$host]}"
+    FW_SET_SLOTS[k]+="${FW_SET_SLOTS[$k]:+ }$name"
+    items+=("on $host: ${FLEET_PRIV[*]} $verb $name")
+    [ "$key" != S ] || active+=("${FF[active]}")
+    [ -z "${FF[job]}" ] || [ "$key" = K ] || busy+="${busy:+, }$lbl (${FF[job_cell]})"
+    n=$((n + 1))
+  done
+  if [ "$n" -eq 0 ]; then
+    fleet_watch_set_line "nothing to $verb among the ${#FW_MARKED[@]} marked slot(s) — " "; nothing issued" "${skipped[@]}"
+    FW_NOTICE="$SET_LINE"
+    return 0
+  fi
+  if [ "$key" = S ]; then
+    fleet_watch_floor_set "$n marked slot(s): not stopped" "unmark some (space) and stop fewer" "${active[@]}" || return 0
+    tail=" — $FW_CAPACITY"
+  fi
+  case "$key" in
+    K) head="Kill the job on $n marked slot(s)? runs " ;;
+    R) head="Restart $n marked slot(s)? runs " ;;
+    S) head="Stop $n marked slot(s)? runs " ;;
+    T) head="Start $n marked slot(s)? runs " ;;
+    *) head="Reap leaked processes on $n marked slot(s)? runs " ;;
+  esac
+  fleet_watch_set_line "$head" "$tail  [y/n]" "${items[@]}"
+  FW_PROMPT="$SET_LINE"
+  if [ "${#skipped[@]}" -gt 0 ]; then
+    fleet_watch_set_line "skipped: " "" "${skipped[@]}"
+    FW_PROMPT+=$'\n'"$SET_LINE"
+  fi
+  if [ "$key" = R ] || [ "$key" = S ]; then
+    [ -z "$busy" ] || FW_PROMPT+=$'\n'"warning: a job is running ($busy) — y kills it and GitHub marks it failed; w waits for it instead"
+    FW_PROMPT+=$'\n'"w instead runs each with --when-idle — waits for its job to finish; anything else cancels"
+  fi
+  FW_ACTION="$verb"
+}
+
+# The confirmed set of slot actions: one background action per host, its slots
+# a call each, in turn (FW_ACT_EACH). WHEN-IDLE is w's --when-idle.
+fleet_watch_run_set() { # [--when-idle]
+  local k host budget s shown label verb="$FW_ACTION"
+  local -a names=() q=()
+  budget="$(fleet_mutate_budget "$verb" 1 "$@")"
+  fleet_priv_cmd
+  for k in "${!FW_SET_HOSTS[@]}"; do
+    host="${FW_SET_HOSTS[$k]}"
+    read -ra names <<<"${FW_SET_SLOTS[$k]}"
+    q=() shown=""
+    for s in "${names[@]}"; do
+      q+=("$(printf %q "$s")")
+      shown+="${shown:+; }${FLEET_PRIV[*]} $verb${1:+ $1} $s"
+    done
+    printf '\nrunning on %s: %s\n' "$host" "$shown"
+    label="${names[*]}"
+    FW_ACT_EACH=("${q[@]}")
+    # GHR-88: recorded on this node as the command line the keys stand for.
+    fleet_watch_act_start "$host" "${label// /, } on $host" "$verb" \
+      "fleet $verb${1:+ $1} --host $host ${names[*]} (fleet watch)" "$budget" "$verb" "$@" || true
+  done
+  fleet_watch_set_done
+}
+
+# D W E X over the hosts of the marked rows. FW_ACT_SCOPE=hostset, each host's
+# slots in FW_SET_SLOTS; the floor of D and X is every one of them together.
+fleet_watch_set_host_key() { # D|W|E|X
+  local key="$1" verb host i n names each busy="" head tail
+  local -a items=() active=() skipped=()
+  FW_NOTICE="" FW_PROMPT="" FW_ACTION="" FW_ACT_SCOPE=hostset FW_SET_HOSTS=() FW_SET_SLOTS=()
+  case "$key" in D) verb=drain ;; W) verb=restart ;; E) verb=enable ;; *) verb=disable ;; esac
+  fleet_watch_set_free || return 0
+  fleet_priv_cmd
+  for host in "${SET_HOSTS[@]}"; do
+    if ! fleet_watch_host_facts "$host"; then
+      skipped+=("$FW_NOTICE") FW_NOTICE=""
+      continue
+    fi
+    if [ "${#HF_NAMES[@]}" -eq 0 ]; then skipped+=("$host: no slots there"); continue; fi
+    names="" each=""
+    for i in "${!HF_NAMES[@]}"; do
+      names+="${names:+ }${HF_NAMES[$i]}"
+      each+="${each:+; }${FLEET_PRIV[*]} $verb ${HF_NAMES[$i]}"
+      [ -z "${HF_JOBS[$i]}" ] || busy+="${busy:+, }${HF_NAMES[$i]} on $host (${HF_JOBS[$i]})"
+    done
+    active+=("${HF_ACTIVE[@]}")
+    FW_SET_HOSTS+=("$host") FW_SET_SLOTS+=("$names")
+    case "$key" in
+      D) items+=("on $host: ${FLEET_PRIV[*]} drain $names") ;;
+      W) items+=("on $host: ${FLEET_PRIV[*]} restart --when-idle $names") ;;
+      *) items+=("on $host, one call per slot: $each") ;;
+    esac
+  done
+  n="${#FW_SET_HOSTS[@]}"
+  if [ "$n" -eq 0 ]; then
+    fleet_watch_set_line "nothing to $verb on the hosts of the marked rows — " "; nothing issued" "${skipped[@]}"
+    FW_NOTICE="$SET_LINE"
+    return 0
+  fi
+  case "$key" in
+    D) fleet_watch_floor_set "$n host(s) of the marked rows: not drained" "unmark a host's rows (space) and drain fewer" "${active[@]}" || return 0
+       head="Drain $n host(s) of the marked rows? runs "
+       tail=" — each slot stopped once its job is done, one at a time; $FW_CAPACITY  [y/n]" ;;
+    W) head="Restart $n host(s) of the marked rows when idle? runs "
+       tail=" — each slot restarted once its job is done, one at a time  [y/n]" ;;
+    E) head="Enable the slots of $n host(s) of the marked rows? runs "
+       tail="  [y/n]" ;;
+    *) fleet_watch_floor_set "$n host(s) of the marked rows: not disabled" "unmark a host's rows (space) and disable fewer" "${active[@]}" || return 0
+       head="Disable the slots of $n host(s) of the marked rows? runs "
+       tail=" — $FW_CAPACITY  [y/n]" ;;
+  esac
+  fleet_watch_set_line "$head" "$tail" "${items[@]}"
+  FW_PROMPT="$SET_LINE"
+  if [ "${#skipped[@]}" -gt 0 ]; then
+    fleet_watch_set_line "skipped: " "" "${skipped[@]}"
+    FW_PROMPT+=$'\n'"$SET_LINE"
+  fi
+  if [ "$key" = X ] && [ -n "$busy" ]; then
+    FW_PROMPT+=$'\n'"warning: a job is running ($busy) — disable stops its slot now and GitHub marks the job failed; D drains instead"
+  fi
+  FW_ACTION="$verb"
+}
+
+# The confirmed host keys over the set: each host's own action, as the host key
+# runs it (fleet_watch_run_host_action), all started at once.
+fleet_watch_run_set_hosts() {
+  local k verb="$FW_ACTION"
+  for k in "${!FW_SET_HOSTS[@]}"; do
+    read -ra FW_ACT_SLOTS <<<"${FW_SET_SLOTS[$k]}"
+    FW_ACTION="$verb" FW_ACT_HOST="${FW_SET_HOSTS[$k]}"
+    fleet_watch_run_host_action
+  done
+  fleet_watch_set_done
+}
+
+# U over the hosts of the marked rows: each host's `upgrade --check`, and one
+# confirm line for the hosts that have an upgrade; the rest are skipped and said.
+fleet_watch_set_upgrade_key() {
+  local host
+  local -a items=() skipped=()
+  FW_NOTICE="" FW_PROMPT="" FW_ACTION="" FW_ACT_SCOPE=upgradeset FW_SET_HOSTS=() FW_SET_FROM=() FW_SET_TO=()
+  fleet_watch_set_free || return 0
+  fleet_priv_cmd
+  for host in "${SET_HOSTS[@]}"; do
+    if ! fleet_watch_upgrade_check "$host"; then
+      skipped+=("$FW_NOTICE") FW_NOTICE=""
+      continue
+    fi
+    FW_SET_HOSTS+=("$host") FW_SET_FROM+=("$FW_UP_FROM") FW_SET_TO+=("$FW_UP_TO")
+    items+=("on $host: ${FLEET_PRIV[*]} upgrade ($FW_UP_FROM -> $FW_UP_TO)")
+  done
+  if [ "${#FW_SET_HOSTS[@]}" -eq 0 ]; then
+    fleet_watch_set_line "no host of the marked rows to upgrade — " "" "${skipped[@]}"
+    FW_NOTICE="$SET_LINE"
+    return 0
+  fi
+  fleet_watch_set_line "Upgrade ${#FW_SET_HOSTS[@]} host(s) of the marked rows? runs " \
+    " — each host downloads the release and replaces its runnerctl, then its version is read back  [y/n]" "${items[@]}"
+  FW_PROMPT="$SET_LINE"
+  if [ "${#skipped[@]}" -gt 0 ]; then
+    fleet_watch_set_line "skipped: " "" "${skipped[@]}"
+    FW_PROMPT+=$'\n'"$SET_LINE"
+  fi
+  FW_ACTION=upgrade
+}
+fleet_watch_run_set_upgrade() {
+  local k
+  for k in "${!FW_SET_HOSTS[@]}"; do
+    FW_ACT_HOST="${FW_SET_HOSTS[$k]}" FW_UP_FROM="${FW_SET_FROM[$k]}" FW_UP_TO="${FW_SET_TO[$k]}"
+    fleet_watch_run_upgrade
+  done
+  fleet_watch_set_done
+}
+
 # --- Fleet watch views (GHR-75) ------------------------------------------------
 # On a healthy fleet almost every row is noise: the operator is looking for
 # the two that are wrong. The view keys choose what the frame shows, and none
@@ -10523,9 +10953,9 @@ FLEET_WATCH_HELP="fleet watch — keys
   ↑ ↓ j k   PgUp PgDn   g G Home End   move the cursor: a row, a page, the ends
   !     problems only: slots STALLED, not active, leaking, at MemoryHigh or under
         critical memory pressure; hosts not answering, disk/OOM, other version
-  b i   busy only / idle only
+  b i a   busy only / idle only / all: clears ! b i, the text and the collapse
   /     rows whose host, runner or repo:job has the text (Enter keeps, Esc cancels)
-  a     all: clears ! b i, the text and the collapse
+  space * u   mark this row / all shown / none; then action keys use the marks
   s     order: config → longest job first → most memory first
   c     one line per host; on a host, c or Enter opens it and c closes it
   Enter   the cursor's slot in full, in place of the table (on the row of a
@@ -10974,12 +11404,17 @@ fleet_watch_handle_key() { # KEY
            case "$FW_ACT_SCOPE" in
              host)    fleet_watch_run_host_action ;;
              upgrade) fleet_watch_run_upgrade ;;
+             # GHR-129: the marked set — slot keys, host keys, U.
+             set)        fleet_watch_run_set ;;
+             hostset)    fleet_watch_run_set_hosts ;;
+             upgradeset) fleet_watch_run_set_upgrade ;;
              *)       fleet_watch_run_action ;;
            esac ;;
       # GHR-126: the graceful form, offered by R and S alone — not by a host
       # key (GHR-127), whose W is already the graceful restart.
       w)   case "$FW_ACT_SCOPE:$FW_ACTION" in
              slot:restart|slot:stop) FW_NOTICE=""; fleet_watch_run_action --when-idle ;;
+             set:restart|set:stop)   FW_NOTICE=""; fleet_watch_run_set --when-idle ;;
              *)            FW_NOTICE="cancelled — nothing run"; FW_ACTION="" FW_PROMPT="" ;;
            esac ;;
       *)   FW_NOTICE="cancelled — nothing run"; FW_ACTION="" FW_PROMPT="" ;;
@@ -10999,11 +11434,18 @@ fleet_watch_handle_key() { # KEY
     down|j) [ "$FW_POS" -lt 0 ] || [ "$FW_POS" -ge $((n - 1)) ] || fleet_watch_select $((FW_POS + 1)) ;;
     up|k)   [ "$FW_POS" -le 0 ] || fleet_watch_select $((FW_POS - 1)) ;;
     pgdn|pgup|g|G|home|end) fleet_watch_page "$1" ;;
-    K|R|S|T|P|L|O) fleet_watch_key_action "$1" ;;
+    # GHR-129: with rows marked, the action keys act on the marked set; L and
+    # O stay the cursor's.
+    K|R|S|T|P)
+      if fleet_watch_marks_on; then fleet_watch_set_slot_key "$1"; else fleet_watch_key_action "$1"; fi ;;
+    L|O) fleet_watch_key_action "$1" ;;
     # GHR-127: the host keys, on the host of whatever row the cursor is on.
-    D|W|E|X) fleet_watch_host_key "$1" ;;
+    D|W|E|X)
+      if fleet_watch_marks_on; then fleet_watch_set_host_key "$1"; else fleet_watch_host_key "$1"; fi ;;
     # GHR-128: upgrade the row's host, after an `upgrade --check`.
-    U) fleet_watch_upgrade_key ;;
+    U) if fleet_watch_marks_on; then fleet_watch_set_upgrade_key; else fleet_watch_upgrade_key; fi ;;
+    # GHR-129: mark the row, every row the view shows, none.
+    ' '|'*'|u) fleet_watch_mark_key "$1" ;;
     # GHR-125: Esc stops following an action; it never cancels one.
     esc) fleet_watch_act_detach ;;
     '!') FW_FILTER=problems ;;
@@ -11145,6 +11587,8 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
         frame="$(fleet_status_table || true)"
         summary="$(fleet_summary_line)"
         FLEET_DIR=""
+        # GHR-129: a marked slot its host no longer reports leaves the set.
+        fleet_watch_mark_prune "$frame"
         # GHR-56: the local watch's narrowing, measured on the ASSEMBLED frame
         # — HOST column included, SGR stripped, error rows and notes not
         # counted — and acted on by asking the remotes for the narrow table on
@@ -11205,6 +11649,8 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
       draw=false
       fleet_watch_view "$frame"
       fleet_watch_place
+      # GHR-129: the marks' gutter, while there are any.
+      fleet_watch_gutter
       # GHR-73: fitted to the terminal's height where it is known, with the
       # summary line as fixed chrome beside the header. The cursor's group runs
       # from the line after the previous row — the host's Disk/OOM line (or the
@@ -11221,6 +11667,7 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
       # being typed while / is open.
       legend="$WATCH_LEGEND" status="${FW_PROMPT:-$FW_NOTICE}"
       fleet_watch_view_plain || legend="$FLEET_WATCH_VIEW_LEGEND"
+      ! fleet_watch_marks_on || legend+="  ${#FW_MARKS[@]} marked, u clears"
       ! fleet_watch_act_attached || legend+="  Esc detach"
       [ "$FW_MODE" != search ] || status="filter: /${FW_SEARCH}_ — Enter keeps it, Esc cancels, an empty one matches everything"
       viewport_draw "$head"$'\n'"$summary" "$(fleet_watch_highlight "$FW_VIEW" "$hl")" \
