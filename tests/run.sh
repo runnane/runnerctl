@@ -4220,7 +4220,7 @@ case_fleet_excluded_commands_say_why() {
 # loop shape, so the home+clear prefix is the same one the local watch's cases
 # count; what differs is what is in the frame and what it cost to fetch.
 # GHR-55: the local watch's legend — the same keys, now against a (host, slot)
-FLEET_WATCH_LEGEND='^↑↓/jk select  K kill job  R restart  S stop  T start  P reap  L logs  q quit$'
+FLEET_WATCH_LEGEND='^↑↓/jk select  K kill  R restart  S stop  T start  P reap  L logs  \? keys  q quit$'
 
 # A terminal is required for the same reason `watch` needs one: the loop
 # redraws in place. The refusal names the one-shot to use instead, and nothing
@@ -8402,7 +8402,7 @@ case_watch_unknown_height_draws_the_frame_of_before() {
 
 case_fleet_watch_unknown_height_draws_the_frame_of_before() {
   local table want sep=$'\033[H\033[2J' legend="${FLEET_WATCH_LEGEND#^}" hdr
-  legend="${legend%\$}"
+  legend="${legend%\$}" legend="${legend//\\?/?}"
   hdr="runnerctl fleet watch — 2 host(s) — TIME — every 4s (q to quit)"
   RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet status --color never
   expect_rc 0
@@ -8415,6 +8415,25 @@ case_fleet_watch_unknown_height_draws_the_frame_of_before() {
     "$sep" "$hdr" "$SUM_OK" "$(with_cursor "$table" '^build-1 +0 +example')" "$legend" \
     "$sep" "$hdr" "$SUM_OK" "$(with_cursor "$table" '^build-1 +1 +example')" "$legend")"
   expect_text "fleet watch at unknown height" "$want" "$(out_without_clock)"
+}
+
+# GHR-98: the legend names ? and is one row at 80 columns, measured as the
+# script measures a line: viewport_rows counts characters, SGR stripped (the
+# arrows are one column each, though three bytes). Both the default legend and
+# the one with a view on say "? keys" exactly once.
+case_fleet_watch_legend_names_the_keys_overlay_in_80_columns() {
+  run_snippet "$STUB" "viewport_rows \"\$FLEET_WATCH_LEGEND\" 80; echo \"\$VIEW_ROWS \${#SGR_STRIPPED}\""
+  expect_rc 0
+  expect_text "the default legend: one row, 80 columns" "1 80" "$OUT"
+  run_snippet "$STUB" "viewport_rows \"\${FLEET_WATCH_LEGEND}x\" 80; echo \"\$VIEW_ROWS\""
+  expect_text "the same legend one column longer wraps (the measure bites)" "2" "$OUT"
+  run_snippet "$STUB" "printf \"%s\\n\" \"\$FLEET_WATCH_VIEW_LEGEND\""
+  expect_out '  a all  \? keys  q quit$'
+  expect_out_count '\? keys' 1
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='q' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never --interval 4
+  expect_rc 0
+  expect_out '^↑↓/jk select  K kill  R restart  S stop  T start  P reap  L logs  \? keys  q quit$'
 }
 
 # The acceptance case: a 16-line frame on an 11-row terminal is exactly 11
@@ -9271,7 +9290,7 @@ EOF
 SUM_MIX='2/2 hosts answering · 6 slots: 1 busy, 2 idle, 1 STALLED, 2 disabled · capacity 2 free of 4'
 V_ROW="^(${REV})?[^ ]+ +[0-9]+ +example\.slot-"
 V_DISK="${HV}Disk: / \[docker,work\] 24% \(353\.9G free\)"
-V_LEGEND="${FLEET_WATCH_LEGEND%\$}  a all  \? keys\$"
+V_LEGEND='^↑↓/jk select  K kill  R restart  S stop  T start  P reap  L logs  a all  \? keys  q quit$'
 # The header of a frame, with the view it names after it (nothing for none).
 view_hdr() { # VIEW-SUFFIX [HOSTS]
   echo "^runnerctl fleet watch — ${2:-2} host\(s\) — [0-9]{2}:[0-9]{2}:[0-9]{2} — every 5s \(q to quit\)$1\$"
@@ -10183,6 +10202,7 @@ t "fleet watch: a failed remote action is a notice, the watch goes on"  case_fle
 # --- GHR-73: a frame that fits the terminal -----------------------------------
 t "watch: unknown height (0) is the frame of before, byte for byte"       case_watch_unknown_height_draws_the_frame_of_before
 t "fleet watch: unknown height (0) is the frame of before, byte for byte" case_fleet_watch_unknown_height_draws_the_frame_of_before
+t "fleet watch: the legend names ? and fits 80 columns"                  case_fleet_watch_legend_names_the_keys_overlay_in_80_columns
 t "watch: a tall frame is cut to the height, chrome and cursor row kept"   case_watch_tall_frame_is_cut_to_the_terminal_height
 t "watch: the window scrolls with the cursor; PgUp/PgDn, g/G, Home/End"   case_watch_window_scrolls_with_the_cursor
 t "watch, fleet watch: the last row brings the notes under the table in"  case_watch_last_row_shows_the_notes_under_the_table
