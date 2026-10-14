@@ -10622,9 +10622,14 @@ install_file() { # SRC DEST [REF]
   dir="$(dirname "$dest")"; staged="$dir/.$(basename "$dest").new.$$"
   local priv=()
   { [ -w "$dir" ] && { [ ! -e "$dest" ] || [ -w "$dest" ]; }; } || priv=(run_priv)
-  "${priv[@]}" cp "$src" "$staged"
+  # GHR-111: DIR can be one its owner writes (a script run in place from a
+  # home), so every name here is theirs to plant. --remove-destination unlinks
+  # STAGED and creates it exclusively, so a symlink planted at the predictable
+  # `.new.<pid>` name is replaced instead of written through; -T below replaces
+  # a DEST that is a symlink to a directory instead of moving STAGED into it.
+  "${priv[@]}" cp --remove-destination "$src" "$staged"
   if [ -e "$ref" ]; then
-    "${priv[@]}" chown --reference="$ref" "$staged"
+    "${priv[@]}" chown -h --reference="$ref" "$staged"
     # Keep what the admin set — setuid bits, a wider group — but never less
     # than a+rx, so a host already installed at 0700 heals on the next run
     # instead of staying unrunnable.
@@ -10635,7 +10640,7 @@ install_file() { # SRC DEST [REF]
     [ "${#priv[@]}" -eq 0 ] || run_priv chown root:root "$staged"
   fi
   "${priv[@]}" chmod "$mode" "$staged"
-  "${priv[@]}" mv -f "$staged" "$dest"
+  "${priv[@]}" mv -fT "$staged" "$dest"
 }
 
 # --- Where an upgrade should land (GHR-52) ------------------------------------
@@ -10748,7 +10753,7 @@ upgrade_rollback() { # TARGET
   dir="$(dirname "$target")"
   # install_file's own test, for the same rename into the same directory.
   { [ -w "$dir" ] && [ -w "$target" ]; } || priv=(run_priv)
-  "${priv[@]}" mv -f "$prev" "$target"
+  "${priv[@]}" mv -fT "$prev" "$target"   # -T: GHR-111, a symlinked $target is replaced, never entered
   echo "Rolled back $RUNNERCTL_VERSION -> $prev_ver at $target"
   # The proof comes from the installed file, as install's does.
   echo
@@ -10904,7 +10909,10 @@ cmd_upgrade() {
   if [ -n "$retire" ]; then
     # Renaming the script that is currently running is safe: the rename keeps
     # the inode, and bash is reading it through an open descriptor.
-    mv -f "$self" "$retire"
+    # -T (GHR-111): $retire is a name in a directory the invoking user owns. A
+    # symlink to a directory planted there would make plain `mv -f` move $self
+    # INTO that directory — as root under sudo. -T replaces the name instead.
+    mv -fT "$self" "$retire"
     if [ -n "$target" ] && [ "$target" != "$self" ] && [ -z "$sys_ver" ]; then
       echo "relocated: $self -> $target"
     fi
@@ -11066,7 +11074,9 @@ cmd_install() {
     # After the new file is in place, never before: a failure here leaves both
     # copies rather than none.
     priv=(); ! needs_priv "$(dirname "$old")" || priv=(run_priv)
-    "${priv[@]}" mv -f "$old" "$retired"
+    # -T (GHR-111): see the same rename in cmd_upgrade — $retired is a name the
+    # invoking user can have planted as a symlink to a directory.
+    "${priv[@]}" mv -fT "$old" "$retired"
     echo "Retired $old as $retired — $target is the one to run now."
   fi
   if $fresh; then
