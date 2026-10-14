@@ -3751,7 +3751,7 @@ pane_render() { # slot|host TITLE
     pane_put unit "${PN[unit]:-}"
     pane_put profile "${PN[profile]:-}"
     pane_put enabled "${PN[enabled]:-}"
-    pane_put runnerctl "${PN[version]:-}"
+    pane_put runnerctl "${PN[version]:-}" "${PN[version_sgr]:-}"
     pane_head "State"
     v=""
     if [ -n "${PN[active]:-}" ]; then
@@ -3826,7 +3826,7 @@ pane_render() { # slot|host TITLE
   fi
   if [ "$1" = host ]; then
     pane_put host "${PN[host]:-}"
-    pane_put runnerctl "${PN[version]:-}"
+    pane_put runnerctl "${PN[version]:-}" "${PN[version_sgr]:-}"
   fi
   pane_put cores "${PN[cores]:-}"
   v=""
@@ -5414,10 +5414,49 @@ fleet_host_info_paint() { # PLAIN-INFO
   [ -z "$events" ] || out+="${out:+ — }$(paint "$C_RED" "$events")"
   printf '%s\n' "$out"
 }
-# A host line as it appears in the assembled frame: the HOST cell, then
-# `Disk: ` or `last <window>: ` — never a slot (no IDX) and never a host that
-# did not answer, so `fleet watch`'s cursor must not stop on it.
-FLEET_INFO_RE='^[^ ]+ +(Disk: |last [^:]*: )'
+# --- A host's runnerctl version, against this node's (GHR-77) -----------------
+# Every host line leads with the version the host reported, and it is
+# compared with THIS node's RUNNERCTL_VERSION as well as with the other
+# hosts': a fleet uniformly one release behind the node driving it is level
+# with itself and still skewed — and that is the skew that bites, because
+# this node forwards flags the hosts may not know.
+#
+# The version comes off a remote's first line (or its --json payload), so it
+# is another host's text: it is held to X.Y.Z here before it is drawn or
+# compared, and anything else is UNKNOWN — drawn `?`, and skew. A runnerctl
+# older than GHR-32 leads its header with `Host:` and has no version to read
+# at all; it is unknown too, which makes the oldest hosts the loudest.
+#
+# The comparison is version_lt's (`sort -V`, what `upgrade` uses), never a
+# string compare: 0.9.0 is behind 0.10.0.
+FLEET_VER=""
+fleet_ver() { # TEXT
+  if [ "${#1}" -le 32 ] && valid_runner_version "$1"; then FLEET_VER="$1"; else FLEET_VER="?"; fi
+}
+# Which side of this node a validated VERSION is on, into FLEET_SIDE: same,
+# behind, ahead or unknown.
+FLEET_SIDE=""
+fleet_ver_side() { # VERSION
+  if [ "$1" = "?" ]; then FLEET_SIDE=unknown
+  elif [ "$1" = "$RUNNERCTL_VERSION" ]; then FLEET_SIDE=same
+  elif version_lt "$1" "$RUNNERCTL_VERSION"; then FLEET_SIDE=behind
+  else FLEET_SIDE=ahead
+  fi
+}
+# The version cell a host line starts with: `v0.20.0`, or `?` for unknown —
+# plain when it is this node's version, yellow when it is not.
+fleet_ver_cell() { # VERSION
+  local t="v$1"
+  [ "$1" != "?" ] || t="?"
+  if [ "$1" = "$RUNNERCTL_VERSION" ]; then printf '%s\n' "$t"; else paint "$C_YELLOW" "$t"; fi
+}
+
+# A host line as it appears in the assembled frame: the HOST cell, then the
+# version cell, alone or followed by ` · ` and the Disk / events fragment —
+# never a slot (no IDX) and never a host that did not answer, so `fleet
+# watch`'s cursor must not stop on it. The version cell and this pattern
+# change together (GHR-77).
+FLEET_INFO_RE='^[^ ]+ +(v[0-9]+\.[0-9]+\.[0-9]+|\?)( · |$)'
 
 # --- Rows kept from a host that stopped answering (GHR-74) --------------------
 # `fleet watch` keeps what each host last returned. A host that then cannot be
@@ -5458,8 +5497,11 @@ fleet_stale_line() { # INDEX RC
 }
 
 fleet_status_table() {
-  local i host rc hostw=4 ver first_ver="" skew=false bad=0 n=0 hdr="" stale
-  local -a lines notes=()
+  local i host rc hostw=4 ver="" bad=0 n=0 hdr="" stale v
+  local -a lines notes=() skew_order=() skew_parts=()
+  # GHR-77: hosts whose version is not this node's, by version, in the order
+  # each version was first seen.
+  local -A skew_hosts=()
   for host in "${FLEET_HOSTS[@]}"; do
     [ "${#host}" -le "$hostw" ] || hostw="${#host}"
   done
@@ -5495,9 +5537,14 @@ fleet_status_table() {
     # A version read off rows this old says nothing about skew today.
     if ! $stale; then
       strip_sgr "${lines[0]}"
-      ver="${SGR_STRIPPED#runnerctl }"; ver="${ver%% *}"
-      if [ -z "$first_ver" ]; then first_ver="$ver"
-      elif [ "$ver" != "$first_ver" ]; then skew=true
+      ver=""
+      if [[ "$SGR_STRIPPED" == "runnerctl "* ]]; then
+        ver="${SGR_STRIPPED#runnerctl }"; ver="${ver%% *}"
+      fi
+      fleet_ver "$ver"; ver="$FLEET_VER"
+      if [ "$ver" != "$RUNNERCTL_VERSION" ]; then
+        [ -n "${skew_hosts[$ver]+x}" ] || skew_order+=("$ver")
+        skew_hosts[$ver]+="${skew_hosts[$ver]:+, }$host"
       fi
     fi
     # The column header is printed once, from the first host that answered —
@@ -5524,8 +5571,13 @@ fleet_status_table() {
       # those facts are as old as the rows and would not be dimmed by them.
       printf '%-*s %s\n' "$hostw" "$host" "$(paint "$C_RED" "$(fleet_stale_line "$i" "$rc")")"
     else
+      # GHR-77: the version cell, then the Disk / events fragment. A host
+      # with no fragment (older than 0.16.0, or nothing to report) still
+      # gets the line when its version is not this node's.
       info="$(fleet_host_info "${lines[0]}")"
-      [ -z "$info" ] || printf '%-*s %s\n' "$hostw" "$host" "$info"
+      if [ -n "$info" ] || [ "$ver" != "$RUNNERCTL_VERSION" ]; then
+        printf '%-*s %s%s\n' "$hostw" "$host" "$(fleet_ver_cell "$ver")" "${info:+ · $info}"
+      fi
     fi
     for l in "${lines[@]:3}"; do
       strip_sgr "$l"
@@ -5548,12 +5600,23 @@ fleet_status_table() {
   if [ "${#notes[@]}" -gt 0 ]; then
     printf '%s\n' "${notes[@]}" | sort -u
   fi
-  if $skew; then
-    # Names only what exists today: `runnerctl upgrade`, run per host. A
-    # fleet-wide upgrade is GHR-41 and this line gets to name it once it is
-    # real — telling someone to run a command that does not exist is worse
-    # than telling them nothing.
-    paint "$C_YELLOW" "note: the hosts are not all on one runnerctl version (see 'fleet status --json', .fleet[].status.runnerctl); run 'runnerctl upgrade' on the ones that lag"
+  # GHR-77: skew is any answering host not on THIS node's version — which
+  # also covers two hosts that differ from each other. The note names them,
+  # grouped by version and with the side they are on, and points at the
+  # fleet-wide command (GHR-41), which shows what an upgrade would change.
+  if [ "${#skew_order[@]}" -gt 0 ]; then
+    for v in "${skew_order[@]}"; do
+      host="${skew_hosts[$v]}"
+      ver=runs
+      [[ "$host" != *", "* ]] || ver=run
+      if [ "$v" = "?" ]; then
+        skew_parts+=("$host $ver no version this node can read")
+      else
+        fleet_ver_side "$v"
+        skew_parts+=("$host $ver $v ($FLEET_SIDE)")
+      fi
+    done
+    paint "$C_YELLOW" "note: $(join_by "; " "${skew_parts[@]}") — this node runs $RUNNERCTL_VERSION; 'runnerctl fleet upgrade --check' shows what would change"
   fi
   [ "$bad" -eq 0 ]
 }
@@ -5631,7 +5694,9 @@ fleet_plural() { # COUNT NOUN
 #             each host counted once, at its worst partition.
 #   events    hosts with an OOM kill or a disk-full line in their window.
 #   capacity  idle slots, of the active ones: what can take a job right now.
-#   versions  distinct runnerctl versions, when there is more than one.
+#   versions  distinct runnerctl versions, THIS node's among them (GHR-77),
+#             when there is more than one; a version that is not X.Y.Z, or
+#             none at all, is one more (`?`).
 #
 # A segment whose count is zero is left out, so a healthy fleet is a short
 # line — except capacity, which is printed whenever there are slots: `0 free`
@@ -5704,7 +5769,8 @@ fleet_slot_classify() { # SLOT-LINE
 }
 
 # The first line of a `status --json` payload — the one carrying the host
-# object — classified, into HC_*: HC_VER its runnerctl version; HC_DISK `crit`
+# object — classified, into HC_*: HC_VER its runnerctl version, held to X.Y.Z
+# by fleet_ver (`?` for anything else, GHR-77); HC_DISK `crit`
 # or `warn` at its WORST partition against this node's DISK_CRIT_PCT /
 # DISK_WARN_PCT, empty below both; HC_EVENTS true with an OOM kill or a
 # disk-full line in its window.
@@ -5712,7 +5778,7 @@ HC_VER="" HC_DISK="" HC_EVENTS=false
 fleet_host_classify() { # HOST-LINE
   local line="$1" lvl n m
   HC_DISK="" HC_EVENTS=false
-  json_line_get "$line" runnerctl; HC_VER="$JF"
+  json_line_get "$line" runnerctl; fleet_ver "$JF"; HC_VER="$FLEET_VER"
   while [[ "$line" =~ \"use_pct\":([0-9]+) ]]; do
     m="${BASH_REMATCH[0]}"
     num_int "${BASH_REMATCH[1]}"
@@ -5747,7 +5813,7 @@ fleet_states_text() { # SLOTS BUSY IDLE STALLED DOWN DISABLED
 }
 
 fleet_summary_line() {
-  local i rc jrc line
+  local i rc jrc line hv
   local hosts="${#FLEET_HOSTS[@]}" answering=0 slots=0 busy=0 idle=0 stalled=0 down=0 disabled=0
   local leaking=0 dcrit=0 dwarn=0 events=0 active
   local -A vers=()
@@ -5762,11 +5828,12 @@ fleet_summary_line() {
     [ "$(fleet_reachable "$jrc")" = true ] || continue
     answering=$((answering + 1))
     [ "$jrc" = 0 ] || continue
+    hv=false
     while IFS= read -r line; do
       case "$line" in
         '{"runnerctl":'*)
           fleet_host_classify "$line"
-          [ -z "$HC_VER" ] || vers[$HC_VER]=1
+          vers[$HC_VER]=1 hv=true
           case "$HC_DISK" in crit) dcrit=$((dcrit + 1)) ;; warn) dwarn=$((dwarn + 1)) ;; esac
           ! $HC_EVENTS || events=$((events + 1)) ;;
         '  {"idx":'*)
@@ -5782,6 +5849,10 @@ fleet_summary_line() {
           ! $SC_LEAKING || leaking=$((leaking + 1)) ;;
       esac
     done <"$FLEET_DIR/$i.json"
+    # GHR-77: a payload with no version line (a runnerctl older than GHR-32
+    # starts it with `{"host":`) is a host whose version is unknown, as the
+    # table calls it.
+    $hv || vers["?"]=1
   done
   line="$answering/$hosts host$([ "$hosts" -eq 1 ] || echo s) answering"
   if [ "$answering" -lt "$hosts" ]; then seg+=("$(paint "$C_RED" "$line")"); else seg+=("$line"); fi
@@ -5797,6 +5868,11 @@ fleet_summary_line() {
     line="capacity $idle free of $active"
     if [ "$idle" -eq 0 ]; then seg+=("$(paint "$C_YELLOW" "$line")"); else seg+=("$line"); fi
   fi
+  # GHR-77: this node's version is one of them whenever a host answered, so
+  # a fleet level with itself but behind this node counts 2 — the segment
+  # and the table's skew note ask the same question (any host not on this
+  # node's version), each from its own call to the host.
+  [ "${#vers[@]}" -eq 0 ] || vers[$RUNNERCTL_VERSION]=1
   [ "${#vers[@]}" -le 1 ] || seg+=("$(paint "$C_YELLOW" "${#vers[@]} versions")")
   join_by " · " "${seg[@]}"
 }
@@ -7256,13 +7332,20 @@ pane_json_int() { # LINE KEY
 # arithmetic on it and this is a string another host sent.
 pane_from_json() { # HOSTLINE SLOTLINE
   local hl="$1" sl="$2" job=null rest piece obj roles k us=$'\x1f'
-  PN=([host]="" [name]="" [unit]="" [profile]="" [enabled]="" [version]="" [active]="" [sub]=""
+  PN=([host]="" [name]="" [unit]="" [profile]="" [enabled]="" [version]="" [version_sgr]="" [active]="" [sub]=""
       [since_age]="" [restarts]="" [result]="" [reason]="" [job]="" [access]=""
       [mem_cur]="" [mem_peak]="" [mem_high]="" [mem_max]="" [p10]="" [p60]=""
       [ev_high]="" [ev_max]="" [ev_oom]="" [leaked]="" [leak_list]=""
       [cores]="" [mem_total]="" [mem_avail]="" [disks]="" [events]="")
   if [ -n "$hl" ]; then
+    # GHR-77: as the host line draws it — X.Y.Z or `?`, yellow when it is
+    # not this node's version. A payload with no version key is a host older
+    # than the field, `—` like any other.
     pane_json "$hl" runnerctl; PN[version]="$PJ"
+    if [ -n "$PJ" ]; then
+      fleet_ver "$PJ"; PN[version]="$FLEET_VER"
+      [ "$FLEET_VER" = "$RUNNERCTL_VERSION" ] || PN[version_sgr]="$C_YELLOW"
+    fi
     pane_json "$hl" name; PN[host_name]="$PJ"
     pane_json_int "$hl" cores; PN[cores]="$PJ"
     pane_json_int "$hl" mem_total; PN[mem_total]="$PJ"
@@ -7645,7 +7728,8 @@ fleet_watch_run_action() {
 # What a view does to the lines that are not slots:
 #
 #   * A host's Disk/OOM line shows with any of its slots, and under ! on its
-#     own when the trouble is the host's (a full disk over healthy slots).
+#     own when the trouble is the host's (a full disk over healthy slots, or
+#     — GHR-77 — a runnerctl version other than this node's).
 #   * A host that stopped answering is a problem by definition: under ! its
 #     age line and ALL its kept rows stay. Under b / i its kept rows are
 #     filtered by the last state the host reported — they are dimmed and
@@ -7685,7 +7769,7 @@ FLEET_WATCH_VIEW_LEGEND="$WATCH_LEGEND  a all  ? keys"
 FLEET_WATCH_HELP="fleet watch — keys
   ↑ ↓ j k   PgUp PgDn   g G Home End   move the cursor: a row, a page, the ends
   !     problems only: slots STALLED, not active, leaking, at MemoryHigh or under
-        critical memory pressure; hosts not answering or with a disk/OOM line
+        critical memory pressure; hosts not answering, disk/OOM, other version
   b i   busy only / idle only
   /     rows whose host, runner or repo:job has the text (Enter keeps, Esc cancels)
   a     all: clears ! b i, the text and the collapse
@@ -7742,7 +7826,12 @@ fleet_watch_load_facts() {
       case "$line" in
         '{"runnerctl":'*)
           fleet_host_classify "$line"
-          if [ -n "$HC_DISK" ] || $HC_EVENTS; then FW_HOSTBAD[$host]=1; fi ;;
+          # GHR-77: a host not on this node's version is one `!` keeps — this
+          # node forwards flags it may not know. Its host line is there to
+          # show, since a version other than this node's always draws one.
+          if [ -n "$HC_DISK" ] || $HC_EVENTS || [ "$HC_VER" != "$RUNNERCTL_VERSION" ]; then
+            FW_HOSTBAD[$host]=1
+          fi ;;
         '  {"idx":'*)
           fleet_slot_classify "$line"
           n=$((n + 1))

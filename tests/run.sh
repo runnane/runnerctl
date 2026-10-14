@@ -2743,14 +2743,19 @@ case_fleet_a_sudo_wrapped_missing_runnerctl_is_a_path_fault_not_a_sudo_one() {
   expect_no_out 'needs passwordless sudo'
 }
 
+# GHR-77: the note names the hosts not on this node's version, by version and
+# side, and points at `fleet upgrade --check`. A level fleet: no note.
 case_fleet_status_version_skew_note() {
+  local me
+  me="$ME_VER"
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver" run fleet status
   expect_rc 0
-  expect_out_count "^note: the hosts are not all on one runnerctl version .*run 'runnerctl upgrade' on the ones that lag$" 1
+  expect_out_count "^note: build-2-oldver runs 0\\.0\\.1 \\(behind\\) — this node runs ${me//./\\.}; 'runnerctl fleet upgrade --check' shows what would change\$" 1
+  expect_out_count '^note: ' 1
   # level fleet: no note at all
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status
   expect_rc 0
-  expect_no_out '^note: the hosts are not all on one runnerctl version'
+  expect_no_out 'this node runs'
 }
 
 # The envelope nests each host's payload UNCHANGED — that is what lets fleet
@@ -4424,7 +4429,7 @@ case_fleet_narrow_an_old_host_renders_full_width_not_an_error() {
   expect_out_count "^HOST +$HDR_NARROW" 3
   expect_out_count "^HOST +$HDR_FULL" 3
   expect_out_count '^gw-norunners +remote exit 1 — ' 3
-  expect_out_count '^note: the hosts are not all on one runnerctl version' 3
+  expect_out_count '^note: gw-oldver runs 0\.0\.1 \(behind\) — this node runs ' 3
   # asked with the flag ONCE, then without it for the rest of the session
   expect_log_count '^probe:ssh_run gw-oldver -- runnerctl status --color never --narrow$' 1
   expect_log_count '^probe:ssh_run gw-oldver -- runnerctl status --color never$' 3
@@ -5986,16 +5991,24 @@ case_host_events_parse() {
 # above that host's slots — the remote header it was cut from is folded away.
 # Line number of the first stdout line matching an ERE, 0 when none does.
 first_line() { grep -nE -m1 "$1" <<<"$OUT" | cut -d: -f1 || echo 0; }
+# GHR-77: a host line starts with the host's version cell. A stub host answers
+# with the script's own version unless a knob says otherwise, so a level
+# host's cell is that version, read from the script under test — release-please
+# moves it, so no case can carry it as a literal. HV is the cell and its
+# separator as an ERE, HV_TXT the same as text.
+ME_VER="$("$RUNNERCTL" version)"; ME_VER="${ME_VER#runnerctl }"
+HV_TXT="v$ME_VER · "
+HV="${HV_TXT//./\\.}"
 
 case_fleet_status_host_line_above_each_hosts_slots() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_FULL="build-2" run fleet status
   expect_rc 0
-  expect_out_count '^build-1 +Disk: / \[docker,work\] 24% \(353\.9G free\)$' 1
-  expect_out_count '^build-2 +Disk: /var/lib/docker \[docker\] 96% \(37\.3G free\), /srv/runner work \[work\] 88% \(223\.5G free\) — last 1h: 2 OOM kills, 1 disk-full$' 1
+  expect_out_count "^build-1 +${HV}Disk: / \[docker,work\] 24% \(353\.9G free\)\$" 1
+  expect_out_count "^build-2 +${HV}Disk: /var/lib/docker \[docker\] 96% \(37\.3G free\), /srv/runner work \[work\] 88% \(223\.5G free\) — last 1h: 2 OOM kills, 1 disk-full\$" 1
   # each host line sits between the previous host's slots and its own
   local h1 s1 h2 s2 last1
-  h1="$(first_line '^build-1 +Disk: ')"; s1="$(first_line '^build-1 +0 ')"
-  h2="$(first_line '^build-2 +Disk: ')"; s2="$(first_line '^build-2 +0 ')"
+  h1="$(first_line "^build-1 +${HV}Disk: ")"; s1="$(first_line '^build-1 +0 ')"
+  h2="$(first_line "^build-2 +${HV}Disk: ")"; s2="$(first_line '^build-2 +0 ')"
   last1="$(first_line '^build-1 +2 ')"
   NEXPECT=$((NEXPECT + 1))
   { [ "$h1" -gt 0 ] && [ "$h1" -lt "$s1" ] && [ "$last1" -lt "$h2" ] && [ "$h2" -lt "$s2" ]; } \
@@ -6012,42 +6025,72 @@ case_fleet_status_host_line_painted_locally() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_FULL="build-2" run fleet status --color always
   expect_rc 0
   expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 1
-  expect_out_count "^build-1 +Disk: $ESC\\[32m/ \\[docker,work\\] 24% \\(353\\.9G free\\)$ESC\\[0m\$" 1
-  expect_out_count "^build-2 +Disk: $ESC\\[31m/var/lib/docker \\[docker\\] 96% \\(37\\.3G free\\)$ESC\\[0m, $ESC\\[33m/srv/runner work \\[work\\] 88% \\(223\\.5G free\\)$ESC\\[0m — $ESC\\[31mlast 1h: 2 OOM kills, 1 disk-full$ESC\\[0m\$" 1
+  # the version cell of a level host is plain (GHR-77): the paint starts at the
+  # first partition, right after the separator
+  expect_out_count "^build-1 +${HV}Disk: $ESC\\[32m/ \\[docker,work\\] 24% \\(353\\.9G free\\)$ESC\\[0m\$" 1
+  expect_out_count "^build-2 +${HV}Disk: $ESC\\[31m/var/lib/docker \\[docker\\] 96% \\(37\\.3G free\\)$ESC\\[0m, $ESC\\[33m/srv/runner work \\[work\\] 88% \\(223\\.5G free\\)$ESC\\[0m — $ESC\\[31mlast 1h: 2 OOM kills, 1 disk-full$ESC\\[0m\$" 1
   expect_no_out "^build-[12] +[0-9]+ .*$ESC"
 }
 
-case_fleet_status_old_host_gets_no_host_line() {
+# GHR-77 (was GHR-66's "no host line"): a header with no Disk / events
+# fragment — a pre-0.16.0 host, or one with nothing to report — gets a host
+# line of its version alone when that version is not this node's, so the
+# oldest hosts are no longer the least visible. Its rows still render, and its
+# cores/RAM are not drawn. A LEVEL host with no fragment still gets no line:
+# a version equal to this node's is not news.
+case_fleet_status_old_host_gets_a_version_line() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-oldver" run fleet status
-  expect_out_count '^build-1 +Disk: ' 1
-  # a pre-0.16.0 header has no fragment: no line, and its rows still render
-  # — not even its cores/RAM: only the 3 slot rows carry its name
-  expect_out_count '^build-oldver ' 3
+  expect_out_count "^build-1 +${HV}Disk: " 1
+  expect_out_count '^build-oldver +v0\.0\.1$' 1
+  expect_out_count '^build-oldver ' 4
   expect_out_count '^build-oldver +[0-9]+ +example\.slot-' 3
+  expect_no_out 'cores'
+  RUNNERCTL_STUB_DISKS=none RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-oldver" run fleet status
+  expect_rc 0
+  expect_out_count '^build-1 ' 3
+  expect_out_count '^build-1 +[0-9]+ +example\.slot-' 3
+  expect_out_count '^build-oldver +v0\.0\.1$' 1
 }
 
 case_fleet_watch_host_line_keeps_the_remote_colours() {
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_FULL="build-1" \
     run fleet watch --iterations 1 --color always
   expect_rc 0
-  expect_out_count "^build-1 +Disk: $ESC\[31m/var/lib/docker \[docker\] 96% \(37\.3G free\)$ESC\[0m, $ESC\[33m/srv/runner work \[work\] 88% \(223\.5G free\)$ESC\[0m — $ESC\[31mlast 1h: 2 OOM kills, 1 disk-full$ESC\[0m\$" 1
-  expect_out_count "^build-2 +Disk: $ESC\\[32m/ \[docker,work\] 24% \(353\.9G free\)$ESC\\[0m\$" 1
+  expect_out_count "^build-1 +${HV}Disk: $ESC\[31m/var/lib/docker \[docker\] 96% \(37\.3G free\)$ESC\[0m, $ESC\[33m/srv/runner work \[work\] 88% \(223\.5G free\)$ESC\[0m — $ESC\[31mlast 1h: 2 OOM kills, 1 disk-full$ESC\[0m\$" 1
+  expect_out_count "^build-2 +${HV}Disk: $ESC\\[32m/ \[docker,work\] 24% \(353\.9G free\)$ESC\\[0m\$" 1
 }
 
 # The cursor walks slot rows only: j from build-1's last slot goes to build-2's
 # first, over build-2's host line, and no frame highlights a host line.
-case_fleet_watch_cursor_skips_host_lines() {
-  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjkq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
-    run fleet watch --color never
+#
+# GHR-77: a host line starts with a version cell, and FLEET_INFO_RE changed
+# with it — a line it failed to recognise would read as build-2's
+# did-not-answer row, which fleet_watch_place prefers, and the cursor would
+# stop on it. So all three shapes of the line: version and fragment (run 1),
+# a version alone (run 2: build-2 behind this node, no disks anywhere, so
+# build-1 has no line at all) and an unknown version alone (run 3).
+fw_cursor_skips() { # HOST-LINE-ERE COUNT
   expect_rc 0
   expect_out_count "$FRAME_PREFIX" 5
-  expect_out_count '^build-[12] +Disk: ' 10
-  expect_no_out "^${REV}build-[12] +Disk: "
+  expect_out_count "$1" "$2"
+  expect_no_out "^${REV}build-[12] +(v[0-9]|\\?)"
   expect_out_count "^${REV}" 5
   expect_out_count "$(fw_row build-1 0 1)" 1
   expect_out_count "$(fw_row build-1 1 2)" 1
   expect_out_count "$(fw_row build-1 2 3)" 2
   expect_out_count "$(fw_row build-2 0 1)" 1
+}
+case_fleet_watch_cursor_skips_host_lines() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjkq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  fw_cursor_skips "^build-[12] +${HV}Disk: " 10
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjkq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_DISKS=none RUNNERCTL_STUB_FLEET_VER="build-2:0.0.1" run fleet watch --color never
+  fw_cursor_skips '^build-2 +v0\.0\.1$' 5
+  expect_no_out '^build-1 +v'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjkq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_DISKS=none RUNNERCTL_STUB_FLEET_VER="build-2:not-a-version" run fleet watch --color never
+  fw_cursor_skips '^build-2 +\?$' 5
 }
 
 # A long host line is not a table row: the fleet watch measures its width
@@ -6147,7 +6190,117 @@ case_fleet_summary_counts_distinct_versions() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver build-3" run fleet status
   expect_rc 0
   expect_last_line '3/3 hosts answering · 9 slots: 3 busy, 3 idle, 3 disabled · capacity 3 free of 6 · 2 versions'
-  expect_out_count '^note: the hosts are not all on one runnerctl version' 1
+  expect_out_count '^note: build-2-oldver runs 0\.0\.1 \(behind\) — this node runs ' 1
+}
+
+# --- GHR-77: each host's version, against this node's --------------------------
+# Hosts used to be compared only with each other, and their versions were drawn
+# nowhere. RUNNERCTL_STUB_FLEET_VER="host:version …" makes a stub host answer
+# as any version (a text that is none included); RUNNERCTL_STUB_VERSION puts
+# this node — and every host the first knob does not name — on one.
+
+# The acceptance case: a fleet level WITH ITSELF but behind this node. Before
+# GHR-77 it read as level. Now each host line carries the version, painted;
+# the note names both hosts, the side they are on and the fleet-wide command;
+# the summary counts this node's version as the second one. And the other
+# side: a fleet ahead of this node is named as ahead.
+case_ghr77_a_fleet_level_with_itself_but_behind_this_node_is_named() {
+  local me
+  me="$ME_VER"
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_VER="build-1:0.1.0 build-2:0.1.0" run fleet status
+  expect_rc 0
+  expect_out_count "^note: build-1, build-2 run 0\\.1\\.0 \\(behind\\) — this node runs ${me//./\\.}; 'runnerctl fleet upgrade --check' shows what would change\$" 1
+  expect_out_count '^build-[12] +v0\.1\.0 · Disk: / ' 2
+  expect_last_line "$SUM_OK · 2 versions"
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_VER="build-1:0.1.0 build-2:0.1.0" run fleet status --color always
+  expect_rc 0
+  expect_out_count "^build-[12] +$ESC\\[33mv0\\.1\\.0$ESC\\[0m · Disk: " 2
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_VER="build-1:999.0.0 build-2:999.0.0" run fleet status
+  expect_rc 0
+  expect_out_count "^note: build-1, build-2 run 999\\.0\\.0 \\(ahead\\) — this node runs ${me//./\\.}; " 1
+}
+
+# A level fleet: the version on every host line, NOT painted (the paint starts
+# at the first partition), no note and no versions segment.
+case_ghr77_a_level_fleet_draws_its_version_plain_and_no_note() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status --color always
+  expect_rc 0
+  expect_out_count "^build-[12] +${HV}Disk: $ESC\\[3[123]m/" 2
+  expect_no_out "$ESC\\[33mv[0-9]"
+  expect_no_out 'this node runs'
+  expect_no_out ' versions'
+}
+
+# Versions compare as versions: with this node on 0.10.0, a host on 0.9.0 is
+# BEHIND (a string compare says ahead: "9" sorts after "1") and one on 0.10.1
+# is ahead. Three versions in the summary, this node's among them.
+case_ghr77_versions_compare_as_versions_not_strings() {
+  RUNNERCTL_STUB_VERSION=0.10.0 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 build-3" \
+    RUNNERCTL_STUB_FLEET_VER="build-2:0.9.0 build-3:0.10.1" run fleet status
+  expect_rc 0
+  expect_out_count "^note: build-2 runs 0\\.9\\.0 \\(behind\\); build-3 runs 0\\.10\\.1 \\(ahead\\) — this node runs 0\\.10\\.0; " 1
+  expect_out_count '^build-1 +v0\.10\.0 · Disk: ' 1
+  expect_out_count '^build-2 +v0\.9\.0 · Disk: ' 1
+  expect_last_line '3/3 hosts answering · 9 slots: 3 busy, 3 idle, 3 disabled · capacity 3 free of 6 · 3 versions'
+}
+
+# The version is the host's text: anything but X.Y.Z — a shell fragment after
+# a version, a valid-looking one past 32 characters — is unknown. It is drawn
+# `?`, named as unreadable, counted as one more version, and never drawn as
+# the host sent it.
+case_ghr77_a_version_that_is_no_version_is_unknown() {
+  local long
+  long="1.2.$(printf '1%.0s' {1..40})"
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 build-3" \
+    RUNNERCTL_STUB_FLEET_VER="build-2:9.9.9;id build-3:$long" run fleet status
+  expect_rc 0
+  expect_out_count '^build-[23] +\? · Disk: / ' 2
+  expect_no_out '9\.9\.9;id'
+  expect_no_out "$long"
+  expect_out_count '^note: build-2, build-3 run no version this node can read — this node runs ' 1
+  expect_last_line '3/3 hosts answering · 9 slots: 3 busy, 3 idle, 3 disabled · capacity 3 free of 6 · 2 versions'
+}
+
+# fleet watch: a host not on this node's version is a problem `!` keeps — its
+# host line alone, over healthy slots, with healthy build-1 gone — and the
+# summary under the header counts it. A collapsed host carries the version
+# as its host line does.
+case_ghr77_fleet_watch_problems_and_collapse_carry_the_version() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='!acq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_VER="build-2:0.1.0" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 4
+  expect_frame_line 2 1 "$(view_hdr ' — view: problems only')"
+  expect_frame_line 2 2 "^${SUM_OK} · 2 versions\$"
+  expect_frame_line 2 4 '^build-2 +v0\.1\.0 · Disk: / '
+  expect_frame_count_of 2 "$V_ROW" 0
+  expect_no_frame 2 "^(${REV})?build-1 "
+  expect_frame 2 '^note: build-2 runs 0\.1\.0 \(behind\) — this node runs '
+  expect_frame_line 4 4 "^(${REV})?build-1 +3 slots: 1 busy, 1 idle, 1 disabled · $V_DISK"
+  expect_frame_line 4 5 "^(${REV})?build-2 +3 slots: 1 busy, 1 idle, 1 disabled · v0\\.1\\.0 · Disk: / "
+  expect_log_count '^probe:ssh_run ' 4
+}
+
+# The slot pane's host block draws the version as the host line does: `?` for
+# one that is no version, this node's plain, another one yellow.
+case_ghr77_fleet_pane_draws_the_version_as_the_host_line_does() {
+  local d="$TMP/ghr77.state" me
+  me="$ME_VER"
+  mkdir -p "$d"
+  echo '{"runnerctl":"9.9.9;id","host":{"name":"h1","cores":8,"mem_total":null,"mem_available":null},' >"$d/0.json"
+  echo "{\"runnerctl\":\"$me\",\"host\":{\"name\":\"h2\",\"cores\":8,\"mem_total\":null,\"mem_available\":null}," >"$d/1.json"
+  echo '{"runnerctl":"0.1.0","host":{"name":"h3","cores":8,"mem_total":null,"mem_available":null},' >"$d/2.json"
+  printf '0\n' | tee "$d/0.jrc" "$d/0.rc" "$d/1.jrc" "$d/1.rc" "$d/2.jrc" "$d/2.rc" >/dev/null
+  # shellcheck disable=SC2016
+  GHR77_D="$d" run_fn eval 'color_setup always; now_epoch() { echo 1000000720; }
+    FLEET_HOSTS=(h1 h2 h3); FW_STATE="$GHR77_D" FW_PANE=host
+    for FW_HOST in h1 h2 h3; do fleet_watch_pane_build; printf "%s\n" "$PANE_OUT" | grep -a "^  runnerctl "; done'
+  expect_rc 0
+  expect_text "the version row of three host blocks" "  runnerctl     ${ESC}[33m?${ESC}[0m
+  runnerctl     $me
+  runnerctl     ${ESC}[33m0.1.0${ESC}[0m" "$OUT"
+  rm -rf "$d"
 }
 
 # The problem segments, each from a state the host really reports: a unit
@@ -6604,7 +6757,7 @@ case_fleet_watch_tall_frame_is_cut_and_scrolls() {
     [ "$(grep -c "^${ESC}\[7m" <<<"${FRAMES[$f]}"; true)" -eq 1 ] || FAILS+=("frame $f: not exactly one cursor row")
   done
   # the top: build-1's host line, its first two slots, five lines below
-  expect_frame_line 1 4 '^build-1 +Disk: '
+  expect_frame_line 1 4 "^build-1 +${HV}Disk: "
   expect_frame_line 1 5 "$(fw_row build-1 0 1)"
   expect_frame_line 1 6 '^build-1 +1 +example\.slot-2 '
   expect_frame_line 1 7 "$(down_mark 5)"
@@ -6614,7 +6767,7 @@ case_fleet_watch_tall_frame_is_cut_and_scrolls() {
   expect_frame_line 3 7 "$(down_mark 4)"
   # j: build-2's first slot, under its own host line
   expect_frame_line 4 4 "$(up_mark 4)"
-  expect_frame_line 4 5 '^build-2 +Disk: '
+  expect_frame_line 4 5 "^build-2 +${HV}Disk: "
   expect_frame_line 4 6 "$(fw_row build-2 0 1)"
   expect_frame_line 4 7 "$(down_mark 2)"
   # G: the last row of the fleet, nothing under it
@@ -6626,16 +6779,16 @@ case_fleet_watch_tall_frame_is_cut_and_scrolls() {
   expect_frame_line 6 6 "$(fw_row build-2 1 2)"
   # k: build-2's first slot was already on screen — its host line joins it
   expect_frame_line 7 4 "$(up_mark 4)"
-  expect_frame_line 7 5 '^build-2 +Disk: '
+  expect_frame_line 7 5 "^build-2 +${HV}Disk: "
   expect_frame_line 7 6 "$(fw_row build-2 0 1)"
   expect_frame_line 7 7 "$(down_mark 2)"
   # k: up over the host line, onto build-1's last slot
   expect_frame_line 8 4 "$(up_mark 3)"
   expect_frame_line 8 5 "$(fw_row build-1 2 3)"
-  expect_frame_line 8 6 '^build-2 +Disk: '
+  expect_frame_line 8 6 "^build-2 +${HV}Disk: "
   expect_frame_line 8 7 "$(down_mark 3)"
   # g: the first row, and build-1's host line above it
-  expect_frame_line 9 4 '^build-1 +Disk: '
+  expect_frame_line 9 4 "^build-1 +${HV}Disk: "
   expect_frame_line 9 5 "$(fw_row build-1 0 1)"
   expect_no_frame 9 '^↑ [0-9]'
   # PgDn: a window of three lines less one — build-1's last slot
@@ -6913,7 +7066,7 @@ case_fleet_watch_a_host_that_stops_answering_keeps_its_rows_with_an_age() {
   frames
   expect_frame_count 4
   for f in 1 4; do
-    expect_frame_line "$f" 8 '^build-2 +Disk: '
+    expect_frame_line "$f" 8 "^build-2 +${HV}Disk: "
     expect_no_frame "$f" 'no answer'
   done
   expect_frame_line 2 8 '^build-2 +no answer for 5s — last seen 01:58:40 — unreachable — ssh: connect to host build-2 port 22: No route to host$'
@@ -6925,7 +7078,7 @@ case_fleet_watch_a_host_that_stops_answering_keeps_its_rows_with_an_age() {
     expect_frame_line "$f" 12 '^$'
   done
   expect_no_out '^build-2 +unreachable'
-  expect_no_frame 2 '^build-2 +Disk: '
+  expect_no_frame 2 "^build-2 +${HV}Disk: "
   # painted: the age line red, and each kept row dim as a whole with the
   # remote's own colours taken off — the STALLED it painted bold red at tick 1
   # is plain text inside the dim at tick 2
@@ -6953,7 +7106,7 @@ case_fleet_watch_a_call_still_out_at_the_next_tick_is_late() {
   frames
   expect_frame_count 3
   expect_frame_line 2 2 "^${SUM_OK}\$"
-  expect_frame_line 2 8 '^build-2 +Disk: '
+  expect_frame_line 2 8 "^build-2 +${HV}Disk: "
   expect_no_frame 2 'no answer'
   expect_frame_line 3 2 "^${SUM_ONE}\$"
   expect_frame_line 3 8 '^build-2 +no answer for 10s — last seen 01:58:40 — its call is still running$'
@@ -7213,7 +7366,7 @@ EOF
 # must not add one.
 SUM_MIX='2/2 hosts answering · 6 slots: 1 busy, 2 idle, 1 STALLED, 2 disabled · capacity 2 free of 4'
 V_ROW="^(${REV})?[^ ]+ +[0-9]+ +example\.slot-"
-V_DISK='Disk: / \[docker,work\] 24% \(353\.9G free\)'
+V_DISK="${HV}Disk: / \[docker,work\] 24% \(353\.9G free\)"
 V_LEGEND="${FLEET_WATCH_LEGEND%\$}  a all  \? keys\$"
 # The header of a frame, with the view it names after it (nothing for none).
 view_hdr() { # VIEW-SUFFIX [HOSTS]
@@ -7279,7 +7432,7 @@ case_fleet_watch_problem_hosts_and_hosts_that_stopped_answering() {
   expect_rc 0
   expect_out_count "${FRAME_PREFIX}runnerctl fleet watch — 3 host\(s\) — [0-9:]{8} — every 5s \(q to quit\) — view: problems only\$" 1
   expect_out_count '^2/3 hosts answering · 6 slots: 2 busy, 2 idle, 2 disabled · 1 host disk crit · 1 host OOM/disk-full · capacity 2 free of 4$' 1
-  expect_out_count '^build-2 +Disk: /var/lib/docker \[docker\] 96% ' 1
+  expect_out_count "^build-2 +${HV}Disk: /var/lib/docker \[docker\] 96% " 1
   expect_out_count '^gw-unreachable +unreachable — ' 1
   expect_out_count '^HOST +IDX +RUNNER ' 1
   expect_no_out '^build-1 '
@@ -7550,7 +7703,7 @@ case_fleet_watch_sort_orders_by_the_hosts_own_facts() {
     color_setup never
     FLEET_HOSTS=(a b) FW_STATE="$GHR75_DIR"
     frame="HOST IDX RUNNER
-a    Disk: / 10% (1.0G free)
+a    v1.0.0 · Disk: / 10% (1.0G free)
 a    0   young
 a    1   fat-idle
 a    2   nomem
@@ -7569,7 +7722,7 @@ note: a note"
   expect_rc 0
   expect_text "the three orders" "== config
 HOST IDX RUNNER
-a    Disk: / 10% (1.0G free)
+a    v1.0.0 · Disk: / 10% (1.0G free)
 a    0   young
 a    1   fat-idle
 a    2   nomem
@@ -7585,7 +7738,7 @@ b    1   mid
 a    0   young
 a    1   fat-idle
 a    2   nomem
-a    Disk: / 10% (1.0G free)
+a    v1.0.0 · Disk: / 10% (1.0G free)
 note: a note
 rows: b:old b:mid a:young a:fat-idle a:nomem
 lines: 2 3 4 5 6
@@ -7596,7 +7749,7 @@ b    0   old
 b    1   mid
 a    0   young
 a    2   nomem
-a    Disk: / 10% (1.0G free)
+a    v1.0.0 · Disk: / 10% (1.0G free)
 note: a note
 rows: a:fat-idle b:old b:mid a:young a:nomem
 lines: 2 3 4 5 6" "$OUT"
@@ -8058,14 +8211,20 @@ t "fleet --narrow: a host too old for it renders full-width, no error" case_flee
 t "fleet watch: j/k walk (host, slot) pairs, clamp, and cost no fan-out" case_fleet_watch_cursor_walks_host_slot_pairs
 t "fleet status: a host line above each host's slots, plain"             case_fleet_status_host_line_above_each_hosts_slots
 t "fleet status --color always: the host line is painted locally"        case_fleet_status_host_line_painted_locally
-t "fleet status: a host too old for the fragment gets no host line"       case_fleet_status_old_host_gets_no_host_line
+t "fleet status: no fragment, other version: a host line of the version" case_fleet_status_old_host_gets_a_version_line
 t "fleet watch: the host line keeps the remote's colours"                 case_fleet_watch_host_line_keeps_the_remote_colours
-t "fleet watch: the cursor skips host lines"                              case_fleet_watch_cursor_skips_host_lines
+t "fleet watch: the cursor skips host lines, in all three shapes"         case_fleet_watch_cursor_skips_host_lines
 t "fleet watch: a host line does not count toward the table width"       case_fleet_watch_host_line_does_not_count_for_width
 t "fleet summary: a healthy fleet is one short last line"                 case_fleet_summary_healthy_fleet_is_a_short_line
 t "fleet summary: a stalled job is counted STALLED, not busy"             case_fleet_summary_counts_a_stalled_job
 t "fleet summary: an unreachable host is a host, its slots are not down"  case_fleet_summary_unreachable_host_counts_as_a_host_only
 t "fleet summary: mixed versions are counted"                             case_fleet_summary_counts_distinct_versions
+t "GHR-77: a fleet level with itself but behind this node is named"        case_ghr77_a_fleet_level_with_itself_but_behind_this_node_is_named
+t "GHR-77: a level fleet draws its version plain, and no note"             case_ghr77_a_level_fleet_draws_its_version_plain_and_no_note
+t "GHR-77: versions compare as versions (0.9.0 is behind 0.10.0)"          case_ghr77_versions_compare_as_versions_not_strings
+t "GHR-77: a version that is no version is unknown, drawn ?"               case_ghr77_a_version_that_is_no_version_is_unknown
+t "GHR-77: fleet watch's ! and collapse carry the version"                 case_ghr77_fleet_watch_problems_and_collapse_carry_the_version
+t "GHR-77: the pane draws the version as the host line does"               case_ghr77_fleet_pane_draws_the_version_as_the_host_line_does
 t "fleet summary: down, leaking, disk and event segments"                 case_fleet_summary_names_what_is_wrong
 t "fleet summary: capacity 0 free is still shown"                         case_fleet_summary_capacity_zero_is_still_shown
 t "fleet summary: painted like the table"                                 case_fleet_summary_is_painted_like_the_table

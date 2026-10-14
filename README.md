@@ -926,13 +926,14 @@ against every runner host in `FLEET_HOSTS`, over ssh:
 ```
 $ runnerctl fleet status
 HOST     IDX RUNNER          PROFILE  ACTIVE           SINCE  ENABLED  ...  WORKING-ON
-build-1  Disk: / [docker,work] 24% (353.9G free)
+build-1  v0.21.0 · Disk: / [docker,work] 24% (353.9G free)
 build-1  0   org.build-1-a   ci       active/running   3d 4h  enabled  ...  my-app:test (12m)
 build-1  1   org.build-1-b   ci       active/running   2d 7h  enabled  ...  idle 2h31m (7 jobs)
-build-2  Disk: /var/lib/docker [docker] 96% (37.3G free), /srv/runners [work] 41% (602.4G free) — last 1h: 1 OOM kill
+build-2  v0.20.0 · Disk: /var/lib/docker [docker] 96% (37.3G free), /srv/runners [work] 41% (602.4G free) — last 1h: 1 OOM kill
 build-2  0   org.build-2-a   ci       active/running   6d     enabled  ...  my-app:lint (2m)
 build-3  unreachable — ssh: connect to host build-3 port 22: No route to host
-2/3 hosts answering · 3 slots: 2 busy, 1 idle · 1 host disk crit · 1 host OOM/disk-full · capacity 1 free of 3
+note: build-2 runs 0.20.0 (behind) — this node runs 0.21.0; 'runnerctl fleet upgrade --check' shows what would change
+2/3 hosts answering · 3 slots: 2 busy, 1 idle · 1 host disk crit · 1 host OOM/disk-full · capacity 1 free of 3 · 2 versions
 ```
 
 The last line is the **fleet summary**: is anything wrong, and how much
@@ -947,7 +948,7 @@ out, so a healthy fleet is a short line:
 | `N host(s) disk crit` / `disk warn` | hosts with a partition past this node's `DISK_CRIT_PCT` / `DISK_WARN_PCT`, each host once, at its worst partition. |
 | `N host(s) OOM/disk-full` | hosts with an OOM kill or a disk-full line in their event window. |
 | `capacity 1 free of 3` | idle slots, of the active ones — what can take a job now. Printed whenever there are slots, `0 free` included. |
-| `N versions` | distinct `runnerctl` versions, when there is more than one. |
+| `N versions` | distinct `runnerctl` versions, **this node's included**, when there is more than one — so a fleet level with itself but behind this node counts 2. A version that is not `X.Y.Z` is one more. |
 
 A host that did not answer is in the host count and in nothing else: its
 slots are unknown, not down. Each segment takes the colour the table uses for
@@ -960,13 +961,26 @@ already held. For a one-shot `fleet status` it is a second ssh login per
 answering host; a host that did not answer is not dialled again.
 `fleet status --json` carries no summary.
 
-Each host that answered gets a **host line** above its slots: the `Disk:` and
-`last 1h:` part of its own `status` header. Each partition on it is green,
-yellow or red: `fleet watch` keeps the colours the host painted, and `fleet
-status` (which asks hosts for plain output) paints the line itself from the
-percentages, against this node's `DISK_WARN_PCT` / `DISK_CRIT_PCT`. The
-`fleet watch` cursor never stops on a host line. A host older than 0.16.0
-prints no such fragment and gets no host line.
+Each host that answered gets a **host line** above its slots: the `runnerctl`
+version it runs, then the `Disk:` and `last 1h:` part of its own `status`
+header. Each partition on it is green, yellow or red: `fleet watch` keeps the
+colours the host painted, and `fleet status` (which asks hosts for plain
+output) paints the line itself from the percentages, against this node's
+`DISK_WARN_PCT` / `DISK_CRIT_PCT`. The `fleet watch` cursor never stops on a
+host line.
+
+The version is compared with **this node's own**, not only with the other
+hosts': a fleet uniformly one release behind the central node is level with
+itself and still skewed — and this node forwards flags such hosts may not
+know. A version other than this node's is painted yellow, and a note under
+the table names those hosts, grouped by version, with the side they are on
+(`behind` / `ahead`) and `runnerctl fleet upgrade --check` to see what an
+upgrade would change. Versions compare as versions (`0.9.0` is behind
+`0.10.0`). What a host reports is held to `X.Y.Z`; anything else — or no
+version at all, from a runnerctl too old to print one — is drawn `?` and counts as
+skew. A host whose header has no `Disk:` fragment (older than 0.16.0, or
+nothing to report) gets a host line of its version alone when that version is
+not this node's; a level one gets none.
 
 Set the inventory on the **central node only** — the runner hosts need no
 fleet config, just `runnerctl` installed and an ssh login:
@@ -1083,10 +1097,10 @@ $ runnerctl fleet watch --interval 5
 runnerctl fleet watch — 3 host(s) — 14:02:11 — every 5s (q to quit)
 2/3 hosts answering · 3 slots: 2 busy, 1 idle · 1 host disk crit · 1 host OOM/disk-full · capacity 1 free of 3
 HOST     IDX RUNNER          PROFILE  ACTIVE           SINCE  ENABLED  ...  WORKING-ON
-build-1  Disk: / [docker,work] 24% (353.9G free)
+build-1  v0.21.0 · Disk: / [docker,work] 24% (353.9G free)
 build-1  0   org.build-1-a   ci       active/running   3d 4h  enabled  ...  my-app:test (12m)
 build-1  1   org.build-1-b   ci       active/running   2d 7h  enabled  ...  idle 2h31m (7 jobs)
-build-2  Disk: /var/lib/docker [docker] 96% (37.3G free), /srv/runners [work] 41% (602.4G free) — last 1h: 1 OOM kill
+build-2  v0.21.0 · Disk: /var/lib/docker [docker] 96% (37.3G free), /srv/runners [work] 41% (602.4G free) — last 1h: 1 OOM kill
 build-2  0   org.build-2-a   ci       active/running   6d     enabled  ...  my-app:lint (2m)
 build-3  no answer for 45s — last seen 14:01:26 — unreachable — ssh: connect to host build-3 port 22: No route to host
 build-3  0   org.build-3-a   ci       active/running   1d 2h  enabled  ...  my-app:build (4m)
@@ -1291,12 +1305,12 @@ they redraw what the last tick brought.
 
 | key | shows |
 | --- | --- |
-| `!` | **problems only**: slots that are `STALLED`, not active (failed, stopped by hand, between restarts), leaking, at or over `MemoryHigh`, or under memory pressure at `PRESSURE_CRIT_PCT`; hosts that are not answering; hosts with a disk at `DISK_WARN_PCT` or worse, or an OOM / disk-full line |
+| `!` | **problems only**: slots that are `STALLED`, not active (failed, stopped by hand, between restarts), leaking, at or over `MemoryHigh`, or under memory pressure at `PRESSURE_CRIT_PCT`; hosts that are not answering; hosts with a disk at `DISK_WARN_PCT` or worse, or an OOM / disk-full line; hosts on a `runnerctl` version other than this node's |
 | `b` / `i` | busy only (a `STALLED` job is a busy slot) / idle only |
 | `/` | rows whose host, runner or `repo:job` contains the text you type, whatever its case; combines with `!` `b` `i` |
 | `a` | all: clears `!` `b` `i`, the text and the collapse |
 | `s` | cycle the order: config order → longest-running job first → most memory used first |
-| `c` | collapse to one line per host (`build-1  4 slots: 3 busy, 1 idle · Disk: / 41% (…)`); on a host, `c` or `Enter` opens it and `c` closes it again |
+| `c` | collapse to one line per host (`build-1  4 slots: 3 busy, 1 idle · v0.21.0 · Disk: / 41% (…)`), carrying what its host line says; on a host, `c` or `Enter` opens it and `c` closes it again |
 | `?` | every key, in place of the table, until any key |
 
 ```
@@ -1304,8 +1318,8 @@ $ runnerctl fleet watch --problems
 runnerctl fleet watch — 3 host(s) — 14:02:11 — every 5s (q to quit) — view: problems only
 3/3 hosts answering · 9 slots: 6 busy, 2 idle, 1 STALLED · 1 host disk crit · capacity 2 free of 9
 HOST     IDX RUNNER          PROFILE  ACTIVE           SINCE  ENABLED  ...  WORKING-ON
-build-2  Disk: /var/lib/docker [docker] 96% (37.3G free), /srv/runners [work] 41% (602.4G free)
-build-3  Disk: / [docker,work] 24% (353.9G free)
+build-2  v0.21.0 · Disk: /var/lib/docker [docker] 96% (37.3G free), /srv/runners [work] 41% (602.4G free)
+build-3  v0.21.0 · Disk: / [docker,work] 24% (353.9G free)
 build-3  1   org.build-3-b   ci       active/running   1d 2h  enabled  ...  my-app:build (2h10m) STALLED
 ```
 
@@ -1318,7 +1332,8 @@ What to know about them:
 - **A disabled slot is not a problem.** Somebody scaled it away on purpose; the
   summary dims it for the same reason. A slot that is merely not active is.
 - **A host's `Disk:` line** shows with any of its slots — and under `!` on its
-  own when the trouble is the host's (a full disk over healthy slots).
+  own when the trouble is the host's (a full disk over healthy slots, or a
+  `runnerctl` version other than this node's).
 - **A host that stopped answering** is a problem by definition: `!` keeps its
   age line and *all* its kept rows. `b` and `i` filter its kept rows by the
   state it last reported — they are dimmed and under their age, which already
