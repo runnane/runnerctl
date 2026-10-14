@@ -1508,6 +1508,7 @@ has its own `slot-1`:
 | `R` / `S` / `T` | restart / stop / start the slot; at the confirm line of `R` and `S`, `y` runs it now and `w` runs it **when idle** (`--when-idle`) |
 | `P` | reap processes a finished job leaked |
 | `D` / `W` / `E` / `X` | on the **host** of the cursor's row, every slot it has: drain, restart when idle (rolling), enable, disable — below |
+| `U` | **upgrade** the host of the cursor's row: `upgrade --check` first, the confirm line names `FROM -> TO`, `y` runs `upgrade` and the version is read back — below |
 | `L` | page the slot's last 50 journal lines through your `$PAGER` |
 | `O` | print the URL of the running job's run on the status line; no round trip |
 | `Enter` | show the selected slot in full, in place of the table; no round trip — below |
@@ -1630,6 +1631,30 @@ that is not answering, a host key is refused — there is nothing to decide on �
 and a slot key still says there is no slot there. `FLEET_SUDO` and the origin
 apply as for the slot keys.
 
+**Upgrading a host: `U`.** Like the host keys it acts on the host of the row the
+cursor is on, and it asks the host first: `runnerctl upgrade --check` there, a
+read that runs as the login and downloads the release to compare (on the
+`FLEET_MUTATE_TIMEOUT` budget). Only a host that says `Update available.` with
+two plain `X.Y.Z` versions gets a confirm line, which names the exact command
+and the versions:
+
+```
+build-1: upgrade 0.15.0 -> 0.17.0? runs on build-1: runnerctl upgrade — …  [y/n]
+```
+
+`y` runs plain `runnerctl upgrade` in the background (one action per host, as
+for every key that changes a host; `FLEET_SUDO` and the origin apply),
+anything else cancels. A host that is already current, ahead of its source, not
+answering, or whose `--check` answer is not understood is said so and nothing
+is issued. When the upgrade ends the host's `version` is read back, as
+`fleet upgrade` does, and the notice reports it: `build-1: upgraded 0.15.0 ->
+0.17.0, read back 0.17.0`. It says `upgraded` only when the read-back is the
+version the host said it wrote; otherwise the notice says `not confirmed` and
+names both versions (or that the read-back did not answer), and the
+`fleet.log` line records `unconfirmed`. A version a host sends that is not
+`X.Y.Z` is never drawn. `U` offers no `--push`: pushing this node's own copy
+is `fleet upgrade --push`.
+
 The cursor survives the frame changing under it. A host that stops answering
 keeps its rows, so the cursor stays on the slot it was on (the age line above
 them is never a stop); a host with no rows to keep is one row, where keys act
@@ -1637,7 +1662,7 @@ on nothing, and the cursor is back on its slot when the host answers. A slot
 that goes away drops the cursor to that host's first slot. `L` is not a stream: the host's
 `logs <slot> -n 50` runs to completion under `FLEET_TIMEOUT` and the result is
 paged locally. The keys that change something (`K` `R` `S` `T` `P`, and the
-host keys `D` `W` `E` `X`) run under
+host keys `D` `W` `E` `X` `U`) run under
 `FLEET_MUTATE_TIMEOUT` instead, in the background: a restart that sits out a
 wedged job's `TimeoutStopSec` is followed for those minutes rather than
 reported `failed` about an action that then completes behind it.

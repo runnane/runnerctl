@@ -8232,8 +8232,11 @@ fleet_pad() { # WIDTH TEXT
   printf '%s%s' "$2" "$pad"
 }
 
+fleet_upgrade_field_of() { # FILE KEY
+  sed -n "s/^$2: \([^ ]*\).*/\1/p" "$1" 2>/dev/null | head -1
+}
 fleet_upgrade_field() { # INDEX KEY
-  sed -n "s/^$2: \([^ ]*\).*/\1/p" "$FLEET_DIR/$1.out" 2>/dev/null | head -1
+  fleet_upgrade_field_of "$FLEET_DIR/$1.out" "$2"
 }
 
 # What host J of the fan-out in flight said to `upgrade`, into row K. The
@@ -10066,6 +10069,123 @@ fleet_watch_run_host_action() {
   FW_ACT_EACH=() FW_ACT_SLOTS=() FW_ACTION="" FW_PROMPT="" FW_ACT_SCOPE=slot
 }
 
+# --- Fleet watch: U upgrades the cursor's host (GHR-128) ------------------------
+# U acts on the HOST of the row the cursor is on, like the host keys, and is the
+# one key that asks the host a question before it builds a confirm line:
+# `upgrade --check` (as the login, a read, on the budget `fleet upgrade --check`
+# gives it — it downloads), parsed with the helpers `fleet upgrade` classifies
+# with. Only a host that says `Update available.` with two versions that are
+# X.Y.Z gets a confirm line; the line names the exact command and `FROM -> TO`.
+# A current host, one ahead of its source, one that does not answer and one
+# whose answer is not understood are each said so, and nothing is issued.
+#
+# `y` runs plain `upgrade` — not --push (GHR-83), which is a second design — as
+# a background action (GHR-125) on the mutating budget, with FLEET_SUDO and the
+# origin as for every key that changes a host. The action's job then reads the
+# host's version back, as `fleet upgrade` does (GHR-82), and the notice says
+# `upgraded` only when the read-back is the version the host said it wrote.
+FW_UP_FROM="" FW_UP_TO="" FW_ACT_FROM=() FW_ACT_TO=()
+
+fleet_watch_upgrade_key() {
+  local host="$FW_HOST" rc=0 budget cur avail
+  FW_NOTICE="" FW_PROMPT="" FW_ACTION="" FW_ACT_HOST="$host" FW_ACT_NAME="" FW_ACT_SLOTS=()
+  if [ "$FW_POS" -lt 0 ]; then FW_NOTICE="no host to act on"; return 0; fi
+  if [ "${FW_KIND[$FW_POS]:-}" != host ] && [ -z "${FW_ROWS[$FW_POS]#*$'\t'}" ]; then
+    FW_NOTICE="$host: not answering — U decides on what the host says, and it says nothing; nothing issued"
+    return 0
+  fi
+  ! fleet_watch_act_refuse "$host" || return 0
+  budget="$(fleet_mutate_budget upgrade 1)"
+  (FLEET_CALL_TIMEOUT="$budget" ssh_run "$host" "$FLEET_RUNNERCTL" upgrade --check) >"$FW_TMP/up" 2>"$FW_TMP/err" || rc=$?
+  relay_file "$FW_TMP/up"
+  relay_file "$FW_TMP/err"
+  if [ "$rc" != 0 ]; then
+    FW_NOTICE="$host: could not check for an upgrade — $(fleet_error_text "$rc" "$FW_TMP/err" "$budget"); nothing issued"
+    return 0
+  fi
+  cur="$(fleet_upgrade_field_of "$FW_TMP/up" installed)"
+  avail="$(fleet_upgrade_field_of "$FW_TMP/up" available)"
+  if grep -q '^Update available\.' "$FW_TMP/up"; then
+    if ! fleet_watch_version_ok "$cur" || ! fleet_watch_version_ok "$avail"; then
+      FW_NOTICE="$host: upgrade --check named a version that is not X.Y.Z — nothing issued"
+      return 0
+    fi
+    fleet_priv_cmd
+    FW_UP_FROM="$cur" FW_UP_TO="$avail" FW_ACTION=upgrade FW_ACT_SCOPE=upgrade
+    FW_PROMPT="$host: upgrade $cur -> $avail? runs on $host: ${FLEET_PRIV[*]} upgrade — the host downloads the release and replaces its runnerctl, then its version is read back  [y/n]"
+  elif grep -q '^Already up to date\.' "$FW_TMP/up"; then
+    fleet_ver "$cur"
+    FW_NOTICE="$host: already current ($FLEET_VER) — nothing to upgrade, nothing issued"
+  elif grep -q 'not downgrading' "$FW_TMP/up"; then
+    fleet_ver "$cur"
+    FW_NOTICE="$host: runs $FLEET_VER, ahead of the source — left alone, nothing issued"
+  else
+    fleet_watch_act_last "$FW_TMP/up" plain
+    FW_NOTICE="$host: upgrade --check answered something unrecognised (${ACT_LAST:-nothing}) — nothing issued"
+  fi
+}
+
+# Whether TEXT is a version this watch may draw: X.Y.Z, and short.
+fleet_watch_version_ok() { # TEXT
+  [ "${#1}" -le 32 ] && valid_runner_version "$1"
+}
+
+# The confirmed U, in the background (GHR-125) with the host as its label. The
+# versions the confirm line named ride along for the notice.
+fleet_watch_run_upgrade() {
+  local budget host="$FW_ACT_HOST"
+  budget="$(fleet_mutate_budget upgrade 1)"
+  fleet_priv_cmd
+  printf '\nrunning on %s: %s upgrade\n' "$host" "${FLEET_PRIV[*]}"
+  if fleet_host_index "$host"; then
+    FW_ACT_FROM[FLEET_HOST_I]="$FW_UP_FROM" FW_ACT_TO[FLEET_HOST_I]="$FW_UP_TO"
+  fi
+  # GHR-88: recorded on this node as the command line the key stands for.
+  fleet_watch_act_start "$host" "$host" upgrade "fleet upgrade --host $host (fleet watch)" "$budget" upgrade || true
+  FW_ACTION="" FW_PROMPT="" FW_ACT_SCOPE=slot
+}
+
+# The notice of an upgrade that ended with rc 0, into UP_NOTICE (and UP_RC, the
+# result its FLEET_LOG line records). `upgraded` is a claim this checks: the
+# version the host's own `Upgraded A -> B` sentence says it wrote, against the
+# one the read-back (the job's `version` call, GHR-82) answered.
+UP_NOTICE="" UP_RC=0
+fleet_watch_upgrade_notice() { # INDEX DIR
+  local i="$1" d="$2" wrote got rb
+  UP_NOTICE="" UP_RC=0
+  wrote="$(fleet_upgrade_wrote "$d/out")"
+  if [ -z "$wrote" ]; then
+    fleet_watch_act_last "$d/out" plain
+    UP_NOTICE="upgrade wrote nothing (${ACT_LAST:-no answer})"
+    return 0
+  fi
+  if ! fleet_watch_version_ok "$wrote"; then
+    UP_RC=unconfirmed
+    UP_NOTICE="upgrade said it wrote a version that is not X.Y.Z, so it was not read back — not confirmed"
+    return 0
+  fi
+  rb="$(cat "$d/rb.rc" 2>/dev/null || echo 255)"
+  if [ "$rb" != 0 ]; then
+    UP_RC=unconfirmed
+    UP_NOTICE="upgrade wrote $wrote but the read-back did not answer: $(fleet_error_text "$rb" "$d/rb.err" "$FLEET_WATCH_TIMEOUT") — not confirmed"
+    return 0
+  fi
+  got="$(fleet_version_answer "$d/rb.out")"
+  if ! fleet_watch_version_ok "$got"; then
+    fleet_watch_act_last "$d/rb.out" plain
+    UP_RC=unconfirmed
+    UP_NOTICE="upgrade wrote $wrote but the read-back answered '${ACT_LAST:-nothing}', not a version — not confirmed"
+    return 0
+  fi
+  if [ "$got" = "$wrote" ]; then
+    UP_NOTICE="upgraded ${FW_ACT_FROM[$i]:-?} -> $wrote, read back $got"
+    [ "$wrote" = "${FW_ACT_TO[$i]:-}" ] || UP_NOTICE+=" (the confirm line named ${FW_ACT_TO[$i]:-?})"
+  else
+    UP_RC=unconfirmed
+    UP_NOTICE="upgrade wrote $wrote but the read-back answers $got — not confirmed (the write landed where the fleet path does not run)"
+  fi
+}
+
 # --- Fleet watch: an action in the background (GHR-125) -------------------------
 # A confirmed action used to run in the foreground, and the frame froze until
 # the remote returned — for a --when-idle restart or a drain, up to
@@ -10169,6 +10289,15 @@ fleet_watch_act_job() { # INDEX BUDGET REMOTE-ARGS...
       [ "$FLEET_CALL_RC" = 0 ] || break
     done
   fi
+  # GHR-128: an upgrade that says it wrote is read back, as a read, before the
+  # rc lands — the loop takes the answer only once it is whole.
+  if [ "${FW_ACT_VERB[$i]}" = upgrade ] && [ "$FLEET_CALL_RC" = 0 ] && fleet_watch_version_ok "$(fleet_upgrade_wrote "$d/out")"; then
+    local rb=0
+    (FLEET_CALL_TIMEOUT="$FLEET_WATCH_TIMEOUT" ssh_run "${FLEET_HOSTS[$i]}" "$FLEET_RUNNERCTL" version) >"$d/rb.out" 2>"$d/rb.err" || rb=$?
+    relay_file "$d/rb.out"
+    relay_file "$d/rb.err"
+    echo "$rb" >"$d/rb.rc"
+  fi
   echo "$FLEET_CALL_RC" >"$d/rc.new"
   mv -f "$d/rc.new" "$d/rc"
 }
@@ -10222,7 +10351,7 @@ fleet_watch_act_notice() { # TEXT
 # shows what the action did. A job gone without its `rc` — killed from
 # outside — is an answer too, as for a fetch (fleet_watch_collect).
 fleet_watch_act_collect() {
-  local i d rc n ended=1
+  local i d rc n logrc ended=1
   for i in "${!FW_ACT_PID[@]}"; do
     [ -n "${FW_ACT_PID[$i]}" ] || continue
     d="$FW_TMP/act.$i"
@@ -10237,15 +10366,19 @@ fleet_watch_act_collect() {
       fi
     fi
     rc="$(cat "$d/rc" 2>/dev/null || echo 255)"
-    if [ "$rc" = 0 ]; then
+    logrc="$rc"
+    if [ "$rc" = 0 ] && [ "${FW_ACT_VERB[$i]}" = upgrade ]; then
+      fleet_watch_upgrade_notice "$i" "$d"
+      n="${FW_ACT_LABEL[$i]}: $UP_NOTICE" logrc="$UP_RC"
+    elif [ "$rc" = 0 ]; then
       fleet_watch_act_last "$d/out"
       n="${FW_ACT_LABEL[$i]}: ${ACT_LAST:-${FW_ACT_VERB[$i]} done}"
     else
       n="${FW_ACT_LABEL[$i]}: ${FW_ACT_VERB[$i]} failed — $(fleet_error_text "$rc" "$d/err" "${FW_ACT_BUDGET[$i]}" mutating)"
     fi
-    fleet_log_write "${FW_ACT_LOG[$i]}" "${FLEET_HOSTS[$i]}=$rc"
+    fleet_log_write "${FW_ACT_LOG[$i]}" "${FLEET_HOSTS[$i]}=$logrc"
     fleet_watch_act_notice "$n"
-    FW_ACT_PID[i]="" FW_ACT_SHOWN[i]="" FW_ACT_DETACHED[i]=""
+    FW_ACT_PID[i]="" FW_ACT_SHOWN[i]="" FW_ACT_DETACHED[i]="" FW_ACT_FROM[i]="" FW_ACT_TO[i]=""
     rm -rf "$d"
     ended=0
   done
@@ -10399,7 +10532,7 @@ FLEET_WATCH_HELP="fleet watch — keys
           host that is not answering: that host). There q Esc Enter go back, h
           shows the host alone, ↑ ↓ PgUp PgDn scroll, K R S T P L O act on it
   K R S T P L   kill job, restart, stop, start, reap, logs; R S: w = when idle
-  D W E X   the row's host: drain, restart when idle, enable, disable
+  D W E X U   the row's host: drain, restart when idle, enable, disable, upgrade
   O     print the run URL of the cursor's job — nothing is opened
   q ?   quit, this list; Esc stops following a running action, which carries on
 ! b i / a s c ask no host anything, and the summary counts the whole fleet."
@@ -10838,7 +10971,11 @@ fleet_watch_handle_key() { # KEY
     FW_ACT_NOTICE=false
     case "$1" in
       y|Y) FW_NOTICE=""
-           if [ "$FW_ACT_SCOPE" = host ]; then fleet_watch_run_host_action; else fleet_watch_run_action; fi ;;
+           case "$FW_ACT_SCOPE" in
+             host)    fleet_watch_run_host_action ;;
+             upgrade) fleet_watch_run_upgrade ;;
+             *)       fleet_watch_run_action ;;
+           esac ;;
       # GHR-126: the graceful form, offered by R and S alone — not by a host
       # key (GHR-127), whose W is already the graceful restart.
       w)   case "$FW_ACT_SCOPE:$FW_ACTION" in
@@ -10865,6 +11002,8 @@ fleet_watch_handle_key() { # KEY
     K|R|S|T|P|L|O) fleet_watch_key_action "$1" ;;
     # GHR-127: the host keys, on the host of whatever row the cursor is on.
     D|W|E|X) fleet_watch_host_key "$1" ;;
+    # GHR-128: upgrade the row's host, after an `upgrade --check`.
+    U) fleet_watch_upgrade_key ;;
     # GHR-125: Esc stops following an action; it never cancels one.
     esc) fleet_watch_act_detach ;;
     '!') FW_FILTER=problems ;;
