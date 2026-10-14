@@ -11189,7 +11189,13 @@ FW_VIEW="" FW_VIEW_NAME="" FW_FACTS_OK=false
 FW_KIND=()
 declare -A FW_FACT=() FW_HOSTBAD=() FW_HOSTSUM=() FW_OPEN=()
 FLEET_WATCH_EMPTY="nothing matches — a shows all"
-FLEET_WATCH_VIEW_LEGEND="$WATCH_LEGEND  a all  ? keys"
+# GHR-98: fleet watch's own legend, since only it has the `?` overlay. It names
+# `?` in the frame a reader sees first, and is 80 columns exactly (the
+# host-scoped keys are in the overlay, not here: no room). With a view on it
+# also names `a`, ahead of `? keys`, which it says once.
+FLEET_WATCH_LEGEND_HEAD="↑↓/jk select  K kill  R restart  S stop  T start  P reap  L logs"
+FLEET_WATCH_LEGEND="$FLEET_WATCH_LEGEND_HEAD  ? keys  q quit"
+FLEET_WATCH_VIEW_LEGEND="$FLEET_WATCH_LEGEND_HEAD  a all  ? keys  q quit"
 # Seventeen lines, so that with the header, the summary and the three lines
 # under it the list fits a terminal of 24 rows; none is wider than 80 columns.
 FLEET_WATCH_HELP="fleet watch — keys
@@ -11908,7 +11914,7 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
       # The legend is the one of before unless a view is on, when it also
       # names the two keys that lead out of it; the status line is the text
       # being typed while / is open.
-      legend="$WATCH_LEGEND" status="${FW_PROMPT:-$FW_NOTICE}"
+      legend="$FLEET_WATCH_LEGEND" status="${FW_PROMPT:-$FW_NOTICE}"
       fleet_watch_view_plain || legend="$FLEET_WATCH_VIEW_LEGEND"
       ! fleet_watch_marks_on || legend+="  ${#FW_MARKS[@]} marked, u clears"
       ! fleet_watch_act_attached || legend+="  Esc detach"
