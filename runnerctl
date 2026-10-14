@@ -802,9 +802,9 @@ audit_logger() { # MESSAGE
 # parent's cleanup — the local watch's teardown, say — on its way out.
 EXIT_CMD="" EXIT_PID=""
 # GHR-123: the wrapper parses `trap [--] CMD SIGSPEC...` exactly, not by shape.
-#   * an option (`-p`, `-l`, anything starting `-` but `--` and a lone `-`) is
-#     the builtin's, untouched: `trap -p EXIT` prints what the builtin prints
-#     (`exit_run`, which is what is armed) and stores nothing;
+#   * `-p` and `-l` are the builtin's: `trap -p EXIT` prints what the builtin
+#     prints (`exit_run`, which is what is armed) and stores nothing; any other
+#     option (anything starting `-` but `--` and a lone `-`) dies loudly;
 #   * `--` ends the options, so `trap -- CMD EXIT` is `trap CMD EXIT`;
 #   * EXIT anywhere in the list is the wrapper's: CMD becomes EXIT_CMD and
 #     exit_run stays armed. `trap - EXIT` and `trap '' EXIT` both mean "no
@@ -816,10 +816,11 @@ trap_is_exit() { # SIGSPEC
   return 1
 }
 trap() {
-  # shellcheck disable=SC2064 # the builtin's own argv, not a handler string
   case "${1-}" in
     --) shift ;;
-    -?*) builtin trap "$@"; return ;;
+    -p) shift; builtin trap -p "$@"; return ;;
+    -l) builtin trap -l; return ;;
+    -?*) die "trap: unsupported option $1" ;;
   esac
   if [ $# -eq 1 ]; then
     # A lone signal is the builtin's reset; for EXIT that is `trap - EXIT`.

@@ -13378,6 +13378,11 @@ case_ghr123_trap_wrapper_forms() {
   run_fn eval "$pre"'trap -p EXIT; trap -l >/dev/null; echo "stored=[$EXIT_CMD]"; trap -p EXIT | grep -c exit_run'
   expect_out '^stored=\[\]$'
   expect_out '^0$'
+  # any other option is refused loudly, never stored as a handler
+  run_fn eval "$pre"'trap -x EXIT; echo "not reached"'
+  expect_rc 1
+  expect_err '^runnerctl: trap: unsupported option -x$'
+  expect_no_out 'not reached'
   # `--` ends the options: the handler is kept and the record still written
   run_fn eval "$pre"'trap -- "echo cmd" EXIT; echo "stored=[$EXIT_CMD]"'
   expect_out '^stored=\[echo cmd\]$'
