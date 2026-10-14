@@ -7335,6 +7335,62 @@ case_ghr77_fleet_pane_draws_the_version_as_the_host_line_does() {
   rm -rf "$d"
 }
 
+# GHR-112: `!` agrees with the summary and the table about a host whose version
+# is unknown. Payloads written here, since no stub host sends these: h1 leads
+# with `{"host":` (a runnerctl older than GHR-32: no version line at all), h3
+# carries a version that is not X.Y.Z, h2 is on this node's version (the
+# negative control: it stays hidden), and h4 is the same no-version payload as
+# h1 from a host whose last call failed (jrc non-zero: not an answer, so not
+# marked here). Healthy slots throughout; only the host lines can be kept.
+case_ghr112_problems_keeps_a_host_whose_version_is_unknown() {
+  local d="$TMP/ghr112.state" me
+  me="$ME_VER"
+  rm -rf "$d"; mkdir -p "$d"
+  s() { # IDX NAME
+    echo "  {\"idx\":$1,\"unit\":\"u\",\"name\":\"$2\",\"active\":\"active\",\"sub\":\"running\",\"enabled\":\"enabled\",\"memory_high\":null,\"memory_current\":5,\"job\":null,\"idle_since\":null,\"jobs_completed\":null,\"working_on_access\":\"ok\",\"leaked_procs\":null,\"memory_pressure\":null}"
+  }
+  {
+    echo '{"host":{"name":"h1","disks":[],"events":{"oom_kills":0,"disk_full":0}},'
+    s 0 r1
+  } >"$d/0.json"
+  {
+    echo "{\"runnerctl\":\"$me\",\"host\":{\"name\":\"h2\",\"disks\":[],\"events\":{\"oom_kills\":0,\"disk_full\":0}},"
+    s 0 r2
+  } >"$d/1.json"
+  {
+    echo '{"runnerctl":"1.2","host":{"name":"h3","disks":[],"events":{"oom_kills":0,"disk_full":0}},'
+    s 0 r3
+  } >"$d/2.json"
+  {
+    echo '{"host":{"name":"h4","disks":[],"events":{"oom_kills":0,"disk_full":0}},'
+    s 0 r4
+  } >"$d/3.json"
+  unset -f s
+  printf '0\n' | tee "$d/0.jrc" "$d/1.jrc" "$d/2.jrc" >/dev/null
+  printf '1\n' >"$d/3.jrc"
+  # shellcheck disable=SC2016
+  GHR112_D="$d" run_fn eval 'color_setup never
+    FLEET_HOSTS=(h1 h2 h3 h4) FW_STATE="$GHR112_D" FW_FILTER=problems
+    frame="HOST IDX RUNNER
+h1   ? · Disk: / 10% (1.0G free)
+h1   0   r1
+h2   v'"$ME_VER"' · Disk: / 10% (1.0G free)
+h2   0   r2
+h3   ? · Disk: / 10% (1.0G free)
+h3   0   r3
+h4   ? · Disk: / 10% (1.0G free)
+h4   0   r4"
+    fleet_watch_view "$frame"
+    echo "$FW_VIEW"
+    echo "bad:$(printf " %s" "${!FW_HOSTBAD[@]}" | tr " " "\n" | sort | tr "\n" " ")"'
+  expect_rc 0
+  expect_text "only the unknown-version hosts' lines" "HOST IDX RUNNER
+h1   ? · Disk: / 10% (1.0G free)
+h3   ? · Disk: / 10% (1.0G free)
+bad: h1 h3 " "$OUT"
+  rm -rf "$d"
+}
+
 # The problem segments, each from a state the host really reports: a unit
 # stopped by hand (enabled, not active) is `down` where slot-3 is `disabled`;
 # an idle slot with processes left behind is leaking; a host with a partition
@@ -9265,7 +9321,8 @@ t "GHR-77: versions compare as versions (0.9.0 is behind 0.10.0)"          case_
 t "GHR-77: a version that is no version is unknown, drawn ?"               case_ghr77_a_version_that_is_no_version_is_unknown
 t "GHR-77: fleet watch's ! and collapse carry the version"                 case_ghr77_fleet_watch_problems_and_collapse_carry_the_version
 t "GHR-77: the pane draws the version as the host line does"               case_ghr77_fleet_pane_draws_the_version_as_the_host_line_does
-t "fleet summary: down, leaking, disk and event segments"                 case_fleet_summary_names_what_is_wrong
+t "GHR-112: ! keeps a host whose version is unknown, not one on this node's" case_ghr112_problems_keeps_a_host_whose_version_is_unknown
+t "fleet summary: down, leaking, disk and event segments"                case_fleet_summary_names_what_is_wrong
 t "fleet summary: capacity 0 free is still shown"                         case_fleet_summary_capacity_zero_is_still_shown
 t "fleet summary: painted like the table"                                 case_fleet_summary_is_painted_like_the_table
 t "fleet summary: the numbers are fleet status --json's"                  case_fleet_summary_matches_fleet_status_json

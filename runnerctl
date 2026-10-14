@@ -9642,15 +9642,16 @@ fleet_watch_view_name() {
 # `4 slots: 3 busy, 1 idle`. Once per frame at most, and only for a view that
 # needs it.
 fleet_watch_load_facts() {
-  local i host line n busy idle stalled down disabled
+  local i host line n busy idle stalled down disabled hv jrc
   FW_FACT=() FW_HOSTBAD=() FW_HOSTSUM=()
   for i in "${!FLEET_HOSTS[@]}"; do
     host="${FLEET_HOSTS[$i]}"
     [ -f "$FW_STATE/$i.json" ] || continue
-    n=0 busy=0 idle=0 stalled=0 down=0 disabled=0
+    n=0 busy=0 idle=0 stalled=0 down=0 disabled=0 hv=false
     while IFS= read -r line; do
       case "$line" in
         '{"runnerctl":'*)
+          hv=true
           fleet_host_classify "$line"
           # GHR-77: a host not on this node's version is one `!` keeps — this
           # node forwards flags it may not know. Its host line is there to
@@ -9671,6 +9672,13 @@ fleet_watch_load_facts() {
           FW_FACT["$host"$'\t'"$SC_NAME"]="$SC_STATE|$SC_PROBLEM|$SC_SINCE|$SC_MEM|$SC_JOB" ;;
       esac
     done <"$FW_STATE/$i.json"
+    # GHR-112: a host that answered with a payload that has no version line (a
+    # runnerctl older than GHR-32 starts it with `{"host":`) is unknown, as
+    # fleet_summary_count counts it — and a host `!` keeps, for the same
+    # reason as above. One that did not answer (jrc non-zero, or none) is
+    # left as it was.
+    jrc="$(cat "$FW_STATE/$i.jrc" 2>/dev/null || echo 255)"
+    if [ "$jrc" = 0 ] && ! $hv; then FW_HOSTBAD[$host]=1; fi
     [ "$n" -eq 0 ] || FW_HOSTSUM[$host]="$(fleet_states_text "$n" "$busy" "$idle" "$stalled" "$down" "$disabled")"
   done
   FW_FACTS_OK=true
