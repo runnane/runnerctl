@@ -1270,7 +1270,7 @@ outcomes are deliberately kept apart, because they call for different actions:
 | --- | --- |
 | `unreachable — …` | ssh could not reach the host. Nothing is known about it. |
 | `timed out after Ns` | a read-only call did not answer inside `FLEET_TIMEOUT` (`FLEET_WATCH_TIMEOUT` under `fleet watch`). Nothing is known about it. |
-| `timed out after Ns — the command may still be running on that host; …` | a call that **changes things** ran out of its own, larger budget. This is *not* "nothing is known": only the local ssh was stopped, and the host carries on until it next writes output — so it may be part-way through, or about to finish. Read `runnerctl fleet status` before re-running anything. |
+| `timed out after Ns — the command may still be running on that host; …` | a call that **changes things** ran out of its own, larger budget. This is *not* "nothing is known": only the local ssh was stopped. The host's `drain`, `stop`, `restart`, `apply` or `scale` then **runs to the end on its own** — every slot it was asked for, each still waiting for idle under `--when-idle` — and records how it ended, as `… (caller gone, ran to the end)`; `runnerctl fleet history --host H` reads that record once it is done, and `runnerctl fleet status` shows where it has got to meanwhile. Read one of them before re-running anything. (A host on a runnerctl from before this behaviour stops instead at its next line of output, part-way.) |
 | `remote exit N — …` | the host answered fine and its `runnerctl` exited non-zero. On a host with no runner units that is its own perfectly good message, not a fleet fault. |
 | `remote exit 127 — …` | nothing named `runnerctl` on that host's non-interactive ssh `PATH` — see the PATH note above. Set `FLEET_RUNNERCTL`, or install it system-wide. |
 | `remote exit 126 — …` | runnerctl **is** there and the ssh login cannot execute it. Installs from 0.9.0 and 0.10.0 landed `0700`/`0711`; `sudo chmod 755` the path the row names, or re-run the installer (0.10.1 widens it). |
@@ -1590,6 +1590,10 @@ is signalled, and its notice still arrives. **`q`** (or Ctrl-C) with an action
 still running ends only this node's side of it — the job and its ssh — says
 which command was left running and that `runnerctl fleet status --host <host>`
 shows where it got to, and records it in the fleet log as `<host>=detached`.
+On the host a `drain`, `stop`, `restart`, `apply` or `scale` then runs to the
+end on its own (see [the mutating
+fan-out](#changing-things-the-mutating-fan-out)), and `runnerctl fleet history
+--host <host>` reads how it ended.
 
 `S` has a **capacity floor**. A single-slot key is as bounded a target as
 there is, so it needs neither `--host` nor `--all-hosts` — but a cursor walked
@@ -2059,6 +2063,35 @@ may still be running on that host; 'runnerctl fleet status' shows where it got
 to`, and it means that: the timeout stops the local ssh, not the remote
 `runnerctl`. The fan-out then moves on to the next host, so check before
 re-running.
+
+**What the host does once its caller has gone.** The same happens when you
+press Ctrl-C on the central node, quit `fleet watch` with an action still
+running, or lose the network: only the local side ends. The host's `drain`,
+`stop`, `restart`, `apply` and `scale` **finish what they started** rather than
+stopping part-way. Once one of them has begun changing things, a closed
+connection does not end it: its output is passed on while there is someone to
+read it and dropped after that, and a hangup (SIGHUP) is ignored. It goes on
+slot by slot, waiting for idle as it was asked to, and each wait is still
+bounded by its `--timeout`. Its record then says so —
+`drain all by deploy via fleet from alice@central-1 — ok (caller gone, ran to
+the end)` — which `runnerctl fleet history --host H` reads back. The choice
+is deliberate: stopping at a slot boundary would still leave the host half
+done, with some slots on the new config or out of the pool and nobody left to
+finish the job. A deliberate Ctrl-C or SIGTERM **on the host itself** still
+stops the command there and is recorded as `interrupted`. A host on a
+runnerctl from before this behaviour stops at its next line of output instead,
+so upgrade the fleet before relying on it.
+
+**A host that vanishes is dropped in about a minute.** Every fleet ssh call
+sends a keepalive (`ServerAliveInterval=15`, `ServerAliveCountMax=4`). A host
+that is powered off or cut off mid-call is reported `unreachable` after about
+a minute rather than holding its place for the whole budget, while a slow but
+live host keeps answering and is waited for. For a mutating call, that
+`unreachable` means only that the connection is gone; the host may have done
+part of the work. ssh keeps the *first* value it is given for an option, and
+runnerctl puts the keepalive after `FLEET_SSH_OPTS`, so setting
+`-o ServerAliveInterval=…` there changes it. `BatchMode` and `ConnectTimeout`
+come before it and cannot be changed that way.
 
 **One host at a time.** `FLEET_PARALLEL` is ignored for mutating commands.
 Combined with the per-host `--when-idle` (one slot at a time *within* a host),
