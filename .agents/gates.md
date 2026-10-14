@@ -441,6 +441,13 @@ Traps:
   no-op there — the first run of GHR-119's composition case was green under
   a plain `make sim` and red under `agent-gate-admit`, with `trap -p` showing
   `trap -- '' SIGINT`.
+- **A space in `RUNNERCTL_STUB_KEYS` is a key (GHR-129)**: `fleet watch`'s
+  mark. The real `IFS= read -rsn1` hands back `' '` for it, and so does the
+  stub (logged `probe:tty_read_char 5 \ `). While any row is marked the table
+  has a two-column gutter (`* ` or two spaces) in front of EVERY line, header
+  included, so `fw_row` and any `^build-1 +…` pattern stop matching: a marks
+  case writes its own `^\* build-1 …` / `^${REV}\* …` patterns. With no marks
+  the frame is the one of before, which is what keeps every older case green.
 - **`history`'s journal read is a hook** (`journal_history_lines N`): the
   stub answers it from `RUNNERCTL_STUB_HISTORY` (a file of journalctl
   short-iso-precise lines; a remote host's is `<file>.<host>` when it exists)

@@ -9529,7 +9529,8 @@ case_fleet_watch_question_mark_lists_every_key() {
   # a line per key, and the list short enough for a 24-row terminal: its 17
   # lines (GHR-78 added O, GHR-76 Enter and what the pane's own keys are), the
   # header, the summary and the three lines under it
-  for k in '!' 'b i' '/' 'a' 's' 'c' 'Enter' 'K R S T P L' 'D W E X U' 'O' 'q \?' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
+  # GHR-129: `a` joined `b i`'s line, and the marks took the line it had
+  for k in '!' 'b i a' '/' 'space \* u' 's' 'c' 'Enter' 'K R S T P L' 'D W E X U' 'O' 'q \?' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
     expect_frame 2 "^  $k   +[a-z]"
   done
   expect_frame 2 '^  K R S T P L   kill job, restart, stop, start, reap, logs; R S: w = when idle$'
@@ -14614,6 +14615,234 @@ t "GHR-128: an unreachable host refuses U"                                      
 t "GHR-128: U runs in the background, one action per host"                                    case_ghr128_U_runs_in_the_background_one_per_host
 t "GHR-128: U carries FLEET_SUDO and --origin on the write alone"                             case_ghr128_U_carries_sudo_and_origin
 t "GHR-128: the help lists U (the line count is pinned by the help case)"                     case_ghr128_the_help_lists_U
+
+# --- GHR-129: marked rows -----------------------------------------------------
+# Space marks the cursor's slot row, * every slot row the view shows, u clears.
+# A mark is the (host, slot) pair; with marks an action key acts on the set
+# after ONE confirm line, one background action per host. The stub's hosts are
+# slot-1 busy, slot-2 idle, slot-3 not active: 4 of 6 active on $FW2. In the
+# keys below a space is a mark — ' j jj ' marks build-1's slot-1 and slot-2
+# and build-2's slot-1.
+GHR129_SLOTKEYS='^probe:ssh_run [^ ]+ -- (sudo -n )?runnerctl (stop|start|restart|kill|reap) '
+GHR129_THREE_RESTART='^Restart 3 marked slot\(s\)\? runs on build-1: runnerctl restart example\.slot-1; on build-1: runnerctl restart example\.slot-2; on build-2: runnerctl restart example\.slot-1  \[y/n\]$'
+
+# The acceptance case: three marks, one confirm listing all three, exactly
+# three restarts — build-1's two in turn inside one action, build-2's in its
+# own — and a notice and a fleet.log line per host. w at the same confirm runs
+# the three with --when-idle instead, and nothing abrupt.
+case_ghr129_three_marks_issue_three_commands_after_one_confirm() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=' j jj Ryq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_out '^\* build-1 +0 +example\.slot-1 '
+  expect_out '^\* build-1 +1 +example\.slot-2 '
+  expect_out "^${REV}\\* build-2 +0 +example\\.slot-1 "
+  expect_out '  3 marked, u clears$'
+  expect_out_count "$GHR129_THREE_RESTART" 1
+  expect_out_count '\[y/n\]' 1
+  expect_out_count '^warning: a job is running \(example\.slot-1 on build-1 \(my-app:test[^)]*\)\), example\.slot-1 on build-2 \(my-app:test[^)]*\)\)\) — y kills it ' 1
+  expect_out_count '^w instead runs each with --when-idle — waits for its job to finish; anything else cancels$' 1
+  expect_no_out '^Restart example\.slot'
+  expect_out_count '^running on build-1: runnerctl restart example\.slot-1; runnerctl restart example\.slot-2$' 1
+  expect_out_count '^running on build-2: runnerctl restart example\.slot-1$' 1
+  expect_out_count '^example\.slot-1, example\.slot-2 on build-1: restart done\.' 1
+  expect_out '(^| · )example\.slot-1 on build-2: restart done\.'
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart example\.slot-1$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart example\.slot-2$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl restart example\.slot-1$' 1
+  expect_log_count "$GHR129_SLOTKEYS" 3
+  expect_log_order '^probe:ssh_run build-1 -- runnerctl restart example\.slot-1$' '^probe:ssh_run build-1 -- runnerctl restart example\.slot-2$'
+  expect_cfg_count "$WRITES/fleet.log" '.' 2
+  expect_cfg "$WRITES/fleet.log" "^$GHR88_TS $ME fleet restart --host build-1 example\\.slot-1 example\\.slot-2 \\(fleet watch\\) — build-1=0\$"
+  expect_cfg "$WRITES/fleet.log" "^$GHR88_TS $ME fleet restart --host build-2 example\\.slot-1 \\(fleet watch\\) — build-2=0\$"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=' j jj Rwq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "$GHR129_THREE_RESTART" 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart --when-idle example\.slot-1$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart --when-idle example\.slot-2$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl restart --when-idle example\.slot-1$' 1
+  expect_log_count "$GHR129_SLOTKEYS" 3
+  expect_cfg "$WRITES/fleet.log" "^$GHR88_TS $ME fleet restart --when-idle --host build-2 example\\.slot-1 \\(fleet watch\\) — build-2=0\$"
+}
+
+# * under ! marks exactly the problem rows — each host's slot-1, STALLED under
+# a stall threshold of the host's own — and no other: back in the whole table
+# (a) only those two carry the gutter's mark, and K kills exactly those two
+# jobs, with nothing skipped (a healthy slot marked by mistake would be).
+case_ghr129_star_under_the_problems_filter_marks_the_problem_rows() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='!*aKyq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_STALL="build-1 build-2" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^marked 2 slot\(s\) the view shows — 2 marked in all$' 1
+  expect_out "^${REV}\\* build-1 +0 +example\\.slot-1 "
+  expect_out '^\* build-2 +0 +example\.slot-1 '
+  expect_no_out '^(.\[7m)?\* build-[12] +[12] '
+  expect_out '  2 marked, u clears$'
+  expect_out_count '^Kill the job on 2 marked slot\(s\)\? runs on build-1: runnerctl kill example\.slot-1; on build-2: runnerctl kill example\.slot-1  \[y/n\]$' 1
+  expect_no_out '^skipped:'
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl kill example\.slot-1$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl kill example\.slot-1$' 1
+  expect_log_count "$GHR129_SLOTKEYS" 2
+}
+
+# A mark is the slot, not the row's place: build-1's slot-2 is marked (row 1),
+# s sorts longest job first — the two busy slot-1s first, so row 1 is now
+# build-2's slot-1 — and a tick refreshes. The mark is still on build-1's
+# slot-2, under the cursor, and R names that slot alone.
+case_ghr129_a_mark_survives_a_refresh_in_which_rows_reorder() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='j s-Rnq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_out 'view: longest job first'
+  expect_out "^${REV}\\* build-1 +1 +example\\.slot-2 "
+  expect_no_out '^(.\[7m)?\* build-(1 +0|1 +2|2 +[012]) '
+  expect_out '  1 marked, u clears$'
+  expect_out_count '^Restart 1 marked slot\(s\)\? runs on build-1: runnerctl restart example\.slot-2  \[y/n\]$' 1
+  expect_no_log "$GHR129_SLOTKEYS"
+}
+
+# The negative control: under --min-available 2 each marked slot ALONE passes
+# the floor (S on build-1's slot-1 is offered, `leaves 3 of 6`, answered n),
+# but the three together would leave 1 — S over the set is refused and issues
+# nothing. Under the default floor the same set is offered and stops three.
+case_ghr129_the_floor_is_checked_for_the_set_together() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Sn j jj Sq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never --min-available 2
+  expect_rc 0
+  expect_out_count '^Stop example\.slot-1 on build-1\? runs on build-1: runnerctl stop example\.slot-1 — leaves 3 of 6 slot\(s\) active across the watched hosts  \[y/n\]' 1
+  expect_out_count '^3 marked slot\(s\): not stopped — it would leave 1 of 6 slot\(s\) active across the watched hosts, under --min-available 2; restart --min-available lower \(0 turns the floor off\), or unmark some \(space\) and stop fewer$' 1
+  expect_no_out '^Stop 3 marked'
+  expect_no_log "$GHR129_SLOTKEYS"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=' j jj Syq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^Stop 3 marked slot\(s\)\? runs on build-1: runnerctl stop example\.slot-1; on build-1: runnerctl stop example\.slot-2; on build-2: runnerctl stop example\.slot-1 — leaves 1 of 6 slot\(s\) active across the watched hosts  \[y/n\]$' 1
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl stop ' 3
+  expect_log_count "$GHR129_SLOTKEYS" 3
+}
+
+# A marked slot that goes away (build-2 scales down from its second frame) is
+# dropped from the set, and the notice says so; T then starts only the mark
+# that is left — build-2 is not named, not even as skipped.
+case_ghr129_a_vanished_slot_is_dropped_and_said() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jj jjj -Tyq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_SCALED="build-2:2" run fleet watch --color never
+  expect_rc 0
+  expect_out '^\* build-2 +2 +example\.slot-3 |^.\[7m\* build-2 +2 +example\.slot-3 '
+  expect_out_count '^mark dropped: example\.slot-3 on build-2 — no longer on that host$' 1
+  expect_out '  1 marked, u clears$'
+  expect_out_count '^Start 1 marked slot\(s\)\? runs on build-1: runnerctl start example\.slot-3  \[y/n\]$' 1
+  expect_no_out '^skipped:'
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl start example\.slot-3$' 1
+  expect_log_count "$GHR129_SLOTKEYS" 1
+}
+
+# With no marks every key is what it was: a mark cleared with u leaves R the
+# single-slot confirm line byte for byte, and the frame loses its gutter.
+case_ghr129_with_no_marks_keys_act_on_the_cursor_as_before() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=' uRnq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^marks cleared — 1 slot\(s\) unmarked; keys act on the cursor.s row again$' 1
+  expect_out_count '^  HOST +IDX ' 1
+  expect_out_count '  1 marked, u clears$' 1
+  expect_out_count "$GHR126_RESTART_LINE" 1
+  expect_out_count "$GHR126_IDLE_RESTART" 1
+  expect_no_out 'marked slot'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='uq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^no marks to clear$' 1
+  expect_no_out '^  HOST'
+}
+
+# L and O act on the cursor's row even with marks: the logs paged are the
+# cursor's slot's, and only it was asked for.
+case_ghr129_L_and_O_stay_on_the_cursor() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=' jLOq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl logs example\.slot-2 -n 50$' 1
+  expect_no_log '^probe:ssh_run build-1 -- runnerctl logs example\.slot-1 '
+  expect_out_count '^example\.slot-2 on build-1: ' 1
+  expect_no_out '\[y/n\]'
+}
+
+# A host key over marks acts on the HOSTS of the marked rows, each once: three
+# marks on two hosts are two drains, one per host, every slot of each, under
+# one confirm line. The floor is the two hosts' active slots together, and
+# under the default floor that set is refused.
+case_ghr129_a_host_key_acts_on_the_hosts_of_the_marked_rows() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=' jjj j Dyq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never --min-available 0
+  expect_rc 0
+  expect_out_count "^Drain 2 host\\(s\\) of the marked rows\\? runs on build-1: runnerctl drain $GHR127_SLOTS; on build-2: runnerctl drain $GHR127_SLOTS — each slot stopped once its job is done, one at a time; leaves 0 of 6 slot\\(s\\) active across the watched hosts  \\[y/n\\]\$" 1
+  expect_log_count "^probe:ssh_run build-1 -- runnerctl drain $GHR127_SLOTS\$" 1
+  expect_log_count "^probe:ssh_run build-2 -- runnerctl drain $GHR127_SLOTS\$" 1
+  expect_log_count "$GHR127_MUTATING" 2
+  expect_out '(^| · )build-1: drain done\.'
+  expect_out '(^| · )build-2: drain done\.'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=' jjj j Dq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^2 host\\(s\\) of the marked rows: not drained — it would leave 0 of 6 slot\\(s\\) active across the watched hosts, under --min-available 1; restart --min-available lower \\(0 turns the floor off\\), or unmark a host's rows \\(space\\) and drain fewer\$" 1
+  expect_no_log "$GHR127_MUTATING"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=' jEyq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^Enable the slots of 1 host\\(s\\) of the marked rows\\? runs on build-1, one call per slot: runnerctl enable example\\.slot-1; runnerctl enable example\\.slot-2; runnerctl enable example\\.slot-3  \\[y/n\\]\$" 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl enable ' 3
+  expect_log_count "$GHR127_MUTATING" 3
+}
+
+# U over marks: each marked host's own check; the host with an upgrade is on
+# the confirm line with its versions, the current one is skipped and said.
+case_ghr129_U_over_marks_upgrades_the_hosts_that_have_one() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=' jjj Uyq' RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^Upgrade 1 host\(s\) of the marked rows\? runs on build-2-oldver: runnerctl upgrade \(0\.0\.1 -> 9\.9\.9\) — each host downloads the release and replaces its runnerctl, then its version is read back  \[y/n\]$' 1
+  expect_out_count '^skipped: build-1: already current \(1\.0\.0\) — nothing to upgrade, nothing issued$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl upgrade --check$' 1
+  expect_log_count '^probe:ssh_run build-2-oldver -- runnerctl upgrade --check$' 1
+  expect_log_count "$GHR128_UPGRADE" 1
+  expect_log_count '^probe:ssh_run build-2-oldver -- runnerctl upgrade$' 1
+  expect_out_count '^build-2-oldver: upgraded 0\.0\.1 -> 9\.9\.9, read back 9\.9\.9$' 1
+}
+
+# One action per host, every host's at once: with both hosts held, the set's
+# two actions are out together (held=2). A set that names a host with an
+# action out is refused whole and issues nothing more.
+case_ghr129_a_set_runs_one_action_per_host() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD="build-1 build-2" RUNNERCTL_STUB_KEYS="j jjj RyR${REL}q" \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_log '^probe:act_poll landed=0 held=2$'
+  expect_out_count '^build-1: busy — restart of example\.slot-2 on build-1 is still running there; one action per host at a time, nothing issued$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart example\.slot-2$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl restart example\.slot-2$' 1
+  expect_log_count "$GHR129_SLOTKEYS" 2
+}
+
+# A confirm line wider than the terminal lists what fits and counts the rest.
+case_ghr129_a_long_confirm_line_is_cut_with_a_count() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=100 RUNNERCTL_STUB_KEYS=' j jj Rnq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^Restart 3 marked slot\(s\)\? runs on build-1: runnerctl restart example\.slot-1; … and 2 more  \[y/n\]$' 1
+  expect_no_log "$GHR129_SLOTKEYS"
+}
+
+# Only a slot row is marked: a host's error row says so, and * passes over it.
+case_ghr129_only_slot_rows_are_marked() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjj *q' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    RUNNERCTL_STUB_FLEET_DOWN="build-2:1,2,3" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^build-2: not answering — no slot there to mark$' 1
+  expect_out_count '^marked 3 slot\(s\) the view shows — 3 marked in all$' 1
+}
+
+t "GHR-129: three marks issue exactly three commands after one confirm listing them" case_ghr129_three_marks_issue_three_commands_after_one_confirm
+t "GHR-129: * under ! marks exactly the problem rows"                                case_ghr129_star_under_the_problems_filter_marks_the_problem_rows
+t "GHR-129: a mark survives a refresh in which the rows reorder"                     case_ghr129_a_mark_survives_a_refresh_in_which_rows_reorder
+t "GHR-129: the floor is checked for the marked set together"                        case_ghr129_the_floor_is_checked_for_the_set_together
+t "GHR-129: a marked slot that vanishes is dropped, and that is said"                case_ghr129_a_vanished_slot_is_dropped_and_said
+t "GHR-129: with no marks every key acts on the cursor as before"                    case_ghr129_with_no_marks_keys_act_on_the_cursor_as_before
+t "GHR-129: L and O stay on the cursor's row"                                        case_ghr129_L_and_O_stay_on_the_cursor
+t "GHR-129: a host key acts on the hosts of the marked rows, each once"              case_ghr129_a_host_key_acts_on_the_hosts_of_the_marked_rows
+t "GHR-129: U over marks upgrades the hosts that have one, skipping the rest"        case_ghr129_U_over_marks_upgrades_the_hosts_that_have_one
+t "GHR-129: a set runs one action per host, and a busy host refuses it whole"        case_ghr129_a_set_runs_one_action_per_host
+t "GHR-129: a long confirm line is cut with a count"                                 case_ghr129_a_long_confirm_line_is_cut_with_a_count
+t "GHR-129: only a slot row is marked"                                               case_ghr129_only_slot_rows_are_marked
 
 # --- Summary ------------------------------------------------------------------
 echo

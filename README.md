@@ -1509,6 +1509,7 @@ has its own `slot-1`:
 | `P` | reap processes a finished job leaked |
 | `D` / `W` / `E` / `X` | on the **host** of the cursor's row, every slot it has: drain, restart when idle (rolling), enable, disable — below |
 | `U` | **upgrade** the host of the cursor's row: `upgrade --check` first, the confirm line names `FROM -> TO`, `y` runs `upgrade` and the version is read back — below |
+| `Space` / `*` / `u` | **mark** the cursor's slot row (again: unmark it) / every slot row the view shows / clear every mark; with marks, the action keys act on the marked set — below |
 | `L` | page the slot's last 50 journal lines through your `$PAGER` |
 | `O` | print the URL of the running job's run on the status line; no round trip |
 | `Enter` | show the selected slot in full, in place of the table; no round trip — below |
@@ -1655,6 +1656,44 @@ names both versions (or that the read-back did not answer), and the
 `X.Y.Z` is never drawn. `U` offers no `--push`: pushing this node's own copy
 is `fleet upgrade --push`.
 
+**Marking rows: `Space`, `*`, `u`.** `Space` marks the slot row the cursor is
+on (on a marked row, it unmarks it), `*` marks every slot row the view shows —
+so `!` then `*` marks exactly the problem rows, and `/` then `*` every row
+matching the text — and `u` clears every mark. A marked row has `*` in a
+two-column gutter in front of the table, and the legend counts the marks; with
+none marked the table is drawn exactly as before. A mark is the *(host, slot)*
+pair, never a position: a sort, a filter or a refresh that reorders the rows
+moves it with its slot, and a row a view hides keeps it. A marked slot its host
+stops reporting (scaled away) is dropped from the set, and the notice says so
+(`mark dropped: example.slot-3 on build-2 — no longer on that host`); a host
+that is not answering keeps its marks, as it keeps its rows. Only slot rows are
+marked — not a host's error row or a folded host.
+
+**With rows marked, an action key acts on the marked set** instead of the
+cursor's row, after **one** confirm line that lists every target and its exact
+command, cut with a count (`… and 2 more`) where the terminal is too narrow:
+
+```
+Restart 3 marked slot(s)? runs on build-1: runnerctl restart example.slot-1; on build-1: runnerctl restart example.slot-2; on build-2: runnerctl restart example.slot-1  [y/n]
+```
+
+| key | over the marked set |
+| --- | --- |
+| `K` `R` `S` `T` `P` | each marked slot, decided on that slot's own `status --json`, read afresh at the key; a slot the key does not apply to (`T` on an active slot) is skipped and named on a `skipped:` line. `R` and `S` still offer `w` (each with `--when-idle`) |
+| `D` `W` `E` `X` `U` | the **hosts** of the marked rows, each once, every slot of each, as the host keys always act; `U` runs each host's own `upgrade --check` first and skips a host that has nothing to upgrade |
+| `L` `O` | the cursor's row only, as without marks |
+
+They run as **one background action per host**, every host's started at once:
+a host's marked slots are one call each, in turn, inside its one action, so
+each host's result is a notice of its own and a `fleet.log` line of its own. A
+marked host that already has an action running refuses the whole set, and
+nothing is issued. The **capacity floor is the set's**: `S` (`y` or `w`), `D`
+and `X` subtract every target's active slots together, so three slots that each
+pass `--min-available` alone are refused when the three would cross it
+(`3 marked slot(s): not stopped — it would leave 1 of 6 …`). The marks stay
+until `u`. In the slot pane (`Enter`) the keys act on the pane's slot, marks or
+not.
+
 The cursor survives the frame changing under it. A host that stops answering
 keeps its rows, so the cursor stays on the slot it was on (the age line above
 them is never a stop); a host with no rows to keep is one row, where keys act
@@ -1723,7 +1762,8 @@ What to know about them:
 - **Action keys act on the row the cursor is on**, whatever the view did to the
   order: the cursor is the *(host, slot)* pair, not a position. A row that
   leaves the view moves the cursor as a row leaving the fleet does. On a
-  collapsed host there is no slot to act on — open it first.
+  collapsed host there is no slot to act on — open it first. With rows marked
+  they act on the marks instead, which a view does not unmark.
 - `--problems` and `--sort config|job|mem` start a watch in a view, so a wall
   display nobody types at shows the right thing from the first frame.
 
