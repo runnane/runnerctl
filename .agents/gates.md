@@ -235,6 +235,14 @@ Traps:
   hook's contract is one line per variable, so a value with a newline in it
   cannot be a stub case: the real reader is `proc_environ_job_vars FILE`,
   which `run_fn` calls on a NUL-separated fixture file.
+- **`watch` remembers a job's run facts (GHR-102), and only `watch` does.**
+  `ENV_MEMO_DIR` is a per-run directory (not `JOURNAL_MEMO_DIR`, which the
+  journal TTL empties) holding what `job_env_facts` kept, keyed by unit,
+  InvocationID and `JOB_SINCE` (2 s of slack: it is derived from an age).
+  `RUNNERCTL_STUB_ENV_ONCE=1` makes slot-1's environment answer once per run.
+  The new-job and term_safe cases call `job_facts` through `run_fn` with the
+  `GHR102_HOOKS` string, because the stub's one fixed job start cannot give a
+  second job. A one-shot `status` has no memo directory, so it forgets.
 - **A remote's table in the fleet stub is `render_status` called directly, not
   `cmd_status`.** So a case about a fleet row does not exercise anything
   `cmd_status` decides before it renders — `STATUS_COLS` (GHR-78: the long

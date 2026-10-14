@@ -2071,6 +2071,43 @@ job_env_facts() { # ENV-LINES
   case "/$JOB_REPO_FULL/" in */./*|*/../*) return 0 ;; esac
   JOB_URL="$server/$JOB_REPO_FULL/actions/runs/$JOB_RUN_ID${JOB_RUN_ATTEMPT:+/attempts/$JOB_RUN_ATTEMPT}"
 }
+# GHR-102: the run a job belongs to is read from a STEP process's environment,
+# and there is none between two steps, during a container step or after the
+# last one — so one read in three can answer nothing for a job whose run has not
+# changed. `watch` (ENV_MEMO_DIR, a per-run directory like CPU_MEMO_DIR — it
+# is NOT the journal memo, which is emptied every JOURNAL_CACHE_TTL ticks) keeps
+# what job_env_facts KEPT, never the raw block, and hands it back while the
+# same job runs. The key is the job, not the slot: the unit (the file), its
+# InvocationID and JOB_SINCE, so the next job on the slot — a later start —
+# inherits nothing. JOB_SINCE is derived from an age in whole seconds, so it
+# can move by one between two reads of the same job: JOB_MEMO_SLACK. A read
+# that found anything replaces the memo; only a read that found nothing asks
+# it. Outside `watch` ENV_MEMO_DIR is empty and this does nothing, so a
+# one-shot `status` is exactly what it was (it has no process that outlives it).
+ENV_MEMO_DIR="" JOB_MEMO_SLACK=2
+job_env_memo() { # UNIT [INVOCATION-ID]
+  [ -n "$ENV_MEMO_DIR" ] && [[ "${JOB_SINCE:-}" =~ ^[0-9]+$ ]] || return 0
+  local f="$ENV_MEMO_DIR/$1" inv="${2:-none}" kinv="" ksince="" d
+  local -a memo=()
+  if [ -n "$JOB_REPO$JOB_REPO_FULL$JOB_ENV_NAME$JOB_WORKFLOW$JOB_RUN_ID$JOB_RUN_ATTEMPT$JOB_RUN_NUMBER$JOB_REF$JOB_SHA$JOB_ACTOR$JOB_EVENT$JOB_URL" ]; then
+    {
+      printf '%s %s\n' "$inv" "$JOB_SINCE"
+      printf '%s\n' "$JOB_REPO" "$JOB_REPO_FULL" "$JOB_ENV_NAME" "$JOB_WORKFLOW" "$JOB_RUN_ID" "$JOB_RUN_ATTEMPT" \
+        "$JOB_RUN_NUMBER" "$JOB_REF" "$JOB_SHA" "$JOB_ACTOR" "$JOB_EVENT" "$JOB_URL"
+    } >"$f"
+    return 0
+  fi
+  [ -f "$f" ] || return 0
+  {
+    read -r kinv ksince || return 0
+    mapfile -t memo
+  } <"$f"
+  [ "${#memo[@]}" -eq 12 ] && [ "$kinv" = "$inv" ] && [[ "$ksince" =~ ^[0-9]+$ ]] || return 0
+  d=$((JOB_SINCE - ksince)); [ "$d" -ge 0 ] || d=$((-d))
+  [ "$d" -le "$JOB_MEMO_SLACK" ] || return 0
+  JOB_REPO="${memo[0]}" JOB_REPO_FULL="${memo[1]}" JOB_ENV_NAME="${memo[2]}" JOB_WORKFLOW="${memo[3]}" JOB_RUN_ID="${memo[4]}" JOB_RUN_ATTEMPT="${memo[5]}"
+  JOB_RUN_NUMBER="${memo[6]}" JOB_REF="${memo[7]}" JOB_SHA="${memo[8]}" JOB_ACTOR="${memo[9]}" JOB_EVENT="${memo[10]}" JOB_URL="${memo[11]}"
+}
 # One free-text fact as it is kept, into UTF8_TEXT. Called under LC_ALL=C, so
 # the cut is in bytes — and where the first byte cut away was a continuation
 # byte the cut went through a character, whose head goes too.
@@ -2185,6 +2222,7 @@ job_facts() { # UNIT CGROUP [INVOCATION-ID] [ACTIVE-ENTER-US]
       JOB_SINCE="$ts"; JOB_RUNTIME="$(fmt_dur "$age")"
     fi
     job_stall_check "$age"
+    job_env_memo "$u" "${3:-}"
     return 0
   fi
   cgroup_readable "$cg" || { JOB_STATE="no-access" JOB_ACCESS="no-access"; return 0; }
@@ -5010,8 +5048,10 @@ cmd_watch() { # [--interval N] [--iterations N] [--color WHEN] [--stall-after N]
   JOURNAL_MEMO_DIR="$(mktemp -d)"
   # GHR-79: the previous tick's CPU samples; never emptied by the journal TTL.
   CPU_MEMO_DIR="$(mktemp -d)"
+  # GHR-102: the last run facts read for each slot's job; same lifetime.
+  ENV_MEMO_DIR="$(mktemp -d)"
   # Ctrl-C exits 0 through the EXIT trap, which restores the cursor either way.
-  trap 'term_cursor show; viewport_close; rm -rf "$JOURNAL_MEMO_DIR" "$CPU_MEMO_DIR"' EXIT
+  trap 'term_cursor show; viewport_close; rm -rf "$JOURNAL_MEMO_DIR" "$CPU_MEMO_DIR" "$ENV_MEMO_DIR"' EXIT
   trap 'exit 0' INT TERM
   term_cursor hide
   while :; do
