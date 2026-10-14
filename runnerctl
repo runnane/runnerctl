@@ -374,9 +374,9 @@
 # never deregisters anything. The registration token comes from --token (the
 # one GitHub's "New self-hosted runner" page shows), from --pat/$GITHUB_TOKEN,
 # or from the gh CLI's existing login; one token registers every slot in the
-# run. Note that `config.sh` takes the token as a command-line argument — as
-# it does in GitHub's own documented install — so it is briefly visible in
-# `ps` to other users on the box; runnerctl itself never prints or stores it.
+# run. The token reaches config.sh through its environment
+# (ACTIONS_RUNNER_INPUT_TOKEN, handed over on stdin — GHR-122), never argv, so
+# `ps` shows it to nobody; runnerctl itself never prints or stores it.
 #
 # `deprovision <target>...` (GHR-46) is the inverse, for a slot that should
 # stop existing rather than merely stop: the unit stopped, disabled and
@@ -10878,7 +10878,7 @@ cmd_provision() {
       if [ -e "$root/$prefix-$s" ] || [ -L "$root/$prefix-$s" ]; then
         echo "would replace:  $root/$prefix-$s (unpacked fresh beside it; the old directory is deleted, nothing in it is kept)"
       fi
-      echo "would register: $prefix-$s via config.sh --unattended --url $url --token *** --name $prefix-$s${labels:+ --labels $labels}${rgroup:+ --runnergroup $rgroup}"
+      echo "would register: $prefix-$s via ACTIONS_RUNNER_INPUT_TOKEN=*** config.sh --unattended --url $url --name $prefix-$s${labels:+ --labels $labels}${rgroup:+ --runnergroup $rgroup}"
       echo "would install:  $SYSTEMD_DIR/${slot_unit[$s]}   (runs $root/$prefix-$s/runsvc.sh as $user), then enable and start it"
     done
     return 0
@@ -10918,11 +10918,13 @@ cmd_provision() {
     fi
     runner_unpack_slot "$tarball" "$root" "$name" "$user" "$group" || { failed+=("$name"); echo "  [FAILED] unpack"; continue; }
     echo "[$name] registering with GitHub"
-    local cfg_args=(./config.sh --unattended --url "$url" --token "$token" --name "$name" --work "$work")
+    # GHR-122: no --token here — the token goes over stdin (runner_exec_with_token)
+    # so it is in no process's argv.
+    local cfg_args=(./config.sh --unattended --url "$url" --name "$name" --work "$work")
     [ -z "$labels" ] || cfg_args+=(--labels "$labels")
     [ -z "$rgroup" ] || cfg_args+=(--runnergroup "$rgroup")
     $replace && cfg_args+=(--replace)
-    if ! runner_exec "$dir" "$user" "${cfg_args[@]}"; then
+    if ! runner_exec_with_token "$token" "$dir" "$user" "${cfg_args[@]}"; then
       failed+=("$name"); echo "  [FAILED] config.sh — the directory is left in place for inspection"; continue
     fi
     echo "[$name] installing the service ${slot_unit[$s]}"

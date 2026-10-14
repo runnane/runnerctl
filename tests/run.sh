@@ -4824,6 +4824,9 @@ case_fleet_unknown_subcommand_dies() {
 # provision does is a host mutation and so is already in the call log.
 PROV_URL="https://github.com/acme"
 PROV_TOKEN="STUB-REG-TOKEN-DO-NOT-PRINT"
+# GHR-122: the registration token reaches config.sh on stdin, which the stub
+# writes here (one line per slot) and never to the log.
+PROV_STDIN="$WRITES/.config-register-stdin"
 
 case_provision_fresh_host_installs_and_registers() {
   RUNNERCTL_STUB_NO_UNITS=1 run provision 2 --url "$PROV_URL" \
@@ -4850,8 +4853,17 @@ case_provision_fresh_host_installs_and_registers() {
   # A fresh host has no old directory to move aside.
   expect_no_log '^mv -T -- /opt/actions-runner/slot-[0-9]+ '
   expect_no_log '^(mkdir|tar|chown)( .*)? /opt/actions-runner/slot-[0-9]+$'
-  expect_log 'config\.sh --unattended --url https://github\.com/acme --token .* --name slot-1 --work _work --labels ci,linux$'
-  expect_log 'config\.sh --unattended --url https://github\.com/acme --token .* --name slot-2 --work _work --labels ci,linux$'
+  expect_log 'config\.sh --unattended --url https://github\.com/acme --name slot-1 --work _work --labels ci,linux$'
+  expect_log 'config\.sh --unattended --url https://github\.com/acme --name slot-2 --work _work --labels ci,linux$'
+  # GHR-122: the token is in no privileged call's argv (the log is every argv
+  # runuser, bash -c and config.sh were given) — not by value and not as a
+  # --token flag — and it did reach each registration, on stdin: exactly the
+  # value given, once per slot, so the absence above is not a version that
+  # sent no token at all.
+  expect_no_log "$PROV_TOKEN"
+  expect_no_log '(^|[ =])--token([ =]|$)'
+  expect_cfg_count "$PROV_STDIN" "^$PROV_TOKEN\$" 2
+  expect_cfg_count "$PROV_STDIN" '.' 2
   # GHR-110: what svc.sh install + start did, done by runnerctl — the unit
   # written by root under SYSTEMD_DIR, enabled and started with systemctl, and
   # the two files svc.sh put in the runner's directory written as the runner.
@@ -4959,7 +4971,8 @@ case_provision_dry_run_changes_nothing() {
   expect_out '^  scope:   repo — https://github\.com/acme/app$'
   expect_out '^\(dry run — nothing downloaded, nothing changed\)$'
   expect_out '^would download: https://github\.com/actions/runner/releases/download/v2\.337\.0/'
-  expect_out '^would register: slot-1 via config\.sh .* --token \*\*\* --name slot-1$'
+  expect_out '^would register: slot-1 via ACTIONS_RUNNER_INPUT_TOKEN=\*\*\* config\.sh --unattended --url https://github\.com/acme/app --name slot-1$'
+  expect_no_out "$PROV_TOKEN"
   expect_out '^would install:  .*/actions\.runner\.acme-app\.slot-1\.service   \(runs /opt/actions-runner/slot-1/runsvc\.sh as github-runner\), then enable and start it$'
   expect_no_out "$SVC_SH"
   expect_no_file "$DROPIN_DIR/actions.runner.acme-app.slot-1.service"
@@ -5020,7 +5033,9 @@ case_provision_token_sources() {
     --name-prefix slot --pat ghp_EXAMPLE_PAT
   expect_rc 0
   expect_log '^api: POST https://api\.github\.com/orgs/acme/actions/runners/registration-token \(authenticated\)$'
-  expect_log 'config\.sh .* --token STUB-REGISTRATION-TOKEN '
+  # The minted token reaches the registration on stdin, not argv (GHR-122).
+  expect_cfg "$PROV_STDIN" '^STUB-REGISTRATION-TOKEN$'
+  expect_no_log 'STUB-REGISTRATION-TOKEN'
   # $GITHUB_TOKEN is the same path without the flag.
   RUNNERCTL_STUB_NO_UNITS=1 GITHUB_TOKEN=ghp_FROM_THE_ENV \
     run provision 1 --url "$PROV_URL" --name-prefix slot
@@ -5036,14 +5051,15 @@ case_provision_token_sources() {
 }
 
 case_provision_never_prints_the_token() {
-  # config.sh takes the registration token in argv — that is GitHub's own
-  # documented install and is why the log carries it. What runnerctl controls
-  # is its OWN output, which must never carry it.
+  # The token goes to config.sh on stdin (GHR-122), so neither runnerctl's own
+  # output nor the log of privileged argvs may carry it.
   RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" \
     --name-prefix slot --token "$PROV_TOKEN"
   expect_rc 0
   expect_no_out "$PROV_TOKEN"
   expect_no_err "$PROV_TOKEN"
+  expect_no_log "$PROV_TOKEN"
+  expect_cfg "$PROV_STDIN" "^$PROV_TOKEN\$"
   # The PAT is stronger: it is passed to curl on stdin, so it reaches neither
   # the output nor argv — the stub asserts the latter by not logging it.
   RUNNERCTL_STUB_NO_UNITS=1 run provision 1 --url "$PROV_URL" \

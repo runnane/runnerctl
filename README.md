@@ -125,10 +125,11 @@ The registration token can come from any of three places, checked in this order:
 | the `gh` CLI | if `gh` is already logged in on the box, no flag at all. |
 
 The PAT is handed to `curl` on **stdin**, through its own config format, so it
-never appears in `/proc/<pid>/cmdline`. The *registration* token is passed to
-`config.sh` as a command-line argument — that is GitHub's own documented
-install, and it means the token is briefly visible in `ps` to other users on
-the box. runnerctl itself never prints or stores it.
+never appears in `/proc/<pid>/cmdline`. The *registration* token reaches
+`config.sh` the same way the removal token does: through the runner's own
+`ACTIONS_RUNNER_INPUT_TOKEN` environment variable, handed over on stdin, never
+a command-line argument, so it never shows up in `ps`. runnerctl itself never
+prints or stores it.
 
 ### Options worth knowing
 
@@ -202,7 +203,7 @@ The removal token comes from the same three places as the registration token
 `.../actions/runners/remove-token` for the scope `--url` or `RUNNER_URL`
 names). It reaches `config.sh` through the runner's own
 `ACTIONS_RUNNER_INPUT_TOKEN` environment variable on stdin, **not** its command
-line, so unlike the registration token it never shows up in `ps`.
+line, so it never shows up in `ps` (neither does the registration token).
 
 A runner GitHub has **already forgotten** — removed in the UI, say — makes
 `config.sh remove` fail. That is a warning, not a stop: the unit and directory
