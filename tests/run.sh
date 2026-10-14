@@ -13689,7 +13689,7 @@ t "GHR-88: fleet history merges the hosts' records by time"                case_
 # (a foreground `sleep 30` in run_priv), sends it SIG, and reads how it ended
 # from a real waitpid — WIFSIGNALED, which a shell's `$?` cannot tell from an
 # `exit 130`. The parent is perl, because it can say that and bash cannot, and
-# because it sets INT and TERM (and HUP, GHR-91) back to the default first: a gate started in the
+# because it sets INT and TERM (and HUP, GHR-91, and PIPE, GHR-131) back to the default first: a gate started in the
 # background runs every case with SIGINT ignored (GHR-75), the child would
 # inherit that, and bash cannot trap a signal ignored at its start. The child
 # leads a process group of its own (setsid), so `group` is what a terminal's
@@ -13702,7 +13702,7 @@ SIGNALLED=""
 # shellcheck disable=SC2016  # perl's own variables
 GHR119_PERL='use strict; use POSIX qw(:sys_wait_h setsid);
 my ($sig, $whom, $flag, $out, $err, @cmd) = @ARGV;
-$SIG{INT} = $SIG{TERM} = $SIG{HUP} = "DEFAULT";
+$SIG{INT} = $SIG{TERM} = $SIG{HUP} = $SIG{PIPE} = "DEFAULT";
 sub nap { select undef, undef, undef, $_[0] }
 my $pid = fork() // die "fork: $!";
 if (!$pid) {
@@ -14040,6 +14040,120 @@ t "GHR-91: a drain whose stdout is cut part-way stops every slot and says so" ca
 t "GHR-91: a hangup does not stop a drain part-way"                         case_ghr91_a_hangup_does_not_stop_a_drain
 t "GHR-91: Ctrl-C and TERM still interrupt a drain, as GHR-119 made them"   case_ghr91_ctrl_c_and_term_still_interrupt_a_drain
 t "GHR-91: ssh_run and ssh_run_stdin carry a keepalive a site can override" case_ghr91_ssh_carries_a_keepalive
+
+# --- GHR-131: a hangup or a cut pipe is an interruption too -------------------
+# Outside a caller guard, HUP and PIPE do what GHR-119 made INT and TERM do:
+# the record says `interrupted (SIGHUP|SIGPIPE)`, once, and the process still
+# dies BY the signal. Before GHR-131 both records said `ok`. env-init is armed
+# and not guarded; the signal goes to the group, as a closed terminal's HUP
+# does. The guarded side — a drain hung up mid-way records its own `ok` and
+# finishes — is case_ghr91_a_hangup_does_not_stop_a_drain.
+case_ghr131_a_hangup_interrupts_an_armed_command() {
+  if ! $HAVE_PERL; then
+    skip "GHR-131: no perl, so no waitpid to tell death by signal from an exit"
+    run_fn eval "audit_logger() { :; }; audit_begin env-init; builtin trap -p HUP"
+    expect_out "^trap -- 'audit_signal HUP' SIGHUP\$"
+    return 0
+  fi
+  run_signalled HUP group '^mkdir -p /etc/runnerctl$' env-init --profile deploy
+  expect_rc 129
+  expect_signalled 1
+  expect_one_record "env-init /etc/runnerctl/deploy\\.env \\(--profile deploy\\) by $ME — interrupted \\(SIGHUP\\)"
+  expect_log_order '^probe:blocked mkdir -p /etc/runnerctl$' '^probe:audit '
+  expect_no_log '^tee '
+}
+case_ghr131_a_cut_pipe_interrupts_an_armed_command() {
+  if ! $HAVE_PERL; then
+    # (the gate's own PIPE may be ignored, which no trap can change — so no
+    # run_fn fallback either: only perl can hand bash a default PIPE)
+    skip "GHR-131: no perl, so no waitpid to tell death by signal from an exit"
+    run env-init --profile deploy
+    expect_one_record "env-init /etc/runnerctl/deploy\\.env \\(--profile deploy\\) by $ME — ok"
+    return 0
+  fi
+  run_signalled PIPE group '^mkdir -p /etc/runnerctl$' env-init --profile deploy
+  expect_rc 141
+  expect_signalled 13
+  expect_one_record "env-init /etc/runnerctl/deploy\\.env \\(--profile deploy\\) by $ME — interrupted \\(SIGPIPE\\)"
+  expect_log_order '^probe:blocked mkdir -p /etc/runnerctl$' '^probe:audit '
+  expect_no_log '^tee '
+}
+
+# The dispositions themselves, through the script's own functions. Armed and
+# not guarded: all four are the record's, and handed back to the default when
+# it is finished. Guarded: HUP is the guard's ignore from the moment it runs
+# and STAYS ignored when the record is finished (never handed back), PIPE is
+# the command's own again, and a command's own `trap … HUP` does not undo the
+# ignore — nor does a subshell's record. A command's own PIPE handler (the
+# `fleet status --json --watch` stream's `exit 0`) is chained to, not replaced.
+# Through run_fn_sigdfl: a gate can start with PIPE ignored (an agent harness
+# does), and bash cannot trap a signal ignored when it started (GHR-75's trap,
+# for another signal).
+run_fn_sigdfl() {
+  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
+  RC=0
+  OUT="$(RUNNERCTL_NO_MAIN=1 perl -e '$SIG{$_} = "DEFAULT" for qw(INT TERM HUP PIPE); exec @ARGV or exit 127' \
+         bash -c '. "$0" && "$@"' "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
+  ERR="$(cat "$TMP/err")"
+}
+case_ghr131_dispositions_armed_guarded_and_owned() {
+  local body
+  if ! $HAVE_PERL; then
+    skip "GHR-131: no perl, so no way to start bash with PIPE at its default"
+    body=$(cat <<'EOF'
+audit_logger() { :; }; audit_begin drain; caller_guard; audit_finish 0; builtin trap -p HUP >&"$CALLER_GUARD_OUT"
+EOF
+)
+    run_fn eval "$body"
+    expect_out "^trap -- '' SIGHUP\$"
+    return 0
+  fi
+  body=$(cat <<'EOF'
+audit_logger() { :; }
+audit_begin env-init; builtin trap -p HUP PIPE
+audit_finish 0; echo "finished"; builtin trap -p HUP PIPE
+EOF
+)
+  run_fn_sigdfl eval "$body"
+  expect_rc 0
+  expect_text "armed, then handed back" "trap -- 'audit_signal HUP' SIGHUP
+trap -- 'audit_signal PIPE' SIGPIPE
+finished" "$OUT"
+  body=$(cat <<'EOF'
+audit_logger() { :; }
+audit_begin drain; caller_guard; builtin trap -p HUP PIPE >&"$CALLER_GUARD_OUT"
+trap "echo own" HUP; builtin trap -p HUP >&"$CALLER_GUARD_OUT"
+( audit_begin restart slot-x; builtin trap -p HUP >&"$CALLER_GUARD_OUT"; audit_finish 0 )
+audit_finish 0; echo "finished" >&"$CALLER_GUARD_OUT"; builtin trap -p HUP PIPE >&"$CALLER_GUARD_OUT"
+EOF
+)
+  run_fn_sigdfl eval "$body"
+  expect_rc 0
+  expect_text "guarded" "trap -- '' SIGHUP
+trap -- '' SIGHUP
+trap -- '' SIGHUP
+finished
+trap -- '' SIGHUP" "$OUT"
+  # The stream's own handler: the record is written and the handler ends it
+  # with its own status. Raised through kill, as a reader's close would.
+  rm -f "$GHR119_REC"
+  body=$(cat <<'EOF'
+audit_logger() { printf "%s\n" "$1" >>"$GHR119_REC"; }
+trap 'echo "owner ran"; exit 0' INT TERM PIPE
+audit_begin restart slot-x
+kill -PIPE "$BASHPID"
+echo "went on"
+EOF
+)
+  GHR119_REC="$GHR119_REC" run_fn_sigdfl eval "$body"
+  expect_rc 0
+  expect_text "owner kept" 'owner ran' "$OUT"
+  expect_text "its record" "restart slot-x by $ME — interrupted (SIGPIPE)" "$(cat "$GHR119_REC" 2>/dev/null; true)"
+}
+
+t "GHR-131: a hangup interrupts an armed command and it dies by SIGHUP"    case_ghr131_a_hangup_interrupts_an_armed_command
+t "GHR-131: a cut pipe interrupts an armed command and it dies by SIGPIPE" case_ghr131_a_cut_pipe_interrupts_an_armed_command
+t "GHR-131: HUP and PIPE armed, yielded to a caller guard, and owned"      case_ghr131_dispositions_armed_guarded_and_owned
 
 # --- GHR-80: fleet JSON for a UI — the envelope, the stream, health --json ----
 # `fleet status --json` gains `generated_at`, `runnerctl`, `summary` and, per
