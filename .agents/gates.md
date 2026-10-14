@@ -200,7 +200,25 @@ Traps:
   reads as shorter text and extra ticks, and the tell is a `probe:ssh_run`
   count four higher than pinned per stray dash. A lone Escape is `$'\e-'`:
   `read_key` looks for the rest of a sequence with a second short read, which
-  would otherwise swallow the next scripted key.
+  would otherwise swallow the next scripted key. A fifth since GHR-125:
+  `$'\x01'` (`REL` in `tests/run.sh`) releases every held action (below).
+- **A `fleet watch` action runs in the background (GHR-125), and the stub
+  models it as it models a fetch.** The poll step counts each action job too:
+  landed once its `rc` is written, still moving until then — so an action that
+  answers at once lands in the first step after `y`, which consumes no key, and
+  the frame count of every older action case is what it was. To keep one out,
+  `RUNNERCTL_STUB_FLEET_HOLD="host…"`: its mutating call prints a progress
+  line and then WAITS (`probe:remote_held`) until a `REL` in the keys
+  (`probe:release`, which also waits for the jobs to end) or 10 s; it counts
+  as hung, so the keys after it are read on the poll step
+  (`probe:act_poll landed=0 held=1`, then `probe:tty_read_char 0.2 <c>`) —
+  a key handled while the action ran. A TERM or HUP it gets is
+  `probe:remote_signal HOST SIG`; its pids up to the central process are in
+  `remote/<host>.held.pids` for `_ghr74_expect_dead`. In the sim the remote
+  is a process under the job, so `q` (which reaps the job's tree) ends it too —
+  assert the absence of `probe:remote_signal` only for Esc.
+  `RUNNERCTL_STUB_FLEET_HOLD_HOSTILE=1` puts `STUB_HOSTILE` on the progress
+  line, which nothing but the draw's `relay_safe` filters while the call runs.
 - **A copy of the script handed to the sim through `$RUNNERCTL` has to be a
   file NAMED `runnerctl`** (GHR-78) — in a directory of its own, one per
   mutant. `case_compose_reap_timer_install_status_remove` pins the script's

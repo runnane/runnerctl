@@ -13608,6 +13608,211 @@ t "GHR-80: health's prose lines are the object's details"                 case_g
 t "GHR-80: fleet health --json, older hosts and failures included"        case_ghr80_fleet_health_json
 t "GHR-80: fleet health --json relays a remote's text"                    case_ghr80_fleet_health_json_relays_remote_text
 
+# --- GHR-125: fleet watch runs an action in the background ----------------------
+# RUNNERCTL_STUB_FLEET_HOLD holds a host's mutating call until the case lets
+# it go — REL, $'\x01', in the keys — so the watch has an action out for as
+# long as the case wants, and every key pressed meanwhile is logged with the
+# poll step as its timeout (`probe:tty_read_char 0.2 j` after `probe:act_poll
+# landed=0 held=1`): a key handled WHILE THE ACTION RAN. What happened first
+# is read off the log and the order of the frames, never off a clock.
+REL=$'\x01'
+GHR125_PROGRESS='draining — 2 of 4 stopped, waiting for example\.slot-3'
+GHR125_DONE='example\.slot-1 on build-1: restart done\.'
+GHR125_LOG="^$GHR88_TS $ME fleet restart --host build-1 example\\.slot-1 \\(fleet watch\\) — build-1="
+# The first frame matching PATTERN, 0 for none.
+frame_first() { # PATTERN
+  local f
+  for ((f = 1; f < ${#FRAMES[@]}; f++)); do
+    if grep -Eq -- "$1" <<<"${FRAMES[$f]}"; then echo "$f"; return 0; fi
+  done
+  echo 0
+}
+# A frame matching PATTERN-A is drawn, and before any frame matching PATTERN-B
+# — which is drawn too.
+expect_frame_before() { # LABEL-A PATTERN-A LABEL-B PATTERN-B
+  _expect
+  local a b
+  a="$(frame_first "$2")" b="$(frame_first "$4")"
+  if [ "$a" -eq 0 ] || [ "$b" -eq 0 ] || [ "$a" -ge "$b" ]; then
+    FAILS+=("$1 (first in frame $a) is not drawn before $3 (first in frame $b)")
+  fi
+}
+
+# The acceptance case. R, y on build-1's slot-1, whose restart is held: the j
+# pressed next is read on the poll step while the action is held, and the
+# frame it moves the cursor in carries the action's progress line and no
+# notice; the notice comes after the release, in a frame of its own, on top of
+# the fresh round the action's end asks for. It lives as a notice does — until
+# the next key (k). One record, with the result.
+case_ghr125_a_slow_action_holds_up_no_key() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD=build-1 RUNNERCTL_STUB_KEYS="Ryj${REL}kq" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 5
+  expect_frame_before "the cursor j moved" "$(fw_row build-1 1 2)" "the action's notice" "^${GHR125_DONE}\$"
+  expect_frame 2 '^Restart example\.slot-1 on build-1\? runs on build-1: runnerctl restart example\.slot-1  \[y/n\]'
+  expect_frame 3 "$(fw_row build-1 1 2)"
+  expect_frame 3 "^example\.slot-1 on build-1: restart running — ${GHR125_PROGRESS}\$"
+  expect_frame 3 "${FLEET_WATCH_LEGEND%\$}  Esc detach\$"
+  expect_no_frame 3 'restart done'
+  expect_frame 4 "^${GHR125_DONE}\$"
+  expect_frame 4 "$(fw_row build-1 1 2)"
+  expect_frame 4 "$FLEET_WATCH_LEGEND"
+  expect_no_frame 4 'restart running'
+  expect_no_frame 5 'restart done'
+  expect_frame 5 "$(fw_row build-1 0 1)"
+  expect_out_count '^running on build-1: runnerctl restart example\.slot-1$' 1
+  expect_log_order '^probe:tty_read_char 5 y$' '^probe:ssh_run build-1 -- runnerctl restart example\.slot-1$' \
+                   '^probe:remote_held build-1$' '^probe:act_poll landed=0 held=1$' '^probe:tty_read_char 0\.2 j$' \
+                   '^probe:release$' '^probe:remote_released build-1$' '^probe:ssh_run build-1 -- runnerctl status --color never$' \
+                   '^probe:tty_read_char 5 k$'
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart ' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 2
+  expect_no_log '^probe:remote_(signal|hold_gave_up) '
+  expect_cfg_count "$WRITES/fleet.log" '.' 1
+  expect_cfg "$WRITES/fleet.log" "${GHR125_LOG}0\$"
+}
+
+# Esc stops FOLLOWING the action: its line and the legend's offer go, the
+# notice says the command goes on. Nothing signals the remote — it waits to be
+# released, and answers — and its notice arrives all the same. The record is
+# the action's result: detaching ended a view, not the command.
+case_ghr125_esc_detaches_and_the_notice_still_arrives() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD=build-1 RUNNERCTL_STUB_KEYS="Ry"$'\e-'"${REL}q" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 4
+  expect_frame 3 '^detached — the command continues on build-1; its notice comes when it ends$'
+  expect_no_frame 3 'restart running'
+  expect_frame 3 "$FLEET_WATCH_LEGEND"
+  expect_frame 4 "^${GHR125_DONE}\$"
+  expect_no_log '^probe:remote_signal '
+  expect_log_order '^probe:remote_held build-1$' '^probe:release$' '^probe:remote_released build-1$'
+  expect_cfg_count "$WRITES/fleet.log" '.' 1
+  expect_cfg "$WRITES/fleet.log" "${GHR125_LOG}0\$"
+  expect_cfg_lacks "$WRITES/fleet.log" 'detached|interrupted'
+}
+
+# q and Ctrl-C with the action still held: exit 0, the line saying it was not
+# cancelled and where to look, and nothing of this node's left — the job, and
+# everything under it down to the (sim's) remote, are gone, and so is every
+# temp file. Its record is `detached`. (In the sim the remote is a process
+# under the job, so it goes too; over ssh only the local side would.)
+case_ghr125_quit_leaves_the_command_and_no_local_process() {
+  local d="$TMP/ghr125-tmp" how
+  for how in q $'\x03'; do
+    rm -rf "$d"; mkdir -p "$d"
+    TMPDIR="$d" RUN_TIMEOUT=10 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD=build-1 RUNNERCTL_STUB_KEYS="Ry$how" \
+      RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+    expect_rc 0
+    expect_out "^example\.slot-1 on build-1: restart was still running when the watch ended — the watch stopped following it and did not cancel it; 'runnerctl fleet status --host build-1' shows where it got to\$"
+    expect_cfg "$WRITES/remote/build-1.held.pids" '^[0-9]+( [0-9]+)+$'
+    _ghr74_expect_dead "$(cat "$WRITES/remote/build-1.held.pids" 2>/dev/null; true)"
+    _ghr74_expect_empty "$d"
+    expect_no_log '^probe:remote_(released|hold_gave_up) '
+    expect_cfg_count "$WRITES/fleet.log" '.' 1
+    expect_cfg "$WRITES/fleet.log" "${GHR125_LOG}detached\$"
+    expect_log_order '^probe:remote_held build-1$' '^probe:term_cursor show$' '^probe:ssh_control build-1 exit$'
+  done
+  rm -rf "$d"
+}
+
+# One action per host. R on build-1's slot-2 while its slot-1 restart is out
+# is refused before anything is read — one facts read of build-1 in the run,
+# the R that started the restart's — and R, y on build-2 starts build-2's own:
+# two lines while both run, and both notices once they end. Then a notice that
+# lands under a confirm line waits for the answer instead of being lost.
+case_ghr125_one_action_per_host_and_another_hosts_starts() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD="build-1 build-2" RUNNERCTL_STUB_KEYS="RyjRjjRyk${REL}q" \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 9
+  expect_frame 4 '^build-1: busy — restart of example\.slot-1 on build-1 is still running there; one action per host at a time, nothing issued$'
+  expect_no_frame 4 '\[y/n\]'
+  expect_frame 7 '^Restart example\.slot-1 on build-2\? runs on build-2: runnerctl restart example\.slot-1  \[y/n\]'
+  expect_frame 8 "^example\.slot-1 on build-1: restart running — ${GHR125_PROGRESS}\$"
+  expect_frame 8 "^example\.slot-1 on build-2: restart running — ${GHR125_PROGRESS}\$"
+  expect_frame 9 "^${GHR125_DONE} · example\.slot-1 on build-2: restart done\.\$"
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart ' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl restart example\.slot-1$' 1
+  # build-1's --json: the first frame's summary, the R that started the
+  # restart, and the round after the two ended — nothing for the refused R
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 3
+  expect_no_log '^probe:remote_signal '
+  expect_cfg_count "$WRITES/fleet.log" '.' 2
+  # the notice that landed under build-2's confirm line
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD="build-1" RUNNERCTL_STUB_KEYS="RyjjjR${REL}nq" \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame 6 '^Restart example\.slot-1 on build-2\? '
+  expect_frame 7 '^Restart example\.slot-1 on build-2\? '
+  expect_no_frame 7 'restart done'
+  expect_frame 8 "^cancelled — nothing run · ${GHR125_DONE}\$"
+  expect_no_log '^probe:ssh_run build-2 -- runnerctl restart '
+}
+
+# The progress line is a remote's bytes on this terminal while nothing else
+# has filtered them — the relay of the call's files runs when it ends. A
+# hostile progress line keeps its text and loses every sequence, whole.
+case_ghr125_progress_line_is_relayed() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD=build-1 RUNNERCTL_STUB_FLEET_HOLD_HOSTILE=1 RUNNERCTL_STUB_KEYS="Ryj${REL}q" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame 3 "^example\.slot-1 on build-1: restart running — ${GHR125_PROGRESS} HOT\$"
+  expect_no_hostile_rest
+}
+
+# GHR-81's budget, in the background as in the foreground: a restart that
+# takes 45 s — past FLEET_WATCH_TIMEOUT's 10 — completes, and one that
+# outlasts FLEET_MUTATE_TIMEOUT is a notice in GHR-81's words, recorded 124.
+case_ghr125_a_background_action_is_on_the_mutating_budget() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_DELAY="build-1:45:restart" RUNNERCTL_STUB_KEYS='Ry-q' \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^${GHR125_DONE}\$" 2
+  expect_no_out 'timed out'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_DELAY="build-1:900:restart" RUNNERCTL_STUB_KEYS='Ry-q' \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^example\.slot-1 on build-1: restart failed — timed out after 900s — the command may still be running on that host; 'runnerctl fleet status' shows where it got to\$" 2
+  expect_cfg "$WRITES/fleet.log" "${GHR125_LOG}124\$"
+}
+
+# The action's line is chrome, like the legend: on a 10-row terminal the
+# one-host frame that fitted exactly gives a window row to it — the frame is
+# still ten lines, the cursor row still in it — and gets it back once the
+# action has ended.
+case_ghr125_a_fitted_frame_makes_room_for_the_progress_line() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_LINES=10 RUNNERCTL_STUB_FLEET_HOLD=build-1 RUNNERCTL_STUB_KEYS="Ryj${REL}-q" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 5
+  expect_frame_lines 3 10
+  expect_frame_line 3 4 '^↑ 2 more'
+  expect_frame_line 3 5 "$(fw_row build-1 1 2)"
+  expect_frame_line 3 8 "^example\.slot-1 on build-1: restart running — ${GHR125_PROGRESS}\$"
+  expect_frame_line 3 9 "${FLEET_WATCH_LEGEND%\$}  Esc detach\$"
+  expect_frame_count_of 3 "^${REV}" 1
+  expect_frame_lines 4 10
+  expect_frame_line 4 5 '^build-1 +0 +example\.slot-1 '
+  expect_frame_line 4 9 "$FLEET_WATCH_LEGEND"
+  expect_frame_line 4 10 "^${GHR125_DONE}\$"
+}
+
+t "GHR-125: a slow action in the background holds up no key"              case_ghr125_a_slow_action_holds_up_no_key
+t "GHR-125: Esc detaches, cancels nothing, and the notice still arrives"   case_ghr125_esc_detaches_and_the_notice_still_arrives
+t "GHR-125: q leaves the command running and no local process"            case_ghr125_quit_leaves_the_command_and_no_local_process
+t "GHR-125: one action per host; another host's starts its own"           case_ghr125_one_action_per_host_and_another_hosts_starts
+t "GHR-125: an action's progress line is relayed safe"                    case_ghr125_progress_line_is_relayed
+t "GHR-125: a background action is on the mutating budget"                case_ghr125_a_background_action_is_on_the_mutating_budget
+t "GHR-125: a fitted frame makes room for the progress line"              case_ghr125_a_fitted_frame_makes_room_for_the_progress_line
+
 # --- Summary ------------------------------------------------------------------
 echo
 echo "sim: $npass ok, $nxfail xfail (${XFAIL_KEYS# }), $nfail failed"
