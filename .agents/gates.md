@@ -399,6 +399,29 @@ Traps:
   with `RUNNERCTL_STUB_FLEET_MS="host:ms …"` (STUB_MS_ADD, which `now_ms`
   adds, per background job). `RUNNERCTL_STUB_FLEET_NOHEALTHJSON="host…"` is a
   host too old for `health --json`.
+- **A `fleet upgrade --push` host (GHR-83) runs the script's REAL remote
+  text.** A push call is one word of shell (`exec /bin/sh -c '…'`), not a
+  runnerctl argv, so `ssh_run_body` hands it to `stub_push_remote`, which runs
+  it with `/bin/sh` under `env -i` in `$WRITES/remote/<host>/` — `bin/` (its
+  runnerctl, first on PATH), `tmp/` (its TMPDIR: assert it empty, the temp
+  file is removed on every path), `etc/config` (empty, so the host's install
+  never reads this box's `/etc/runnerctl/config`), `before` (its runnerctl as
+  the case began) and `fake/`, whose `sudo` runs the REAL `install` of the file
+  it is handed, as this user, with the host's `--config` and `--prefix` added,
+  whose `logger` logs `probe:remote_push_logger`, and whose `curl` logs
+  `probe:remote_push_curl` and fails — no host may download. That fake `sudo` refuses
+  anything but `-n bash FILE` (`probe:remote_push_piped` for a `bash -s`,
+  which would download). The stub's `ssh_run_stdin` keeps what a host
+  received as `remote/<host>.received`. Hosts by name: `*absent*`,
+  `*pushsame*`, `*ahead*` (9.9.9), else 0.0.1; `*mangle*` receives one byte
+  changed, `*pushcorrupt*` installs other bytes than it was handed,
+  `*nosudo*` refuses sudo. The host's own sha256 check and the central
+  read-back BOTH catch wrong bytes, so a case about the host's check asserts
+  the file in place is unchanged — the read-back alone cannot show that — and
+  `newer` is pinned on what was SENT, since the host's `install` refuses a
+  downgrade by itself too. `install-test` 3b pins the same `bash FILE
+  install` shape outside the stub: the file is the source, nothing is
+  downloaded (a fake `curl`), a pre-config script is migrated first.
 - **`health`'s problems are kept as kind / slot / detail (GHR-80)**, and the
   prose line is rebuilt from them (`<slot>: <detail>`, `host: <detail>`);
   `host_problems` prints `KIND<TAB>TEXT`. A new problem goes through

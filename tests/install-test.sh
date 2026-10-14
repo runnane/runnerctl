@@ -63,6 +63,23 @@ grep -q "^DROPIN_NAME='10-example-runner.conf'" "$tmp/legacy/etc/config" || fail
 grep -q "^profile_deploy()" "$tmp/legacy/etc/config" || fail "migrated config lacks profile_deploy"
 grep -q '^RUNNERCTL_VERSION=' "$tmp/legacy/runnerctl" || fail "legacy file was not replaced"
 
+# 3b. GHR-83: the shape `fleet upgrade --push` runs on a host — `bash FILE
+#     install`, FILE a mktemp copy (mode 0600, not named runnerctl) — is an
+#     ordinary FILE install: this file is the source, nothing is downloaded
+#     (a fake `curl` first on PATH fails loudly if anything tries), and a
+#     pre-config install is migrated first, as in case 3.
+mkdir -p "$tmp/pushed" "$tmp/nocurl"; cp "$legacy" "$tmp/pushed/runnerctl"; chmod 755 "$tmp/pushed/runnerctl"
+printf '#!/bin/sh\necho "TEST TRIED TO DOWNLOAD: $*" >&2; exit 97\n' >"$tmp/nocurl/curl"; chmod +x "$tmp/nocurl/curl"
+pf="$(mktemp "$tmp/tmp.XXXXXX")"; cat runnerctl >"$pf"
+PATH="$tmp/nocurl:$PATH" RUNNERCTL_CONFIG="$tmp/pushed/etc/config" bash "$pf" install --prefix "$tmp/pushed" >"$tmp/out3b" 2>&1 \
+  || fail "bash FILE install exited $? — $(cat "$tmp/out3b")"
+grep -qx "source: $pf (this file)" "$tmp/out3b" || fail "bash FILE install did not take the file as its source: $(cat "$tmp/out3b")"
+! grep -q "TEST TRIED TO DOWNLOAD" "$tmp/out3b" || fail "bash FILE install downloaded"
+m="$(grep -n -- '--- migrate done ---' "$tmp/out3b" | cut -d: -f1)"
+i="$(grep -n '^Installed runnerctl' "$tmp/out3b" | cut -d: -f1)"
+[ -n "$m" ] && [ -n "$i" ] && [ "$m" -lt "$i" ] || fail "bash FILE install did not migrate before installing: $(cat "$tmp/out3b")"
+cmp -s runnerctl "$tmp/pushed/runnerctl" || fail "bash FILE install did not land the pushed bytes"
+
 # 4. Legacy dry run: nothing changes, no config written.
 mkdir -p "$tmp/dry"; cp "$legacy" "$tmp/dry/runnerctl"
 RUNNERCTL_CONFIG="$tmp/dry/etc/config" ./runnerctl install --prefix "$tmp/dry" --dry-run >"$tmp/out4" 2>&1 \
