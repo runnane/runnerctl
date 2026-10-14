@@ -10250,6 +10250,116 @@ case_watch_O_prints_the_cursors_run_url() {
   expect_out_count '^example\.slot-1: cannot tell whether a job is running — needs journal read access \(systemd-journal group\) or root$' 1
 }
 
+# GHR-102: a job's run is read from a step's environment, which is gone
+# between two steps. In `watch` the last run facts read for the job are kept
+# and handed back while the SAME job runs: RUNNERCTL_STUB_ENV_ONCE=1 answers
+# slot-1's environment for the first read and never again, so every frame after
+# the first has only the memo to draw the long cell and O's URL from.
+case_watch_remembers_a_jobs_run_between_reads() {
+  RUNNERCTL_STUB_ENV_ONCE=1 RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run watch --iterations 3 --color never
+  expect_rc 0
+  expect_out_count '^0 +example\.slot-1 .* my-app:CI / test @main \(12m\)$' 3
+  expect_no_out '^0 +example\.slot-1 .* test \(12m\)$'
+  # the environment really was asked for again, and answered nothing
+  expect_log '^probe:proc_job_env .*slot-1'
+  # O, two ticks on: the URL the first read saw, not "its run URL is not known"
+  RUNNERCTL_STUB_ENV_ONCE=1 RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='--Oq' run watch --color never
+  expect_rc 0
+  expect_out_count "^example\.slot-1: $RUN_URL1\$" 1
+  expect_no_out 'run URL is not known'
+  expect_no_log "$READ_ONLY_LOG"
+  # one-shot status has no process that outlives it: nothing is remembered, so
+  # a second read in one process (ENV_MEMO_DIR empty) finds nothing
+  local snip
+  snip="$(cat <<'EOF'
+      job_facts u /cg inv1; one_line first
+      GHR102_ENV=""; job_facts u /cg inv1; one_line second
+EOF
+)"
+  GHR102_ENV=$'GITHUB_REPOSITORY=example/my-app\nGITHUB_JOB=test\nGITHUB_RUN_ID=111\nGITHUB_SERVER_URL=https://github.com' \
+    run_fn eval "$GHR102_HOOKS"$'\n'"$snip"
+  expect_rc 0
+  expect_text "no memo outside watch" $'first|my-app|111|https://github.com/example/my-app/actions/runs/111\nsecond|||' "$OUT"
+}
+
+# The hooks for the function-level cases below: slot "u" has a journal that
+# says GHR102_JL, a step environment GHR102_ENV (the text the hook prints) and
+# no Runner.Worker, so the job's start is the journal's stamp.
+GHR102_HOOKS="$(cat <<'EOF'
+  journal_job_lines() { printf "%s\n" "$GHR102_JL"; }
+  proc_job_env() { [ -z "$GHR102_ENV" ] || printf "%s\n" "$GHR102_ENV"; }
+  proc_worker_pid() { :; }
+  cgroup_readable() { :; }
+  now_epoch() { echo 1000000720; }
+  one_line() { printf "%s|%s|%s|%s\n" "$1" "$JOB_REPO" "$JOB_RUN_ID" "$JOB_URL"; }
+  GHR102_JL="1000000000.000000 runsvc.sh[1]: Z: Running job: test"
+EOF
+)"
+
+# The key is the job, not the slot: two consecutive jobs on one unit, the
+# second with an environment nobody can read, must not show the first's run —
+# not by a different start, not by a different InvocationID.
+case_watch_a_new_job_inherits_nothing_of_the_last_ones_run() {
+  local env1=$'GITHUB_REPOSITORY=example/old-app\nGITHUB_JOB=test\nGITHUB_WORKFLOW=Old\nGITHUB_RUN_ID=111\nGITHUB_SERVER_URL=https://github.com'
+  local snip
+  snip="$(cat <<'EOF'
+    ENV_MEMO_DIR="$(mktemp -d)"
+    job_facts u /cg inv1; one_line job1-read
+    GHR102_ENV=""
+    job_facts u /cg inv1; one_line job1-again
+    GHR102_JL="1000000300.000000 runsvc.sh[1]: Z: Running job: test"
+    job_facts u /cg inv1; one_line job2-unreadable
+    echo "cell:$(job_cell 300)"
+    GHR102_JL="1000000000.000000 runsvc.sh[1]: Z: Running job: test"
+    job_facts u /cg inv2; one_line other-invocation
+    GHR102_JL="1000000300.000000 runsvc.sh[1]: Z: Running job: test"
+    GHR102_ENV="GITHUB_REPOSITORY=example/new-app
+GITHUB_RUN_ID=222
+GITHUB_SERVER_URL=https://github.com"
+    job_facts u /cg inv1; one_line job2-read
+    GHR102_ENV=""
+    job_facts u /cg inv1; one_line job2-again
+    rm -rf "$ENV_MEMO_DIR"
+EOF
+)"
+  GHR102_ENV="$env1" run_fn eval "$GHR102_HOOKS"$'\n'"$snip"
+  expect_rc 0
+  expect_text "a new job on the slot" "job1-read|old-app|111|https://github.com/example/old-app/actions/runs/111
+job1-again|old-app|111|https://github.com/example/old-app/actions/runs/111
+job2-unreadable|||
+cell:test (7m)
+other-invocation|||
+job2-read|new-app|222|https://github.com/example/new-app/actions/runs/222
+job2-again|new-app|222|https://github.com/example/new-app/actions/runs/222" "$OUT"
+  expect_no_out 'job2-unreadable.*111'
+  expect_no_out 'old-app.*other-invocation'
+}
+
+# A remembered value is drawn as every other is: through term_safe, whole
+# sequences gone — and what the memo holds is what job_env_facts kept, not the
+# raw block (a run id that is not a number is not remembered either).
+case_watch_a_remembered_value_is_drawn_safe() {
+  local env1=$'GITHUB_REPOSITORY=example/my-app\nGITHUB_JOB=test\nGITHUB_WORKFLOW=C\e[2JI\x07\nGITHUB_REF_NAME=ma\e]0;pwned\x07in\nGITHUB_RUN_ID=12ab\nGITHUB_SERVER_URL=https://github.com'
+  local snip
+  snip="$(cat <<'EOF'
+    ENV_MEMO_DIR="$(mktemp -d)"
+    job_facts u /cg inv1; echo "first:$(job_cell 300)"
+    GHR102_ENV=""
+    job_facts u /cg inv1; echo "second:$(job_cell 300)"; one_line second
+    grep -c "12ab" "$ENV_MEMO_DIR/u" || true
+    rm -rf "$ENV_MEMO_DIR"
+EOF
+)"
+  GHR102_ENV="$env1" run_fn eval "$GHR102_HOOKS"$'\n'"$snip"
+  expect_rc 0
+  expect_no_out $'\e'
+  expect_no_out $'\x07'
+  expect_out '^first:my-app:CI / test @main \(12m\)$'
+  expect_out '^second:my-app:CI / test @main \(12m\)$'
+  expect_out '^second\|my-app\|\|$'
+  expect_out '^0$'
+}
+
 # O in `fleet watch`: the same, for the (host, slot) the cursor is on, from
 # the payload the tick already brought — the key asks no host anything, so the
 # only ssh calls are the first frame's four (a table and a --json per host).
@@ -10367,6 +10477,9 @@ t "job_env_facts: digits or nothing, hex or nothing, a URL only from valid parts
 t "proc_environ_job_vars: the real reader on an environ block"              case_proc_environ_job_vars_reads_the_real_block
 t "term_safe: the bytes that are drawn, under any locale"                   case_term_safe_pins_the_bytes
 t "watch: O prints the run URL of the cursor's job"                         case_watch_O_prints_the_cursors_run_url
+t "GHR-102: watch keeps a job's run facts while the same job runs"          case_watch_remembers_a_jobs_run_between_reads
+t "GHR-102: a new job on the slot inherits nothing of the last one's run"   case_watch_a_new_job_inherits_nothing_of_the_last_ones_run
+t "GHR-102: a remembered value is drawn safe, and only kept facts are kept" case_watch_a_remembered_value_is_drawn_safe
 t "fleet watch: O prints the cursor's run URL and asks no host"             case_fleet_watch_O_prints_the_cursors_run_url
 t "fleet watch: O prints nothing that is not a run page's address"          case_fleet_watch_run_url_trusts_no_remote_string
 t "status --json: a job's text cannot forge the slot line its readers parse" case_run_facts_cannot_forge_the_slot_line
