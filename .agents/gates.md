@@ -374,8 +374,33 @@ Traps:
 - **`trap CMD EXIT` is a wrapper, not the builtin** (GHR-88): it keeps CMD in
   `EXIT_CMD` and installs `exit_run`, which writes the record first. A
   subshell inherits `EXIT_CMD` but not the trap, so `exit_run` runs CMD only
-  in the process that set it (`EXIT_PID`). Every other `trap` form is the
-  builtin. Code that needs the raw builtin says `builtin trap`.
+  in the process that set it (`EXIT_PID`). Code that needs the raw builtin
+  says `builtin trap`.
+- **INT and TERM through the `trap` wrapper are the record's too** (GHR-119).
+  While a record is armed both run `audit_signal`, which writes `interrupted
+  (SIGINT|SIGTERM)` and then either runs the command's own handler for that
+  signal (kept by `sig_own` — `watch` and `fleet watch` trap both to `exit
+  0`) or resets the disposition and re-raises at `$BASHPID`, so the process
+  still dies BY the signal. `audit_finish` hands both back to the command's
+  handler, or to the default. Every other signal is the builtin's. A shell's
+  `$?` cannot tell a death by signal from `exit 130`, so the cases that pin
+  it go through `run_signalled SIG group|pid BLOCK-ERE ARGS…`: a perl parent
+  (reset INT/TERM to default first — the GHR-75 trap — then fork, `setsid`,
+  exec) that waits for the stub's `RUNNERCTL_STUB_BLOCK` call (the
+  `run_priv` whose argv matches it hangs in a foreground `sleep 30` after
+  touching `$WRITES/.blocked`), signals the group or the pid alone, and reads
+  WIFSIGNALED from a real `waitpid` — `expect_signalled N`. Signal the
+  GROUP for an armed command: bash runs a trap only once the foreground
+  step has ended, so a TERM to the pid alone would wait out the stub's 30 s
+  sleep and read as `survived`. That deferral is also the observable a
+  signal handler armed before the record changes, which is why the
+  before-arming case signals the pid alone. Where perl is absent the cases
+  print a `skip` and keep a weaker assertion; ubuntu has perl. A `run_fn`
+  case about these handlers uses TERM only: its bash inherits the gate's
+  ignored SIGINT under a backgrounded gate, so `trap … INT` is a silent
+  no-op there — the first run of GHR-119's composition case was green under
+  a plain `make sim` and red under `agent-gate-admit`, with `trap -p` showing
+  `trap -- '' SIGINT`.
 - **`history`'s journal read is a hook** (`journal_history_lines N`): the
   stub answers it from `RUNNERCTL_STUB_HISTORY` (a file of journalctl
   short-iso-precise lines; a remote host's is `<file>.<host>` when it exists)
