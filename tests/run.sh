@@ -6676,7 +6676,8 @@ case_fleet_summary_healthy_fleet_is_a_short_line() {
   expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 1
   expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 1
   expect_log_count '^probe:ssh_run ' 4
-  # and `fleet status --json` is untouched: no summary there (that is GHR-80)
+  # and `fleet status --json` carries no line: its summary is an object
+  # (GHR-80), counted from the same payloads, with no call of its own
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status --json
   expect_rc 0
   expect_no_out ' answering'
@@ -10195,7 +10196,7 @@ case_fleet_status_relays_only_sgr_from_a_host() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 hostile" run fleet status --json
   expect_rc 1
   expect_no_control_bytes
-  expect_out '^  \{"host_name":"hostile","reachable":true,"exit_code":0,"error":"exit 0 but stdout carries raw control bytes, which no runnerctl JSON does — check FLEET_RUNNERCTL and the remote login.s output","status":null\}$'
+  expect_out '^  \{"host_name":"hostile","reachable":true,"exit_code":0,"error":"exit 0 but stdout carries raw control bytes, which no runnerctl JSON does — check FLEET_RUNNERCTL and the remote login.s output","status":null,"duration_ms":0,"stale":false,"last_seen":null\}$'
   if $HAVE_PYTHON3; then
     expect_json 'd["fleet"][0]["status"]["slots"][0]["name"] == "example.slot-1" and d["fleet"][1]["status"] is None'
   else
@@ -12058,6 +12059,332 @@ t "GHR-88: FLEET_LOG is a validated config knob"                           case_
 t "GHR-88: history reads the records back"                                 case_ghr88_history_reads_the_records_back
 t "GHR-88: the real history reader over journalctl"                        case_ghr88_the_real_history_reader
 t "GHR-88: fleet history merges the hosts' records by time"                case_ghr88_fleet_history_merges_by_time
+
+# --- GHR-80: fleet JSON for a UI — the envelope, the stream, health --json ----
+# `fleet status --json` gains `generated_at`, `runnerctl`, `summary` and, per
+# host, `duration_ms`, `stale` and `last_seen` — each AFTER every key that was
+# there, so the old ones keep their places. RUNNERCTL_STUB_FLEET_MS pins how
+# long each host's call takes, as now_ms sees it.
+
+# Line N of OUT parses as JSON on its own, and EXPR over it (`d`) is true —
+# for the stream, which is one envelope per line.
+expect_json_line() { # N EXPR
+  _expect
+  local err
+  err="$(PYTHON_COLORS=0 python3 -c 'import json,sys; d=json.loads(sys.stdin.read().split("\n")[int(sys.argv[1]) - 1]); e=sys.argv[2]; assert eval(e), e' "$1" "$2" <<<"$OUT" 2>&1)" \
+    || FAILS+=("json line $1: $2 (${err##*$'\n'})")
+}
+
+GHR80_KEYS='["host_name", "reachable", "exit_code", "error", "status", "duration_ms", "stale", "last_seen"]'
+
+# The acceptance case. Four hosts: two answer, in 212 and 87 ms; one is
+# unreachable (the stub answers that at once: 0 ms); one times out, and
+# reports its budget. The summary is pinned to literals, and so is the line
+# `fleet status` prints for the same fleet — two renderings of one count that
+# merely agreed could be wrong together. Every key, old and new, in its place.
+case_ghr80_envelope_keys_summary_and_durations_are_pinned() {
+  local knobs='build-1 build-2 gw-unreachable slow-timeout'
+  RUNNERCTL_STUB_FLEET_HOSTS="$knobs" RUNNERCTL_STUB_FLEET_MS="build-1:212 build-2:87" \
+    RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 run fleet status --stall-after 600
+  expect_rc 1
+  expect_last_line '2/4 hosts answering · 6 slots: 2 idle, 2 STALLED, 2 disabled · 2 leaking · capacity 2 free of 4'
+  RUNNERCTL_STUB_FLEET_HOSTS="$knobs" RUNNERCTL_STUB_FLEET_MS="build-1:212 build-2:87" \
+    RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 run fleet status --json --stall-after 600
+  expect_rc 1
+  # no second call for the summary: the payload is the call
+  expect_log_count '^probe:ssh_run ' 4
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: the envelope's keys not parsed"; return 0; fi
+  expect_json 'list(d) == ["fleet", "generated_at", "runnerctl", "summary"]'
+  expect_json "all(list(h) == $GHR80_KEYS for h in d[\"fleet\"])"
+  expect_json 'd["generated_at"] == 1000000720'
+  expect_json "d[\"runnerctl\"] == \"$ME_VER\""
+  expect_json 'd["summary"] == {"hosts": 4, "hosts_answering": 2, "slots": 6, "busy": 0, "idle": 2, "stalled": 2, "down": 0, "disabled": 2, "leaking": 2, "disk_crit_hosts": 0, "disk_warn_hosts": 0, "event_hosts": 0, "overloaded_hosts": 0, "capacity_free": 2, "capacity_total": 4, "versions": 1}'
+  expect_json '[h["duration_ms"] for h in d["fleet"]] == [212, 87, 0, 30000]'
+  expect_json '[h["stale"] for h in d["fleet"]] == [False, False, False, False]'
+  expect_json '[h["last_seen"] for h in d["fleet"]] == [1000000720, 1000000720, None, None]'
+  # the count agrees with the payloads it was taken from
+  expect_json 'sum(len(h["status"]["slots"]) for h in d["fleet"] if h["status"]) == d["summary"]["slots"]'
+}
+
+# The rest of the line's segments, each from a state a host really reports:
+# a full disk and journal events on build-2, every host's load past
+# LOAD_CRIT_RATIO, and build-3 on another version — which, with this node's,
+# is two (GHR-77). Line and object pinned to literals, each.
+case_ghr80_summary_carries_every_segment_of_the_line() {
+  local knobs='build-1 build-2 build-3'
+  RUNNERCTL_STUB_LOAD="40.00 9.00 4.00" RUNNERCTL_STUB_FLEET_HOSTS="$knobs" RUNNERCTL_STUB_FLEET_FULL="build-2" \
+    RUNNERCTL_STUB_FLEET_VER="build-3:0.1.0" run fleet status
+  expect_rc 0
+  expect_last_line '3/3 hosts answering · 9 slots: 3 busy, 3 idle, 3 disabled · 1 host disk crit · 1 host OOM/disk-full · 3 hosts overloaded · capacity 3 free of 6 · 2 versions'
+  RUNNERCTL_STUB_LOAD="40.00 9.00 4.00" RUNNERCTL_STUB_FLEET_HOSTS="$knobs" RUNNERCTL_STUB_FLEET_FULL="build-2" \
+    RUNNERCTL_STUB_FLEET_VER="build-3:0.1.0" run fleet status --json
+  expect_rc 0
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: the summary object not parsed"; return 0; fi
+  expect_json 'd["summary"] == {"hosts": 3, "hosts_answering": 3, "slots": 9, "busy": 3, "idle": 3, "stalled": 0, "down": 0, "disabled": 3, "leaking": 0, "disk_crit_hosts": 1, "disk_warn_hosts": 0, "event_hosts": 1, "overloaded_hosts": 3, "capacity_free": 3, "capacity_total": 6, "versions": 2}'
+  # a level fleet is one version, and a zero is a zero, never left out
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status --json
+  expect_rc 0
+  expect_json 'd["summary"]["versions"] == 1 and d["summary"]["stalled"] == 0 and d["summary"]["leaking"] == 0'
+  # nobody answering: hosts only, and no version at all
+  RUNNERCTL_STUB_FLEET_HOSTS="gw-unreachable" run fleet status --json
+  expect_rc 1
+  expect_json 'd["summary"]["hosts"] == 1 and d["summary"]["hosts_answering"] == 0 and d["summary"]["slots"] == 0 and d["summary"]["versions"] == 0'
+}
+
+# The summary counts exactly what the envelope nests: a host that answered
+# exit 0 with no object, or with raw control bytes, answered — and has no
+# slots to count, since its `status` is null.
+case_ghr80_summary_counts_only_nested_payloads() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 ugly-garbage hostile" run fleet status --json
+  expect_rc 1
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: the summary object not parsed"; return 0; fi
+  expect_json '[h["status"] is None for h in d["fleet"]] == [False, True, True]'
+  expect_json 'd["summary"]["hosts_answering"] == 3 and d["summary"]["slots"] == 3 and d["summary"]["busy"] == 1'
+}
+
+# --- the stream: `fleet status --json --watch` ---------------------------------
+# RUNNERCTL_STUB_FLEET_JSON_POLLS=1 makes the --json call the frame poll, so
+# RUNNERCTL_STUB_FLEET_DOWN and _HANG reach the stream's one call per tick.
+
+# Two ticks. build-2 drops out of the second: it is reported as `fleet watch`
+# draws it — its last payload kept, `stale`, `last_seen` the first tick's time
+# — and counts towards `hosts` only. One call per host per tick, every one of
+# them over the held connection; nothing left in the temp directory.
+case_ghr80_stream_one_envelope_per_tick_over_held_connections() {
+  local d="$TMP/ghr80-tmp"
+  rm -rf "$d"; mkdir -p "$d"
+  TMPDIR="$d" RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_JSON_POLLS=1 RUNNERCTL_STUB_FLEET_DOWN="build-2:2" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_MS="build-1:40 build-2:9" \
+    run fleet status --json --watch --interval 7 --iterations 2
+  expect_rc 0
+  expect_out_count '.' 2
+  expect_out_count '^\{"fleet":\[.*\],"generated_at":[0-9]+,"runnerctl":"[^"]*","summary":\{[^{}]*\}\}$' 2
+  # the stream's own cost: one `status --json` per host per tick, each a
+  # channel on the held master — never a second call, never a fresh login
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 2
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 2
+  expect_log_count '^probe:ssh_run ' 4
+  expect_log_count '^probe:ssh_control_opts ' 4
+  expect_log_order '^probe:ssh_control build-1 exit$' '^probe:ssh_control build-2 exit$'
+  _ghr74_expect_empty "$d"
+  rm -rf "$d"
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: the envelopes not parsed"; return 0; fi
+  expect_json_line 1 'd["generated_at"] == 1000000720 and [h["duration_ms"] for h in d["fleet"]] == [40, 9]'
+  expect_json_line 1 "all(list(h) == $GHR80_KEYS for h in d[\"fleet\"])"
+  expect_json_line 1 'd["summary"]["hosts_answering"] == 2 and d["summary"]["slots"] == 6'
+  expect_json_line 2 'd["generated_at"] == 1000000727'
+  expect_json_line 2 'd["fleet"][1]["reachable"] is False and d["fleet"][1]["exit_code"] == 255 and "No route to host" in d["fleet"][1]["error"]'
+  expect_json_line 2 'd["fleet"][1]["stale"] is True and d["fleet"][1]["last_seen"] == 1000000720 and len(d["fleet"][1]["status"]["slots"]) == 3'
+  expect_json_line 2 'd["fleet"][0]["stale"] is False and d["fleet"][0]["last_seen"] == 1000000727'
+  expect_json_line 2 'd["summary"] == {"hosts": 2, "hosts_answering": 1, "slots": 3, "busy": 1, "idle": 1, "stalled": 0, "down": 0, "disabled": 1, "leaking": 0, "disk_crit_hosts": 0, "disk_warn_hosts": 0, "event_hosts": 0, "overloaded_hosts": 0, "capacity_free": 1, "capacity_total": 2, "versions": 1}'
+}
+
+# A reader that closes the pipe ends the stream: exit 0, the fetch of a host
+# that never answers ended with it, nothing left behind. slow-1 hangs from its
+# first call, so the first envelope is written when the interval runs out,
+# with slow-1 not answering yet.
+case_ghr80_stream_ends_cleanly_when_the_reader_goes() {
+  local d="$TMP/ghr80-tmp" rc
+  rm -rf "$d"; mkdir -p "$d"
+  : >"$LOG"; rm -f "$LOG.clock"; rm -rf "$WRITES"; mkdir -p "$WRITES"
+  ( r=0
+    TMPDIR="$d" RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_JSON_POLLS=1 RUNNERCTL_STUB_FLEET_HANG="slow-1" \
+      RUNNERCTL_STUB_FLEET_HOSTS="build-1 slow-1" RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" \
+      RUNNERCTL_TEST_WRITES="$WRITES" timeout 20 "$RUNNERCTL" fleet status --json --watch --interval 1 2>"$TMP/err" || r=$?
+    echo "$r" >"$TMP/ghr80.rc" ) | head -n 1 >"$TMP/ghr80.out"
+  OUT="$(cat "$TMP/ghr80.out")" ERR="$(cat "$TMP/err")" rc="$(cat "$TMP/ghr80.rc")"
+  expect_text "the stream's exit status after its reader went" 0 "$rc"
+  expect_text "its stderr" "" "$ERR"
+  expect_cfg "$WRITES/remote/slow-1.hung.pids" '^[0-9]+ [0-9]+$'
+  _ghr74_expect_dead "$(cat "$WRITES/remote/slow-1.hung.pids" 2>/dev/null; true)"
+  _ghr74_expect_empty "$d"
+  expect_log_order '^probe:ssh_control build-1 exit$' '^probe:ssh_control slow-1 exit$'
+  rm -rf "$d"
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: the envelope not parsed"; return 0; fi
+  expect_json 'd["fleet"][1]["status"] is None and d["fleet"][1]["reachable"] is False and d["fleet"][1]["error"] == "waiting for its first answer" and d["fleet"][1]["duration_ms"] is None'
+  expect_json 'd["summary"]["hosts"] == 2 and d["summary"]["hosts_answering"] == 1 and d["summary"]["slots"] == 3'
+}
+
+# SIGTERM (and SIGINT, on the same trap) ends it the same way: exit 0, the
+# hung fetch gone, the masters closed, the temp directory empty.
+case_ghr80_stream_ends_cleanly_on_sigterm() {
+  local d="$TMP/ghr80-tmp" pid n=0 rc=0 out="$TMP/ghr80-term.out"
+  rm -rf "$d"; mkdir -p "$d"
+  rm -f "$out"
+  : >"$LOG"; rm -f "$LOG.clock"; rm -rf "$WRITES"; mkdir -p "$WRITES"
+  TMPDIR="$d" RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_JSON_POLLS=1 RUNNERCTL_STUB_FLEET_HANG="slow-1" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1 slow-1" RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" \
+    RUNNERCTL_TEST_WRITES="$WRITES" "$RUNNERCTL" fleet status --json --watch --interval 1 >"$out" 2>"$TMP/err" &
+  pid=$!
+  # the first envelope is out, so slow-1's call is out and the trap is armed
+  while [ ! -s "$out" ] && [ "$n" -lt 500 ]; do sleep 0.02; n=$((n + 1)); done
+  kill -TERM "$pid" 2>/dev/null || true
+  wait "$pid" || rc=$?
+  OUT="$(head -n 1 "$out")" ERR="$(cat "$TMP/err")"
+  expect_text "the stream's exit status after SIGTERM" 0 "$rc"
+  expect_text "its stderr" "" "$ERR"
+  expect_cfg "$WRITES/remote/slow-1.hung.pids" '^[0-9]+ [0-9]+$'
+  _ghr74_expect_dead "$(cat "$WRITES/remote/slow-1.hung.pids" 2>/dev/null; true)"
+  _ghr74_expect_empty "$d"
+  expect_log_order '^probe:ssh_control build-1 exit$' '^probe:ssh_control slow-1 exit$'
+  rm -rf "$d"
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: the envelope not parsed"; return 0; fi
+  expect_json 'd["fleet"][0]["reachable"] is True and d["fleet"][1]["reachable"] is False'
+}
+
+# The stream is the fleet's only: the one-host `status` still refuses --watch
+# with --json, the table form is `fleet watch`, and the stream's own flags do
+# not reach a one-shot by accident. Nothing is dialled for any of them.
+case_ghr80_stream_flags_are_refused_where_they_mean_nothing() {
+  run status --json --watch
+  expect_rc 1
+  expect_err "--json cannot be combined with --watch; poll 'runnerctl status --json' instead"
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet status --watch
+  expect_rc 1
+  expect_err "fleet status --watch is the JSON stream and needs --json; for the table, use 'runnerctl fleet watch'"
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet status --json --interval 5
+  expect_rc 1
+  expect_err "--interval and --iterations belong to the stream"
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet status --json --watch --interval 0
+  expect_rc 1
+  expect_err "--interval value '0' is invalid"
+  expect_no_log '^probe:ssh_run '
+}
+
+# --- health --json -------------------------------------------------------------
+# Every problem `health` reports, as {host, slot, kind, detail}, the exit code
+# the prose form's for the same input — pinned per case, both forms.
+case_ghr80_health_json_kinds_and_exit_codes() {
+  local h='"host": "stub-host-1"'
+  run health
+  expect_rc 0
+  run health --json
+  expect_rc 0
+  if $HAVE_PYTHON3; then expect_json 'd == {"ok": True, "slots": 3, "problems": []}'; fi
+  RUNNERCTL_STUB_DISKS=full RUNNERCTL_STUB_HOST_EVENTS=events run health --max-restarts 3 --stall-after 600
+  expect_rc 1
+  RUNNERCTL_STUB_DISKS=full RUNNERCTL_STUB_HOST_EVENTS=events run health --json --max-restarts 3 --stall-after 600
+  expect_rc 1
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
+  if $HAVE_PYTHON3; then
+    expect_json 'd["ok"] is False and d["slots"] == 3'
+    expect_json '[(p["slot"], p["kind"]) for p in d["problems"]] == [("example.slot-1", "stalled"), ("example.slot-2", "restarts"), (None, "disk"), (None, "oom"), (None, "disk-full")]'
+    expect_json "d[\"problems\"][0] == {$h, \"slot\": \"example.slot-1\", \"kind\": \"stalled\", \"detail\": \"stalled — job my-app:test running 12m, longer than 10m (--stall-after 600)\"}"
+    expect_json "d[\"problems\"][1] == {$h, \"slot\": \"example.slot-2\", \"kind\": \"restarts\", \"detail\": \"3 restarts since last start (oom-kill)\"}"
+    expect_json "d[\"problems\"][2] == {$h, \"slot\": None, \"kind\": \"disk\", \"detail\": \"/var/lib/docker [docker] is 96% full (37.3G free, DISK_CRIT_PCT=95)\"}"
+    expect_json "d[\"problems\"][4] == {$h, \"slot\": None, \"kind\": \"disk-full\", \"detail\": \"1 'No space left on device' line(s) in the journal in the last 1h (last from dockerd)\"}"
+  fi
+  RUNNERCTL_STUB_SLOT3_ENABLED=1 run health
+  expect_rc 1
+  RUNNERCTL_STUB_SLOT3_ENABLED=1 run health --json
+  expect_rc 1
+  if $HAVE_PYTHON3; then expect_json "d[\"problems\"] == [{$h, \"slot\": \"example.slot-3\", \"kind\": \"not-running\", \"detail\": \"enabled but inactive/dead since 6d\"}]"; fi
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 run health --json
+  expect_rc 1
+  if $HAVE_PYTHON3; then expect_json "d[\"problems\"] == [{$h, \"slot\": \"example.slot-2\", \"kind\": \"leaked\", \"detail\": \"2 leaked process(es) left by finished jobs (node, esbuild) — runnerctl reap 1\"}]"; fi
+  RUNNERCTL_STUB_PRESSURE=1 run health --json
+  expect_rc 1
+  if $HAVE_PYTHON3; then expect_json '[(p["slot"], p["kind"]) for p in d["problems"]] == [("example.slot-1", "pressure")]'; fi
+  # --quiet has nothing to quieten in an object
+  run health --json --quiet
+  expect_rc 1
+  expect_err '--quiet cannot be combined with --json'
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: health --json objects not parsed"; fi
+}
+
+# The prose form reads the same problems: one line per problem, `<slot>: ` or
+# `host: ` and then the object's `detail`, in the object's order.
+case_ghr80_health_prose_is_the_objects_details() {
+  RUNNERCTL_STUB_DISKS=full RUNNERCTL_STUB_HOST_EVENTS=events run health --max-restarts 3 --stall-after 600
+  expect_rc 1
+  local prose="$OUT"
+  RUNNERCTL_STUB_DISKS=full RUNNERCTL_STUB_HOST_EVENTS=events run health --json --max-restarts 3 --stall-after 600
+  expect_rc 1
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: health --json not parsed"; return 0; fi
+  expect_text "the prose lines, rebuilt from the object" "$prose" \
+    "$(PYTHON_COLORS=0 python3 -c 'import json,sys; d=json.load(sys.stdin); print("\n".join((p["slot"] or "host") + ": " + p["detail"] for p in d["problems"]))' <<<"$OUT")"
+}
+
+# `fleet health --json`: each host's problems under its configured name. A
+# host too old for `health --json` is asked again without it and its lines
+# become `unclassified` problems; one that did not answer is `unreachable`,
+# one whose runnerctl died `error` — the prose form's text for each. Exit
+# codes pinned against the prose form's.
+case_ghr80_fleet_health_json() {
+  local knobs='build-1 build-2 gw-unreachable slow-timeout box-norunners'
+  RUNNERCTL_STUB_FLEET_HOSTS="$knobs" RUNNERCTL_STUB_FLEET_NOHEALTHJSON="build-2" run fleet health --stall-after 600
+  expect_rc 1
+  RUNNERCTL_STUB_FLEET_HOSTS="$knobs" RUNNERCTL_STUB_FLEET_NOHEALTHJSON="build-2" run fleet health --json --stall-after 600
+  expect_rc 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl health --stall-after 600 --json$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl health --stall-after 600 --json$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl health --stall-after 600$' 1
+  expect_no_control_bytes
+  if $HAVE_PYTHON3; then
+    expect_json '[(p["host"], p["slot"], p["kind"]) for p in d["problems"]] == [("build-1", "example.slot-1", "stalled"), ("build-2", "example.slot-1", "unclassified"), ("gw-unreachable", None, "unreachable"), ("slow-timeout", None, "unreachable"), ("box-norunners", None, "error")]'
+    expect_json 'd["problems"][0]["detail"] == d["problems"][1]["detail"] == "stalled — job my-app:test running 12m, longer than 10m (--stall-after 600)"'
+    expect_json 'd["problems"][2]["detail"] == "unreachable — ssh: connect to host gw-unreachable port 22: No route to host"'
+    expect_json 'd["problems"][3]["detail"] == "timed out after 30s"'
+    expect_json "d[\"problems\"][4][\"detail\"] == \"remote exit 1 — runnerctl: no 'actions.runner.*.service' units found on this host.\""
+    expect_json 'd["ok"] is False and d["slots"] is None'
+  fi
+  # healthy, an older host among them: exit 0 both ways, its count read off
+  # its `ok:` line
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_NOHEALTHJSON="build-2" run fleet health
+  expect_rc 0
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_NOHEALTHJSON="build-2" run fleet health --json
+  expect_rc 0
+  if $HAVE_PYTHON3; then expect_json 'd == {"ok": True, "slots": 6, "problems": []}'; fi
+  # one unreachable host alone: exit 1 both ways
+  RUNNERCTL_STUB_FLEET_HOSTS="gw-unreachable" run fleet health
+  expect_rc 1
+  RUNNERCTL_STUB_FLEET_HOSTS="gw-unreachable" run fleet health --json
+  expect_rc 1
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet health --json --quiet
+  expect_rc 1
+  expect_err '--quiet cannot be combined with --json'
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: fleet health --json not parsed"; fi
+}
+
+# A remote's problem is data: each field decoded and drawn through relay_safe
+# before it is written again — so an escape a remote spelled `\u001b` inside a
+# string, which json_unescape turns back into an ESC, is gone whole, and a
+# hostile host's raw bytes outside the strings never reach the output.
+case_ghr80_fleet_health_json_relays_remote_text() {
+  local d="$TMP/ghr80.fleet"
+  rm -rf "$d"; mkdir -p "$d"
+  printf '%s\n' '{"ok":false,"slots":1,"problems":[' \
+    '  {"host":"elsewhere","slot":"s\u001b[2J1","kind":"stal\u001b]0;x\u0007led","detail":"a\u001b]0;t\u0007b\u001b[31mc\u009b2Jd"}' \
+    ']}' >"$d/0.out"
+  echo 1 >"$d/0.rc"
+  # shellcheck disable=SC2016
+  GHR80_D="$d" run_fn eval 'FLEET_HOSTS=(h1); FLEET_DIR="$GHR80_D"; fleet_health_json'
+  expect_rc 1
+  expect_no_control_bytes
+  if $HAVE_PYTHON3; then
+    expect_json 'd["problems"] == [{"host": "h1", "slot": "s1", "kind": "stalled", "detail": "abcd"}]'
+  fi
+  rm -rf "$d"
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 hostile" run fleet health --json --stall-after 600
+  expect_rc 1
+  expect_no_control_bytes
+  if $HAVE_PYTHON3; then
+    expect_json '[(p["host"], p["kind"]) for p in d["problems"]] == [("build-1", "stalled"), ("hostile", "stalled")]'
+    expect_json 'd["problems"][0]["detail"] == d["problems"][1]["detail"]'
+  fi
+}
+
+t "GHR-80: the envelope's new keys, summary and durations, pinned"        case_ghr80_envelope_keys_summary_and_durations_are_pinned
+t "GHR-80: the summary object carries every segment of the line"          case_ghr80_summary_carries_every_segment_of_the_line
+t "GHR-80: the summary counts only the payloads the envelope nests"      case_ghr80_summary_counts_only_nested_payloads
+t "GHR-80: the stream is one envelope per tick over held connections"     case_ghr80_stream_one_envelope_per_tick_over_held_connections
+t "GHR-80: the stream ends cleanly when its reader goes"                  case_ghr80_stream_ends_cleanly_when_the_reader_goes
+t "GHR-80: the stream ends cleanly on SIGTERM"                            case_ghr80_stream_ends_cleanly_on_sigterm
+t "GHR-80: the stream's flags are refused where they mean nothing"        case_ghr80_stream_flags_are_refused_where_they_mean_nothing
+t "GHR-80: health --json kinds, exit codes as the prose form's"           case_ghr80_health_json_kinds_and_exit_codes
+t "GHR-80: health's prose lines are the object's details"                 case_ghr80_health_prose_is_the_objects_details
+t "GHR-80: fleet health --json, older hosts and failures included"        case_ghr80_fleet_health_json
+t "GHR-80: fleet health --json relays a remote's text"                    case_ghr80_fleet_health_json_relays_remote_text
 
 # --- Summary ------------------------------------------------------------------
 echo

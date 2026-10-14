@@ -367,6 +367,26 @@ Traps:
   `journalctl -t` that matches nothing exits 0 and prints nothing, so a
   non-zero exit is journalctl failing.
 
+- **`fleet status --json --watch` (GHR-80) is `fleet watch`'s fetch with one
+  call per tick, `status --json`** — so the stub's frame-poll knobs, which
+  count and fail `status` TABLE calls only, do not reach it unless the case
+  sets `RUNNERCTL_STUB_FLEET_JSON_POLLS=1` (then the `--json` call is the
+  poll: `RUNNERCTL_STUB_FLEET_DOWN` and `_HANG` apply). The stream's waits go
+  through the `stream_wait` hook, logged `probe:stream_wait S`: a poll step
+  (S = `FW_POLL`) is modelled like `fleet watch`'s, and with
+  `RUNNERCTL_STUB_CLOCK=1` a step with only hung hosts left jumps the clock to
+  the end of the interval — so a stream with a hung host writes its envelope.
+  Without the moving clock that stream never writes one: run it with
+  `--iterations`, or set the clock. Each envelope is one LINE: assert with
+  `expect_json_line N`, not `expect_json`. `duration_ms` is pinned per host
+  with `RUNNERCTL_STUB_FLEET_MS="host:ms …"` (STUB_MS_ADD, which `now_ms`
+  adds, per background job). `RUNNERCTL_STUB_FLEET_NOHEALTHJSON="host…"` is a
+  host too old for `health --json`.
+- **`health`'s problems are kept as kind / slot / detail (GHR-80)**, and the
+  prose line is rebuilt from them (`<slot>: <detail>`, `host: <detail>`);
+  `host_problems` prints `KIND<TAB>TEXT`. A new problem goes through
+  `health_add` with a kind, or `health --json` cannot report it.
+
 ## migrate-test
 
 `bash tests/migrate-test.sh`. Runs `runnerctl migrate` against
