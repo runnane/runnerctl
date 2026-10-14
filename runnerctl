@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # runnerctl — manage self-hosted GitHub Actions runner slots on this host.
 #
-# Runners are systemd services (actions.runner.<scope>.<name>.service) installed
-# by GitHub's svc.sh. This tool applies a role PROFILE (memory caps, restart
+# Runners are systemd services (actions.runner.<scope>.<name>.service), as
+# GitHub's svc.sh installs them — or as `provision` writes the same unit
+# itself (GHR-110). This tool applies a role PROFILE (memory caps, restart
 # policy, on-device secrets) via systemd drop-in overrides — so the generated
 # unit files are never hand-edited and the config survives a runner reinstall —
 # plus reports status and scales the active pool.
@@ -352,9 +353,10 @@
 # 'actions.runner.*.service' units found" — `install` installs THIS SCRIPT,
 # and nothing installed a runner. provision fetches GitHub's runner release
 # (verifying the SHA-256 published with it), unpacks one copy per slot under
-# RUNNER_ROOT, registers each with the runner's own `config.sh` and lets the
-# runner's own `svc.sh` write the unit — so the result is exactly the units
-# the rest of this tool manages, never a unit file written by hand. It is
+# RUNNER_ROOT, registers each with the runner's own `config.sh` (as the runner
+# user) and writes the unit `svc.sh install` would write, from a template held
+# here (GHR-110: root never runs a script out of a runner's directory, which
+# the account jobs run as can rewrite). It is
 # idempotent against a target count like `scale`: `provision 4` on a host
 # with 2 adds two, `provision 2` on a host with 4 changes nothing, and it
 # never deregisters anything. The registration token comes from --token (the
@@ -365,7 +367,8 @@
 # `ps` to other users on the box; runnerctl itself never prints or stores it.
 #
 # `deprovision <target>...` (GHR-46) is the inverse, for a slot that should
-# stop existing rather than merely stop: svc.sh stop + uninstall, `config.sh
+# stop existing rather than merely stop: the unit stopped, disabled and
+# removed (what svc.sh stop + uninstall did, without running it), `config.sh
 # remove` with a removal token (minted like the registration one, from
 # --token, --pat/$GITHUB_TOKEN or gh), then the runner's directory is
 # deleted. Irreversible, so it takes explicit targets only, asks y/N unless
@@ -667,7 +670,7 @@ sudo_flag_problem() { # COMMAND ARGS...
       provision:--url|deprovision:--url)
         SUDO_WHY="it chooses which GitHub account this host's runners take jobs from, or which one a credential is sent to — and a job is code run on this host" ;;
       provision:--runner-user)
-        SUDO_WHY="it chooses the account that owns each runner's directory, whose scripts provision then runs as root" ;;
+        SUDO_WHY="it chooses the account every runner — and so every job — runs as, and which account owns each runner's directory" ;;
       provision:--runner-root|provision:--work)
         SUDO_WHY="it chooses where root unpacks, chowns and writes" ;;
       provision:--runner-version|provision:--no-verify-checksum)
@@ -9091,9 +9094,19 @@ cmd_profiles() {
 # require_runners' refusal and the first step was an undocumented manual loop.
 # `provision N` closes that gap: it fetches GitHub's runner release, unpacks a
 # copy per slot under $RUNNER_ROOT, registers each with the runner's own
-# `config.sh` and lets the runner's own `svc.sh` write the systemd unit. The
-# units are therefore exactly the ones the rest of this tool already knows how
-# to manage through drop-ins — provision never writes a unit file itself.
+# `config.sh` as the runner user, and writes the systemd unit `svc.sh install`
+# would have written (render_runner_unit, below). The units are therefore
+# exactly the ones the rest of this tool already knows how to manage through
+# drop-ins, and the same file a host provisioned by svc.sh carries.
+#
+# GHR-110: it used to run `./svc.sh install` / `start` (and deprovision
+# `./svc.sh stop` / `uninstall`) as ROOT from the runner's directory — which
+# the runner user owns, and the runner user is what every job runs as. svc.sh
+# also sources ./env.sh. So any job could rewrite either and have the next
+# provision or deprovision on the host run it as uid 0. Nothing in a runner's
+# directory is executed as root any more: root writes the unit, runs
+# systemctl, unpacks, chowns and deletes; the runner's own scripts run as the
+# runner user only (runner_exec refuses uid 0 outright).
 #
 # It is idempotent against a TARGET COUNT, like `scale`: slots that exist are
 # left alone, so `provision 4` on a host with 2 adds two and `provision 2` on
@@ -9188,22 +9201,177 @@ runner_sha256() { # FILE
   sha256sum "$1" | awk '{print $1}'
 }
 
-# Run CMD... from DIR as USER. GitHub's config.sh and svc.sh source ./env.sh
-# relative to the WORKING DIRECTORY, so they only work from the runner's own
-# directory, and `runuser` has no --chdir of its own (probed, util-linux on
-# the dev box) — hence the explicit cd in the shell it starts. Goes through
-# run_priv like every other host mutation, so the harness sees it.
+# Is USER uid 0? By name and by uid, so an alias of root (a second uid-0
+# account) is caught too. A name that does not resolve is not root.
+runner_user_is_root() { # USER
+  [ "$1" = root ] && return 0
+  local uid; uid="$(id -u -- "$1" 2>/dev/null || true)"
+  [ "$uid" = 0 ]
+}
+
+# Run CMD... from DIR as USER — never as root (GHR-110). Everything in a
+# runner's directory is writable by the runner user, which is the account
+# every job runs as, so a file there run as root is a job's code run as root.
+# GitHub's config.sh sources ./env.sh relative to the WORKING DIRECTORY, so
+# it only works from the runner's own directory, and `runuser` has no --chdir
+# of its own (probed, util-linux on the dev box) — hence the explicit cd in
+# the shell it starts. Goes through run_priv like every other host mutation,
+# so the harness sees it.
 runner_exec() { # DIR USER CMD...
   local dir="$1" user="$2"; shift 2
-  local as=()
-  # run_priv is already root, so becoming root again through runuser would be
-  # a dependency and a log line for nothing. Only dropping privilege needs it.
-  [ "$user" = root ] || as=(runuser -u "$user" --)
+  if runner_user_is_root "$user"; then
+    echo "runnerctl: refusing to run '$*' in $dir as $user: everything in a runner's directory is writable by the account jobs run as, so runnerctl never runs it as root" >&2
+    return 1
+  fi
   # SC2016 is the point: the $1/$@ below belong to the inner bash, which gets
   # the directory and the command as its own arguments rather than having them
   # pasted into a string this shell expanded.
   # shellcheck disable=SC2016
-  run_priv ${as+"${as[@]}"} bash -c 'cd "$1" || exit 1; shift; exec "$@"' runnerctl "$dir" "$@"
+  run_priv runuser -u "$user" -- bash -c 'cd "$1" || exit 1; shift; exec "$@"' runnerctl "$dir" "$@"
+}
+
+# --- The runner's systemd unit, written by runnerctl (GHR-110) ---------------
+# What `svc.sh install` does, read as data from actions/runner v2.338.0
+# (commit 197ca027b90de199464dee3bb9ff198a1db60967), files
+# src/Misc/layoutbin/systemd.svc.sh.template, actions.runner.service.template
+# and runsvc.sh, and src/Runner.Listener/Configuration/
+# {ServiceControlManager,SystemdControlManager}.cs. A runner release that
+# changes any of them is a known thing to re-check against what is here:
+#
+#   name     config.sh writes it into svc.sh: actions.runner.<scope>.<name>.service,
+#            <scope> being the URL's path (org, org/repo, enterprises/slug)
+#            with every character outside [0-9A-Za-z._-] made '-'. Past 150
+#            characters it truncates and adds a RANDOM 4-digit suffix —
+#            runner_unit_name refuses that length instead of guessing.
+#   install  refuses if /etc/systemd/system/<name> exists; renders the template
+#            (Description, User, RunnerRoot = its working directory) into it;
+#            restorecon under enforcing SELinux; chmod 664; daemon-reload;
+#            copies bin/runsvc.sh to ./runsvc.sh, owned by the user, mode 755;
+#            systemctl enable <name>; writes <name> to ./.service, owned by
+#            the user.
+#   start    systemctl start <name>.   stop  systemctl stop <name>.
+#   uninstall  stop, systemctl disable <name>, rm the unit file, rm
+#            ./.service, daemon-reload.
+#
+# The unit runs ExecStart=<dir>/runsvc.sh as User=<the runner user> — systemd
+# drops to that user before exec, so a runner-owned runsvc.sh is run with the
+# runner's own privileges, which is what it already has. The template has no
+# ExecStartPre/ExecStartPost/ExecStop/ExecReload, and ExecStart carries no
+# '+' or '!' prefix (either would run it with full privileges); the drop-in
+# `apply` adds has no Exec line at all. runner_unit_root_exec_problem below is
+# the check the sim pins that on.
+#
+# Differences from svc.sh, each deliberate: the unit is 0644 root:root rather
+# than 664 (nothing but root needs to write it); runsvc.sh and .service are
+# written AS THE RUNNER USER rather than by root and then chowned (the result
+# is the same file with the same owner, and root never writes through a path
+# inside a directory the runner user controls); restorecon is not run — svc.sh
+# needed it because it rendered the unit in the runner's directory and `mv`ed
+# it, which keeps the source's SELinux label, while runnerctl creates the file
+# in SYSTEMD_DIR, so it takes that directory's default label (not verified on
+# an SELinux host).
+#
+# .service: the runner reads it in one place — `config.sh remove` refuses
+# with "Uninstall service first" while it exists (ConfigurationStore.
+# IsServiceConfigured) — so it is written, to keep that guard for an operator
+# running config.sh by hand, and deprovision removes it before config.sh
+# remove. Nothing in runnerctl reads it.
+
+# A path written into a unit as WorkingDirectory= and ExecStart=: absolute,
+# no '.' or '..' segment, and only characters that mean nothing to systemd —
+# no whitespace, quote, '%' specifier, '\' escape, ';' or newline, any of
+# which would change what the line says or start a new one.
+valid_unit_path() { # PATH
+  [[ "$1" =~ ^(/[A-Za-z0-9._-]+)+$ ]] || return 1
+  [[ "$1/" != */./* && "$1/" != */../* ]]
+}
+
+# The unit name config.sh computes for URL and RUNNER-NAME, printed; or a
+# reason on stderr and 1 when runnerctl will not write one.
+runner_unit_name() { # URL RUNNER-NAME
+  local path="${1%/}" scope unit
+  path="${path#*://}"; path="${path#*/}"
+  scope="$(LC_ALL=C; printf '%s' "${path//[^0-9A-Za-z._-]/-}")"
+  unit="actions.runner.$scope.$2.service"
+  if ! [[ "$unit" =~ ^actions\.runner\.[A-Za-z0-9._-]+\.service$ ]] || ! valid_runner_name "$2"; then
+    echo "runnerctl: cannot name a unit for runner '$2' at '$1'" >&2; return 1
+  fi
+  if [ "${#unit}" -gt 150 ]; then
+    echo "runnerctl: the unit name $unit is ${#unit} characters; the runner truncates names past 150 with a random suffix, which runnerctl cannot predict — pass a shorter --name-prefix" >&2
+    return 1
+  fi
+  printf '%s\n' "$unit"
+}
+
+# The unit text `svc.sh install` would write for UNIT, DIR and USER — byte for
+# byte actions.runner.service.template with its three values filled in, so a
+# unit runnerctl wrote and one svc.sh wrote are the same file. Every value is
+# validated HERE, not only by the caller: a newline, '%' or ']' in any of them
+# would write a directive of its own into a file systemd runs as root.
+render_runner_unit() { # UNIT DIR USER
+  local unit="$1" dir="$2" user="$3" desc
+  [[ "$unit" =~ ^actions\.runner\.([A-Za-z0-9._-]+)\.service$ ]] || { echo "runnerctl: refusing to render a unit named '$unit'" >&2; return 1; }
+  desc="${BASH_REMATCH[1]}"
+  valid_unit_path "$dir" || { echo "runnerctl: refusing to render a unit for the directory '$dir' — want an absolute path of letters, digits, '.', '_' and '-'" >&2; return 1; }
+  valid_user_name "$user" || { echo "runnerctl: refusing to render a unit for the user '$user'" >&2; return 1; }
+  ! runner_user_is_root "$user" || { echo "runnerctl: refusing to render a unit that runs a runner as root" >&2; return 1; }
+  cat <<UNIT
+[Unit]
+Description=GitHub Actions Runner ($desc)
+After=network-online.target
+
+[Service]
+ExecStart=$dir/runsvc.sh
+User=$user
+WorkingDirectory=$dir
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=5min
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+# Why the unit text on stdin would run a file in DIR as root, or nothing. The
+# audit the sim pins: a runner unit must run only as a non-root User=, with no
+# privileged ExecStart prefix and no other Exec line — any Exec*= runs as
+# User= too, but it is one edit away from a '+' and it has no business in a
+# runner's unit, so its presence alone is the problem.
+runner_unit_root_exec_problem() { # DIR  (unit text on stdin)
+  local dir="$1" text user
+  text="$(cat)"
+  user="$(sed -n 's/^User=//p' <<<"$text" | tail -n 1)"
+  if [ -z "$user" ] || runner_user_is_root "$user"; then echo "the unit runs as root (User='$user')"; return 0; fi
+  if grep -Eq '^Exec(StartPre|StartPost|Stop|StopPost|Reload|Condition)=' <<<"$text"; then
+    echo "the unit has an Exec line other than ExecStart: $(grep -E '^Exec' <<<"$text" | grep -v '^ExecStart=' | head -n 1)"; return 0
+  fi
+  if grep -Eq '^ExecStart=[-@:+!]*[+!]' <<<"$text"; then echo "ExecStart= runs with full privileges ('+' or '!')"; return 0; fi
+  grep -Fxq "ExecStart=$dir/runsvc.sh" <<<"$text" || echo "ExecStart= is not $dir/runsvc.sh"
+}
+
+# Write UNIT for the runner in DIR, as svc.sh install would, then enable it.
+# Root writes only the root-owned unit under SYSTEMD_DIR and runs systemctl;
+# the two files that go into DIR are written by the runner user.
+runner_unit_install() { # UNIT DIR USER
+  local unit="$1" dir="$2" user="$3" text path="$SYSTEMD_DIR/$1" problem
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    echo "  $path already exists — not overwriting a unit runnerctl did not just write" >&2; return 1
+  fi
+  text="$(render_runner_unit "$unit" "$dir" "$user")" || return 1
+  problem="$(runner_unit_root_exec_problem "$dir" <<<"$text")"
+  [ -z "$problem" ] || { echo "runnerctl: refusing to install $unit: $problem" >&2; return 1; }
+  # Created empty with its final owner and mode first, so the text never sits
+  # in a file with whatever mode root's umask would have given it.
+  run_priv install -m 0644 -o root -g root /dev/null "$path" || return 1
+  printf '%s\n' "$text" | run_priv tee "$path" >/dev/null || return 1
+  runner_exec "$dir" "$user" install -m 0755 ./bin/runsvc.sh ./runsvc.sh || return 1
+  run_priv systemctl daemon-reload || return 1
+  run_priv systemctl enable "$unit" || return 1
+  # SC2016: the $1 belongs to the inner bash, which takes the unit name as an
+  # argument rather than having it pasted into the string.
+  # shellcheck disable=SC2016
+  runner_exec "$dir" "$user" bash -c 'printf "%s\n" "$1" >.service' runnerctl "$unit" || return 1
 }
 
 # The three questions provision asks the host about accounts and tooling,
@@ -9346,7 +9514,9 @@ cmd_provision() {
   [[ "$work" != /* && -n "$work" ]] || die "--work '$work' is invalid — want a path relative to the runner's own directory"
   [ -z "$sha_pin" ] || [[ "$sha_pin" =~ ^[0-9a-f]{64}$ ]] || die "--sha256 '$sha_pin' is invalid — want 64 lowercase hex characters"
   valid_user_name "$user" || die "--runner-user '$user' is invalid — want a POSIX user name"
-  [[ "$root" == /* ]] || die "--runner-root '$root' is invalid — want an absolute path"
+  ! runner_user_is_root "$user" || die "--runner-user '$user' is invalid — a runner never runs as root: config.sh refuses it, and every job would run as root"
+  # It is written into each runner's unit as WorkingDirectory= and ExecStart=.
+  valid_unit_path "$root" || die "--runner-root '$root' is invalid — want an absolute path of letters, digits, '.', '_' and '-' (it is written into each runner's systemd unit)"
   [ -z "$version" ] || valid_runner_version "$version" || die "--runner-version '$version' is invalid — want X.Y.Z"
 
   local have; have="$(discover | wc -l)"
@@ -9383,6 +9553,14 @@ cmd_provision() {
   done
   [ "${#slots[@]}" -eq "$want" ] || die "could not find $want free runner name(s) under prefix '$prefix' — pass --name-prefix, or --replace to reuse an existing directory"
   echo "  new:     $want slot(s) — ${slots[*]/#/$prefix-}"
+  # The unit each slot gets (GHR-110), named before anything is touched so a
+  # name runnerctl will not write refuses the whole run up front.
+  local -A slot_unit=()
+  local s_ u_
+  for s_ in "${slots[@]}"; do
+    u_="$(runner_unit_name "$url" "$prefix-$s_")" || exit 1
+    slot_unit[$s_]="$u_"
+  done
 
   # Resolve the release before touching the host, so a bad version or an
   # unreachable API fails with nothing half-created.
@@ -9428,7 +9606,7 @@ cmd_provision() {
     local s
     for s in "${slots[@]}"; do
       echo "would register: $prefix-$s via config.sh --unattended --url $url --token *** --name $prefix-$s${labels:+ --labels $labels}${rgroup:+ --runnergroup $rgroup}"
-      echo "would install:  svc.sh install $user   (in $root/$prefix-$s)"
+      echo "would install:  $SYSTEMD_DIR/${slot_unit[$s]}   (runs $root/$prefix-$s/runsvc.sh as $user), then enable and start it"
     done
     return 0
   fi
@@ -9468,12 +9646,12 @@ cmd_provision() {
     if ! runner_exec "$dir" "$user" "${cfg_args[@]}"; then
       failed+=("$name"); echo "  [FAILED] config.sh — the directory is left in place for inspection"; continue
     fi
-    echo "[$name] installing the service"
-    if ! runner_exec "$dir" root ./svc.sh install "$user"; then
-      failed+=("$name"); echo "  [FAILED] svc.sh install"; continue
+    echo "[$name] installing the service ${slot_unit[$s]}"
+    if ! runner_unit_install "${slot_unit[$s]}" "$dir" "$user"; then
+      failed+=("$name"); echo "  [FAILED] installing ${slot_unit[$s]}"; continue
     fi
-    if ! runner_exec "$dir" root ./svc.sh start; then
-      failed+=("$name"); echo "  [FAILED] svc.sh start"; continue
+    if ! run_priv systemctl start "${slot_unit[$s]}"; then
+      failed+=("$name"); echo "  [FAILED] systemctl start ${slot_unit[$s]}"; continue
     fi
     made+=("$name")
     echo "  [ok] $name"
@@ -9497,10 +9675,12 @@ cmd_provision() {
 # --- Deprovisioning: removing a runner for good (GHR-46) ---------------------
 # The inverse of `provision`, and the step `scale` deliberately stops short
 # of: `scale` disables a slot, which leaves it registered with GitHub (offline)
-# and on disk. `deprovision <target>...` runs the runner's own teardown in the
-# order the runner insists on — `svc.sh stop`, `svc.sh uninstall` (config.sh
-# refuses to remove a runner whose service is still installed: "Uninstall
-# service first"), then `config.sh remove` with a REMOVAL token — and deletes
+# and on disk. `deprovision <target>...` runs the runner's teardown in the
+# order the runner insists on — what `svc.sh stop` + `svc.sh uninstall` do,
+# done by runnerctl as root (GHR-110: stop, disable, remove the unit file),
+# then the runner's .service marker removed and `config.sh remove` run with a
+# REMOVAL token as the runner user (config.sh refuses to remove a runner
+# whose service is still installed: "Uninstall service first") — and deletes
 # the runner's directory.
 #
 # Destructive and irreversible, so: only explicit targets (a bare
@@ -9535,19 +9715,22 @@ stdin_is_tty() { [ -t 0 ]; }
 # root.
 runner_exec_with_token() { # TOKEN DIR USER CMD...
   local token="$1" dir="$2" user="$3"; shift 3
-  local as=()
-  [ "$user" = root ] || as=(runuser -u "$user" --)
+  # Never as root, for runner_exec's reason (GHR-110).
+  if runner_user_is_root "$user"; then
+    echo "runnerctl: refusing to run '$*' in $dir as $user: everything in a runner's directory is writable by the account jobs run as, so runnerctl never runs it as root" >&2
+    return 1
+  fi
   # SC2016 for runner_exec's reason: the $1/$@ belong to the inner bash.
   # shellcheck disable=SC2016
-  run_priv ${as+"${as[@]}"} bash -c 'IFS= read -r ACTIONS_RUNNER_INPUT_TOKEN || exit 1; export ACTIONS_RUNNER_INPUT_TOKEN; cd "$1" || exit 1; shift; exec "$@"' runnerctl "$dir" "$@" <<<"$token"
+  run_priv runuser -u "$user" -- bash -c 'IFS= read -r ACTIONS_RUNNER_INPUT_TOKEN || exit 1; export ACTIONS_RUNNER_INPUT_TOKEN; cd "$1" || exit 1; shift; exec "$@"' runnerctl "$dir" "$@" <<<"$token"
 }
 
 deprovision_usage() {
   cat <<'DEPROVISION'
 Usage: runnerctl deprovision <unit|slot-index|name>... [options]
 
-Removes runner slots for good: stops and uninstalls each one's service
-(svc.sh stop + svc.sh uninstall), deregisters it from GitHub (config.sh remove,
+Removes runner slots for good: stops, disables and removes each one's systemd
+unit, deregisters it from GitHub (config.sh remove, run as the runner's user,
 with a removal token) and deletes its directory. Irreversible. There is no
 "all": every slot to remove is named.
 
@@ -9611,11 +9794,19 @@ cmd_deprovision() {
   local dirs=() users=() dir user short i
   for u in "${units[@]}"; do
     short="$(short_name "$u")"
-    # svc.sh writes WorkingDirectory=<the runner's dir> and User=<its user>.
+    # The unit (svc.sh's or provision's) has WorkingDirectory=<the runner's
+    # dir> and User=<its user>.
     dir="$(prop "$u" WorkingDirectory)"; dir="${dir%/}"
     user="$(prop "$u" User)"; [ -n "$user" ] || user="$RUNNER_USER"
     [[ "$dir" == /?* ]] || die "$short: its unit names no runner directory (WorkingDirectory='$dir') — was it installed by svc.sh? Nothing was changed."
     runner_dir_is_runner "$dir" || die "$short: $dir has no config.sh and svc.sh — refusing to delete a directory that is not a runner's. Nothing was changed."
+    # GHR-110: the unit file is removed by name under SYSTEMD_DIR, so the name
+    # must be a plain unit name; and the runner's own scripts run as its user,
+    # which must not be root — `--local-only` runs none of them.
+    [[ "$u" =~ ^[A-Za-z0-9@._:-]+\.service$ ]] || die "$short: '$u' is not a unit name runnerctl will remove a file for. Nothing was changed."
+    if ! $local_only && { ! valid_user_name "$user" || runner_user_is_root "$user"; }; then
+      die "$short: its unit runs the runner as '$user' — runnerctl never runs a runner's own scripts (config.sh remove) as root. Pass --local-only and remove it under Settings -> Actions -> Runners. Nothing was changed."
+    fi
     dirs+=("$dir"); users+=("$user")
   done
 
@@ -9659,8 +9850,10 @@ cmd_deprovision() {
     for i in "${!units[@]}"; do
       u="${units[$i]}"; dir="${dirs[$i]}"
       ! $when_idle || echo "would wait:  until $(short_name "$u") is idle (--when-idle, up to ${WAIT_TIMEOUT}s)"
-      echo "would run:   cd $dir && ./svc.sh stop"
-      echo "would run:   cd $dir && ./svc.sh uninstall"
+      echo "would run:   systemctl stop $u"
+      echo "would run:   systemctl disable $u"
+      echo "would run:   rm -f -- $SYSTEMD_DIR/$u"
+      $local_only || echo "would run:   cd $dir && rm -f .service   (as ${users[$i]})"
       $local_only || echo "would run:   cd $dir && ACTIONS_RUNNER_INPUT_TOKEN=*** ./config.sh remove   (as ${users[$i]})"
       echo "would run:   rm -rf -- $dir"
       echo "would run:   rm -f $SYSTEMD_DIR/$u.d/$DROPIN_NAME"
@@ -9689,14 +9882,24 @@ cmd_deprovision() {
   for i in "${!units[@]}"; do
     u="${units[$i]}"; dir="${dirs[$i]}"; user="${users[$i]}"; short="$(short_name "$u")"
     idle_gate "$u" deprovisioned "${units[*]:0:$i}" "${units[*]:$((i + 1))}"
-    echo "[$short] stopping and uninstalling the service"
-    if ! runner_exec "$dir" root ./svc.sh stop; then
-      failed+=("$short"); echo "  [FAILED] svc.sh stop — left in place"; continue
+    echo "[$short] stopping and removing the service"
+    # svc.sh stop + uninstall, done here (GHR-110): its unit file is removed
+    # by name whoever wrote it, so a unit svc.sh installed goes the same way.
+    if ! run_priv systemctl stop "$u"; then
+      failed+=("$short"); echo "  [FAILED] systemctl stop — left in place"; continue
     fi
-    if ! runner_exec "$dir" root ./svc.sh uninstall; then
-      failed+=("$short"); echo "  [FAILED] svc.sh uninstall — left in place"; continue
+    if ! run_priv systemctl disable "$u"; then
+      failed+=("$short"); echo "  [FAILED] systemctl disable — left in place"; continue
+    fi
+    if ! run_priv rm -f -- "$SYSTEMD_DIR/$u"; then
+      failed+=("$short"); echo "  [FAILED] rm -f $SYSTEMD_DIR/$u — left in place"; continue
     fi
     if ! $local_only; then
+      # config.sh remove refuses while .service exists ("Uninstall service
+      # first"). Removed as the runner user: it is the runner's file.
+      if ! runner_exec "$dir" "$user" rm -f .service; then
+        failed+=("$short"); echo "  [FAILED] removing $dir/.service — left in place"; continue
+      fi
       echo "[$short] deregistering from GitHub"
       if ! runner_exec_with_token "$token" "$dir" "$user" ./config.sh remove; then
         unconfirmed+=("$short")
@@ -9707,7 +9910,7 @@ cmd_deprovision() {
     if ! run_priv rm -rf -- "$dir"; then
       failed+=("$short"); echo "  [FAILED] rm -rf $dir"; continue
     fi
-    # runnerctl's own drop-in outlives the unit svc.sh just removed.
+    # runnerctl's own drop-in outlives the unit just removed.
     run_priv rm -f "$SYSTEMD_DIR/$u.d/$DROPIN_NAME" || true
     if [ -d "$SYSTEMD_DIR/$u.d" ]; then run_priv rmdir --ignore-fail-on-non-empty "$SYSTEMD_DIR/$u.d" || true; fi
     made+=("$short")

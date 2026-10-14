@@ -305,6 +305,22 @@ Traps:
   `cpu_window_wait`, or by whole seconds under `RUNNERCTL_STUB_CLOCK=1`, and is
   kept per remote host. The real parsers — `loadavg_read`, `cpu_stat_usage`,
   `cpu_pressure_some` — are covered by `run_fn` over fixture files.
+- **Nothing in a runner's directory runs as root (GHR-110).** `provision`
+  writes the runner's unit itself (`render_runner_unit`, upstream's template
+  read from actions/runner v2.338.0 — re-check it when a runner release
+  changes `actions.runner.service.template` or `systemd.svc.sh.template`), and
+  `runner_exec` / `runner_exec_with_token` refuse uid 0, so every runner
+  script goes through `runuser -u <user> --`. `expect_no_root_exec_in_runner_dirs`
+  holds a run's whole log to that: a privileged call naming
+  `/opt/actions-runner/...` that is not `runuser` must be `mkdir -p`, `tar -C`,
+  `chown -R` or `rm -rf --` of the directory. Match the runner's `svc.sh` with
+  `$SVC_SH`, never a bare `svc\.sh`, which also matches `runsvc.sh` — the file
+  the unit runs as the runner user. `RUNNERCTL_STUB_UNIT_USER` answers another
+  `User=` for a deprovisioned unit (`root`, for the refusal). A real-helper
+  case that wants a runner script actually run replaces `run_priv` with one
+  that drops the `runuser -u <user> --` prefix; there is no root form to pick
+  instead, and a mutant reaching the real `run_priv` would be a real sudo —
+  so cases that call `runner_exec` go through `run_snippet` with the stub.
 
 ## migrate-test
 

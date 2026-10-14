@@ -82,9 +82,27 @@ sudo runnerctl scale 2 --max 26G --high 25G
 What it does, per slot: fetches the [actions/runner](https://github.com/actions/runner)
 release, **verifies the SHA-256 GitHub publishes with it**, unpacks a copy into
 `/opt/actions-runner/<prefix>-<n>`, registers it with the runner's own
-`config.sh --unattended`, and lets the runner's own `svc.sh install` write the
-systemd unit. runnerctl never writes a unit file itself — the result is exactly
-the units the rest of this tool already manages through drop-ins.
+`config.sh --unattended` (as the runner user), and writes the systemd unit
+`svc.sh install` would have written — the runner's own unit template, byte for
+byte, with the runner's name, directory and user filled in — then enables and
+starts it. The result is exactly the units the rest of this tool already
+manages through drop-ins, and the same file a host provisioned by hand with
+`svc.sh` carries.
+
+**Nothing in a runner's directory is ever run as root.** That directory is
+owned by the runner user, which is the account every job runs as, so a script
+there run as root would be a job's code run as root. runnerctl therefore does
+not run the runner's `svc.sh` (which also sources `./env.sh`) at all: as root
+it only creates, unpacks into, `chown`s and deletes the directory, writes the
+root-owned unit (`0644 root:root`) and runs `systemctl`; `config.sh`, and the
+two files `svc.sh` would have put in the directory (`runsvc.sh` and the
+`.service` marker), are run and written as the runner user. The unit runs
+`runsvc.sh` as that user too (`User=`), with no `ExecStartPre`/`ExecStop` or
+privileged `+`/`!` prefix. The template was read from actions/runner v2.338.0.
+(`svc.sh` ran `restorecon` on SELinux hosts because it rendered the unit in the
+runner's directory and moved it, which keeps the source's label; runnerctl
+creates the file in `/etc/systemd/system` itself, so it is labelled like any
+other file created there — not verified on an SELinux host.)
 
 It is **idempotent against a target count**, like `scale`. `provision 4` on a
 host with 2 slots adds two and leaves the existing ones untouched; `provision 2`
@@ -143,11 +161,15 @@ sudo runnerctl deprovision host-4 --token <removal token> --yes    # by runner n
 sudo runnerctl deprovision 2 3 --dry-run                           # print the commands only
 ```
 
-Per slot, in the order the runner itself requires: `svc.sh stop`, `svc.sh
-uninstall` (the runner refuses to deregister while its service is installed),
-`config.sh remove` with a **removal token**, then the runner's directory — the
-unit's `WorkingDirectory`, which must hold `config.sh` and `svc.sh` or the slot
-is refused — and runnerctl's own drop-in are deleted.
+Per slot, in the order the runner itself requires: what `svc.sh stop` and
+`svc.sh uninstall` did — `systemctl stop`, `systemctl disable`, and the unit
+file removed by name, which works the same on a unit `svc.sh` installed — then
+the runner's `.service` marker is removed (the runner refuses to deregister
+while it exists) and `config.sh remove` runs with a **removal token**, both as
+the runner user; then the runner's directory — the unit's `WorkingDirectory`,
+which must hold `config.sh` and `svc.sh` or the slot is refused — and
+runnerctl's own drop-in are deleted. A unit whose `User=` is root is refused
+unless `--local-only`, which runs none of the runner's own scripts.
 
 It is **destructive and irreversible**, so:
 
@@ -1772,10 +1794,11 @@ passes a flag the opt-in would refuse. Check each host yourself, e.g. `ssh
 
 **What it does not bound.** The verbs themselves: the login can stop,
 restart, kill, reap, provision and deprovision runners, roll the script back
-to its `.prev`, and upgrade to any published release. `provision` and
-`deprovision` run the runner's own `svc.sh` as root from the runner's
-directory, which the runner account — the one jobs run as — can write; that
-holds with or without sudo, and is a known gap. And it holds only
+to its `.prev`, and upgrade to any published release. (`provision` and
+`deprovision` used to run the runner's own `svc.sh` as root from a directory
+the runner account can write; since GHR-110 they run nothing from a runner's
+directory as root — see [Provisioning runners](#provisioning-runners).) And
+it holds only
 while sudo keeps its defaults: `env_reset` on, no `SETENV` or `env_keep` for
 this command, `NOPASSWD` alone — a grant that lets the caller set the
 environment hands `BASH_ENV` to bash before runnerctl's first line runs.
