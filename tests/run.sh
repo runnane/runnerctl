@@ -12312,6 +12312,38 @@ case_ghr100_real_collectors_make_comms_safe() {
   expect_no_control_bytes
 }
 
+# GHR-120: every walk of a cgroup reads its pids through cgroup_procs — one
+# whole-file read — and never cgroup.procs line by line, which skips a live
+# pid when a process ahead of it exits mid-walk (see cgroup_procs). The
+# cgroup here does not exist, so a walk that went to the file itself would
+# list nothing. The child's own pid is the only one cgroup_procs answers. The
+# first run's command line names none of the runner's processes, so every
+# walk lists it and the Worker walk finds none; the second carries the
+# Worker's name as a trailing comment, so the Worker walk finds the child.
+case_ghr120_walks_read_the_cgroup_through_cgroup_procs() {
+  # shellcheck disable=SC2016  # the child expands these
+  GITHUB_REPOSITORY=o/r run_fn eval 'cgroup_readable() { :; }
+    cgroup_procs() { printf "%s\n" "$$"; }
+    echo "self=$$"
+    echo "leaked=$(proc_leaked /ghr120-none | cut -f1)"
+    echo "tree=$(proc_job_tree /ghr120-none | cut -f1)"
+    echo "env=$(proc_job_env /ghr120-none | grep "^GITHUB_REPOSITORY=")"
+    echo "worker=$(proc_worker_pid /ghr120-none)"
+    '
+  expect_rc 0
+  local self
+  self="$(sed -n 's/^self=//p' <<<"$OUT")"
+  expect_text "the walks' pids" \
+    "self=$self"$'\n'"leaked=$self"$'\n'"tree=$self"$'\n'"env=GITHUB_REPOSITORY=o/r"$'\n'"worker=" "$OUT"
+  # shellcheck disable=SC2016
+  run_fn eval 'cgroup_readable() { :; }
+    cgroup_procs() { printf "%s\n" "$$"; }
+    echo "self=$$ worker=$(proc_worker_pid /ghr120-none)"
+    ' '#' Runner.Worker
+  expect_rc 0
+  expect_out '^self=([0-9]+) worker=\1$'
+}
+
 t "GHR-100: health's stalled line draws a job's text without its sequences"  case_ghr100_health_stalled_line
 t "GHR-100: the --if-stalled line draws a job's text without its sequences"  case_ghr100_if_stalled_line
 t "GHR-100: reap --dry-run draws a comm without its sequence"                case_ghr100_reap_dry_run_line
@@ -12325,6 +12357,7 @@ t "GHR-100: a hostile comm leaves the signalled pids exactly as read"         ca
 t "GHR-100: the journal's process name and identifier are drawn safely"      case_ghr100_host_events_text_is_drawn_safely
 t "GHR-100: compose-reap draws a project label safely, removes nothing for it" case_ghr100_compose_reap_project_label_is_drawn_safely
 t "GHR-100: the real collectors, and the real proc_leaked, make comms safe"  case_ghr100_real_collectors_make_comms_safe
+t "GHR-120: every cgroup walk reads its pids through one whole-file read"    case_ghr120_walks_read_the_cgroup_through_cgroup_procs
 
 # --- GHR-109: no label decides what compose-reap removes ----------------------
 t "GHR-109: a | in a label chooses no id --apply removes"              case_ghr109_pipe_in_a_label_chooses_no_id
