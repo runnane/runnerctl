@@ -322,6 +322,23 @@ Traps:
   instead, and a mutant reaching the real `run_priv` would be a real sudo —
   so cases that call `runner_exec` go through `run_snippet` with the stub.
 
+- **The runner root's trust check (GHR-121) is a stub hook too.**
+  `runner_root_problem` answers "fine" in the stub, because no sim directory
+  is root-owned — so a case through the stub tests the stub. The cases that
+  matter set `RUNNERCTL_STUB_ROOT_REAL=1`, which runs the real helper (built
+  on `root_exec_problem` via `dir_chain_problem`), and fake only `stat`'s uid
+  and mode from a config of their own (`ghr121_config`, `GHR121_TABLE`); the
+  stub's `root_exec_problem` is shadowed too, so that config restores the real
+  one from `real_root_exec_problem`. A path the table does not list is root's,
+  755. `deprovision` reads the root from the unit's `WorkingDirectory`, which
+  the case config points at a real fixture directory (a missing component ends
+  the walk, as it does for a root `mkdir -p` has yet to create). It asks the
+  stubbed `runner_root_chain_problem` directly and, when the parent is
+  untrusted, removes the slot with `runuser -u <user> -- rm -rf` instead of
+  refusing (`GHR121_RM_FAIL=1` makes that rm fail). The real
+  helper is also run unfaked over real directories: `/tmp` (sticky 1777) must
+  be refused. `deprovision N` counts from 0 in the stub: `deprovision 1` is
+  `example.slot-2`.
 - **The record (GHR-88) never reaches the real journal or the real fleet
   log.** Three nets, because each covers a path the others miss: the stub
   shadows the record's hook `audit_logger` (each record is a

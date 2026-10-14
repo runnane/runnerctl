@@ -144,7 +144,17 @@ the box. runnerctl itself never prints or stores it.
 - `--runner-user U` / `--runner-root DIR` — the account the runners run as
   (default `github-runner`, created as a system user when missing) and where
   they live (default `/opt/actions-runner`). `config.sh` refuses to run as
-  root, so the runner never does.
+  root, so the runner never does. The root must be root's: `provision` refuses
+  (before any change, and in a `--dry-run`) a runner root or a parent of it
+  that is not owned by root or is group- or world-writable (a sticky `/tmp`
+  included), and a root that is a symlink, because root does its file work
+  inside it and whoever can write there can swap a slot under root's calls. The
+  refusal names the directory and the fix (`chown root:root DIR; chmod 755
+  DIR`). `deprovision` does not refuse a slot under such a parent (a classic
+  `svc.sh` runner lives in its user's home): it removes the directory as the
+  unit's user (`runuser -u <user> -- rm -rf`) instead of as root, says so, and
+  shows it in a `--dry-run`; only a unit with no non-root user to remove it as
+  is refused, and then nothing is changed.
 - `--url` — the org, repo or enterprise to register against. Set `RUNNER_URL`
   in the config file to stop repeating it on a host.
 
