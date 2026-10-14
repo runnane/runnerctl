@@ -262,6 +262,18 @@ Traps:
   host sends — an older host's, a hostile one's — is a hand-written
   `FW_STATE/0.json` handed to `fleet_watch_pane_build` through `run_fn`, with
   `now_epoch` pinned in the same eval.
+- **A fleet host line starts with the host's version cell (GHR-77)**:
+  `build-1 v0.20.0 · Disk: …`, or the cell alone for a host with no Disk /
+  events fragment whose version is not this node's. A stub host answers with
+  the script's own version, which release-please moves, so a case matches a
+  level host's line through `HV` (`v<version> · ` as an ERE, read from the
+  script under test), never a literal — and `FLEET_INFO_RE`, which keeps the
+  watch cursor off host lines, changes with the cell. The knobs:
+  `RUNNERCTL_STUB_FLEET_VER="host:version …"` (one host answers as any
+  version, a text that is no version included — no `*` or `?` in it, the list
+  is word-split) and `RUNNERCTL_STUB_VERSION` (this node's version, and every
+  host's the first knob does not name: the remote runs in a subshell of the
+  central process).
 - **A process's or a job's text on this host's own lines (GHR-100)** is drawn
   through `relay_safe … plain`, so an expected text has a sequence gone WHOLE
   (`my-app`, never `my[2J-app` — that is `term_safe` alone, and what a
