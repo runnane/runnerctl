@@ -10,6 +10,9 @@ tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # Nothing under test may escalate: a fake sudo first on PATH turns any attempt
 # into a loud failure instead of a root-owned file in the temp dir.
 mkdir -p "$tmp/nosudo"; printf '#!/bin/sh\necho "TEST TRIED TO SUDO: $*" >&2; exit 97\n' >"$tmp/nosudo/sudo"; chmod +x "$tmp/nosudo/sudo"
+# GHR-88: migrate records itself in the journal through `logger`; a fake one
+# first on PATH keeps the test out of the real journal.
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>"%s/logger.calls"\n' "$tmp" >"$tmp/nosudo/logger"; chmod +x "$tmp/nosudo/logger"
 export PATH="$tmp/nosudo:$PATH"
 legacy=tests/fixtures/runnerctl-legacy
 cfg=tests/migrate.config

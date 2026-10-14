@@ -185,6 +185,14 @@
 # FLEET_RUNNERCTL to, so set FLEET_RUNNERCTL to that path.
 #FLEET_SUDO="0"
 
+# This node's record of every fleet command that changed a host (and every
+# fleet watch action key): one line each — UTC time, operator, the command,
+# each host's exit code. Created 0600 in a 0700 directory. Empty = the
+# invoking user's ${XDG_STATE_HOME:-~/.local/state}/runnerctl/fleet.log;
+# otherwise an absolute path. Each host keeps its own record in its journal
+# (`runnerctl history`; `runnerctl fleet history` merges them).
+#FLEET_LOG=""
+
 # --- sudo contract (on each runner host) ------------------------------------
 # narrow = this host's sudoers grants a login runnerctl itself (the narrow
 # contract in the README). Under sudo runnerctl then refuses whatever would

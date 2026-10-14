@@ -15,6 +15,9 @@ tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 # Nothing under test may escalate: a fake sudo first on PATH turns any attempt
 # into a loud failure instead of a root-owned file in the temp dir.
 mkdir -p "$tmp/nosudo"; printf '#!/bin/sh\necho "TEST TRIED TO SUDO: $*" >&2; exit 97\n' >"$tmp/nosudo/sudo"; chmod +x "$tmp/nosudo/sudo"
+# GHR-88: install records itself in the journal through `logger`. A fake one
+# first on PATH keeps the test out of the real journal and says what it got.
+printf '#!/bin/sh\nprintf "%%s\\n" "$*" >>"%s/logger.calls"\n' "$tmp" >"$tmp/nosudo/logger"; chmod +x "$tmp/nosudo/logger"
 # PATH is pinned to what sudo's secure_path would leave, so `command -v
 # runnerctl` is empty whatever this box has installed, and HOME is a temp dir
 # so the home-directory lookup (cases 10-13) can never touch a real
@@ -37,6 +40,9 @@ grep -q "fresh install" "$tmp/out1" || fail "fresh path not reported"
 grep -q "^Next:" "$tmp/out1" || fail "next steps not printed on fresh install"
 [ "$(tail -1 "$tmp/out1")" = "runnerctl $ver" ] || fail "last line is not the installed file's version: $(tail -1 "$tmp/out1")"
 [ -d "$tmp/etc" ] || fail "config directory was not created"
+# GHR-88: one record, from the fake logger above — the install's.
+[ "$(grep -c . "$tmp/logger.calls" 2>/dev/null || true)" = 1 ] || fail "want one journal record, got: $(cat "$tmp/logger.calls" 2>/dev/null)"
+grep -qE "^-t runnerctl -- install $ver by [^ ]+ — ok\$" "$tmp/logger.calls" || fail "install record: $(cat "$tmp/logger.calls")"
 
 # 2. Idempotent: the same command again changes nothing.
 RUNNERCTL_CONFIG="$tmp/etc/config" ./runnerctl install --prefix "$tmp/bin" >"$tmp/out2" 2>&1 \

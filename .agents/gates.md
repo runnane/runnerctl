@@ -322,6 +322,51 @@ Traps:
   instead, and a mutant reaching the real `run_priv` would be a real sudo —
   so cases that call `runner_exec` go through `run_snippet` with the stub.
 
+- **The record (GHR-88) never reaches the real journal or the real fleet
+  log.** Three nets, because each covers a path the others miss: the stub
+  shadows the record's hook `audit_logger` (each record is a
+  `probe:audit <line>` in the case's log — pin the whole line with
+  `expect_one_record`), shadows `logger` as a `direct:` safety net, and
+  `tests/run.sh` puts a fake `logger` BINARY first on `PATH` for the whole
+  sim, since the real hook runs it through `timeout`, which no shell function
+  can shadow, and `run_fn` / `run_bare` get past the stub. That binary logs
+  `direct:logger …` into the case's log (a failure) unless `FAKE_LOGGER=record`
+  (argc and each argument to `$TMP/logger.calls`) or `FAKE_LOGGER=fail`;
+  `RUNNERCTL_STUB_AUDIT=real` keeps the real hook so it is reached.
+  `install-test`, `upgrade-test` and `migrate-test` pin `PATH` to
+  `/usr/bin:/bin`, where the real `logger` lives, so each puts its own fake
+  `logger` in its `nosudo` directory. The central node's `FLEET_LOG` is
+  pointed into each run's writes tree by the stub (`$WRITES/fleet.log`);
+  `RUNNERCTL_STUB_FLEET_LOG=default` leaves it empty for the default-path case,
+  which points `HOME` at a temp dir — and `XDG_STATE_HOME` is a temp dir for
+  the whole sim, so a run past the stub cannot append to `~/.local/state`.
+  The first sim run of GHR-88, before the stub pointed it away, wrote 93
+  lines to the developer's own `~/.local/state/runnerctl/fleet.log`.
+- **`--origin` is logged on its own line, not in `probe:ssh_run`.** The fleet
+  stub takes `--origin=…` off the command line where main would read it —
+  the word after `FLEET_RUNNERCTL` (after `sudo -n` under `FLEET_SUDO=1`) —
+  and logs `probe:ssh_origin HOST VALUE` before the call's `probe:ssh_run`,
+  so every pinned `probe:ssh_run` line reads as before. Anywhere else it is
+  left in place, where it breaks those pinned lines. A host named
+  `*preorigin*` refuses it as main refuses an unknown command (exit 1, does
+  nothing) — the older-host retry; the claim is `$ME@stub-host-1`.
+- **`relay_safe` clobbers `BASH_REMATCH`** (it matches regexes of its own).
+  Take every capture you need into a variable BEFORE calling it — the first
+  `history` parser read the time after relaying the message and died
+  `unbound variable` on the one record that carried an escape sequence.
+- **`trap CMD EXIT` is a wrapper, not the builtin** (GHR-88): it keeps CMD in
+  `EXIT_CMD` and installs `exit_run`, which writes the record first. A
+  subshell inherits `EXIT_CMD` but not the trap, so `exit_run` runs CMD only
+  in the process that set it (`EXIT_PID`). Every other `trap` form is the
+  builtin. Code that needs the raw builtin says `builtin trap`.
+- **`history`'s journal read is a hook** (`journal_history_lines N`): the
+  stub answers it from `RUNNERCTL_STUB_HISTORY` (a file of journalctl
+  short-iso-precise lines; a remote host's is `<file>.<host>` when it exists)
+  and `RUNNERCTL_STUB_HISTORY_RC` fails it; the real reader is covered by
+  `run_fn` over a fake `journalctl` on `PATH`. `-t`, never `-g`: with `-q`,
+  `journalctl -t` that matches nothing exits 0 and prints nothing, so a
+  non-zero exit is journalctl failing.
+
 ## migrate-test
 
 `bash tests/migrate-test.sh`. Runs `runnerctl migrate` against
