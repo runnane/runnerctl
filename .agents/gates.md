@@ -451,6 +451,20 @@ Traps:
   prose line is rebuilt from them (`<slot>: <detail>`, `host: <detail>`);
   `host_problems` prints `KIND<TAB>TEXT`. A new problem goes through
   `health_add` with a kind, or `health --json` cannot report it.
+- **`host.sudo_contract` (GHR-113) is a stub hook too, and the real reader is
+  a `run_fn` case over files of its own.** The real `host_sudo_contract` reads
+  `/etc/runnerctl/config`, which no sim case may touch, so the stub pins it
+  (`narrow`; `RUNNERCTL_STUB_SUDOC` for the local run). Per fleet host:
+  `RUNNERCTL_STUB_FLEET_SUDOC="host:value …"` (any text, no `*` or `?`; `-` is
+  an empty answer, so `null`) and `RUNNERCTL_STUB_FLEET_NOSUDOC="host…"` for a
+  host from before the key (the stub takes it out of the payload with `sed`).
+  Everything is read from the `status --json` call the summary already makes
+  (`fleet_sudo_state`), so a case about the note needs `RUNNERCTL_STUB_FLEET_SUDO=1`
+  and a host that answered both calls. A case that checks "not named" must
+  assert on `SUDO_CONTRACT` AND `root-equivalent`, since the host line and the
+  note are two separate lines. A new `expect_*` helper defined further down
+  `tests/run.sh` than the cases cannot be used by them: `t` runs a case where
+  it is registered (`expect_no_control_bytes` is one such).
 
 ## migrate-test
 
