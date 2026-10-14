@@ -6195,20 +6195,31 @@ fleet_origin() {
 # too old for --origin is asked again without it, as a fan-out asks it, and
 # remembered. The exit status is left in FLEET_CALL_RC.
 FLEET_CALL_RC=0
+fleet_in_subshell() { ( "$@" ); }
 fleet_call_mutating() { # HOST OUT ERR BUDGET SUBCOMMAND [ARGS...]
-  local host="$1" out="$2" err="$3" budget="$4" rc=0
+  local host="$1" out="$2" err="$3" budget="$4" rc=0 stream=false
+  local FLEET_CALL_TIMEOUT="$budget"
   shift 4
   local -a origin=(${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"})
   fleet_priv_cmd
   if [ "${#origin[@]}" -gt 0 ] && fleet_optional_skip "$host" "${origin[0]}"; then origin=(); fi
-  (FLEET_CALL_TIMEOUT="$budget" ssh_run "$host" "${FLEET_PRIV[@]}" ${origin[@]+"${origin[@]}"} "$@") >"$out" 2>"$err" || rc=$?
+  # GHR-92: streamed (the budget walk's slot calls) when the caller said so
+  # with FLEET_STREAM; `fleet watch`'s action keys never do — their terminal
+  # is the watch's.
+  if $FLEET_STREAM && ! fleet_args_json "$@"; then stream=true; fi
+  # In a subshell, as it always was: this runs in the caller's own shell.
+  fleet_into "$stream" "${FLEET_STREAM_LABEL:-$host}" "$out" "$err" \
+    fleet_in_subshell ssh_run "$host" "${FLEET_PRIV[@]}" ${origin[@]+"${origin[@]}"} "$@" || rc=$?
   if [ "$rc" = 1 ] && [ "${#origin[@]}" -gt 0 ] && fleet_optional_rejects "$err" "${origin[0]}"; then
     FLEET_OPTIONAL_REJECTED+="$host=--origin "
     rc=0
-    (FLEET_CALL_TIMEOUT="$budget" ssh_run "$host" "${FLEET_PRIV[@]}" "$@") >"$out" 2>"$err" || rc=$?
+    fleet_into "$stream" "${FLEET_STREAM_LABEL:-$host}" "$out" "$err" \
+      fleet_in_subshell ssh_run "$host" "${FLEET_PRIV[@]}" "$@" || rc=$?
   fi
-  relay_file "$out"
-  relay_file "$err"
+  if ! $stream; then
+    relay_file "$out"
+    relay_file "$err"
+  fi
   FLEET_CALL_RC="$rc"
 }
 
@@ -6355,19 +6366,98 @@ fleet_fanout_one() { # INDEX REMOTE-ARGS...
   # GHR-83: a fan-out that feeds every host the same file (FLEET_STDIN_FILE,
   # `fleet upgrade --push`) goes through ssh_run_stdin; every other one has
   # nothing on stdin to give.
+  # GHR-92: a fan-out that asked to STREAM (FLEET_STREAM — only the ones that
+  # change a host, which run one at a time) shows each line as it arrives; a
+  # `--json` call never does, its payload is for a program.
+  local stream=false
+  if $FLEET_STREAM && ! fleet_args_json "${args[@]}"; then stream=true; fi
+  local FLEET_CALL_TIMEOUT="${FLEET_BUDGETS[$i]:-}"
   if [ -n "$FLEET_STDIN_FILE" ]; then
-    FLEET_CALL_TIMEOUT="${FLEET_BUDGETS[$i]:-}" ssh_run_stdin "$host" "$FLEET_STDIN_FILE" -- "${args[@]}" >"$FLEET_DIR/$i.out" 2>"$FLEET_DIR/$i.err" || hrc=$?
+    fleet_into "$stream" "$host" "$FLEET_DIR/$i.out" "$FLEET_DIR/$i.err" \
+      ssh_run_stdin "$host" "$FLEET_STDIN_FILE" -- "${args[@]}" || hrc=$?
   else
-    FLEET_CALL_TIMEOUT="${FLEET_BUDGETS[$i]:-}" ssh_run "$host" "${args[@]}" >"$FLEET_DIR/$i.out" 2>"$FLEET_DIR/$i.err" || hrc=$?
+    fleet_into "$stream" "$host" "$FLEET_DIR/$i.out" "$FLEET_DIR/$i.err" \
+      ssh_run "$host" "${args[@]}" || hrc=$?
   fi
   echo $(($(now_ms) - t0)) >"$FLEET_DIR/$i.ms"
   # GHR-101: the one place a fan-out's answer lands, so every reader after it
   # — the table, the reports, the error rows — has relayable text and none
   # has the raw bytes to get wrong. A `--json` payload is data for a program,
   # passed on unparsed: fleet_payload_ok decides whether it is passed at all.
-  relay_file "$FLEET_DIR/$i.err"
-  fleet_args_json "${args[@]}" || relay_file "$FLEET_DIR/$i.out"
+  # A streamed answer was made safe line by line on its way to the screen and
+  # into these files (fleet_stream_lines), so there is nothing left to relay.
+  if ! $stream; then
+    relay_file "$FLEET_DIR/$i.err"
+    fleet_args_json "${args[@]}" || relay_file "$FLEET_DIR/$i.out"
+  fi
   echo "$hrc" >"$FLEET_DIR/$i.rc"
+}
+
+# --- Streaming a mutating call's lines (GHR-92) --------------------------------
+# A read-only fan-out is buffered on purpose: its hosts run side by side, and
+# half a line of one inside another's JSON is unparseable. A call that CHANGES
+# hosts runs one at a time and may take a long while (GHR-81), saying useful
+# things throughout (`waiting for <slot> ...` once a minute), so its lines are
+# shown as they are printed instead of after the whole fleet is done.
+#
+# FLEET_STREAM is set around exactly those fan-outs by their callers, never
+# left on: a read made in between (the slot-count read, a read-back) stays
+# buffered. FLEET_STREAM_LABEL replaces the host name in the prefix (the budget
+# walk's `host slot N`).
+FLEET_STREAM=false
+FLEET_STREAM_LABEL=""
+
+# One stream, on stdin: each line made safe (relay_safe — what reaches the
+# terminal is never the host's raw bytes, a last line without its newline
+# included), kept in FILE exactly as fleet_fanout_one's buffered files hold
+# it, and shown as `LABEL: line`. A stdout stream shows on stdout and a stderr
+# one on stderr, so a stderr line stays distinguishable (2>file) and nothing
+# that reads stdout sees it. An empty line is kept in the file and not shown,
+# as the buffered report has never shown one.
+fleet_stream_lines() { # LABEL FILE out|err
+  local label="$1" fh line
+  exec {fh}>"$2"
+  while IFS= read -r line || [ -n "$line" ]; do
+    relay_safe "$line"
+    printf '%s\n' "$RELAY_SAFE" >&"$fh"
+    [ -n "$RELAY_SAFE" ] || continue
+    if [ "$3" = err ]; then
+      printf '%s: %s\n' "$label" "$RELAY_SAFE" >&2
+    else
+      printf '%s: %s\n' "$label" "$RELAY_SAFE"
+    fi
+  done
+  exec {fh}>&-
+}
+
+# COMMAND... run with its stdout into OUT and its stderr into
+# ERR; with STREAM = true each is a fleet_stream_lines stream (a tee: the file
+# is still written), else a plain redirection. Returns the command's status and
+# only returns once both streams have drained, so a reader of the files never
+# sees them part-written. The descriptors are closed for the command itself, so
+# nothing it starts (an ssh master that outlives it) can hold a stream open.
+fleet_into() { # STREAM LABEL OUT ERR COMMAND...
+  local stream="$1" label="$2" out="$3" err="$4" rc=0 ofd efd p1="" p2=""
+  shift 4
+  if [ "$stream" = true ]; then
+    exec {ofd}> >(fleet_stream_lines "$label" "$out" out); p1=$!
+    exec {efd}> >(fleet_stream_lines "$label" "$err" err); p2=$!
+  else
+    exec {ofd}>"$out" {efd}>"$err"
+  fi
+  "$@" >&"$ofd" 2>&"$efd" {ofd}>&- {efd}>&- || rc=$?
+  exec {ofd}>&- {efd}>&-
+  [ -z "$p1" ] || wait "$p1" "$p2" 2>/dev/null || true
+  return "$rc"
+}
+
+# fleet_fanout with its lines streamed. Only for a fan-out that changes hosts.
+fleet_fanout_stream() { # REMOTE-ARGS...
+  local rc=0
+  FLEET_STREAM=true
+  fleet_fanout "$@" || rc=$?
+  FLEET_STREAM=false
+  return "$rc"
 }
 # Whether a remote command line asks for `--json`.
 fleet_args_json() { # ARGS...
@@ -7362,7 +7452,10 @@ fleet_budget_walk() { # SUBCOMMAND MODE BUDGET [REMOTE-ARGS...]
     # FLEET_SUDO=1 most of all — and relayed like any fan-out's (GHR-101).
     # GHR-88: with the origin, and recorded per slot on this node.
     fleet_log_begin "$(fleet_log_argv)"
-    fleet_call_mutating "$host" /dev/null "$FLEET_BUDGET_TMP.err" "$budget1" "$sub" "$idx" "$@"
+    # GHR-92: streamed, as `host slot N: line`, so a slot's `waiting for …`
+    # lines show while it waits instead of being thrown away with its stdout.
+    FLEET_STREAM=true FLEET_STREAM_LABEL="$host slot $idx" \
+      fleet_call_mutating "$host" /dev/null "$FLEET_BUDGET_TMP.err" "$budget1" "$sub" "$idx" "$@"
     rc1="$FLEET_CALL_RC"
     fleet_log_result "$host/$idx" "$rc1"
     if [ "$rc1" = 0 ]; then
@@ -7516,9 +7609,16 @@ cmd_fleet_run() { # SUBCOMMAND [--host H]... [--all-hosts] [REMOTE-ARGS...]
   FLEET_PARALLEL=1
   fleet_priv_cmd
   fleet_log_begin "$(fleet_log_argv)"
-  fleet_fanout "${FLEET_PRIV[@]}" ${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"} "$sub" ${fwd[@]+"${fwd[@]}"}
+  # GHR-92: streamed — each line a host prints is shown, `host: line`, as it
+  # arrives (they run one at a time, so there is nothing to interleave).
+  # fleet_run_report then does not print them again.
+  fleet_fanout_stream "${FLEET_PRIV[@]}" ${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"} "$sub" ${fwd[@]+"${fwd[@]}"}
   fleet_log_results
-  fleet_run_report "$sub" || rc=$?
+  if fleet_args_json ${fwd[@]+"${fwd[@]}"}; then
+    fleet_run_report "$sub" || rc=$?
+  else
+    fleet_run_report "$sub" streamed || rc=$?
+  fi
   fleet_cleanup
   fleet_log_finish
   return "$rc"
@@ -7532,7 +7632,14 @@ fleet_log_results() {
 # One block per host: whatever that host said, prefixed, then a count. A
 # host's own output is reused rather than summarised, because these commands
 # already say useful per-slot things ("2 stalled slot(s)", "nothing to reap").
-fleet_run_report() { # SUBCOMMAND
+#
+# GHR-92: with STREAMED (any second word) the host's lines were already shown,
+# as they were printed, so they are not printed a second time — a long drain's
+# report would otherwise repeat every `waiting for …` line. What stays is what
+# the stream cannot say: a failed host's row (its exit status, the first line
+# of its stderr, the hint, and the may-still-be-running sentence for a
+# timeout) and the count, which are the same words as before.
+fleet_run_report() { # SUBCOMMAND [STREAMED]
   local sub="$1" i host rc line ok=0 bad=0
   for i in "${!FLEET_HOSTS[@]}"; do
     host="${FLEET_HOSTS[$i]}"
@@ -7540,7 +7647,7 @@ fleet_run_report() { # SUBCOMMAND
     if [ "$rc" = 0 ]; then ok=$((ok + 1)); else bad=$((bad + 1)); fi
     # stdout first even when the host failed: a command that got part way
     # through says so there, and losing that would hide a half-applied host.
-    while IFS= read -r line; do
+    [ -n "${2:-}" ] || while IFS= read -r line; do
       [ -n "$line" ] || continue
       printf '%s: %s\n' "$host" "$line"
     done <"$FLEET_DIR/$i.out"
@@ -7821,7 +7928,15 @@ fleet_upgrade_stage() { # CHECK INDEX...
     fleet_origin
     fleet_log_begin "$(fleet_log_argv)"
   fi
-  fleet_fanout "${FLEET_PRIV[@]}" ${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"} "${args[@]}"
+  # GHR-92: the write (and a rollback) streams, `host: line` as each host
+  # says it; --check is a read and stays buffered. Hosts of a stage run side
+  # by side unless --serial, so lines of different hosts may alternate — each
+  # is whole and carries its host.
+  if $check; then
+    fleet_fanout "${FLEET_PRIV[@]}" ${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"} "${args[@]}"
+  else
+    fleet_fanout_stream "${FLEET_PRIV[@]}" ${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"} "${args[@]}"
+  fi
   $check || fleet_log_results
   for j in "${!idx[@]}"; do
     k="${idx[$j]}"
@@ -8162,7 +8277,7 @@ fleet_push_stage() { # CHECK INDEX...
     # GHR-88: the record says this was a push, and of which bytes.
     fleet_log_begin "$(fleet_log_argv) (push sha256 $FLEET_PUSH_SHA)"
     FLEET_STDIN_FILE="$FLEET_PUSH_SRC"
-    fleet_fanout "$(fleet_push_install_cmd "$oword")"
+    fleet_fanout_stream "$(fleet_push_install_cmd "$oword")"
     FLEET_STDIN_FILE=""
     fleet_log_results
     for j in "${!send[@]}"; do

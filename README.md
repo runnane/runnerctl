@@ -1871,7 +1871,7 @@ build-2: restart done.
 fleet restart: 2 host(s) ok, 0 failed
 ```
 
-These differ from the read-only commands in four ways, all deliberate.
+These differ from the read-only commands in five ways, all deliberate.
 
 **Their own time budget.** `FLEET_TIMEOUT` (30 s) is sized for a status read;
 these are slow by design, so each host gets `FLEET_MUTATE_TIMEOUT` instead
@@ -1897,6 +1897,23 @@ Combined with the per-host `--when-idle` (one slot at a time *within* a host),
 that bounds the blast radius to a single host at any moment. It is slow on a
 large fleet; that is the right trade for something that can take CI capacity
 down.
+
+**Their lines are shown as they are printed.** Because they run one host at a
+time, nothing interleaves, so each line the running host prints appears
+straight away, as `host: line` — a drain that waits for a busy slot shows its
+`waiting for … ` line every minute rather than nothing until the whole fleet
+is done. What the host prints on stderr is shown the same way, on *your*
+stderr (so `2>` still separates it). Each line is drawn as safe text, as every
+line from a host is: its colours are kept and any other control sequence is
+dropped, and a last line the host never finished is shown once its output
+ends. Nothing is shown twice: the report that follows is each failed host's
+row (its exit status, the first line of its stderr and what to do about it) and
+the `fleet <command>: N host(s) ok, M failed` count. With `--max-unavailable`
+and `--min-available` each slot's lines carry `host slot N: `. `fleet upgrade`
+(and `--push`) show the write the same way, before the table; its hosts run
+side by side unless `--serial`, so lines of different hosts may alternate, each
+whole and carrying its host. The read-only commands (`status`, `health`,
+`history`, `fleet status --json`) stay buffered until every host has answered.
 
 **`--host H`** narrows the target and is repeatable. It is validated against
 `FLEET_HOSTS`, so a typo dies naming the host rather than silently doing
