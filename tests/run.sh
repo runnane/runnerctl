@@ -13359,6 +13359,73 @@ case_ghr88_a_failing_logger_changes_nothing() {
   expect_no_err 'logger|Connection refused'
 }
 
+# GHR-123: the exit-trap wrapper parses `trap` exactly. Each case sources the
+# script, stands in for audit_finish (the record) with a line on stdout, arms
+# the form under test and exits: "record" is the record written, "cmd" the
+# caller's own handler run after it.
+# shellcheck disable=SC2016
+case_ghr123_trap_wrapper_forms() {
+  local pre='audit_finish() { echo "record"; }; '
+  # -p prints what the builtin prints and stores nothing (no EXIT_CMD=-p).
+  run_fn eval "$pre"'trap -p EXIT; echo "stored=[$EXIT_CMD]"; trap "echo cmd" EXIT; trap -p EXIT'
+  expect_rc 0
+  expect_out_count "^trap -- 'exit_run' EXIT$" 1
+  expect_out '^stored=\[\]$'
+  expect_out '^record$'
+  expect_out '^cmd$'
+  expect_no_err '.'
+  # an option form never arms or stores anything, whatever follows it
+  run_fn eval "$pre"'trap -p EXIT; trap -l >/dev/null; echo "stored=[$EXIT_CMD]"; trap -p EXIT | grep -c exit_run'
+  expect_out '^stored=\[\]$'
+  expect_out '^0$'
+  # `--` ends the options: the handler is kept and the record still written
+  run_fn eval "$pre"'trap -- "echo cmd" EXIT; echo "stored=[$EXIT_CMD]"'
+  expect_out '^stored=\[echo cmd\]$'
+  expect_out_count '^record$' 1
+  expect_out_count '^cmd$' 1
+  expect_no_err '.'
+  # `-` clears the caller's handler; the record is still written
+  run_fn eval "$pre"'trap "echo cmd" EXIT; trap - EXIT; echo "stored=[$EXIT_CMD]"'
+  expect_out '^stored=\[\]$'
+  expect_out_count '^record$' 1
+  expect_no_out '^cmd$'
+  expect_no_err '.'
+  run_fn eval "$pre"'trap -- - EXIT'
+  expect_out_count '^record$' 1
+  expect_no_err '.'
+  # a lone EXIT is the builtin's reset: the same as `-`, record kept
+  run_fn eval "$pre"'trap "echo cmd" EXIT; trap EXIT'
+  expect_out_count '^record$' 1
+  expect_no_out '^cmd$'
+  # '' (ignore) is chosen to mean "no handler of its own": nothing is eval'd
+  # at exit, and the record is still written
+  run_fn eval "$pre"'trap "echo cmd" EXIT; trap "" EXIT; echo "stored=[$EXIT_CMD]"; trap -- "" EXIT'
+  expect_out '^stored=\[\]$'
+  expect_out_count '^record$' 1
+  expect_no_out '^cmd$'
+  expect_no_err '.'
+  # EXIT among other signals: the EXIT part is the wrapper's (record kept, the
+  # handler run once at exit) and the rest is the builtin's, in either order
+  run_fn eval "$pre"'trap "echo cmd" EXIT HUP; trap -p HUP; trap -p EXIT'
+  expect_out '^trap -- .echo cmd. SIGHUP$'
+  expect_out "^trap -- 'exit_run' EXIT\$"
+  expect_out_count '^record$' 1
+  expect_out_count '^cmd$' 1
+  run_fn eval "$pre"'trap -- "echo cmd" HUP EXIT; trap -p HUP'
+  expect_out '^trap -- .echo cmd. SIGHUP$'
+  expect_out_count '^record$' 1
+  expect_out_count '^cmd$' 1
+  # INT is still the record's own (GHR-119): chained to, not replacing it
+  run_fn eval "$pre"'trap "echo cmd" EXIT INT; echo "int=[$SIG_OWN_INT]"'
+  expect_out '^int=\[echo cmd\]$'
+  expect_out_count '^record$' 1
+  expect_out_count '^cmd$' 1
+  # the plain form every site uses is unchanged
+  run_fn eval "$pre"'trap "echo cmd" EXIT'
+  expect_out_count '^record$' 1
+  expect_out_count '^cmd$' 1
+}
+
 # The real journal write: `logger -t runnerctl -- <line>`, the line ONE
 # argument, never through a shell; and no logger at all is silence.
 case_ghr88_the_real_logger_call() {
@@ -13588,6 +13655,7 @@ t "GHR-88: a record cannot be forged into two"                             case_
 t "GHR-88: --origin is a validated claim, never fatal"                     case_ghr88_origin_is_a_validated_claim
 t "GHR-88: --origin under the narrow sudo contract"                        case_ghr88_origin_under_the_narrow_sudo_contract
 t "GHR-88: a failing logger changes no exit status"                        case_ghr88_a_failing_logger_changes_nothing
+t "GHR-123: the exit-trap wrapper parses trap exactly, every form"         case_ghr123_trap_wrapper_forms
 t "GHR-88: the real logger call, and no logger at all"                     case_ghr88_the_real_logger_call
 t "GHR-88: fleet sends the origin; an older host still acts"               case_ghr88_fleet_carries_the_origin_and_older_hosts_still_act
 t "GHR-88: the central node records each fleet mutation, privately"        case_ghr88_central_node_records_each_fleet_mutation

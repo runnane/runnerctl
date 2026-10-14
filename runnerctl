@@ -792,37 +792,64 @@ audit_logger() { # MESSAGE
 # fan-out). A plain `trap CMD EXIT` replaces whatever was there, so the first
 # command to clean up after itself would silently drop its record. Rather than
 # every such site having to know about the record, `trap` is wrapped: the
-# two-argument EXIT form keeps CMD in EXIT_CMD and installs exit_run, which
-# writes the record first and then runs CMD exactly as the builtin would have.
+# EXIT form (`trap [--] CMD EXIT`, parsed exactly — GHR-123) keeps CMD in
+# EXIT_CMD and installs exit_run, which writes the record first and then runs
+# CMD exactly as the builtin would have.
 # Every other form — signals, `trap - WINCH` — is the builtin, untouched.
 #
 # EXIT_PID: a subshell inherits EXIT_CMD but not the trap (bash resets traps in
 # one), so a subshell that arms a record of its own must not also run its
 # parent's cleanup — the local watch's teardown, say — on its way out.
 EXIT_CMD="" EXIT_PID=""
+# GHR-123: the wrapper parses `trap [--] CMD SIGSPEC...` exactly, not by shape.
+#   * an option (`-p`, `-l`, anything starting `-` but `--` and a lone `-`) is
+#     the builtin's, untouched: `trap -p EXIT` prints what the builtin prints
+#     (`exit_run`, which is what is armed) and stores nothing;
+#   * `--` ends the options, so `trap -- CMD EXIT` is `trap CMD EXIT`;
+#   * EXIT anywhere in the list is the wrapper's: CMD becomes EXIT_CMD and
+#     exit_run stays armed. `trap - EXIT` and `trap '' EXIT` both mean "no
+#     handler of the command's own" (the builtin's `''` is "ignore", and an
+#     ignored EXIT has nothing to run) — the record is still written;
+#   * the other signals of the same call go on as they would have alone.
+trap_is_exit() { # SIGSPEC
+  case "${1^^}" in EXIT|SIGEXIT|0) return 0 ;; esac
+  return 1
+}
 trap() {
-  if [ $# -eq 2 ] && [ "$2" = EXIT ]; then
-    EXIT_CMD="$1" EXIT_PID="$BASHPID"
+  # shellcheck disable=SC2064 # the builtin's own argv, not a handler string
+  case "${1-}" in
+    --) shift ;;
+    -?*) builtin trap "$@"; return ;;
+  esac
+  if [ $# -eq 1 ]; then
+    # A lone signal is the builtin's reset; for EXIT that is `trap - EXIT`.
+    trap_is_exit "$1" || { builtin trap -- "$@"; return; }
+    set -- - "$1"
+  fi
+  [ $# -ge 2 ] || { builtin trap -- "$@"; return; }
+  local cmd="$1" s rest=() has_exit=false
+  shift
+  for s in "$@"; do
+    if trap_is_exit "$s"; then has_exit=true; else rest+=("$s"); fi
+  done
+  if $has_exit; then
+    EXIT_CMD="$cmd" EXIT_PID="$BASHPID"
+    case "$cmd" in -) EXIT_CMD="" ;; esac
     builtin trap exit_run EXIT
-    return 0
   fi
   # GHR-119: INT and TERM are the record's while one is armed, so a command's
   # own handler for them (`watch`, `fleet watch`) is kept by sig_own and
   # chained to, never replaced. Every other signal is the builtin's.
-  if [ $# -ge 2 ] && [[ "$1" != -?* ]]; then
-    local cmd="$1" s rest=()
-    shift
-    for s in "$@"; do
-      case "$s" in
-        INT|SIGINT)   sig_own INT "$cmd" ;;
-        TERM|SIGTERM) sig_own TERM "$cmd" ;;
-        *)            rest+=("$s") ;;
-      esac
-    done
-    [ "${#rest[@]}" -eq 0 ] || builtin trap -- "$cmd" "${rest[@]}"
-    return 0
-  fi
-  builtin trap -- "$@"
+  local others=()
+  for s in ${rest[@]+"${rest[@]}"}; do
+    case "$s" in
+      INT|SIGINT)   sig_own INT "$cmd" ;;
+      TERM|SIGTERM) sig_own TERM "$cmd" ;;
+      *)            others+=("$s") ;;
+    esac
+  done
+  [ "${#others[@]}" -eq 0 ] || builtin trap -- "$cmd" "${others[@]}"
+  return 0
 }
 exit_run() {
   local rc=$?
