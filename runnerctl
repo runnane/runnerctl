@@ -11383,6 +11383,11 @@ fleet_host_index() { # HOST
 # action out — detached or not, since its command is still running there.
 fleet_watch_act_refuse() { # HOST
   local i
+  # GHR-144: a `:` command holds every host it targets.
+  if fleet_watch_cmd_holds "$1"; then
+    FW_NOTICE="$1: busy — '${FW_CMD_JOB#runnerctl }' (from :) is still running there${FW_CMD_DETACHED:+ (detached)}; one action per host at a time, nothing issued"
+    return 0
+  fi
   fleet_host_index "$1" || return 1
   i="$FLEET_HOST_I"
   [ -n "${FW_ACT_PID[$i]:-}" ] || return 1
@@ -11454,11 +11459,13 @@ fleet_watch_act_is_read() { # VERB
 # Whether any action is out / any is still being watched (not detached).
 fleet_watch_act_out() {
   local i
+  [ -z "$FW_CMD_PID" ] || return 0
   for i in "${!FW_ACT_PID[@]}"; do [ -z "${FW_ACT_PID[$i]}" ] || return 0; done
   return 1
 }
 fleet_watch_act_attached() {
   local i
+  [[ -z "$FW_CMD_PID" || -n "$FW_CMD_DETACHED" ]] || return 0
   for i in "${!FW_ACT_PID[@]}"; do
     [[ -z "${FW_ACT_PID[$i]}" || -n "${FW_ACT_DETACHED[$i]}" ]] || return 0
   done
@@ -11502,6 +11509,8 @@ fleet_watch_act_notice() { # TEXT
 # outside — is an answer too, as for a fetch (fleet_watch_collect).
 fleet_watch_act_collect() {
   local i d rc n logrc ended=1
+  # GHR-144: the `:` command's job, taken in the same way.
+  ! fleet_watch_cmd_collect || ended=0
   for i in "${!FW_ACT_PID[@]}"; do
     [ -n "${FW_ACT_PID[$i]}" ] || continue
     d="$FW_TMP/act.$i"
@@ -11551,11 +11560,19 @@ fleet_watch_act_collect() {
 # Esc: stop watching the cursor's host's action — or, with none there, every
 # action still watched. Nothing is signalled.
 fleet_watch_act_detach() {
-  local i at="" where="" n=0
+  local i at="" where="" n=0 h
   if fleet_host_index "$FW_HOST" && [[ -n "${FW_ACT_PID[$FLEET_HOST_I]:-}" && -z "${FW_ACT_DETACHED[$FLEET_HOST_I]:-}" ]]; then
     at="$FLEET_HOST_I"
+  # GHR-144: the cursor's host is one a watched `:` command holds — that one.
+  elif [ -z "$FW_CMD_DETACHED" ] && fleet_watch_cmd_holds "$FW_HOST"; then
+    at=cmd
+  fi
+  if [[ -n "$FW_CMD_PID" && -z "$FW_CMD_DETACHED" ]] && [[ -z "$at" || "$at" = cmd ]]; then
+    FW_CMD_DETACHED=1 n=$((n + 1))
+    for h in ${FW_CMD_HOSTS[@]+"${FW_CMD_HOSTS[@]}"}; do where+="${where:+, }$h"; done
   fi
   for i in "${!FW_ACT_PID[@]}"; do
+    [ "$at" != cmd ] || break
     [[ -n "${FW_ACT_PID[$i]}" && -z "${FW_ACT_DETACHED[$i]}" ]] || continue
     [[ -z "$at" || "$i" = "$at" ]] || continue
     FW_ACT_DETACHED[i]=1
@@ -11571,22 +11588,28 @@ fleet_watch_act_detach() {
 # The lines the watched actions take under the table, into FW_ACT_FOOT, each
 # ending in a newline; empty with none.
 fleet_watch_act_foot() {
-  local i k=0 rest=""
+  local i k=0 rest="" max="$FW_ACT_LINES"
   local -a on=()
   FW_ACT_FOOT=""
+  # GHR-144: a watched `:` command's line comes first, and counts.
+  if [[ -n "$FW_CMD_PID" && -z "$FW_CMD_DETACHED" ]]; then
+    [ -n "$FW_CMD_LINE" ] || fleet_watch_cmd_progress
+    FW_ACT_FOOT+="$FW_CMD_LINE"$'\n'
+    max=$((max - 1))
+  fi
   for i in "${!FW_ACT_PID[@]}"; do
     [[ -z "${FW_ACT_PID[$i]}" || -n "${FW_ACT_DETACHED[$i]}" ]] || on+=("$i")
   done
   for i in ${on[@]+"${on[@]}"}; do
     k=$((k + 1))
-    if [ "${#on[@]}" -gt "$FW_ACT_LINES" ] && [ "$k" -ge "$FW_ACT_LINES" ]; then
+    if [ "${#on[@]}" -gt "$max" ] && [ "$k" -ge "$max" ]; then
       rest+="${rest:+, }${FLEET_HOSTS[$i]}"
       continue
     fi
     [ -n "${FW_ACT_SHOWN[$i]:-}" ] || fleet_watch_act_progress "$i"
     FW_ACT_FOOT+="${FW_ACT_SHOWN[$i]}"$'\n'
   done
-  [ -z "$rest" ] || FW_ACT_FOOT+="… and $((${#on[@]} - FW_ACT_LINES + 1)) more running: $rest"$'\n'
+  [ -z "$rest" ] || FW_ACT_FOOT+="… and $((${#on[@]} - max + 1)) more running: $rest"$'\n'
 }
 
 # On the way out (the EXIT trap): what ended meanwhile is taken in, and every
@@ -11596,6 +11619,15 @@ fleet_watch_act_quit() {
   local i pid host
   fleet_watch_act_out || return 0
   fleet_watch_act_collect || true
+  # GHR-144: a `:` command still out. Its record is cmd_fleet's own: the
+  # watch writes none for it.
+  pid="$FW_CMD_PID"
+  if [ -n "$pid" ]; then
+    FW_CMD_PID=""
+    printf "%s was still running when the watch ended — the watch stopped following it and did not cancel it on the hosts; 'runnerctl fleet status' shows where it got to\n" \
+      "${FW_CMD_JOB#runnerctl }"
+    [ "$(proc_ppid "$pid")" != "$$" ] || proc_tree_kill "$pid"
+  fi
   for i in "${!FW_ACT_PID[@]}"; do
     pid="${FW_ACT_PID[$i]}" host="${FLEET_HOSTS[$i]}"
     [ -n "$pid" ] || continue
@@ -12596,13 +12628,28 @@ fleet_watch_page() { # KEY
 #     local watch's keys: cmd_fleet `die`s on a refusal — the capacity gate,
 #     the budget flags, the excluded commands (env-init, provision,
 #     deprovision, logs), an unknown one — and outside a subshell that would
-#     end the watch. Here the refusal's own words are the notice. A command
-#     that changes hosts streams its lines while it runs (GHR-92), pages them
-#     all when it ends, and the table is fetched again afterwards. It runs in
-#     the foreground: the view is the command's until it ends.
+#     end the watch. Here the refusal's own words are the notice.
+#   * A COMMAND THAT CHANGES HOSTS RUNS IN THE BACKGROUND (GHR-144), as an
+#     action key's does (GHR-125): the subshell is a job writing its lines to
+#     a file and its exit status last, the ticks keep coming and the keys keep
+#     working, the latest line it wrote is a progress line under the table,
+#     and Esc detaches — nothing is signalled. When it ends its last line is
+#     the notice, its output (more than one line) opens in the pager — once no
+#     confirm line or / text is up — and the table is fetched again. A
+#     detached one's notice still comes; its output is not paged, and the
+#     notice says how many lines that was. The record is cmd_fleet's own, as
+#     on the command line.
+#   * IT HOLDS EVERY HOST IT TARGETS, not one slot for the fleet: each of
+#     them is busy for any other action key (fleet_watch_act_refuse) until it
+#     ends, exactly as if each had an action of its own out, and a host it
+#     does not name is not. A command whose line names no host (`%` on an
+#     unnarrowed watch, or a --host typed in the line) holds every watched
+#     host. One `:` command is out at a time — its output is one file — so a
+#     second, on hosts it does not hold, is refused in words of its own.
 #   * The lines entered are kept for the session; ↑ ↓ in the prompt walk them.
 #     Esc, or an empty line, cancels.
 FW_CMD_HIST=() FW_CMD_ARGV=() FW_CMD_SHOWN="" FW_HOSTS_NARROWED=false
+FW_CMD_ON=() FW_CMD_PID="" FW_CMD_JOB="" FW_CMD_HOSTS=() FW_CMD_DETACHED="" FW_CMD_LINE="" FW_CMD_PAGE=""
 
 # ARGV as a command line, each word %q'd (so a word with a blank or a control
 # byte in it is shown as what it is), into CMD_WORDS.
@@ -12719,6 +12766,12 @@ fleet_watch_cmd_key() {
   for h in "${on[@]}"; do
     ! fleet_watch_act_refuse "$h" || return 0
   done
+  # GHR-144: one `:` command out at a time, wherever it runs.
+  if [ -n "$FW_CMD_PID" ]; then
+    FW_NOTICE="busy — '${FW_CMD_JOB#runnerctl }' is still running${FW_CMD_DETACHED:+ (detached)}; one : command at a time, nothing issued"
+    return 0
+  fi
+  FW_CMD_ON=("${on[@]}")
   FW_ACTION=cmd FW_ACT_SCOPE=cmd
   FW_PROMPT="runs: $FW_CMD_SHOWN  [y/n]"
 }
@@ -12733,36 +12786,119 @@ fleet_watch_cmd_sub() (
   cmd_fleet "${FW_CMD_ARGV[@]}"
 )
 
-# Run FW_CMD_ARGV: KIND is `read` (into the pager), `mutate` (its lines shown as
-# they come, then paged) or `refused` (a refusal: the notice alone). The last
-# line it printed is the notice; output of more than one line is paged, under
-# a first line naming the command — a read asks no confirm, so the pager is
-# where its scope is shown.
-fleet_watch_cmd_exec() { # read|mutate|refused
-  local out="$FW_TMP/cmd" rc=0 line tail_line="" n=0 fd p=""
-  FW_ACTION="" FW_PROMPT="" FW_ACT_SCOPE=slot
-  term_cursor show
-  if [ "$1" = mutate ]; then
-    printf '\nrunning: %s\n' "$FW_CMD_SHOWN"
-    exec {fd}> >(tee "$out.run"); p=$!
-    fleet_watch_cmd_sub </dev/null >&"$fd" 2>&1 || rc=$?
-    exec {fd}>&-
-    wait "$p" 2>/dev/null || true
-  else
-    fleet_watch_cmd_sub </dev/null >"$out.run" 2>&1 || rc=$?
-  fi
+# The output in FILE, of the command SHOWN that exited RC: its last non-empty
+# line made safe — or, with none, a line saying so — into CMD_NOTICE, and its
+# non-empty line count into CMD_LINES. More than one line is written to
+# FW_TMP/cmd under a first line naming the command, for the pager: a read asks
+# no confirm, so the pager is where its scope is shown.
+CMD_NOTICE="" CMD_LINES=0
+fleet_watch_cmd_result() { # FILE SHOWN RC
+  local line tail_line=""
+  CMD_LINES=0
   while IFS= read -r line || [ -n "$line" ]; do
     [ -n "$line" ] || continue
-    n=$((n + 1)) tail_line="$line"
-  done <"$out.run"
+    CMD_LINES=$((CMD_LINES + 1)) tail_line="$line"
+  done <"$1"
   relay_safe "$tail_line" plain
-  FW_NOTICE="${RELAY_SAFE:-${FW_CMD_SHOWN#runnerctl }: no output (exit $rc)}"
-  if [ "$n" -gt 1 ]; then
-    { printf 'ran: %s\n\n' "$FW_CMD_SHOWN"; cat "$out.run"; } >"$out"
-    page <"$out"
-  fi
+  CMD_NOTICE="${RELAY_SAFE:-${2#runnerctl }: no output (exit $3)}"
+  [ "$CMD_LINES" -le 1 ] || { printf 'ran: %s\n\n' "$2"; cat "$1"; } >"$FW_TMP/cmd"
+}
+
+# Run FW_CMD_ARGV at once: KIND is `read` (into the pager) or `refused` (a
+# refusal: the notice alone). A command that changes hosts is not run here but
+# by fleet_watch_cmd_start, in the background.
+fleet_watch_cmd_exec() { # read|refused
+  local out="$FW_TMP/cmd" rc=0
+  FW_ACTION="" FW_PROMPT="" FW_ACT_SCOPE=slot
+  term_cursor show
+  fleet_watch_cmd_sub </dev/null >"$out.run" 2>&1 || rc=$?
+  fleet_watch_cmd_result "$out.run" "$FW_CMD_SHOWN" "$rc"
+  FW_NOTICE="$CMD_NOTICE"
+  [ "$CMD_LINES" -le 1 ] || page <"$out"
   term_cursor hide
-  [ "$1" != mutate ] || FW_REFRESH=true
+}
+
+# GHR-144: y at a `:` command's confirm. The job is the same subshell, its
+# stdout and stderr into FW_TMP/cmd.job/out and its exit status into `rc`
+# LAST; it holds FW_CMD_ON — the hosts the confirm was raised for — until it
+# ends.
+fleet_watch_cmd_start() {
+  local d="$FW_TMP/cmd.job" h
+  FW_ACTION="" FW_PROMPT="" FW_ACT_SCOPE=slot
+  # Nothing can have started between the confirm and its y; checked again
+  # all the same, since the busy rule is the one thing this must not break.
+  for h in ${FW_CMD_ON[@]+"${FW_CMD_ON[@]}"}; do
+    ! fleet_watch_act_refuse "$h" || return 0
+  done
+  rm -rf "$d"
+  mkdir "$d"
+  FW_CMD_JOB="$FW_CMD_SHOWN" FW_CMD_HOSTS=(${FW_CMD_ON[@]+"${FW_CMD_ON[@]}"})
+  FW_CMD_DETACHED="" FW_CMD_LINE="" FW_CMD_PAGE=""
+  fleet_watch_cmd_job "$d" </dev/null >/dev/null 2>&1 &
+  FW_CMD_PID="$!"
+  FW_ACT_LAUNCHED=true
+}
+fleet_watch_cmd_job() { # DIR
+  local rc=0
+  fleet_watch_cmd_sub >"$1/out" 2>&1 || rc=$?
+  echo "$rc" >"$1/rc.new"
+  mv -f "$1/rc.new" "$1/rc"
+}
+
+# Whether HOST is one the running `:` command holds.
+fleet_watch_cmd_holds() { # HOST
+  local h
+  [ -n "$FW_CMD_PID" ] || return 1
+  for h in ${FW_CMD_HOSTS[@]+"${FW_CMD_HOSTS[@]}"}; do [ "$h" != "$1" ] || return 0; done
+  return 1
+}
+
+# The running command's line, into FW_CMD_LINE; FW_ACT_DRAW when it changed.
+fleet_watch_cmd_progress() {
+  local s
+  fleet_watch_act_last "$FW_TMP/cmd.job/out" plain
+  s="${FW_CMD_JOB#runnerctl }: running${ACT_LAST:+ — $ACT_LAST}"
+  [ "$s" = "$FW_CMD_LINE" ] || FW_CMD_LINE="$s" FW_ACT_DRAW=true
+}
+
+# Take in the `:` command if it has ended: 0 when it did. Its notice is the
+# last line; its output waits in FW_CMD_PAGE for fleet_watch_cmd_page, unless
+# it was detached. A job gone without its `rc` is an answer too.
+fleet_watch_cmd_collect() {
+  local d="$FW_TMP/cmd.job" rc
+  [ -n "$FW_CMD_PID" ] || return 1
+  if [ ! -e "$d/rc" ]; then
+    if kill -0 "$FW_CMD_PID" 2>/dev/null; then
+      [ -n "$FW_CMD_DETACHED" ] || fleet_watch_cmd_progress
+      return 1
+    fi
+    if [ ! -e "$d/rc" ]; then
+      echo 255 >"$d/rc"
+      echo "the command ended without an answer" >>"$d/out"
+    fi
+  fi
+  rc="$(cat "$d/rc" 2>/dev/null || echo 255)"
+  fleet_watch_cmd_result "$d/out" "$FW_CMD_JOB" "$rc"
+  if [ "$CMD_LINES" -gt 1 ] && [ -n "$FW_CMD_DETACHED" ]; then
+    CMD_NOTICE+=" (detached: its $CMD_LINES lines of output were not paged)"
+  elif [ "$CMD_LINES" -gt 1 ]; then
+    FW_CMD_PAGE=1
+  fi
+  fleet_watch_act_notice "$CMD_NOTICE"
+  FW_CMD_PID="" FW_CMD_HOSTS=() FW_CMD_DETACHED="" FW_CMD_LINE=""
+  rm -rf "$d"
+  return 0
+}
+
+# The ended command's output, into the pager — not while a confirm line or the
+# / text is up, which the pager would take the keys from: it waits for them.
+fleet_watch_cmd_page() {
+  [ -n "$FW_CMD_PAGE" ] || return 1
+  [ -z "$FW_PROMPT" ] && [ "$FW_MODE" != search ] || return 1
+  FW_CMD_PAGE=""
+  term_cursor show
+  page <"$FW_TMP/cmd"
+  term_cursor hide
 }
 
 # One key against the watch. Returns 1 on `q`. At a confirm only `y` runs it
@@ -12791,7 +12927,7 @@ fleet_watch_handle_key() { # KEY
              hostset)    fleet_watch_run_set_hosts ;;
              upgradeset) fleet_watch_run_set_upgrade ;;
              # GHR-86: a mutating command from the `:` prompt.
-             cmd)        fleet_watch_cmd_exec mutate ;;
+             cmd)        fleet_watch_cmd_start ;;
              *)       fleet_watch_run_action ;;
            esac ;;
       # GHR-126: the graceful form, offered by R and S alone — not by a host
@@ -12968,6 +13104,8 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
       # is drawn with what that round brings back — the action's effect.
       if fleet_watch_act_collect; then fetch=refresh; continue; fi
       if $FW_ACT_DRAW; then FW_ACT_DRAW=false draw=true; fi
+      # GHR-144: an ended `:` command's output, once nothing holds the keys.
+      if fleet_watch_cmd_page; then draw=true; fi
       # GHR-118: the history pane's read, once it has landed.
       if fleet_watch_hist_collect; then draw=true; fi
       if $FW_DIRTY; then
