@@ -492,7 +492,7 @@ case_apply_ci() {
   expect_out 'Config takes effect on next'
   expect_log_count "tee $DROPIN_DIR/$U1\\.d/10-runnerctl\\.conf" 1
   expect_log_count 'tee .*/10-runnerctl\.conf$' 3
-  expect_log_order "mkdir -p $DROPIN_DIR/$U1\\.d" "tee .*/$U1\\.d/" "tee .*/$U2\\.d/" "tee .*/$U3\\.d/" '^systemctl daemon-reload$'
+  expect_log_order "mkdir -p -m 755 $DROPIN_DIR/$U1\\.d" "tee .*/$U1\\.d/" "tee .*/$U2\\.d/" "tee .*/$U3\\.d/" '^systemctl daemon-reload$'
   expect_log_count '^systemctl daemon-reload$' 1
   expect_no_log '^systemctl restart'
   expect_file "$DROPIN_DIR/$U1.d/10-runnerctl.conf" '^MemoryMax=26G$'
@@ -6952,6 +6952,32 @@ case_ghr140_created_config_and_env_directories_are_755_under_umask_077() {
   umask "$um"
 }
 
+# GHR-142: apply writes a slot's drop-in directory at an explicit 755 and the
+# file at 644. Neither call had a mode, so under root's umask 077 a new <unit>.d
+# was 0700 and the drop-in 0600, and the unprivileged read slot_profile does
+# (status's PROFILE column) could not see it. The stub makes the directory and
+# the file for real under the writes tree, so the logged calls and the modes on
+# disk are both asserted. This process owns the files, so the readback alone
+# cannot fail on a bad mode; the mode assertions are what pin it.
+case_ghr142_apply_makes_the_dropin_directory_755_and_the_file_644_under_umask_077() {
+  local um u
+  um="$(umask)"; umask 077
+  run apply
+  umask "$um"
+  expect_rc 0
+  for u in "$U1" "$U2" "$U3"; do
+    expect_log "^mkdir -p -m 755 $(ere_quote "$DROPIN_DIR/$u.d")\$"
+    expect_log "^chmod 644 $(ere_quote "$DROPIN_DIR/$u.d/10-runnerctl.conf")\$"
+    expect_mode "$DROPIN_DIR/$u.d" 755
+    expect_mode "$DROPIN_DIR/$u.d/10-runnerctl.conf" 644
+  done
+  expect_log_order "mkdir -p -m 755 $(ere_quote "$DROPIN_DIR/$U1.d")" "tee $(ere_quote "$DROPIN_DIR/$U1.d/10-runnerctl.conf")" "chmod 644 $(ere_quote "$DROPIN_DIR/$U1.d/10-runnerctl.conf")"
+  # The unprivileged readback status does.
+  run_keep status
+  expect_rc 0
+  expect_out '^0 +example\.slot-1 +ci +active/running '
+}
+
 case_ghr135_save_refuses_a_directory_others_can_write() {
   local d="$TMP/ghr135r" ov="$TMP/ghr135r.sh" u r c h
   rm -rf "$d"; mkdir -p "$d/shared" "$d/home/cfg"
@@ -10372,6 +10398,7 @@ t "GHR-135: --save in a user's directory is written as that user"       case_ghr
 t "GHR-135: --save refuses a directory others can write, before a call" case_ghr135_save_refuses_a_directory_others_can_write
 t "GHR-135: --save in a root-owned directory is root's write, as before" case_ghr135_save_in_a_root_owned_directory_is_root_s_write_as_before
 t "GHR-140: created config and env directories are 755 under umask 077" case_ghr140_created_config_and_env_directories_are_755_under_umask_077
+t "GHR-142: apply makes the drop-in directory 755 and the file 644 under umask 077" case_ghr142_apply_makes_the_dropin_directory_755_and_the_file_644_under_umask_077
 
 # --- GHR-48: the real discover(), not the stub's stand-in -------------------
 t "discover: no matching units is empty and exit 0, not a failure"     case_discover_no_matching_units_is_empty_not_a_failure
