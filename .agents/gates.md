@@ -203,15 +203,32 @@ Traps:
   sends SIGTERM there instead (logged `probe:sigterm`, not `probe:sigint`), so
   check which of the two a log shows before claiming the SIGINT path ran.
 - **A guarded command's output goes through relays (GHR-91).** From the point
-  `drain`, `stop`/`restart`, `apply` and `scale` arm their record,
+  `drain`, `start`/`stop`/`restart`, `apply` and `scale` arm their record,
   `caller_guard` sends stdout and stderr through a relay process each and
-  ignores SIGHUP. So a cut reader or a hangup no longer ends them, and
+  ignores SIGHUP. Since GHR-137 the same is true of `upgrade` (and
+  `--rollback`), `deprovision` (after its prompt), `kill`, `reap`,
+  `enable`/`disable`, `remove-limits`, `env-init`, `compose-reap --apply` and
+  `health --restart-stalled`. `provision`, `install`, `migrate` and
+  `compose-reap-timer` are not guarded (GHR-153). That is why the GHR-131
+  HUP/PIPE cases signal `compose-reap-timer remove`, not env-init: a case
+  that wants an armed command which is not guarded has to pick one from that
+  list. So a cut reader or a hangup no longer ends them, and
   `exit_run` waits for the relays before it writes the record. A case that
   closes the reader part-way uses `run_cut N` with `RUNNERCTL_STUB_CUT_AT=K`.
   The reader keeps N lines, closes its end, and only then touches
   `$WRITES/.cut`. The stub's K-th `pause` waits for that file
   (`probe:cut_seen K`), so every later write meets a closed reader at a known
-  point. `RC` is the command's own status, not the pipeline's. Without
+  point. A command that never pauses (env-init, `disable`, `remove-limits`,
+  `health --restart-stalled`, `compose-reap --apply`) is cut with
+  `RUNNERCTL_STUB_CUT_ON=ERE` instead: the first `run_priv` or `compose_rm`
+  line that matches waits the same way (`probe:cut_seen on`), after the
+  call is logged and before it acts. N must be exactly the number of lines
+  the command prints before that point. Fewer, and a write made before the
+  guard meets the closed reader and ends the run unguarded. More, and the
+  reader never closes and the wait gives up (`probe:cut_gave_up`). `upgrade`
+  runs for real in `tests/upgrade-test.sh` (case 16), where a fake `mv`
+  first on PATH is the cut point. `RC` is the command's own status, not the
+  pipeline's. Without
   `RUNNERCTL_STUB_BUSY_POLLS`, the stub's slot-1 is busy for ever, so a
   `drain` case sits out the whole `WAIT_TIMEOUT` in polls. For a signal the
   command is meant to survive, `RUNNERCTL_STUB_BLOCK_SECS` shortens

@@ -14307,10 +14307,12 @@ t "GHR-91: ssh_run and ssh_run_stdin carry a keepalive a site can override" case
 # --- GHR-131: a hangup or a cut pipe is an interruption too -------------------
 # Outside a caller guard, HUP and PIPE do what GHR-119 made INT and TERM do:
 # the record says `interrupted (SIGHUP|SIGPIPE)`, once, and the process still
-# dies BY the signal. Before GHR-131 both records said `ok`. env-init is armed
-# and not guarded; the signal goes to the group, as a closed terminal's HUP
+# dies BY the signal. Before GHR-131 both records said `ok`. `compose-reap-timer
+# remove` is armed and not guarded (GHR-153; it was env-init until GHR-137
+# guarded that); the signal goes to the group, as a closed terminal's HUP
 # does. The guarded side — a drain hung up mid-way records its own `ok` and
 # finishes — is case_ghr91_a_hangup_does_not_stop_a_drain.
+GHR131_BLOCK='^systemctl disable --now runnerctl-compose-reap\.timer$'
 case_ghr131_a_hangup_interrupts_an_armed_command() {
   if ! $HAVE_PERL; then
     skip "GHR-131: no perl, so no waitpid to tell death by signal from an exit"
@@ -14318,28 +14320,28 @@ case_ghr131_a_hangup_interrupts_an_armed_command() {
     expect_out "^trap -- 'audit_signal HUP' SIGHUP\$"
     return 0
   fi
-  run_signalled HUP group '^mkdir -p -m 755 /etc/runnerctl$' env-init --profile deploy
+  run_signalled HUP group "$GHR131_BLOCK" compose-reap-timer remove
   expect_rc 129
   expect_signalled 1
-  expect_one_record "env-init /etc/runnerctl/deploy\\.env \\(--profile deploy\\) by $ME — interrupted \\(SIGHUP\\)"
-  expect_log_order '^probe:blocked mkdir -p -m 755 /etc/runnerctl$' '^probe:audit '
-  expect_no_log '^tee '
+  expect_one_record "compose-reap-timer remove by $ME — interrupted \\(SIGHUP\\)"
+  expect_log_order '^probe:blocked systemctl disable --now runnerctl-compose-reap\.timer$' '^probe:audit '
+  expect_no_log '^rm -f '
 }
 case_ghr131_a_cut_pipe_interrupts_an_armed_command() {
   if ! $HAVE_PERL; then
     # (the gate's own PIPE may be ignored, which no trap can change — so no
     # run_fn fallback either: only perl can hand bash a default PIPE)
     skip "GHR-131: no perl, so no waitpid to tell death by signal from an exit"
-    run env-init --profile deploy
-    expect_one_record "env-init /etc/runnerctl/deploy\\.env \\(--profile deploy\\) by $ME — ok"
+    run compose-reap-timer remove
+    expect_one_record "compose-reap-timer remove by $ME — ok"
     return 0
   fi
-  run_signalled PIPE group '^mkdir -p -m 755 /etc/runnerctl$' env-init --profile deploy
+  run_signalled PIPE group "$GHR131_BLOCK" compose-reap-timer remove
   expect_rc 141
   expect_signalled 13
-  expect_one_record "env-init /etc/runnerctl/deploy\\.env \\(--profile deploy\\) by $ME — interrupted \\(SIGPIPE\\)"
-  expect_log_order '^probe:blocked mkdir -p -m 755 /etc/runnerctl$' '^probe:audit '
-  expect_no_log '^tee '
+  expect_one_record "compose-reap-timer remove by $ME — interrupted \\(SIGPIPE\\)"
+  expect_log_order '^probe:blocked systemctl disable --now runnerctl-compose-reap\.timer$' '^probe:audit '
+  expect_no_log '^rm -f '
 }
 
 # The dispositions themselves, through the script's own functions. Armed and
@@ -14417,6 +14419,103 @@ EOF
 t "GHR-131: a hangup interrupts an armed command and it dies by SIGHUP"    case_ghr131_a_hangup_interrupts_an_armed_command
 t "GHR-131: a cut pipe interrupts an armed command and it dies by SIGPIPE" case_ghr131_a_cut_pipe_interrupts_an_armed_command
 t "GHR-131: HUP and PIPE armed, yielded to a caller guard, and owned"      case_ghr131_dispositions_armed_guarded_and_owned
+
+# --- GHR-137: the rest of the mutating commands finish what they started ------
+# One run_cut case per command GHR-137 guarded: its stdout reader goes away at
+# a point the case pins, and the command still does every step after it,
+# exits with its own status and records `(caller gone, ran to the end)`.
+# A command that pauses is cut at its K-th pause (RUNNERCTL_STUB_CUT_AT); one
+# that never pauses is cut at its first privileged call or docker removal that
+# matches RUNNERCTL_STUB_CUT_ON (`probe:cut_seen on`), which waits until the
+# reader has gone before that call acts. N is the number of lines the command
+# prints before that point, so nothing before the guard meets the closed
+# reader. Without the guard, the next write after the cut ends the command
+# there: SIGPIPE where the gate's PIPE is at its default, a failed write under
+# `set -e` where it is ignored (an agent harness). Either way the steps
+# asserted after `cut_seen` never happen and the record is not this one.
+# `upgrade` is cut in tests/upgrade-test.sh, which runs the real download and
+# placement.
+case_ghr137_env_init_cut_off_finishes() {
+  RUNNERCTL_STUB_CUT_ON='^mkdir -p -m 755 /etc/runnerctl$' run_cut 0 env-init --profile deploy
+  expect_rc 0
+  expect_log_order '^probe:cut_seen on$' "^tee $DEPLOY_ENV\$" "^chown root:root $DEPLOY_ENV\$" "^chmod 600 $DEPLOY_ENV\$"
+  expect_one_record "env-init /etc/runnerctl/deploy\\.env \\(--profile deploy\\) by $ME — ok \\(caller gone, ran to the end\\)"
+  expect_no_err .
+}
+case_ghr137_disable_cut_off_finishes() {
+  RUNNERCTL_STUB_CUT_ON="^systemctl disable --now $U1\$" run_cut 0 disable 0 1
+  expect_rc 0
+  expect_log_order '^probe:cut_seen on$' "^systemctl disable --now $U2\$"
+  expect_one_record "disable example\\.slot-1 example\\.slot-2 by $ME — ok \\(caller gone, ran to the end\\)"
+  expect_no_err .
+}
+case_ghr137_remove_limits_cut_off_finishes() {
+  # cut at slot-1's removal: its `removed drop-in` line is the first write after
+  RUNNERCTL_STUB_CUT_ON="^rm -f $DROPIN_DIR/$U1\\.d/" run_cut 0 remove-limits
+  expect_rc 0
+  expect_log_order '^probe:cut_seen on$' "^rm -f $DROPIN_DIR/$U2\\.d/10-runnerctl\\.conf\$" \
+                   "^rm -f $DROPIN_DIR/$U3\\.d/10-runnerctl\\.conf\$" '^systemctl daemon-reload$'
+  expect_one_record "remove-limits all by $ME — ok \\(caller gone, ran to the end\\)"
+  expect_no_err .
+}
+case_ghr137_reap_cut_off_finishes() {
+  # slot-1's `busy` line is read, then the cut lands in slot-2's grace
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_LEAKED=1 RUNNERCTL_STUB_SURVIVORS=4243 RUNNERCTL_STUB_CUT_AT=1 \
+    run_cut 1 reap
+  expect_rc 0
+  expect_out_count '.' 1
+  expect_log_order '^kill -TERM 4242 4243$' '^probe:cut_seen 1$' '^probe:pid_alive 4243$' '^kill -KILL 4243$'
+  expect_one_record "reap all by $ME — ok \\(caller gone, ran to the end\\)"
+  expect_no_err .
+}
+case_ghr137_kill_cut_off_still_escalates() {
+  # The job survives its SIGKILL, so after KILL_GRACE_SEC the unit is killed —
+  # announced by a line, which without the guard is where it would end.
+  RUNNERCTL_STUB_CGROUP_READABLE=1 RUNNERCTL_STUB_CUT_AT=1 run_cut 0 kill 0
+  expect_rc 0
+  expect_log_order '^kill -KILL 4100 4101$' '^probe:cut_seen 1$' '^probe:pause 5$' "^systemctl kill -s KILL $SLOT1_UNIT\$"
+  expect_one_record "kill example\\.slot-1 by $ME — ok \\(caller gone, ran to the end\\)"
+  expect_no_err .
+}
+case_ghr137_compose_reap_apply_cut_off_finishes() {
+  # the first project's verdict line is read; the cut lands at its first removal
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_COMPOSE_WORKER=1 RUNNERCTL_STUB_CUT_ON='^docker rm container c-pidgone$' \
+    run_cut 1 compose-reap --apply
+  expect_rc 0
+  expect_out_count '.' 1
+  expect_log_order '^probe:cut_seen on$' '^docker rm network n-pidgone$' '^docker rm container c-stale$' '^docker rm network n-netonly$'
+  expect_log_count '^docker rm ' 8
+  expect_one_record "compose-reap \\(--apply\\) by $ME — ok \\(removed=8 failed=0 images-removed=0\\) \\(caller gone, ran to the end\\)"
+  expect_no_err .
+}
+case_ghr137_health_restart_stalled_cut_off_finishes() {
+  RUNNERCTL_STUB_CUT_ON="^systemctl restart $U1\$" run_cut 0 health --restart-stalled --stall-after 600
+  # 1 is health's own answer: there was a problem to report
+  expect_rc 1
+  expect_log_order '^probe:cut_seen on$' '^probe:audit '
+  expect_one_record "health example\\.slot-1 \\(--restart-stalled\\) by $ME — restarted 1 \\(caller gone, ran to the end\\)"
+  expect_no_err .
+}
+case_ghr137_deprovision_cut_off_finishes() {
+  # the plan's two lines and slot-1's `waiting for` are read; the cut lands in
+  # the wait, before anything was stopped
+  RUNNERCTL_STUB_BUSY_POLLS=2 RUNNERCTL_STUB_CUT_AT=1 run_cut 3 deprovision 0 --token "$DEPROV_TOKEN" --yes --when-idle
+  expect_rc 0
+  expect_out '^waiting for example\.slot-1 '
+  expect_log_order '^probe:cut_seen 1$' "^systemctl stop $U1\$" '\./config\.sh remove$' \
+                   '^rm -rf -- /opt/actions-runner/slot-1$' '^systemctl daemon-reload$'
+  expect_one_record "deprovision example\\.slot-1 \\(--when-idle\\) by $ME — ok \\(caller gone, ran to the end\\)"
+  expect_no_err .
+}
+
+t "GHR-137: env-init cut off part-way still sets the file's owner and mode" case_ghr137_env_init_cut_off_finishes
+t "GHR-137: disable cut off part-way still disables every target"          case_ghr137_disable_cut_off_finishes
+t "GHR-137: remove-limits cut off part-way removes all and reloads"         case_ghr137_remove_limits_cut_off_finishes
+t "GHR-137: reap cut off in its grace still sends the KILL"                 case_ghr137_reap_cut_off_finishes
+t "GHR-137: kill cut off in its wait still escalates to the unit"           case_ghr137_kill_cut_off_still_escalates
+t "GHR-137: compose-reap --apply cut off part-way removes every project"    case_ghr137_compose_reap_apply_cut_off_finishes
+t "GHR-137: health --restart-stalled cut off still records its restart"     case_ghr137_health_restart_stalled_cut_off_finishes
+t "GHR-137: deprovision cut off in its idle wait still removes the slot"    case_ghr137_deprovision_cut_off_finishes
 
 # --- GHR-80: fleet JSON for a UI — the envelope, the stream, health --json ----
 # `fleet status --json` gains `generated_at`, `runnerctl`, `summary` and, per

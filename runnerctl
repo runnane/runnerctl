@@ -1039,6 +1039,14 @@ audit_signal() { # INT|TERM|HUP|PIPE
 # the command printed comes after its exit; a relay that could not deliver
 # makes the record say `(caller gone, ran to the end)`.
 #
+# GHR-137 moved the other mutating commands in, each from the point it arms its
+# record: `upgrade` (and --rollback), `deprovision` (after its y/N prompt,
+# never before), `kill` (and --if-stalled), `reap`, `enable`/`disable`,
+# `remove-limits`, `env-init`, `compose-reap --apply` and `health
+# --restart-stalled`. Each is a sequence whose middle is a worse host than
+# either end. `provision`, `install`, `migrate` and `compose-reap-timer` are
+# not guarded (GHR-153) and keep the GHR-131 rule below.
+#
 # So for a command guarded here, SIGHUP and SIGPIPE are not interruptions:
 # HUP is ignored and PIPE cannot arise, and the record carries the command's
 # own outcome. Every other armed command records both as `interrupted
@@ -4305,6 +4313,9 @@ cmd_env_init() {
     return 0
   fi
   audit_begin env-init "$ENV_FILE" "--profile $PROFILE"
+  # GHR-137: a hangup between the tee and the chmod would leave the file at
+  # the default mode, and every later env-init leaves an existing file alone.
+  caller_guard
   run_priv mkdir -p -m 755 "$(dirname "$ENV_FILE")"
   render_env_template | run_priv tee "$ENV_FILE" >/dev/null
   run_priv chown root:root "$ENV_FILE"
@@ -4387,6 +4398,7 @@ cmd_toggle() { # enable|disable <target> [target ...]
   done
   audit_begin "$action"
   audit_slots "${#units[@]}" "${units[@]}"
+  caller_guard # GHR-137
   for u in "${units[@]}"; do
     run_priv systemctl "$action" --now "$u"
   done
@@ -5589,6 +5601,9 @@ cmd_remove_limits() {
   fi
   audit_begin remove-limits
   audit_slots "${#TARGETS[@]}" "${units[@]}"
+  # GHR-137: the drop-ins removed and no daemon-reload is a host whose files
+  # and running config disagree.
+  caller_guard
   for u in "${units[@]}"; do
     run_priv rm -f "$SYSTEMD_DIR/$u.d/$DROPIN_NAME"
     echo "  removed drop-in for $u"
@@ -5634,6 +5649,9 @@ cmd_reap() { # [--dry-run] [target ...] (default: all)
   if ! $dry_run; then
     audit_begin reap
     audit_slots "${#targets[@]}" "${units[@]}"
+    # GHR-137: a hangup in the grace would leave the TERM's survivors without
+    # their KILL, and a cut pipe would leave the slots after this one unreaped.
+    caller_guard
   fi
   for u in "${units[@]}"; do
     short="$(short_name "$u")"
@@ -5731,12 +5749,15 @@ cmd_kill() { # [--dry-run] [--if-stalled] [--stall-after N] [target ...]
   if ! $dry_run && ! $if_stalled; then
     audit_begin kill
     audit_slots "${#targets[@]}" "${units[@]}"
+    # GHR-137: cut off in the wait after the SIGKILL, a wedged Listener would
+    # never be escalated to the unit kill.
+    caller_guard
   fi
   for u in "${units[@]}"; do
     short="$(short_name "$u")"
     if $if_stalled; then
       stalled_gate "$u" killing || continue
-      $dry_run || audit_begin kill --if-stalled "$short"
+      $dry_run || { audit_begin kill --if-stalled "$short"; caller_guard; }
     else
       slot_job_facts "$u"
       kill_gate "$short" || continue
@@ -6174,6 +6195,8 @@ cmd_compose_reap() { # [--apply] [--standalone] [--project NAME] [--max-age-hour
     # GHR-88: a timer runs this hourly, so the record is armed by the first
     # removal, not by --apply: an hour with nothing to reap writes nothing.
     audit_begin compose-reap --apply "$($standalone && echo --standalone)"
+    # GHR-137: a project's containers, networks and volumes go together.
+    caller_guard
     ok=0 bad=0
     for kind in container network volume; do
       case "$kind" in
@@ -6229,6 +6252,7 @@ cmd_compose_reap() { # [--apply] [--standalone] [--project NAME] [--max-age-hour
       reaped=$((reaped + 1))
       $apply || continue
       audit_begin compose-reap --apply --standalone
+      caller_guard # GHR-137
       if compose_rm container "$cid"; then
         n_removed=$((n_removed + 1)); freed_images[$img]="$image"
       else
@@ -6597,6 +6621,7 @@ cmd_health() { # [--quiet] [--json] [--max-restarts N] [--stall-after N] [--rest
         # records nothing — and the outcome is the restarts', not health's
         # exit status, which is 1 whenever there was a problem to report.
         audit_begin health --restart-stalled "$short"
+        caller_guard # GHR-137
         if run_priv systemctl restart "$u"; then
           line+=" — restarted"; h_ok=$((h_ok + 1))
         else
@@ -13942,6 +13967,11 @@ cmd_deprovision() {
     esac
   fi
   audit_begin deprovision "$(join_short "${units[*]}")" "$($local_only && echo --local-only)" "$($when_idle && echo --when-idle)" # GHR-88: names only — never a token
+  # GHR-137: after the prompt, never before it — a relay passes whole lines,
+  # so a prompt with no newline would not show until something followed it.
+  # From here a slot cut off part-way would be stopped and still registered,
+  # or deregistered with its directory still there.
+  caller_guard
 
   # Only now, confirmed and with every target validated, is a credential used.
   if ! $local_only && [ -z "$token" ]; then
@@ -15032,6 +15062,7 @@ cmd_upgrade() {
       die "--rollback takes no other option — it downloads nothing and moves nothing, it puts $self.prev back ('runnerctl upgrade --check' names the rollback copy)"
     fi
     audit_begin upgrade --rollback
+    caller_guard # GHR-137, as below
     upgrade_rollback "$self"
     return 0
   fi
@@ -15041,7 +15072,15 @@ cmd_upgrade() {
   DOWNLOAD_TMP="$(mktemp)"; trap 'rm -f "$DOWNLOAD_TMP"' EXIT
   fetch_script "$url" "$DOWNLOAD_TMP" "$sha_pin"
   new_ver="$(remote_version "$DOWNLOAD_TMP")"
-  $check || audit_begin upgrade "${new_ver:+to $new_ver}" "${ref:+--ref $ref}"
+  if ! $check; then
+    audit_begin upgrade "${new_ver:+to $new_ver}" "${ref:+--ref $ref}"
+    # GHR-137: cut off between keeping .prev and placing the new file, or
+    # between placing it and retiring a home copy, the host is left with
+    # neither placement. The relays are this process's own children, already
+    # running from memory, so replacing the script on disk does not touch
+    # them; the download's cleanup is EXIT_CMD, run after they are closed.
+    caller_guard
+  fi
 
   # --- placement -------------------------------------------------------------
   # target  = the file to write, empty when this call must not write one
