@@ -1802,9 +1802,14 @@ watch already holds:
   fleet mode refuses (`env-init`, `provision`, `deprovision`, `logs`) behave
   exactly as they do on the command line — a refusal's own words become the
   notice under the table, and the watch carries on. `:%stop` on an unnarrowed
-  watch is the `fleet stop` the gate refuses. The command's lines are shown as
-  they come, the whole output is paged when it ends, and the table is fetched
-  again. It runs in the foreground: the view is the command's until it ends.
+  watch is the `fleet stop` the gate refuses. It runs in the background, as
+  an action key's command does: the table keeps refreshing and the keys keep
+  working, the latest line it has written shows under the table, and `Esc`
+  stops following it without cancelling it. When it ends its last line is the
+  notice, the whole output is paged (unless you detached), and the table is
+  fetched again. While it runs it holds **every host it targets**: an action
+  key on any of them says `busy` and issues nothing, a host it does not name
+  is free, and a second `:` command waits for the first to end.
 - **The line is split on blanks, and nothing else** — no quoting, no `$`, no
   globbing: it is never handed to a shell, here or on a host. Each word reaches
   the host's `runnerctl` as the one literal argument it was (the fleet commands

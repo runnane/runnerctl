@@ -16157,7 +16157,9 @@ case_ghr86_scale_on_the_cursors_host_only() {
   expect_rc 0
   expect_log_count '^probe:tty_read_line : 0 - scale\\ 3$' 1
   expect_out_count '^runs: runnerctl fleet scale 3 --host build-1  \[y/n\]$' 1
-  expect_out_count '^running: runnerctl fleet scale 3 --host build-1$' 1
+  # GHR-144: it runs in the background, so nothing is printed over the view
+  # while it runs; its output is still paged when it ends.
+  expect_no_out '^running: '
   expect_log_count '^probe:ssh_run build-1 -- runnerctl scale 3$' 1
   expect_log_count "$GHR86_REMOTE_MUTATING" 1
   expect_log_count "^probe:ssh_origin build-1 $GHR88_ORIGIN\$" 1
@@ -16206,8 +16208,9 @@ case_ghr86_a_refused_command_is_a_notice_and_the_watch_goes_on() {
     run fleet watch --color never
   expect_rc 0
   expect_out_count '^runs: runnerctl fleet stop  \[y/n\]$' 1
-  # once as the command printed it, once as the notice under the next frame
-  expect_out_count "^$gate" 2
+  # once, as the notice under the next frame: since GHR-144 the command runs
+  # in the background and its lines are not printed over the view
+  expect_out_count "^$gate" 1
   expect_no_log '^probe:ssh_run [^ ]+ -- (sudo -n )?runnerctl stop'
   expect_log_count '^probe:ssh_run build-1 -- runnerctl scale 3$' 1
   expect_log_count "$GHR86_REMOTE_MUTATING" 1
@@ -16283,6 +16286,113 @@ t "GHR-86: :%stop is refused by the capacity gate and the watch goes on"        
 t "GHR-86: :provision 2 shows the exclusion message, nothing dialled"             case_ghr86_an_excluded_command_shows_its_refusal
 t "GHR-86: a read runs at once into the pager, on the cursor's host or with % all" case_ghr86_a_read_runs_at_once_into_the_pager
 t "GHR-86: a word with shell metacharacters reaches the host as one argument"     case_ghr86_a_metacharacter_word_reaches_the_host_literally
+
+# --- GHR-144: a mutating `:` command runs in the background ---------------------
+# The `:` job is held as GHR-125's actions are: RUNNERCTL_STUB_FLEET_HOLD keeps
+# its remote call out until REL, and the stub counts the job on the poll step,
+# held while any host it holds is. A key logged `probe:tty_read_char 0.2 <c>`
+# after `probe:act_poll landed=0 held=1` was handled while the command ran.
+GHR144_RUNNING='^fleet scale 3 --host build-1: running — build-1: '"$GHR125_PROGRESS"'$'
+GHR144_DONE='fleet scale: 1 host\(s\) ok, 0 failed'
+GHR144_LOG="^$GHR88_TS $ME fleet scale 3 --host build-1 — build-1=0\$"
+
+# The acceptance case. `:scale 3`, y on build-1, its remote held: the j pressed
+# next is read on the poll step while the command is out, and the frame it
+# moves the cursor in carries the command's progress line and no notice. After
+# the release its output is paged, its last line is the notice — over the
+# fresh round its end asks for — and the next key (k) clears it. One record.
+case_ghr144_a_slow_colon_command_holds_up_no_key() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD=build-1 RUNNERCTL_STUB_KEYS=":yj${REL}kq" RUNNERCTL_STUB_PROMPT_IN='scale 3' \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 5
+  expect_frame 2 '^runs: runnerctl fleet scale 3 --host build-1  \[y/n\]$'
+  expect_frame 3 "$GHR144_RUNNING"
+  expect_frame 3 "^Esc detach  \? keys\$"
+  expect_frame 3 "$(fw_row build-1 1 2)"
+  # (frame 3's text runs on into the pager's, which ends with the same line
+  # the notice is: the order is the log's, below)
+  expect_frame 4 "^$GHR144_DONE\$"
+  expect_no_frame 4 ': running'
+  expect_frame 4 "$FLEET_WATCH_LEGEND"
+  expect_no_frame 5 "$GHR144_DONE"
+  expect_log_order '^probe:tty_read_char 5 y$' '^probe:ssh_run build-1 -- runnerctl scale 3$' \
+                   '^probe:remote_held build-1$' '^probe:act_poll landed=0 held=1$' '^probe:tty_read_char 0\.2 j$' \
+                   '^probe:release$' '^probe:remote_released build-1$' \
+                   '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' '^probe:page$' '^probe:tty_read_char 5 k$'
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl scale 3$' 1
+  expect_log_count "$GHR86_REMOTE_MUTATING" 1
+  expect_log_count '^probe:page$' 1
+  expect_out_count '^ran: runnerctl fleet scale 3 --host build-1$' 1
+  expect_no_log '^probe:remote_(signal|hold_gave_up) '
+  expect_cfg_count "$WRITES/fleet.log" '.' 1
+  expect_cfg "$WRITES/fleet.log" "$GHR144_LOG"
+}
+
+# Esc stops FOLLOWING it: the line and the legend's offer go, nothing signals
+# the remote — which waits for the release and answers — and the notice still
+# comes, saying its output was not paged. The record is the command's result.
+case_ghr144_esc_detaches_and_the_command_completes() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD=build-1 RUNNERCTL_STUB_KEYS=":y"$'\e-'"${REL}q" RUNNERCTL_STUB_PROMPT_IN='scale 3' \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 4
+  expect_frame 3 '^detached — the command continues on build-1; its notice comes when it ends$'
+  expect_no_frame 3 ': running'
+  expect_frame 3 "$FLEET_WATCH_LEGEND"
+  expect_frame 4 "^$GHR144_DONE \\(detached: its 3 lines of output were not paged\\)\$"
+  expect_no_log '^probe:remote_signal '
+  expect_log_order '^probe:remote_held build-1$' '^probe:release$' '^probe:remote_released build-1$' '^probe:ssh_run_done build-1$'
+  expect_log_count '^probe:page$' 0
+  expect_cfg_count "$WRITES/fleet.log" '.' 1
+  expect_cfg "$WRITES/fleet.log" "$GHR144_LOG"
+}
+
+# It holds the host it runs on: R on build-1 while it is out is refused as
+# busy, naming it, before anything is read (one --json read of build-1, the
+# round's own), and so is a second `:` command anywhere; R on build-2, which
+# it does not hold, starts build-2's own.
+case_ghr144_a_colon_command_holds_its_hosts() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD="build-1 build-2" RUNNERCTL_STUB_KEYS=":yRjjj:Ry${REL}q" \
+    RUNNERCTL_STUB_PROMPT_IN=$'scale 3\nscale 2' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame 3 "^build-1: busy — 'fleet scale 3 --host build-1' \\(from :\\) is still running there; one action per host at a time, nothing issued\$"
+  expect_frame 3 "$GHR144_RUNNING"
+  expect_no_frame 3 '\[y/n\]'
+  expect_out_count "^busy — 'fleet scale 3 --host build-1' is still running; one : command at a time, nothing issued\$" 1
+  expect_out_count '^Restart example\.slot-1 on build-2\? ' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl restart ' 0
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl restart example\.slot-1$' 1
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl scale 2' 0
+  expect_out "^$GHR144_DONE · example\\.slot-1 on build-2: restart done\\.\$"
+  expect_no_log '^probe:remote_signal '
+}
+
+# q with the command still held: exit 0, a line saying the watch did not
+# cancel it, and nothing of this node's left behind (in the sim the remote is
+# a process under the job, so it goes too; over ssh only the local side would).
+case_ghr144_quit_leaves_no_local_process() {
+  local d="$TMP/ghr144-tmp"
+  rm -rf "$d"; mkdir -p "$d"
+  TMPDIR="$d" RUN_TIMEOUT=10 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD=build-1 RUNNERCTL_STUB_KEYS=':yq' \
+    RUNNERCTL_STUB_PROMPT_IN='scale 3' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_out "^fleet scale 3 --host build-1 was still running when the watch ended — the watch stopped following it and did not cancel it on the hosts; 'runnerctl fleet status' shows where it got to\$"
+  expect_cfg "$WRITES/remote/build-1.held.pids" '^[0-9]+( [0-9]+)+$'
+  _ghr74_expect_dead "$(cat "$WRITES/remote/build-1.held.pids" 2>/dev/null; true)"
+  _ghr74_expect_empty "$d"
+  expect_log_count '^probe:page$' 0
+  rm -rf "$d"
+}
+
+t "GHR-144: a slow :command in the background holds up no key"               case_ghr144_a_slow_colon_command_holds_up_no_key
+t "GHR-144: q with a :command out leaves no local process"                   case_ghr144_quit_leaves_no_local_process
+t "GHR-144: Esc detaches a :command, cancels nothing, and it completes"      case_ghr144_esc_detaches_and_the_command_completes
+t "GHR-144: a :command holds every host it targets; another host is free"    case_ghr144_a_colon_command_holds_its_hosts
 
 # --- GHR-87: fleet compose-reap and compose-reap-timer ------------------------
 # The stub's hosts answer compose-reap with the real command over the shared

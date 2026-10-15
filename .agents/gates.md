@@ -265,6 +265,13 @@ Traps:
   assert the absence of `probe:remote_signal` only for Esc.
   `RUNNERCTL_STUB_FLEET_HOLD_HOSTILE=1` puts `STUB_HOSTILE` on the progress
   line, which nothing but the draw's `relay_safe` filters while the call runs.
+  Since GHR-144 a confirmed `:` command is one more job counted the same way
+  (`FW_CMD_PID`, its `rc` in `FW_TMP/cmd.job/`), held while ANY host it
+  holds is held. Its paged output is printed after the frame it ended under
+  and before the next frame prefix, so `frames` puts the pager's lines in
+  the PREVIOUS frame — and the notice is the output's last line, so a
+  "notice not in frame N" assertion matches the pager's copy. Order the end
+  by the log (`probe:page`) instead.
 - **A copy of the script handed to the sim through `$RUNNERCTL` has to be a
   file NAMED `runnerctl`** (GHR-78) — in a directory of its own, one per
   mutant. `case_compose_reap_timer_install_status_remove` pins the script's
