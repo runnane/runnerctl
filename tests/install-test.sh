@@ -135,6 +135,7 @@ grep -q "^source: file://" "$tmp/out10" || fail "piped install did not download 
 #     there is found via $SUDO_USER (getent stubbed to a temp home), migrated
 #     from, and retired as .legacy after the new file lands at the prefix.
 mkdir -p "$tmp/getent" "$tmp/home10/.local/bin"
+# shellcheck disable=SC2016  # the stub getent is a child shell script; it expands $1/$2, not this script
 printf '#!/bin/sh\n[ "$1" = passwd ] && [ "$2" = someone ] && echo "someone:x:1234:1234::%s:/bin/sh"\n' "$tmp/home10" >"$tmp/getent/getent"
 chmod +x "$tmp/getent/getent"
 cp "$legacy" "$tmp/home10/.local/bin/runnerctl"; chmod 755 "$tmp/home10/.local/bin/runnerctl"
