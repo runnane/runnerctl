@@ -1513,6 +1513,7 @@ has its own `slot-1`:
 | `Space` / `*` / `u` | **mark** the cursor's slot row (again: unmark it) / every slot row the view shows / clear every mark; with marks, the action keys act on the marked set — below |
 | `L` | page the slot's last 50 journal lines through your `$PAGER` |
 | `O` | print the URL of the running job's run on the status line; no round trip |
+| `:` | a prompt for **any fleet command** — `scale 3`, `health`, `apply --profile ci` — on the cursor's host, the marked rows' hosts, or with `%` every watched host — below |
 | `Enter` | show the selected slot in full, in place of the table; no round trip — below |
 | `!` `b` `i` `/` `a` `s` `c` `?` | [view keys](#a-live-fleet-view-fleet-watch): filter, sort, collapse, help — below |
 | `Esc` | while an action runs: stop following it — the command carries on, its notice still comes — below |
@@ -1698,6 +1699,56 @@ pass `--min-available` alone are refused when the three would cross it
 (`3 marked slot(s): not stopped — it would leave 1 of 6 …`). The marks stay
 until `u`. In the slot pane (`Enter`) the keys act on the pane's slot, marks or
 not.
+
+**Any fleet command: `:`.** The keys are a fixed set; the fleet commands are
+not. `:` opens a one-line prompt at the bottom of the view, and what you type
+there is a fleet subcommand with its own flags, run through the same code as
+the command line — without leaving the view, and over the ssh connections the
+watch already holds:
+
+```
+:scale 3                     → runnerctl fleet scale 3 --host <the cursor's host>
+:apply --profile ci --restart --when-idle
+:%health                     → fleet health on every watched host
+:upgrade --check
+```
+
+- **The scope is explicit and shown before anything runs**: the host of the
+  cursor's row; the hosts of the marked rows while any are marked; every
+  watched host with `%` in front of the command. On a watch started with
+  `--host`, `%` names each watched host; on one that watches the whole fleet it
+  adds nothing, so the command is exactly the one you would type. A `--host` or
+  `--all-hosts` you type yourself is the scope as typed. `fleet status` and
+  `fleet health` take no `--host`, so they are run on the scope's hosts and the
+  line says which: `runnerctl fleet health (on build-1)`.
+- **Reads run at once** — `status`, `health`, `history`, `upgrade --check`,
+  `reap --dry-run` — and their output opens in your `$PAGER`, as `L`'s does,
+  under a first line naming the command that ran.
+- **Everything else asks first**, with the command fully expanded:
+
+  ```
+  runs: runnerctl fleet scale 3 --host build-1  [y/n]
+  ```
+
+  `y` runs it; anything else cancels. It goes through `fleet`'s own code, so
+  the capacity gate, `--min-available` / `--max-unavailable` and the commands
+  fleet mode refuses (`env-init`, `provision`, `deprovision`, `logs`) behave
+  exactly as they do on the command line — a refusal's own words become the
+  notice under the table, and the watch carries on. `:%stop` on an unnarrowed
+  watch is the `fleet stop` the gate refuses. The command's lines are shown as
+  they come, the whole output is paged when it ends, and the table is fetched
+  again. It runs in the foreground: the view is the command's until it ends.
+- **The line is split on blanks, and nothing else** — no quoting, no `$`, no
+  globbing: it is never handed to a shell, here or on a host. Each word reaches
+  the host's `runnerctl` as the one literal argument it was (the fleet commands
+  quote every word they forward for the remote shell).
+- `↑` / `↓` in the prompt bring back what you typed earlier in the session, the
+  usual line editing works, and `Esc` (or an empty line) cancels. `:watch` is
+  refused — you are in it — and so is `:status --json --watch`, a stream that
+  never ends.
+
+`:` is not in the one-line legend under the table, which has no column to spare
+at 80; `?` lists it.
 
 The cursor survives the frame changing under it. A host that stops answering
 keeps its rows, so the cursor stays on the slot it was on (the age line above

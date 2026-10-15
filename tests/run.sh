@@ -9863,9 +9863,11 @@ case_fleet_watch_question_mark_lists_every_key() {
   # lines (GHR-78 added O, GHR-76 Enter and what the pane's own keys are), the
   # header, the summary and the three lines under it
   # GHR-129: `a` joined `b i`'s line, and the marks took the line it had
-  for k in '!' 'b i a' '/' 'space \* u' 's' 'c' 'Enter' 'K R S T P L' 'D W E X U' 'O' 'q \?' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
+  # GHR-86: `:` joined O's line, which keeps the count at 17
+  for k in '!' 'b i a' '/' 'space \* u' 's' 'c' 'Enter' 'K R S T P L' 'D W E X U' 'O :' 'q \?' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
     expect_frame 2 "^  $k   +[a-z]"
   done
+  expect_frame 2 "^  O :   print the run URL of the cursor's job; a prompt for any fleet command\$"
   expect_frame 2 '^  K R S T P L   kill job, restart, stop, start, reap, logs; R S: w = when idle$'
   # GHR-127: the host keys took the line `?` had; `?` folded into q's
   # GHR-128: U joined them, in the same line
@@ -15545,6 +15547,149 @@ t "GHR-129: U over marks upgrades the hosts that have one, skipping the rest"   
 t "GHR-129: a set runs one action per host, and a busy host refuses it whole"        case_ghr129_a_set_runs_one_action_per_host
 t "GHR-129: a long confirm line is cut with a count"                                 case_ghr129_a_long_confirm_line_is_cut_with_a_count
 t "GHR-129: only a slot row is marked"                                               case_ghr129_only_slot_rows_are_marked
+
+# --- GHR-86: the `:` command prompt -------------------------------------------
+# `:` reads a line (the stub's tty_read_line, from RUNNERCTL_STUB_PROMPT_IN) and
+# runs it as a fleet subcommand: a read at once into the pager, anything else
+# after a confirm naming the fully expanded command, in a subshell so a refusal
+# is a notice. The stub's hosts on $FW2 are build-1 and build-2.
+GHR86_REMOTE_MUTATING='^probe:ssh_run [^ ]+ -- (sudo -n )?runnerctl (scale|stop|start|restart|drain|apply|kill|reap|enable|disable|remove-limits|provision|deprovision|env-init) '
+
+# The acceptance case: `:scale 3`, `y` on build-1's row issues `scale 3` to
+# build-1 alone, after a confirm line naming it; its output is paged, its
+# record written, and the table fetched again. From build-2's row it is build-2.
+case_ghr86_scale_on_the_cursors_host_only() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=':yq' RUNNERCTL_STUB_PROMPT_IN='scale 3' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_log_count '^probe:tty_read_line : 0 - scale\\ 3$' 1
+  expect_out_count '^runs: runnerctl fleet scale 3 --host build-1  \[y/n\]$' 1
+  expect_out_count '^running: runnerctl fleet scale 3 --host build-1$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl scale 3$' 1
+  expect_log_count "$GHR86_REMOTE_MUTATING" 1
+  expect_log_count "^probe:ssh_origin build-1 $GHR88_ORIGIN\$" 1
+  expect_log_count '^probe:page$' 1
+  expect_out_count '^ran: runnerctl fleet scale 3 --host build-1$' 1
+  expect_cfg "$WRITES/fleet.log" "^$GHR88_TS $ME fleet scale 3 --host build-1 — build-1=0\$"
+  # the refresh: a third round of table calls after the two of the start
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never' 2
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjj:yq' RUNNERCTL_STUB_PROMPT_IN='scale 3' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^runs: runnerctl fleet scale 3 --host build-2  \[y/n\]$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl scale 3$' 1
+  expect_log_count "$GHR86_REMOTE_MUTATING" 1
+}
+
+# With rows marked the scope is the marked rows' hosts, not the cursor's: a
+# mark on build-2 with the cursor back on build-1 is build-2 alone.
+case_ghr86_marks_are_the_scope() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjj kkk:yq' RUNNERCTL_STUB_PROMPT_IN='scale 3' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^runs: runnerctl fleet scale 3 --host build-2  \[y/n\]$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl scale 3$' 1
+  expect_log_count "$GHR86_REMOTE_MUTATING" 1
+}
+
+# Anything but `y` at the confirm runs nothing.
+case_ghr86_n_at_the_confirm_runs_nothing() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=':nq' RUNNERCTL_STUB_PROMPT_IN='restart' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^runs: runnerctl fleet restart --host build-1  \[y/n\]$' 1
+  expect_out_count '^cancelled — nothing run$' 1
+  expect_no_log "$GHR86_REMOTE_MUTATING"
+  expect_log_count '^probe:page$' 0
+}
+
+# The negative control for the subshell: `:%stop` on a watch of the whole fleet
+# is `fleet stop` with no --host, which the capacity gate refuses. Its `die`
+# becomes the notice, nothing is stopped, and the watch goes on — the next
+# `:scale 3` runs. On a watch narrowed with --host, `%` names each host.
+case_ghr86_a_refused_command_is_a_notice_and_the_watch_goes_on() {
+  local gate="runnerctl: 'fleet stop' across every host would take the whole pool's capacity down at once"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=':yj:yq' RUNNERCTL_STUB_PROMPT_IN=$'%stop\nscale 3' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^runs: runnerctl fleet stop  \[y/n\]$' 1
+  # once as the command printed it, once as the notice under the next frame
+  expect_out_count "^$gate" 2
+  expect_no_log '^probe:ssh_run [^ ]+ -- (sudo -n )?runnerctl stop'
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl scale 3$' 1
+  expect_log_count "$GHR86_REMOTE_MUTATING" 1
+  expect_log_count '^probe:page$' 1
+  expect_log_count '^probe:tty_read_line : 1 %stop scale\\ 3$' 1
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=':nq' RUNNERCTL_STUB_PROMPT_IN='%stop' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never --host build-1 --host build-2
+  expect_rc 0
+  expect_out_count '^runs: runnerctl fleet stop --host build-1 --host build-2  \[y/n\]$' 1
+  expect_no_log "$GHR86_REMOTE_MUTATING"
+}
+
+# `:provision 2` says what `fleet provision` says, before anything is dialled,
+# with no confirm and no pager; so do `:logs` and an unknown word, and `:watch`
+# is refused in words of its own.
+case_ghr86_an_excluded_command_shows_its_refusal() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='::::q' RUNNERCTL_STUB_PROMPT_IN=$'provision 2\nlogs\nfrobnicate\nwatch' \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^runnerctl: fleet provision is not supported: it takes a registration token \(fanning it out copies a credential to every host\) and each host needs its own runner names\. Run .runnerctl provision N. on each host\.$' 1
+  expect_out_count '^runnerctl: fleet logs is not supported: ' 1
+  expect_out_count "^runnerctl: unknown fleet command 'frobnicate' " 1
+  expect_out_count '^:watch — this is fleet watch already; nothing run$' 1
+  expect_no_out '^runs: '
+  expect_no_log "$GHR86_REMOTE_MUTATING"
+  expect_log_count '^probe:page$' 0
+  # nothing but the watch's own two table calls and their --json reads
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl (provision|logs|frobnicate)'
+}
+
+# A read runs at once, on the cursor's host, into the pager under a line naming
+# it; `%` makes it every watched host. The history the next prompt is handed
+# holds what was typed, and an empty line (what Esc gives) cancels.
+case_ghr86_a_read_runs_at_once_into_the_pager() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=':::q' RUNNERCTL_STUB_PROMPT_IN=$'status --stall-after 60\n%status --stall-after 60\n' \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_no_out '^runs: '
+  # status takes no --host: it is run on the scope's hosts, and the line says so
+  expect_out_count '^ran: runnerctl fleet status --stall-after 60 \(on build-1\)$' 1
+  expect_out_count '^ran: runnerctl fleet status --stall-after 60$' 1
+  expect_log_count '^probe:page$' 2
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --stall-after 60$' 2
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --stall-after 60$' 1
+  expect_log_count '^probe:tty_read_line : 0 - status\\ --stall-after\\ 60$' 1
+  expect_log_count '^probe:tty_read_line : 2 %status\\ --stall-after\\ 60 '"''"'$' 1
+  expect_out_count '^cancelled — nothing run$' 1
+  expect_no_log "$GHR86_REMOTE_MUTATING"
+  # a read is never handed --origin: nothing is recorded for it
+  expect_no_log '^probe:ssh_origin '
+}
+
+# A word with shell metacharacters in it reaches the host as ONE literal
+# argument: the stub hands the joined call to a real /bin/sh, as ssh does, and
+# that shell sees the word whole — and runs nothing out of it.
+case_ghr86_a_metacharacter_word_reaches_the_host_literally() {
+  local word="ci;touch>pwned\$(touch>pwned2)"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=':yq' RUNNERCTL_STUB_PROMPT_IN="apply --profile $word" RUNNERCTL_STUB_REMOTE_SH=1 \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^runs: runnerctl fleet apply --profile ci\\;touch\\>pwned\\\$\\\(touch\\>pwned2\\\) --host build-1  \[y/n\]$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl apply --profile ci\\;touch\\>pwned\\\$\\\(touch\\>pwned2\\\)$' 1
+  expect_log_count '^probe:remote_words build-1 <runnerctl><apply><--profile><ci;touch>pwned\$\(touch>pwned2\)>$' 1
+  expect_no_path "$WRITES/remote-sh/pwned"
+  expect_no_path "$WRITES/remote-sh/pwned2"
+  expect_log_count "$GHR86_REMOTE_MUTATING" 1
+}
+
+t "GHR-86: :scale 3, y issues scale 3 to the cursor's host only"                  case_ghr86_scale_on_the_cursors_host_only
+t "GHR-86: with rows marked the scope is their hosts"                            case_ghr86_marks_are_the_scope
+t "GHR-86: anything but y at the confirm runs nothing"                            case_ghr86_n_at_the_confirm_runs_nothing
+t "GHR-86: :%stop is refused by the capacity gate and the watch goes on"          case_ghr86_a_refused_command_is_a_notice_and_the_watch_goes_on
+t "GHR-86: :provision 2 shows the exclusion message, nothing dialled"             case_ghr86_an_excluded_command_shows_its_refusal
+t "GHR-86: a read runs at once into the pager, on the cursor's host or with % all" case_ghr86_a_read_runs_at_once_into_the_pager
+t "GHR-86: a word with shell metacharacters reaches the host as one argument"     case_ghr86_a_metacharacter_word_reaches_the_host_literally
 
 # --- Summary ------------------------------------------------------------------
 echo
