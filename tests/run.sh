@@ -1290,6 +1290,22 @@ case_status_idle_no_jobs_yet_since_active_enter() {
   expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test) '
 }
 
+# GHR-148: the runner runs as a regular user, so journald files the
+# Listener's job lines in user-<uid>.journal. The real journal_job_lines runs
+# over a journalctl that finds them only when the search has no `--system`;
+# with it, every slot read `idle <uptime> (no jobs yet)` — the busy one too.
+case_status_reads_job_lines_from_a_user_journal() {
+  RUNNERCTL_STUB_JOURNAL_USER=1 run status
+  expect_rc 0
+  expect_out '^0 +example\.slot-1 .* my-app:test \(12m\)$'
+  expect_out '^1 +example\.slot-2 .* idle 2h31m \(2 jobs\)$'
+  expect_no_out 'no jobs yet'
+  expect_no_out '^note: '
+  # the real hook's access probe stays on --system and the search does not
+  expect_log_count '^probe:journal_job_lines ' 2
+  expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test) '
+}
+
 case_status_idle_unknown_without_journal() {
   RUNNERCTL_STUB_JOURNAL_ACCESS=0 RUNNERCTL_STUB_CGROUP_READABLE=1 run status
   expect_rc 0
@@ -1764,7 +1780,9 @@ case_journal_job_args_use_grep_not_a_window() {
   expect_out '^-g$'
   expect_out '^Running job: \|completed with result: $'
   expect_out '^_SYSTEMD_INVOCATION_ID=abc123$'
-  expect_out '^--system$'
+  # GHR-148: no --system, or a regular-user runner's user-<uid>.journal is
+  # never opened
+  expect_no_out '^--system$'
   expect_no_out '^-n$'
 }
 
@@ -10053,6 +10071,7 @@ t "journal_running_job: last Running job without a later completion" case_journa
 t "journal_running_job: nothing once the last job completed"         case_journal_running_job_idle_after_completion
 t "status: idle slot shows time since last completion and job count" case_status_idle_time_and_job_count
 t "status: idle with no completion yet is measured from active-enter"  case_status_idle_no_jobs_yet_since_active_enter
+t "status: job lines from a regular-user runner's user journal (GHR-148)"  case_status_reads_job_lines_from_a_user_journal
 t "status: idle ? without journal access, with the hint"              case_status_idle_unknown_without_journal
 t "journal_idle_info: last completion stamp and count"                case_journal_idle_info_last_completion_and_count
 t "journal_idle_info: nothing without a completion"                   case_journal_idle_info_none_completed
@@ -10139,7 +10158,7 @@ t "status --json --watch / watch --json: refused"                      case_stat
 t "json_str: escapes backslash, quote, newline, control chars"         case_json_str_escapes
 
 # --- GHR-26: journal fetch filters with -g ------------------------------------
-t "journal_job_args: -g with the job pattern, invocation scope, no -n"  case_journal_job_args_use_grep_not_a_window
+t "journal_job_args: -g with the job pattern, invocation scope, no -n, no --system"  case_journal_job_args_use_grep_not_a_window
 t "journal_job_args: no invocation id -> no scope argument"             case_journal_job_args_without_invocation_id
 t "journal_job_lines: a -g search with no match is empty success (GHR-65)"  case_journal_job_lines_no_match_is_empty_success
 t "journal_job_lines: no access fails and never searches (GHR-65)"          case_journal_job_lines_no_access_fails_without_searching

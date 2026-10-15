@@ -433,7 +433,7 @@ set -euo pipefail
 # `*([0-9;])` (GHR-27); extglob is what makes that pattern legal.
 shopt -s extglob
 
-RUNNERCTL_VERSION="0.24.0" # x-release-please-version
+RUNNERCTL_VERSION="0.25.0" # x-release-please-version
 
 # --- Defaults (all overridable from the config file) -------------------------
 # The BUILTIN_* copies stay untouched by the config so `migrate` can tell a
@@ -1567,12 +1567,19 @@ unit_props() {
 # INVOCATION-ID when given, so a previous run's job cannot leak in) that
 # mention a job start or end, in `-o short-unix` form: the first field is the
 # epoch second the line was logged. Returns 1 and prints nothing when the
-# journal cannot be read. `--system` is load-bearing for that: without it a
-# user outside systemd-journal gets an EMPTY journal and exit 0 (probed on
-# systemd 261), indistinguishable from an idle slot; with it journalctl says
-# "insufficient permissions" and exits 1. Read-only and called directly, never
+# journal cannot be read — decided by journal_job_lines' `--system` access
+# probe, below, not by the search. Read-only and called directly, never
 # through run_priv — status must never prompt for sudo. A config can shadow
 # this to stub it.
+#
+# The search itself carries no `--system` (GHR-148). journald's default
+# SplitMode=uid files the messages of a unit running as a regular user
+# (uid >= 1000) in user-<uid>.journal, and `--system` opens only the system
+# journal files, so for such a runner a `--system` search saw systemd[1]'s
+# own start/stop lines and never the Listener's job lines: every slot read
+# `idle (no jobs yet)`, busy or not. Measured on such a host: 0 lines with
+# `--system`, 3520 without. A reader with journal access (systemd-journal,
+# root) sees every file without it; `-u` still scopes the search to the unit.
 #
 # The filtering is journalctl's own `-g` (a regex over MESSAGE), not a tail:
 # a `-n` window would be eaten by every other line the Listener writes
@@ -1586,7 +1593,7 @@ JOURNAL_JOB_PATTERN='Running job: |completed with result: '
 # harness can assert on it without a journal (journal_job_lines itself is
 # stubbed under `make sim`).
 journal_job_args() { # UNIT [INVOCATION-ID]
-  printf '%s\n' --system -u "$1" -o short-unix --no-pager -q -g "$JOURNAL_JOB_PATTERN"
+  printf '%s\n' -u "$1" -o short-unix --no-pager -q -g "$JOURNAL_JOB_PATTERN"
   [ -n "${2:-}" ] && printf '%s\n' "_SYSTEMD_INVOCATION_ID=$2"
   return 0
 }
@@ -1594,10 +1601,15 @@ journal_job_args() { # UNIT [INVOCATION-ID]
 # Two calls, because one cannot tell "no access" from "no match" (GHR-65):
 # `journalctl -g` exits 1 when NOTHING MATCHES — measured, as root, on a
 # readable journal — the same status it gives a user outside systemd-journal.
-# So access is asked first with `-n 1` (--system: a plain journalctl answers
-# an unreadable journal with exit 0), which exits 0 on an empty journal too,
-# and the search's own non-zero then means only "no job line yet": success
-# with no output, which job_facts reads as a fresh slot, not a missing journal.
+# So access is asked first with `-n 1`, which exits 0 on an empty journal
+# too, and the search's own non-zero then means only "no job line yet":
+# success with no output, which job_facts reads as a fresh slot, not a
+# missing journal. The probe keeps `--system` and the search does not
+# (GHR-148): without it a user outside systemd-journal gets their OWN user
+# journal and exit 0 (probed on systemd 261), indistinguishable from an idle
+# slot; with it journalctl says "insufficient permissions" and exits 1. A
+# reader the probe admits can read the user-<uid>.journal files the search
+# needs; one it refuses never reaches the search.
 journal_job_lines() { # UNIT [INVOCATION-ID]
   local args=()
   mapfile -t args < <(journal_job_args "$@")
@@ -1672,7 +1684,9 @@ journal_idle_info() { # LINES
 # NRestarts > 0 (one extra journalctl fork per slot, at most), read-only and
 # direct like journal_job_lines — status must never prompt for sudo. Prints
 # nothing when the journal cannot be read or carries neither line. A config
-# can shadow this to stub it.
+# can shadow this to stub it. `--system` stays here, unlike the job-line
+# search (GHR-148): both sentences are systemd[1]'s own, which journald files
+# in the system journal whatever user the unit runs as.
 journal_restart_reason() { # UNIT
   local out lines line
   out="$(journalctl --system -u "$1" -o cat --no-pager -q -n 200 2>/dev/null)" || return 0
