@@ -1332,7 +1332,7 @@ outcomes are deliberately kept apart, because they call for different actions:
 | --- | --- |
 | `unreachable — …` | ssh could not reach the host. Nothing is known about it. |
 | `timed out after Ns` | a read-only call did not answer inside `FLEET_TIMEOUT` (`FLEET_WATCH_TIMEOUT` under `fleet watch`). Nothing is known about it. |
-| `timed out after Ns — the command may still be running on that host; …` | a call that **changes things** ran out of its own, larger budget. This is *not* "nothing is known": only the local ssh was stopped. The host's `drain`, `stop`, `restart`, `apply` or `scale` then **runs to the end on its own** — every slot it was asked for, each still waiting for idle under `--when-idle` — and records how it ended, as `… (caller gone, ran to the end)`; `runnerctl fleet history --host H` reads that record once it is done, and `runnerctl fleet status` shows where it has got to meanwhile. Read one of them before re-running anything. (A host on a runnerctl from before this behaviour stops instead at its next line of output, part-way.) |
+| `timed out after Ns — the command may still be running on that host; …` | a call that **changes things** ran out of its own, larger budget. This is *not* "nothing is known": only the local ssh was stopped. The host's command (`drain`, `stop`, `restart`, `apply`, `scale`, `upgrade`, `compose-reap --apply`, `health --restart-stalled` and the rest — the list is under *What the host does once its caller has gone*) then **runs to the end on its own** — every slot it was asked for, each still waiting for idle under `--when-idle` — and records how it ended, as `… (caller gone, ran to the end)`; `runnerctl fleet history --host H` reads that record once it is done, and `runnerctl fleet status` shows where it has got to meanwhile. Read one of them before re-running anything. (A host on a runnerctl from before this behaviour stops instead at its next line of output, part-way.) |
 | `remote exit N — …` | the host answered fine and its `runnerctl` exited non-zero. On a host with no runner units that is its own perfectly good message, not a fleet fault. |
 | `remote exit 127 — …` | nothing named `runnerctl` on that host's non-interactive ssh `PATH` — see the PATH note above. Set `FLEET_RUNNERCTL`, or install it system-wide. |
 | `remote exit 126 — …` | runnerctl **is** there and the ssh login cannot execute it. Installs from 0.9.0 and 0.10.0 landed `0700`/`0711`; `sudo chmod 755` the path the row names, or re-run the installer (0.10.1 widens it). |
@@ -2198,8 +2198,14 @@ re-running.
 **What the host does once its caller has gone.** The same happens when you
 press Ctrl-C on the central node, quit `fleet watch` with an action still
 running, or lose the network: only the local side ends. The host's `drain`,
-`stop`, `restart`, `apply` and `scale` **finish what they started** rather than
-stopping part-way. Once one of them has begun changing things, a closed
+`start`, `stop`, `restart`, `apply`, `scale`, `upgrade` (and `upgrade
+--rollback`), `deprovision`, `kill`, `reap`, `enable`, `disable`,
+`remove-limits`, `env-init`, `compose-reap --apply` and `health
+--restart-stalled` **finish what they started** rather than stopping
+part-way. `deprovision` does this only once its `y/N` question has been
+answered. `provision`, `install`, `migrate` and `compose-reap-timer` do not: cut off,
+they stop at their next line of output and record `interrupted (SIGPIPE)` or
+`interrupted (SIGHUP)`. Once a command that finishes has begun changing things, a closed
 connection does not end it: its output is passed on while there is someone to
 read it and dropped after that, and a hangup (SIGHUP) is ignored. It goes on
 slot by slot, waiting for idle as it was asked to, and each wait is still

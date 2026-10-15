@@ -481,4 +481,68 @@ grep -q -- "--sha256 'NOT-HEX' is invalid — want 64 lowercase hex characters" 
 [ ! -s "$tmp/u15.i" ] || fail "15i: something was downloaded before the --sha256 was validated: $(cat "$tmp/u15.i")"
 for t in a b c d e f g h i; do no_sudo "$tmp/o15.$t" "15$t"; done
 
+# --- GHR-137: an upgrade whose caller goes finishes what it started ----------
+# The central node's ssh ended (its budget, Ctrl-C, fleet watch's q) is the
+# reader of upgrade's stdout closing part-way. The reader here keeps N lines,
+# closes its end and only then touches CUT; a fake `mv` first on PATH waits
+# (5 s at most) for CUT before its first real rename, so every write after
+# that rename meets a closed reader at a known point — the rename that keeps
+# .prev, for an upgrade, and the one that puts .prev back, for a rollback.
+# Without caller_guard the next line written ends the run there: SIGPIPE, or
+# a failed write under `set -e` where PIPE is ignored (an agent harness) — so
+# .prev is kept and the new file never placed. With it the run places the
+# file, exits 0, cleans up its download (TMPDIR is this case's own, and must
+# be empty afterwards) and records `(caller gone, ran to the end)`.
+mkdir -p "$tmp/cutbin"
+cat >"$tmp/cutbin/mv" <<'EOF'
+#!/bin/sh
+if [ -n "${CUT:-}" ] && [ ! -e "$CUT.armed" ]; then
+  : >"$CUT.armed"
+  w=0
+  while [ ! -e "$CUT" ] && [ "$w" -lt 250 ]; do sleep 0.02; w=$((w + 1)); done
+  if [ -e "$CUT" ]; then echo "cut_seen mv $*" >>"$CUT.log"; else echo "cut_gave_up mv $*" >>"$CUT.log"; fi
+fi
+exec "$REAL_MV" "$@"
+EOF
+chmod +x "$tmp/cutbin/mv"
+real_mv="$(command -v mv)"
+cut16() { # TAG N COMMAND... — rc16; $tmp/o16.TAG what the reader kept, $tmp/e16.TAG stderr
+  local tag="$1" n="$2" cut="$tmp/cut16.$1"
+  shift 2
+  rm -rf "$cut" "$cut.armed" "$cut.log" "$tmp/t16.$tag"; mkdir -p "$tmp/t16.$tag"
+  : >"$tmp/o16.$tag"; : >"$tmp/logger.calls"
+  { c=0
+    PATH="$tmp/cutbin:$PATH" CUT="$cut" REAL_MV="$real_mv" TMPDIR="$tmp/t16.$tag" "$@" 2>"$tmp/e16.$tag" || c=$?
+    echo "$c" >"$tmp/rc16.$tag"; } \
+    | { i=0
+        while [ "$i" -lt "$n" ] && IFS= read -r l; do printf '%s\n' "$l" >>"$tmp/o16.$tag"; i=$((i + 1)); done
+        exec 0<&-
+        : >"$cut"; }
+  rc16="$(cat "$tmp/rc16.$tag")"
+  grep -q '^cut_seen mv ' "$cut.log" 2>/dev/null || fail "16$tag: the cut was never seen at a rename: $(cat "$cut.log" 2>/dev/null)"
+}
+# 16a. cut after `not verified`, `installed` and `available`, at the rename
+#      that keeps .prev
+old_at "$tmp/sys16/runnerctl" 0.0.1
+cut16 a 3 "$tmp/sys16/runnerctl" --config "$cfg" upgrade --prefix "$tmp/sys16"
+[ "$rc16" = 0 ] || fail "16a: an upgrade cut off part-way exited $rc16 — kept: $(cat "$tmp/o16.a"); stderr: $(cat "$tmp/e16.a")"
+grep -q '^available: ' "$tmp/o16.a" || fail "16a: the reader did not get the lines before the cut: $(cat "$tmp/o16.a")"
+cmp -s runnerctl "$tmp/sys16/runnerctl" || fail "16a: an upgrade cut off part-way did not place the new file"
+grep -q '^RUNNERCTL_VERSION="0.0.1"' "$tmp/sys16/runnerctl.prev" || fail "16a: .prev is not the version replaced"
+[ -z "$(ls -A "$tmp/t16.a")" ] || fail "16a: the download was not cleaned up on the way out: $(ls -A "$tmp/t16.a")"
+[ -z "$(find "$tmp/sys16" -name '.*.new.*')" ] || fail "16a: a staged file was left behind: $(find "$tmp/sys16" -name '.*.new.*')"
+[ "$(grep -cE "^-t runnerctl -- upgrade to $ver by [^ ]+ — ok \(caller gone, ran to the end\)\$" "$tmp/logger.calls" || true)" = 1 ] \
+  || fail "16a: want one upgrade record that ran to the end: $(cat "$tmp/logger.calls")"
+[ ! -s "$tmp/e16.a" ] || fail "16a: stderr: $(cat "$tmp/e16.a")"
+# 16b. --rollback, cut after `installed` and `rollback`, at the rename that
+#      puts .prev back: the run still ends with its own proof, and exit 0
+cut16 b 2 "$tmp/sys16/runnerctl" --config "$cfg" upgrade --rollback
+[ "$rc16" = 0 ] || fail "16b: a rollback cut off part-way exited $rc16 — kept: $(cat "$tmp/o16.b"); stderr: $(cat "$tmp/e16.b")"
+grep -q '^RUNNERCTL_VERSION="0.0.1"' "$tmp/sys16/runnerctl" || fail "16b: the rollback did not put .prev back"
+[ ! -e "$tmp/sys16/runnerctl.prev" ] || fail "16b: .prev is still there"
+[ "$(grep -cE "^-t runnerctl -- upgrade \(--rollback\) by [^ ]+ — ok \(caller gone, ran to the end\)\$" "$tmp/logger.calls" || true)" = 1 ] \
+  || fail "16b: want one rollback record that ran to the end: $(cat "$tmp/logger.calls")"
+[ ! -s "$tmp/e16.b" ] || fail "16b: stderr: $(cat "$tmp/e16.b")"
+for t in a b; do no_sudo "$tmp/e16.$t" "16$t"; done
+
 echo "upgrade-test ok"
