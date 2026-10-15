@@ -237,7 +237,7 @@ r7="$(sed -n "s/.*run 'sudo \\([^ ]*\\) upgrade'.*/\\1/p" "$tmp/o7")"
 remedy_runs "$r7" "7"
 grep -q "^retired: $HOME/.local/bin/runnerctl.retired$" "$tmp/o7" || fail "7: shadow not retired: $(cat "$tmp/o7")"
 [ ! -e "$HOME/.local/bin/runnerctl" ] || fail "7: shadow left in place"
-grep -q "^Already up to date\.$" "$tmp/o7" || fail "7: $sys already had these bytes, so this is up to date: $(cat "$tmp/o7")"
+grep -q "^Already up to date\.$" "$tmp/o7" || fail "7: the system copy already had these bytes, so this is up to date: $(cat "$tmp/o7")"
 no_sudo "$tmp/o7" "7"
 chmod 755 "$tmp/ro7"; rm -f "$HOME/.local/bin/runnerctl.retired"
 
@@ -307,7 +307,7 @@ sum() { sha256sum "$1" | awk '{print $1}'; }
 digest_cmd='sha256sum runnerctl > runnerctl.sha256'
 [ "$(grep -cxF "          $digest_cmd" .github/workflows/ci.yml)" = 1 ] \
   || fail "12: the release job no longer writes the digest with '$digest_cmd'"
-grep -qE '^ +gh release upload "\$TAG" runnerctl runnerctl\.sha256 --clobber$' .github/workflows/ci.yml \
+grep -qE "^ +gh release upload \"\\\$TAG\" runnerctl runnerctl\\.sha256 --clobber\$" .github/workflows/ci.yml \
   || fail "12: the release job no longer uploads runnerctl.sha256 beside runnerctl"
 publish() { # DIR — the script and its digest, as the release job publishes them
   mkdir -p "$1"; cp runnerctl "$1/runnerctl"

@@ -16213,6 +16213,40 @@ case_ghr129_U_over_marks_upgrades_the_hosts_that_have_one() {
   expect_out_count '^build-2-oldver: upgraded 0\.0\.1 -> 9\.9\.9, read back 9\.9\.9$' 1
 }
 
+# GHR-151: the marked rows' checks are background reads. Both marked hosts are
+# held (the check alone, GHR-136's knob): the j after U is read while the two
+# checks are out, each host has its own `checking` line, and once released ONE
+# confirm lists both targets' FROM -> TO and y issues exactly one upgrade per
+# target. build-2-oldver and build-3-oldver both answer 0.0.1 -> 9.9.9.
+GHR151_PROMPT='^Upgrade 2 host\(s\) of the marked rows\? runs on build-2-oldver: runnerctl upgrade \(0\.0\.1 -> 9\.9\.9\); on build-3-oldver: runnerctl upgrade \(0\.0\.1 -> 9\.9\.9\) — each host downloads the release and replaces its runnerctl, then its version is read back  \[y/n\]$'
+case_ghr151_marked_checks_do_not_block_the_keys() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD_CHECK="build-2-oldver build-3-oldver" RUNNERCTL_STUB_KEYS=" jjj Uj${REL}yq" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver build-3-oldver" run fleet watch --color never
+  expect_rc 0
+  expect_out '^checking build-2-oldver …$'
+  expect_out '^checking build-3-oldver …$'
+  expect_out_count "$GHR151_PROMPT" 1
+  expect_log_order '^probe:ssh_run build-2-oldver -- runnerctl upgrade --check$' '^probe:act_poll landed=0 held=2$' \
+                   '^probe:tty_read_char 0\.2 j$' '^probe:release$' '^probe:tty_read_char 5 y$' '^probe:ssh_run build-2-oldver -- runnerctl upgrade$'
+  expect_log_count '^probe:ssh_run build-2-oldver -- runnerctl upgrade --check$' 1
+  expect_log_count '^probe:ssh_run build-3-oldver -- runnerctl upgrade --check$' 1
+  expect_log_count '^probe:ssh_run build-2-oldver -- runnerctl upgrade$' 1
+  expect_log_count '^probe:ssh_run build-3-oldver -- runnerctl upgrade$' 1
+  expect_log_count "$GHR128_UPGRADE" 2
+}
+
+# The marks changed before the last check landed (u clears them): no confirm, a
+# notice, and the y after it issues nothing.
+case_ghr151_changed_marks_get_a_notice_not_a_confirm() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD_CHECK="build-2-oldver build-3-oldver" RUNNERCTL_STUB_KEYS=" jjj Uu${REL}yq" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver build-3-oldver" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^the marked rows changed while the upgrade checks were out — nothing is asked and nothing issued$' 1
+  expect_no_out '\[y/n\]'
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl upgrade --check$' 2
+  expect_no_log "$GHR128_UPGRADE"
+}
+
 # One action per host, every host's at once: with both hosts held, the set's
 # two actions are out together (held=2). A set that names a host with an
 # action out is refused whole and issues nothing more.
@@ -16254,6 +16288,8 @@ t "GHR-129: with no marks every key acts on the cursor as before"               
 t "GHR-129: L and O stay on the cursor's row"                                        case_ghr129_L_and_O_stay_on_the_cursor
 t "GHR-129: a host key acts on the hosts of the marked rows, each once"              case_ghr129_a_host_key_acts_on_the_hosts_of_the_marked_rows
 t "GHR-129: U over marks upgrades the hosts that have one, skipping the rest"        case_ghr129_U_over_marks_upgrades_the_hosts_that_have_one
+t "GHR-151: a marked-rows U's checks do not block the keys; one confirm lists every target" case_ghr151_marked_checks_do_not_block_the_keys
+t "GHR-151: changed marks before the last check lands get a notice, and y issues nothing"   case_ghr151_changed_marks_get_a_notice_not_a_confirm
 t "GHR-129: a set runs one action per host, and a busy host refuses it whole"        case_ghr129_a_set_runs_one_action_per_host
 t "GHR-129: a long confirm line is cut with a count"                                 case_ghr129_a_long_confirm_line_is_cut_with_a_count
 t "GHR-129: only a slot row is marked"                                               case_ghr129_only_slot_rows_are_marked

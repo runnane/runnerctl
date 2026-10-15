@@ -11593,25 +11593,6 @@ fleet_watch_upgrade_key() {
   fleet_watch_act_start "$host" "$host" upgrade-check "" "$(fleet_mutate_budget upgrade 1)" upgrade --check || true
 }
 
-# HOST's `upgrade --check`: 0 with FW_UP_FROM / FW_UP_TO when it says an update
-# is available with two X.Y.Z versions; 1 with FW_NOTICE saying why not (each
-# ending `nothing issued`). The marked-rows U (GHR-129) decides on this, in the
-# foreground; the cursor's own U runs the same call as a background read
-# (GHR-136) and parses its answer with the same function.
-fleet_watch_upgrade_check() { # HOST
-  local host="$1" rc=0 budget
-  budget="$(fleet_mutate_budget upgrade 1)"
-  (FLEET_CALL_TIMEOUT="$budget" ssh_run "$host" "$FLEET_RUNNERCTL" upgrade --check) >"$FW_TMP/up" 2>"$FW_TMP/err" || rc=$?
-  relay_file "$FW_TMP/up"
-  relay_file "$FW_TMP/err"
-  if fleet_watch_upgrade_parse "$host" "$rc" "$FW_TMP/up" "$FW_TMP/err" "$budget"; then
-    FW_UP_FROM="$UPC_FROM" FW_UP_TO="$UPC_TO"
-    return 0
-  fi
-  FW_NOTICE="$UPC_NOTICE"
-  return 1
-}
-
 # What an `upgrade --check` answered, whoever ran it: 0 with UPC_FROM / UPC_TO
 # when an update is available with two X.Y.Z versions; 1 with UPC_NOTICE saying
 # why not. Pure: it reads the two files and sets nothing the watch draws.
@@ -11651,6 +11632,11 @@ fleet_watch_upgrade_parse() { # HOST RC UP-FILE ERR-FILE BUDGET
 # text); otherwise the result is a notice and nothing is asked or issued.
 fleet_watch_upgrade_landed() { # INDEX RC DIR
   local i="$1" host="${FLEET_HOSTS[$1]}"
+  # GHR-151: a check the marked-rows U started is one of that set's.
+  if [ -n "${FW_UPS_WAIT[$host]:-}" ]; then
+    fleet_watch_upset_landed "$i" "$2" "$3"
+    return 0
+  fi
   if ! fleet_watch_upgrade_parse "$host" "$2" "$3/out" "$3/err" "${FW_ACT_BUDGET[$i]}"; then
     fleet_watch_act_notice "$UPC_NOTICE"
     return 0
@@ -11945,6 +11931,9 @@ fleet_watch_act_collect() {
       if [ -z "${FW_ACT_DETACHED[$i]}" ]; then
         FW_ACT_PID[i]="" FW_ACT_SHOWN[i]=""
         fleet_watch_upgrade_landed "$i" "$rc" "$d"
+      else
+        # GHR-151: a detached check of a marked set ends that set's confirm.
+        fleet_watch_upset_forget "$i"
       fi
       FW_ACT_PID[i]="" FW_ACT_SHOWN[i]="" FW_ACT_DETACHED[i]=""
       rm -rf "$d"
@@ -12451,27 +12440,89 @@ fleet_watch_run_set_hosts() {
   fleet_watch_set_done
 }
 
-# U over the hosts of the marked rows: each host's `upgrade --check`, and one
-# confirm line for the hosts that have an upgrade; the rest are skipped and said.
+# U over the hosts of the marked rows: each host's `upgrade --check` runs as
+# the background read the cursor's own U uses (GHR-136, GHR-151), all started
+# at once, each holding its host's one action slot, so the table, the keys and
+# the other hosts' progress go on while the hosts download. When the LAST one
+# lands (fleet_watch_upset_landed) one confirm line lists the hosts that have
+# an upgrade with their versions and the rest are skipped and said — and only
+# if the marked hosts are still the ones the checks were started for.
+declare -A FW_UPS_WAIT=() FW_UPS_FROM=() FW_UPS_TO=() FW_UPS_SKIP=()
+FW_UPS_HOSTS=() FW_UPS_PEND=0 FW_UPS_ABANDON=false
 fleet_watch_set_upgrade_key() {
   local host
-  local -a items=() skipped=()
-  FW_NOTICE="" FW_PROMPT="" FW_ACTION="" FW_ACT_SCOPE=upgradeset FW_SET_HOSTS=() FW_SET_FROM=() FW_SET_TO=()
+  FW_NOTICE="" FW_PROMPT="" FW_ACTION="" FW_ACT_SCOPE=slot FW_SET_HOSTS=() FW_SET_FROM=() FW_SET_TO=()
+  if [ "$FW_UPS_PEND" -gt 0 ]; then
+    FW_NOTICE="the upgrade checks of the marked rows are still out; nothing issued"
+    return 0
+  fi
   fleet_watch_set_free || return 0
+  FW_UPS_HOSTS=("${SET_HOSTS[@]}") FW_UPS_FROM=() FW_UPS_TO=() FW_UPS_SKIP=() FW_UPS_WAIT=()
+  FW_UPS_ABANDON=false
+  for host in "${FW_UPS_HOSTS[@]}"; do
+    if fleet_watch_act_start "$host" "$host" upgrade-check "" "$(fleet_mutate_budget upgrade 1)" upgrade --check; then
+      FW_UPS_WAIT[$host]=1
+    else
+      FW_UPS_SKIP[$host]="$host: could not start the upgrade check — nothing issued"
+    fi
+  done
+  FW_UPS_PEND="${#FW_UPS_WAIT[@]}"
+  if [ "$FW_UPS_PEND" -eq 0 ]; then fleet_watch_upset_done; fi
+}
+
+# One of the set's checks has landed: what it said is kept for the confirm.
+fleet_watch_upset_landed() { # INDEX RC DIR
+  local i="$1" host="${FLEET_HOSTS[$1]}"
+  if fleet_watch_upgrade_parse "$host" "$2" "$3/out" "$3/err" "${FW_ACT_BUDGET[$i]}"; then
+    FW_UPS_FROM[$host]="$UPC_FROM" FW_UPS_TO[$host]="$UPC_TO"
+  else
+    FW_UPS_SKIP[$host]="$UPC_NOTICE"
+  fi
+  fleet_watch_upset_one_less "$host"
+}
+# One of the set's checks was detached (Esc): the set is no longer followed, so
+# no confirm rises for it.
+fleet_watch_upset_forget() { # INDEX
+  local host="${FLEET_HOSTS[$1]}"
+  [ -n "${FW_UPS_WAIT[$host]:-}" ] || return 0
+  FW_UPS_ABANDON=true
+  fleet_watch_upset_one_less "$host"
+}
+fleet_watch_upset_one_less() { # HOST
+  unset "FW_UPS_WAIT[$1]"
+  FW_UPS_PEND=$((FW_UPS_PEND - 1))
+  if [ "$FW_UPS_PEND" -le 0 ]; then FW_UPS_PEND=0; fleet_watch_upset_done; fi
+}
+# Every check of the set is in: raise the one confirm, or say why not.
+fleet_watch_upset_done() {
+  local host
+  local -a items=() skipped=()
+  if $FW_UPS_ABANDON; then return 0; fi
+  fleet_watch_marked_hosts
+  if [ "${SET_HOSTS[*]-}" != "${FW_UPS_HOSTS[*]-}" ]; then
+    fleet_watch_act_notice "the marked rows changed while the upgrade checks were out — nothing is asked and nothing issued"
+    return 0
+  fi
+  if [ -n "$FW_PROMPT" ] || [ -n "$FW_MODE" ]; then
+    fleet_watch_act_notice "the upgrade checks of the marked rows landed while something else was up — nothing is asked and nothing issued"
+    return 0
+  fi
+  FW_SET_HOSTS=() FW_SET_FROM=() FW_SET_TO=()
   fleet_priv_cmd
-  for host in "${SET_HOSTS[@]}"; do
-    if ! fleet_watch_upgrade_check "$host"; then
-      skipped+=("$FW_NOTICE") FW_NOTICE=""
+  for host in "${FW_UPS_HOSTS[@]}"; do
+    if [ -z "${FW_UPS_FROM[$host]:-}" ]; then
+      skipped+=("${FW_UPS_SKIP[$host]:-$host: no answer — nothing issued}")
       continue
     fi
-    FW_SET_HOSTS+=("$host") FW_SET_FROM+=("$FW_UP_FROM") FW_SET_TO+=("$FW_UP_TO")
-    items+=("on $host: ${FLEET_PRIV[*]} upgrade ($FW_UP_FROM -> $FW_UP_TO)")
+    FW_SET_HOSTS+=("$host") FW_SET_FROM+=("${FW_UPS_FROM[$host]}") FW_SET_TO+=("${FW_UPS_TO[$host]}")
+    items+=("on $host: ${FLEET_PRIV[*]} upgrade (${FW_UPS_FROM[$host]} -> ${FW_UPS_TO[$host]})")
   done
   if [ "${#FW_SET_HOSTS[@]}" -eq 0 ]; then
     fleet_watch_set_line "no host of the marked rows to upgrade — " "" "${skipped[@]}"
-    FW_NOTICE="$SET_LINE"
+    fleet_watch_act_notice "$SET_LINE"
     return 0
   fi
+  FW_NOTICE="" FW_ACT_SCOPE=upgradeset
   fleet_watch_set_line "Upgrade ${#FW_SET_HOSTS[@]} host(s) of the marked rows? runs " \
     " — each host downloads the release and replaces its runnerctl, then its version is read back  [y/n]" "${items[@]}"
   FW_PROMPT="$SET_LINE"
