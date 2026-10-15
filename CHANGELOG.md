@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.25.0](https://github.com/runnane/runnerctl/compare/v0.24.0...v0.25.0) (2026-10-15)
+
+
+### Features
+
+* fleet watch H shows the cursor's host's recent runnerctl records, or the whole fleet's on a second press (GHR-118) ([#146](https://github.com/runnane/runnerctl/issues/146)) ([2ae71d0](https://github.com/runnane/runnerctl/commit/2ae71d0d7d0715386e1b4cf273e3bd5d98028c06))
+
+
+### Bug Fixes
+
+* fleet watch hands each host its previous CPU sample back, so a tick no longer waits CPU_SAMPLE_MS on every host (GHR-115) ([#144](https://github.com/runnane/runnerctl/issues/144)) ([2182b30](https://github.com/runnane/runnerctl/commit/2182b30417588bc30014bc836c58eda6170370d2))
+
 ## [0.24.0](https://github.com/runnane/runnerctl/compare/v0.23.0...v0.24.0) (2026-10-15)
 
 
