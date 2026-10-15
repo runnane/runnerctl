@@ -4159,6 +4159,50 @@ case_fleet_other_mutating_callers_are_on_the_mutating_budget() {
   expect_out "^build-1: timed out after 900s — the command may still be running on that host; 'runnerctl fleet status --host build-1' shows where it got to\$"
 }
 
+# --- GHR-138: a mutating call cut off by ssh's keepalive ----------------------------
+# ssh's keepalive giving up (GHR-91) exits 255 with "Timeout, server H not
+# responding." For a call that changes things the connection was up and the host
+# may have acted, so the row must not say `unreachable` (nothing is known). A
+# connect failure, and the same words on a read-only call, keep `unreachable`.
+GHR138_LOST="connection lost mid-call — the host may have acted; 'runnerctl fleet status --host build-keepalive' shows where it got to and 'runnerctl fleet history --host build-keepalive' what it recorded — Timeout, server build-keepalive not responding\."
+case_ghr138_fan_out_names_a_keepalive_cut_and_keeps_the_controls() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-keepalive" run fleet restart
+  expect_rc 1
+  expect_out "^build-keepalive: ${GHR138_LOST}\$"
+  expect_no_out 'unreachable'
+  expect_out '^build-1: restart done\.$'
+  expect_out '^fleet restart: 1 host\(s\) ok, 1 failed$'
+  # control: a connect failure on the same mutating command is still unreachable
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-refused" run fleet restart
+  expect_rc 1
+  expect_out '^build-refused: unreachable — ssh: connect to host build-refused port 22: Connection refused$'
+  expect_no_out 'connection lost'
+  # control: the same words on a read-only call are `unreachable`
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-keepalive" run fleet status
+  expect_rc 1
+  expect_out '^build-keepalive +unreachable — Timeout, server build-keepalive not responding\.$'
+  expect_no_out 'connection lost'
+}
+
+# The budget walk (--max-unavailable) and the `fleet watch` action key are the
+# other callers that pass the mutating flag.
+case_ghr138_walk_and_watch_action_name_a_keepalive_cut() {
+  RUNNERCTL_STUB_FLEET_CUT_ONLY=restart RUNNERCTL_STUB_FLEET_SLOTS=2 \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-keepalive" run fleet restart --max-unavailable 1
+  expect_rc 1
+  expect_out_count "^build-keepalive slot [01]: restart FAILED \\(${GHR138_LOST}\\)\$" 2
+  expect_no_out 'unreachable'
+  RUNNERCTL_STUB_FLEET_CUT_ONLY=restart RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Ry-q' \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-keepalive" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^example\\.slot-1 on build-keepalive: restart failed — ${GHR138_LOST}\$" 2
+  # control: a connect failure on the watch action keeps `unreachable`
+  RUNNERCTL_STUB_FLEET_CUT_ONLY=restart RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Ry-q' \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-refused" run fleet watch --color never
+  expect_out 'restart failed — unreachable — ssh: connect to host build-refused port 22: Connection refused'
+  expect_no_out 'connection lost'
+}
+
 # --- GHR-92: a mutating host's lines are shown as they are printed ---------------
 # The remote (stub_fleet_progress) writes line 1, records it, waits until the
 # central node's reader has shown line 1, then writes line 2: so the ORDER in
@@ -10318,6 +10362,8 @@ t "fleet --when-idle: budget is the wait per slot plus the action"     case_flee
 t "fleet <mutating>: the budget arithmetic"                            case_fleet_mutate_budget_arithmetic
 t "fleet budget walk: each slot call is on the mutating budget"        case_fleet_budget_walk_gives_each_slot_the_mutating_budget
 t "fleet watch keys, upgrade, health --restart-stalled: same budget"   case_fleet_other_mutating_callers_are_on_the_mutating_budget
+t "fleet <mutating>: a keepalive cut says the host may have acted (GHR-138)" case_ghr138_fan_out_names_a_keepalive_cut_and_keeps_the_controls
+t "fleet walk and watch action: a keepalive cut says the host may have acted (GHR-138)" case_ghr138_walk_and_watch_action_name_a_keepalive_cut
 t "fleet ssh_run: the real timeout wrapper honours the call's budget"  case_fleet_real_ssh_run_times_out_on_the_budget_of_the_call
 t "fleet <mutating>: a host's lines are shown before it returns (GHR-92)" case_fleet_mutating_streams_a_hosts_lines_before_it_returns
 t "fleet <mutating>: the stream still keeps the files the report reads"  case_fleet_mutating_stream_still_keeps_the_record

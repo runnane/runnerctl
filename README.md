@@ -1333,6 +1333,7 @@ outcomes are deliberately kept apart, because they call for different actions:
 | `unreachable — …` | ssh could not reach the host. Nothing is known about it. |
 | `timed out after Ns` | a read-only call did not answer inside `FLEET_TIMEOUT` (`FLEET_WATCH_TIMEOUT` under `fleet watch`). Nothing is known about it. |
 | `timed out after Ns — the command may still be running on that host; …` | a call that **changes things** ran out of its own, larger budget. This is *not* "nothing is known": only the local ssh was stopped. The host's command (`drain`, `stop`, `restart`, `apply`, `scale`, `upgrade`, `compose-reap --apply`, `health --restart-stalled` and the rest — the list is under *What the host does once its caller has gone*) then **runs to the end on its own** — every slot it was asked for, each still waiting for idle under `--when-idle` — and records how it ended, as `… (caller gone, ran to the end)`; `runnerctl fleet history --host H` reads that record once it is done, and `runnerctl fleet status` shows where it has got to meanwhile. Read one of them before re-running anything. (A host on a runnerctl from before this behaviour stops instead at its next line of output, part-way.) |
+| `connection lost mid-call — the host may have acted; … — Timeout, server H not responding.` | a call that **changes things** was dropped by ssh's keepalive (see *A host that vanishes is dropped in about a minute*) after the connection was up. This is *not* "nothing is known": the host may have started, or finished, the work. `runnerctl fleet status --host H` shows where it got to and `runnerctl fleet history --host H` what it recorded; read one of them before re-running anything. The same ssh words on a read-only call, and any connect failure, stay `unreachable — …`. |
 | `remote exit N — …` | the host answered fine and its `runnerctl` exited non-zero. On a host with no runner units that is its own perfectly good message, not a fleet fault. |
 | `remote exit 127 — …` | nothing named `runnerctl` on that host's non-interactive ssh `PATH` — see the PATH note above. Set `FLEET_RUNNERCTL`, or install it system-wide. |
 | `remote exit 126 — …` | runnerctl **is** there and the ssh login cannot execute it. Installs from 0.9.0 and 0.10.0 landed `0700`/`0711`; `sudo chmod 755` the path the row names, or re-run the installer (0.10.1 widens it). |
@@ -2223,9 +2224,9 @@ so upgrade the fleet before relying on it.
 sends a keepalive (`ServerAliveInterval=15`, `ServerAliveCountMax=4`). A host
 that is powered off or cut off mid-call is reported `unreachable` after about
 a minute rather than holding its place for the whole budget, while a slow but
-live host keeps answering and is waited for. For a mutating call, that
-`unreachable` means only that the connection is gone; the host may have done
-part of the work. ssh keeps the *first* value it is given for an option, and
+live host keeps answering and is waited for. For a mutating call the row
+says `connection lost mid-call` instead, because the connection is gone and
+the host may have done part of the work. ssh keeps the *first* value it is given for an option, and
 runnerctl puts the keepalive after `FLEET_SSH_OPTS`, so setting
 `-o ServerAliveInterval=…` there changes it. `BatchMode` and `ConnectTimeout`
 come before it and cannot be changed that way.
