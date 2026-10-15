@@ -490,8 +490,10 @@ case_status_envfile_value_with_embedded_equals() {
   run status
   expect_rc 0
   # unit_props's slot-2 EnvironmentFiles value itself contains '=' — the
-  # ENVFILE column must carry the whole value, not just the part before it.
-  expect_out '^1 +example\.slot-2 .*/etc/x \(ignore_errors=no\) +idle 2h31m \(2 jobs\)$'
+  # ENVFILE column must carry the whole path, not just the part before it,
+  # and (GHR-157) the path alone: systemd's ` (ignore_errors=no)` is gone.
+  expect_out '^1 +example\.slot-2 .*/etc/x +idle 2h31m \(2 jobs\)$'
+  expect_no_out 'ignore_errors'
 }
 
 case_apply_ci() {
@@ -889,6 +891,32 @@ case_status_job_runtime_in_working_on() {
 }
 
 case_fmt_dur_seconds()       { run_fn fmt_dur 5;      expect_rc 0; expect_out '^5s$'; }
+# GHR-157: `systemctl show -p EnvironmentFiles` renders each file as
+# `<path> (ignore_errors=no|yes)`; the cell carries the path(s) alone, and a
+# `-`-prefixed optional file keeps its prefix (the suffix is systemd's
+# rendering of it).
+case_env_file_paths_strips_the_ignore_errors_suffix() {
+  run_fn env_file_paths '/etc/x (ignore_errors=no)'; expect_rc 0; expect_out '^/etc/x$'
+  run_fn env_file_paths '/etc/x (ignore_errors=no) -/etc/opt.env (ignore_errors=yes)'; expect_rc 0; expect_out '^/etc/x -/etc/opt\.env$'
+  run_fn env_file_paths ''; expect_rc 0; expect_out '^$'
+}
+# narrow_wanted's two directions, with the measured width in force: narrow
+# at 150 wide on a 140-column terminal; once narrow (width 100, gave back
+# 50), 150 columns is NOT enough — the wide table would be 150 and the slack
+# is 4 — and 154 is. Before the measurement the fallback (22) stands in.
+case_narrow_wanted_uses_the_measured_width() {
+  run_fn narrow_wanted false 150 140; expect_rc 0
+  run_fn narrow_wanted false 140 140; expect_rc 1
+  run_fn eval 'STATUS_NARROW_GAVE=50; narrow_wanted true 100 150'; expect_rc 0
+  run_fn eval 'STATUS_NARROW_GAVE=50; narrow_wanted true 100 153'; expect_rc 0
+  run_fn eval 'STATUS_NARROW_GAVE=50; narrow_wanted true 100 154'; expect_rc 1
+  run_fn eval 'narrow_wanted true 100 125'; expect_rc 0
+  run_fn eval 'narrow_wanted true 100 126'; expect_rc 1
+  # shellcheck disable=SC2016  # the child expands $STATUS_NARROW_GAVE, not this shell
+  run_fn eval 'narrow_gave 150 100; echo "$STATUS_NARROW_GAVE"'; expect_rc 0; expect_out '^50$'
+  # shellcheck disable=SC2016
+  run_fn eval 'narrow_gave 100 100; echo "[$STATUS_NARROW_GAVE]"'; expect_rc 0; expect_out '^\[\]$'
+}
 case_fmt_dur_zero()          { run_fn fmt_dur 0;      expect_rc 0; expect_out '^0s$'; }
 case_fmt_dur_minutes()       { run_fn fmt_dur 2460;   expect_rc 0; expect_out '^41m$'; }
 case_fmt_dur_hours_minutes() { run_fn fmt_dur 11520;  expect_rc 0; expect_out '^3h12m$'; }
@@ -1617,7 +1645,7 @@ case_status_json_parses_and_carries_the_slot_facts() {
   expect_json 'isinstance(d["slots"][1]["idle_since"], int) and d["slots"][1]["idle_since"] == 999991660'
   expect_json 'd["slots"][1]["jobs_completed"] == 2'
   expect_json 'd["slots"][1]["restarts"] == 3 and d["slots"][1]["last_restart_reason"] == "oom-kill"'
-  expect_json 'd["slots"][1]["env_file"] == "/etc/x (ignore_errors=no)"'
+  expect_json 'd["slots"][1]["env_file"] == "/etc/x"'
   expect_json 'd["slots"][1]["memory_peak"] is None'
   # slot-3: stopped — infinity / [not set] become null, since from the inactive-enter stamp.
   expect_json 'd["slots"][2]["active"] == "inactive" and d["slots"][2]["sub"] == "dead" and d["slots"][2]["enabled"] == "disabled"'
@@ -2303,14 +2331,14 @@ case_watch_narrow_terminal_drops_max_high_envfile() {
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 RUNNERCTL_STUB_KEYS='q' run watch
   expect_rc 0
   expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +CPU +RESTART +ENVFILE +WORKING-ON$'
-  expect_out '^1 +example\.slot-2 .* /etc/x \(ignore_errors=no\) idle 2h31m \(2 jobs\)$'
+  expect_out '^1 +example\.slot-2 .* /etc/x +idle 2h31m \(2 jobs\)$'
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='q' run watch
   expect_rc 0
   expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +CPU +RESTART +ENVFILE +WORKING-ON$'
   RUNNERCTL_STUB_COLS=80 run status
   expect_rc 0
   expect_out '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +MAX +HIGH +USED +PRESS +CPU +RESTART +ENVFILE +WORKING-ON$'
-  expect_out '^1 +example\.slot-2 .* /etc/x \(ignore_errors=no\) idle 2h31m \(2 jobs\)$'
+  expect_out '^1 +example\.slot-2 .* /etc/x +idle 2h31m \(2 jobs\)$'
 }
 
 # --color always: the cursor's reverse video is re-applied after every
@@ -4941,15 +4969,14 @@ case_fleet_status_narrow_is_forwarded_and_arrives() {
 
 # `fleet watch` measures the ASSEMBLED frame — HOST column included — and asks
 # the remotes for the narrow table on the NEXT tick. 180 columns is between
-# the two widths (narrow ~164 with HOST, full ~204), and less than the narrow
-# width plus the 22-column margin: so the table narrows once and then STAYS
-# narrow, where a watch without the hysteresis would put the columns back on
-# the next tick and flip on every one after it.
+# the two widths (narrow 164 with HOST, full 192), so the table narrows once
+# and then STAYS narrow, where a watch without the hysteresis would put the
+# columns back on the next tick and flip on every one after it.
 # The LOCAL watch's hysteresis, on its own path through narrow_wanted (the
 # fleet case above cannot see it). 170 columns is between the local table's
-# widths (narrow 156, full 196) and under narrow + the 22-column margin, so
-# once narrowed the table holds; a watch without the margin widens on the
-# next frame and flips on every one after it. 300 then puts the columns back.
+# widths (narrow 156, full 184), so once narrowed the table holds; a watch
+# without the hysteresis widens on the next frame and flips on every one
+# after it. 300 then puts the columns back.
 case_watch_narrow_holds_inside_the_margin() {
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=170 run watch --iterations 4 --color never
   expect_rc 0
@@ -4961,6 +4988,51 @@ case_watch_narrow_holds_inside_the_margin() {
   expect_out_count "^$HDR_FULL" 1
 }
 
+# GHR-157: the hysteresis is MEASURED, not the constant 22 it used to be. A
+# 21-character EnvironmentFile path widens the ENVFILE column, so narrowing
+# gives back 42 columns here (full 198, narrow 156), and 185 is a terminal
+# the wide table overflows while the narrow one fits with more than 22 to
+# spare: the constant margin widened it on the next frame, the wide frame
+# overflowed again, and the table flipped on every tick. Measured, it holds.
+# 210 — more than the measured width plus the slack — then widens it.
+case_watch_narrow_holds_when_the_dropped_columns_are_wide() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_ENV_PATH=/etc/runnerctl/ci.env RUNNERCTL_STUB_COLS=185 \
+    run watch --iterations 4 --color never
+  expect_rc 0
+  expect_out_count "^$HDR_NARROW" 4
+  expect_no_out "^$HDR_FULL"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_ENV_PATH=/etc/runnerctl/ci.env RUNNERCTL_STUB_COLS=185,185,210 \
+    run watch --iterations 3 --color never
+  expect_rc 0
+  expect_out_count "^$HDR_NARROW" 2
+  expect_out_count "^$HDR_FULL" 1
+  expect_out_count '^1 +example\.slot-2 .* +always +/etc/runnerctl/ci\.env +idle 2h31m \(2 jobs\)$' 1
+}
+
+# The same band for `fleet watch`, whose measurement spans two ticks (the
+# last wide frame against the first narrow one): full 206, narrow 164 with
+# HOST, 195 in between and more than 22 past the narrow width.
+case_fleet_watch_narrow_holds_when_the_dropped_columns_are_wide() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    RUNNERCTL_STUB_ENV_PATH=/etc/runnerctl/ci.env RUNNERCTL_STUB_COLS=195 \
+    run fleet watch --iterations 5 --color never
+  expect_rc 0
+  expect_out_count "$FRAME_PREFIX" 5
+  # frame 1 is full-width (nothing measured yet), frames 2-5 narrow and STAY so
+  expect_out_count "^HOST +$HDR_FULL" 1
+  expect_out_count "^HOST +$HDR_NARROW" 4
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --narrow --with-json$' 4
+  # and a terminal the wide table fits puts the columns back — on the tick
+  # after the decision, since the remotes are asked for the wide table then
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
+    RUNNERCTL_STUB_ENV_PATH=/etc/runnerctl/ci.env RUNNERCTL_STUB_COLS=195,195,195,220 \
+    run fleet watch --iterations 5 --color never
+  expect_rc 0
+  expect_out_count "^HOST +$HDR_FULL" 2
+  expect_out_count "^HOST +$HDR_NARROW" 3
+}
+
 case_fleet_watch_narrows_on_the_next_tick_and_holds() {
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_COLS=180 \
     run fleet watch --iterations 4 --color never
@@ -4970,7 +5042,7 @@ case_fleet_watch_narrows_on_the_next_tick_and_holds() {
   expect_out_count "^HOST +$HDR_FULL" 1
   expect_out_count "^HOST +$HDR_NARROW" 3
   expect_out_count '^build-1 +1 +example\.slot-2 .* +always +idle 2h31m \(2 jobs\)$' 3
-  expect_out_count '^build-1 +1 +example\.slot-2 .* /etc/x \(ignore_errors=no\) idle 2h31m \(2 jobs\)$' 1
+  expect_out_count '^build-1 +1 +example\.slot-2 .* /etc/x +idle 2h31m \(2 jobs\)$' 1
   expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 1
   expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --narrow --with-json$' 3
   expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --narrow --with-json$' 3
@@ -5024,7 +5096,7 @@ case_fleet_narrow_an_old_host_renders_full_width_not_an_error() {
     run fleet watch --narrow --iterations 3 --color never
   expect_rc 0
   expect_no_out 'unknown option'
-  expect_out_count '^gw-oldver +1 +example\.slot-2 .* /etc/x \(ignore_errors=no\) idle 2h31m \(2 jobs\)$' 3
+  expect_out_count '^gw-oldver +1 +example\.slot-2 .* /etc/x +idle 2h31m \(2 jobs\)$' 3
   expect_out_count '^build-1 +1 +example\.slot-2 .* +always +idle 2h31m \(2 jobs\)$' 3
   expect_out_count "^HOST +$HDR_NARROW" 3
   expect_out_count "^HOST +$HDR_FULL" 3
@@ -10157,6 +10229,8 @@ case_fleet_watch_a_view_is_fitted_and_paged_like_any_frame() {
 t "status: header and one row per discovered slot"                case_status_table
 t "status: one unit_props call per slot, not one per column"        case_status_one_unit_props_call_per_slot
 t "status: EnvironmentFiles value with embedded '=' survives"       case_status_envfile_value_with_embedded_equals
+t "env_file_paths: the path(s) alone, ignore_errors suffix gone"    case_env_file_paths_strips_the_ignore_errors_suffix
+t "narrow_wanted: widens on the measured width, not a constant"      case_narrow_wanted_uses_the_measured_width
 t "apply: ci drop-in on every slot, then one daemon-reload"        case_apply_ci
 t "apply --restart with flag overrides: restart after reload"      case_apply_restart_flags
 t "apply --profile deploy: refuses without the env file"           case_apply_deploy_refuses_without_env_file
@@ -10498,6 +10572,8 @@ t "fleet watch: bad options die before anything is dialled"            case_flee
 t "status --narrow: drops MAX/HIGH/CPU/ENVFILE; refused with --json"  case_status_narrow_drops_max_high_envfile
 t "fleet status --narrow: forwarded, and the narrow table arrives"     case_fleet_status_narrow_is_forwarded_and_arrives
 t "watch: once narrowed, holds until the margin fits"                  case_watch_narrow_holds_inside_the_margin
+t "watch: holds narrow when the dropped columns are wider than 22"     case_watch_narrow_holds_when_the_dropped_columns_are_wide
+t "fleet watch: holds narrow when the dropped columns are wider than 22" case_fleet_watch_narrow_holds_when_the_dropped_columns_are_wide
 t "fleet watch: a too-wide frame narrows next tick and stays narrow"   case_fleet_watch_narrows_on_the_next_tick_and_holds
 t "fleet watch: widens again with room to spare; --narrow pins it"    case_fleet_watch_widens_again_and_narrow_pins_it
 t "fleet --narrow: a host too old for it renders full-width, no error" case_fleet_narrow_an_old_host_renders_full_width_not_an_error
@@ -10783,23 +10859,25 @@ case_run_facts_wide_cell_only_where_it_fits() {
     RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run status
   expect_text "a long ref" 'my-app:CI / test @feature/a-branch-name-that-goes-on-for-… (12m)' "$(slot1_cell)"
   # watch reads the width per frame. At 150 the table is narrow and the cell
-  # short. 178 is where this table gets MAX, HIGH and ENVFILE back with or
-  # without a run named (slot-2's row is 156 wide when narrow, plus the
-  # margin of 22) — and there it is the full table AND the long cell.
+  # short. 188 is where this table gets MAX, HIGH and ENVFILE back with or
+  # without a run named (slot-2's row is 156 wide when narrow and 184 wide
+  # when full, so narrowing gave back 28, plus the slack of 4 — GHR-157: it
+  # used to be 178, narrow plus a constant 22, which is a terminal the full
+  # table overflows) — and there it is the full table AND the long cell.
   local narrow='^0 +example\.slot-1 +— +active/running +3d 4h +enabled +1\.0G/25\.0G +— +always +' full='^0 +example\.slot-1 +— +active/running +3d 4h +enabled +26\.0G +22\.0G +1\.0G/25\.0G +— +— +always +— +'
-  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=150,178 run watch --iterations 2 --color never
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=150,188 run watch --iterations 2 --color never
   expect_rc 0
   expect_out_count "${narrow}my-app:test \\(12m\\)\$" 1
   expect_out_count "${full}my-app:CI / test @main \\(12m\\)\$" 1
-  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=150,178 run watch --iterations 2 --color never
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=150,188 run watch --iterations 2 --color never
   expect_out_count "${narrow}my-app:test \\(12m\\)\$" 1
   expect_out_count "${full}my-app:test \\(12m\\)\$" 1
   # The long cell is measured against the FULL table, so it is never what
   # keeps those columns away: a 50-character one would fit beside the narrow
-  # table at 178 (56 to spare) and, drawn there, hold the table narrow for
-  # good. It does not fit beside the full one (28), so the cell is the short
+  # table at 188 (66 to spare) and, drawn there, hold the table narrow for
+  # good. It does not fit beside the full one (38), so the cell is the short
   # one and the columns are back.
-  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_REF_NAME='release/2026-10-candidate1' RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=150,178 \
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_REF_NAME='release/2026-10-candidate1' RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=150,188 \
     run watch --iterations 2 --color never
   expect_out_count "${full}my-app:test \\(12m\\)\$" 1
   expect_no_out 'candidate1'
@@ -13222,7 +13300,7 @@ case_ghr79_status_cpu_column_from_two_samples() {
   expect_rc 0
   expect_out "^$HDR_FULL"
   expect_out "${GHR79_ROW1}3\\.2 +always +— +my-app:test \\(12m\\)\$"
-  expect_out '^1 +example\.slot-2 .* +1\.0G +— +1\.5 +always +/etc/x \(ignore_errors=no\) +idle 2h31m \(2 jobs\)$'
+  expect_out '^1 +example\.slot-2 .* +1\.0G +— +1\.5 +always +/etc/x +idle 2h31m \(2 jobs\)$'
   # slot-3 has no cgroup: never read, and `—`
   expect_out "$GHR79_ROW3"
   expect_log_count '^probe:cpu_window_wait 250$' 1
