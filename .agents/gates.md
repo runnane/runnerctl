@@ -566,6 +566,17 @@ Traps:
   local `compose-reap-timer status` (not `--brief`) runs `systemctl
   list-timers`, which IS `direct:` — the older cases only pass because a later
   `run` in the same case resets the log.
+- **A fleet table call is `status … --with-json` (GHR-90)**, the flag LAST on
+  the line, and the summary's payload comes back in the same answer — so a
+  host that takes the flag is never asked `status --json` by `fleet status`
+  or a watch tick; a `status --json$` line in a watch log is an action key's
+  read or the capacity floor's. The stub answers the flag with the real
+  `render_status` under `STATUS_WITH_JSON`. `RUNNERCTL_STUB_FLEET_NOWITHJSON=
+  "host…"` is a host from before it (refuses it as an unknown option, so it
+  takes the old two-call path); `RUNNERCTL_STUB_FLEET_FLIP="host…"` flips that
+  host's slot-1 to `inactive` on every second collection (counted in
+  `remote/<host>.flip`), which is what tells one collection from two: a table
+  and a payload from one collection agree on slot-1, two never do.
 
 ## migrate-test
 

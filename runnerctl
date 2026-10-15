@@ -33,7 +33,7 @@
 #   runnerctl deprovision <unit|slot-index|name>... [--token TOK | --pat TOK] \
 #                         [--url URL] [--local-only] [--when-idle] [--timeout N] \
 #                         [--yes] [--dry-run]
-#   runnerctl status [--json] [--watch|-w] [--interval N] [--once] \
+#   runnerctl status [--json | --with-json] [--watch|-w] [--interval N] [--once] \
 #                    [--color auto|always|never] [--stall-after N] [--narrow]
 #   runnerctl watch  [--interval N] [--color auto|always|never] [--stall-after N] \
 #                    [--narrow]
@@ -199,6 +199,10 @@
 # value has to be — they come from a job's environment, so a number is digits
 # or null, and the WORKING-ON cell draws none of it with a control character
 # left in.
+# `status --with-json` (GHR-90) is a machine form for `fleet`: the table, a
+# separator line starting with the byte 0x1e, then the `status --json` object,
+# all from one collection, so a reader gets both views of the same moment for
+# the cost of one. It refuses --json and --watch.
 # An idle slot whose cgroup still holds processes that are not the runner's
 # own — a dev server or watcher a finished job left behind — shows `+N
 # leaked` in WORKING-ON, `leaked_procs` in --json and a `health` problem;
@@ -245,7 +249,9 @@
 # so under the table. A summary line (GHR-72) totals it: hosts answering,
 # slots by state, leaks, disk and event hosts, free capacity, versions — the
 # last line of `fleet status`, under the header in `fleet watch`, counted
-# from a second `status --json` call to each host that answered.
+# from the `status --json` object each host sends after its table in the same
+# answer (`status --with-json`, GHR-90); a host too old for that flag is asked
+# a second time, for `status --json` alone.
 # `fleet watch` (GHR-54) is that same table in a redraw loop, and the reason
 # it is a command of its own rather than `watch runnerctl fleet status` is the
 # ssh cost. A fan-out pays a TCP connect, a key exchange and an auth PER HOST
@@ -3442,16 +3448,37 @@ collect_slot() { # UNIT IDX
   SLOT[job_sha]="$JOB_SHA" SLOT[job_actor]="$JOB_ACTOR" SLOT[job_event]="$JOB_EVENT" SLOT[job_url]="$JOB_URL"
 }
 
+# GHR-90: `status --with-json` — the table, then a line that is
+# STATUS_JSON_SEP, then the `status --json` object, both formatted from the
+# SAME collection: one collect_slot per slot, one collect_host. It is the
+# form `fleet status` and `fleet watch` ask every host for, so their summary
+# line (which counts from the JSON, never from the painted table) costs no
+# second call and describes the same moment as the rows beside it.
+#
+# The separator starts with an ASCII record separator (0x1e). Nothing in a
+# table line can begin with it: every line the table draws starts with
+# printable text or with an SGR sequence (ESC), and text a job or a process
+# supplied is drawn through term_safe / relay_safe, which never pass a raw
+# control byte. The rest of the line is only there for a human reading the
+# raw answer; a reader matches the leading byte alone (fleet_with_json_split).
+STATUS_WITH_JSON=false
+STATUS_JSON_SEP=$'\x1e''runnerctl status --json follows'
+
 # The status table itself, printed once to stdout. `status` calls it once;
 # `watch` (GHR-3, below cmd_logs) captures it per tick and redraws it in place.
+# With STATUS_WITH_JSON the JSON object follows it (above).
 render_status() {
   require_runners
+  local cores="" mem_total="" mem_avail="" jhead="" jbody="" jsep=""
+  # In render_status_json's order: host_facts, then collect_host.
+  ! $STATUS_WITH_JSON || read -r cores mem_total mem_avail < <(host_facts) || true
   # The version leads the header (GHR-32): `upgrade` fetches main, so what a
   # host actually runs is otherwise only visible through a second command.
   # Disks and journal events (GHR-64) ride on this same line rather than a
   # new one: `fleet status` and `fleet watch` read the column header as the
   # third line of a host's output, and a host's table must not move it.
   collect_host
+  ! $STATUS_WITH_JSON || jhead="$(status_json_head "$cores" "$mem_total" "$mem_avail")"
   echo "runnerctl $RUNNERCTL_VERSION — Host: $(host_line)$(host_header_suffix)"
   echo
   paint "$C_BOLD" "$(status_row IDX RUNNER PROFILE ACTIVE SINCE ENABLED MAX HIGH USED PRESS CPU RESTART ENVFILE WORKING-ON)"
@@ -3475,6 +3502,10 @@ render_status() {
   while read -r u; do
     [ -n "$u" ] || continue
     collect_slot "$u" "$i"
+    if $STATUS_WITH_JSON; then
+      jbody+="$(status_json_slot "$jsep" "$i" "$u")"
+      jsep=","
+    fi
     # `idle ?` is the /proc-only reader's idle: it knows the slot is idle but
     # not for how long, which is the same missing journal access.
     case "${SLOT[job_state]}" in no-access|idle-unknown) no_access=true ;; esac
@@ -3552,6 +3583,9 @@ render_status() {
   fi
   if $leaked; then
     paint "$C_YELLOW" "note: +N leaked = processes a finished job left in the slot's cgroup, counting against MemoryMax; 'runnerctl reap <IDX>' kills them"
+  fi
+  if $STATUS_WITH_JSON; then
+    printf '%s\n%s%s\n]}\n' "$STATUS_JSON_SEP" "$jhead" "$jbody"
   fi
 }
 
@@ -3990,16 +4024,37 @@ render_status_json() {
   # able from an ssh failure — two very different things to be paged about.
   # The table path keeps dying, because an operator who typed `status` on the
   # wrong box should be told so.
-  local cores mem_total mem_avail i=0 u sep="" job idle_since completed
+  local cores mem_total mem_avail i=0 u sep=""
   read -r cores mem_total mem_avail < <(host_facts) || true
   collect_host
-  printf '{"runnerctl":%s,"host":{"name":%s,"cores":%s,"mem_total":%s,"mem_available":%s,"load":%s,"disks":%s,"events":%s,"sudo_contract":%s},\n "slots":[' \
-    "$(json_str "$RUNNERCTL_VERSION")" "$(json_strn "$(host_name)")" \
-    "$(json_num "$cores")" "$(json_num "$mem_total")" "$(json_num "$mem_avail")" \
-    "$(host_load_json)" "$(host_disks_json)" "$(host_events_json)" "$(json_strn "$(host_sudo_contract)")"
+  status_json_head "$cores" "$mem_total" "$mem_avail"
   while read -r u; do
     [ -n "$u" ] || continue
     collect_slot "$u" "$i"
+    status_json_slot "$sep" "$i" "$u"
+    sep=","
+    i=$((i+1))
+  done < <(discover)
+  printf '\n]}\n'
+}
+
+# The object's opening, up to and including `"slots":[` with no newline after
+# it: host_facts' three numbers (CORES MEM-TOTAL MEM-AVAIL) and collect_host's
+# globals, which the caller has already filled.
+status_json_head() { # CORES MEM-TOTAL MEM-AVAIL
+  printf '{"runnerctl":%s,"host":{"name":%s,"cores":%s,"mem_total":%s,"mem_available":%s,"load":%s,"disks":%s,"events":%s,"sudo_contract":%s},\n "slots":[' \
+    "$(json_str "$RUNNERCTL_VERSION")" "$(json_strn "$(host_name)")" \
+    "$(json_num "$1")" "$(json_num "$2")" "$(json_num "$3")" \
+    "$(host_load_json)" "$(host_disks_json)" "$(host_events_json)" "$(json_strn "$(host_sudo_contract)")"
+}
+
+# One slot of the object, from SLOT as collect_slot left it (GHR-90: split out
+# so `status --with-json` formats the slots its table collected): SEP — `,`
+# for every slot but the first — a newline, then the slot on a line of its
+# own with no newline after it. One slot per line is what every reader of the
+# payload relies on (json_line_get).
+status_json_slot() { # SEP IDX UNIT
+  local i="$2" u="$3" job idle_since completed
     case "${SLOT[job_state]}" in
       running|starting)
         # GHR-78: the run's keys are APPENDED, after `stalled`. The slot line
@@ -4019,7 +4074,7 @@ render_status_json() {
       *)               idle_since=null; completed=null ;;
     esac
     printf '%s\n  {"idx":%s,"unit":%s,"name":%s,"active":%s,"sub":%s,"enabled":%s' \
-      "$sep" "$i" "$(json_str "$u")" "$(json_str "${SLOT[name]}")" \
+      "$1" "$i" "$(json_str "$u")" "$(json_str "${SLOT[name]}")" \
       "$(json_strn "${SLOT[active]}")" "$(json_strn "${SLOT[sub]}")" "$(json_strn "${SLOT[enabled]}")"
     printf ',"memory_max":%s,"memory_high":%s,"memory_current":%s,"memory_peak":%s' \
       "$(json_bytes "${SLOT[memory_max]}")" "$(json_bytes "${SLOT[memory_high]}")" \
@@ -4054,10 +4109,6 @@ render_status_json() {
     else
       printf ',"memory_pressure":null}'
     fi
-    sep=","
-    i=$((i+1))
-  done < <(discover)
-  printf '\n]}\n'
 }
 
 cmd_apply() {
@@ -4306,8 +4357,8 @@ cmd_logs() {
 # (GHR-16) prints the same facts as one JSON object instead of the table; it
 # is a one-shot format, so it refuses --watch rather than streaming frames.
 # --color and --stall-after (GHR-27) are parsed here for both shapes.
-cmd_status() { # [--json] [--watch|-w] [--once] [--interval N] [--color WHEN] [--stall-after N] [--narrow]
-  local watch=false json=false narrow=false args=()
+cmd_status() { # [--json | --with-json] [--watch|-w] [--once] [--interval N] [--color WHEN] [--stall-after N] [--narrow]
+  local watch=false json=false narrow=false with_json=false args=()
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     view_opt "$@"
@@ -4317,14 +4368,18 @@ cmd_status() { # [--json] [--watch|-w] [--once] [--interval N] [--color WHEN] [-
       --once)     watch=false; shift ;;
       --json)     json=true; shift ;;
       --narrow)   narrow=true; shift ;;
+      # GHR-90: the table AND the JSON from one collection (render_status).
+      --with-json) with_json=true; shift ;;
       *)          args+=("$1"); shift ;;
     esac
   done
   # --narrow is a table shape; JSON has no columns to drop, and accepting it
   # there would be a flag that silently does nothing.
   ! { $json && $narrow; } || die "--narrow cannot be combined with --json; the JSON object has no columns to drop"
+  ! { $json && $with_json; } || die "--with-json cannot be combined with --json; --with-json prints the table and then the same object"
   if $watch; then
     ! $json || die "--json cannot be combined with --watch; poll 'runnerctl status --json' instead"
+    ! $with_json || die "--with-json cannot be combined with --watch; it is a one-shot form for a program reading both"
     ! $narrow || args+=(--narrow)
     cmd_watch ${args[@]+"${args[@]}"}
   else
@@ -4336,6 +4391,7 @@ cmd_status() { # [--json] [--watch|-w] [--once] [--interval N] [--color WHEN] [-
       color_setup "$COLOR_MODE"
       # GHR-78: only a table going to a terminal may use its width.
       if stdout_is_tty; then STATUS_COLS="$(term_cols)"; fi
+      STATUS_WITH_JSON="$with_json"
       render_status
     fi
   fi
@@ -6776,18 +6832,21 @@ fleet_cleanup() {
 # indexed by position in FLEET_HOSTS so the render order is the config order
 # rather than whichever host answered first.
 #
-# Version skew (GHR-56). FLEET_OPTIONAL_ARG names ONE flag the caller would
-# like every host to take but can do without — `status --narrow` — and a host
-# older than that flag rejects it the way every runnerctl rejects an unknown
-# option: `runnerctl: unknown option: <flag>` on stderr, exit 1. Such a host
-# is asked again WITHOUT the flag in the same fan-out, so it shows its
-# full-width table rather than a `remote exit 1` row, and it is remembered in
-# FLEET_OPTIONAL_REJECTED so a watch does not pay that second round trip on
-# every tick. Detected by the refusal itself rather than by a minimum
-# version: release-please assigns a change its version AFTER it merges, so a
-# number written here would be a guess, and a probe would cost a round trip
-# per host before the first frame.
-FLEET_OPTIONAL_ARG=""
+# Version skew (GHR-56). FLEET_OPTIONAL_ARGS names the flags the caller would
+# like every host to take but can do without — `status --narrow`, and since
+# GHR-90 `status --with-json` — blank-separated, and a host older than one
+# rejects it the way every runnerctl rejects an unknown option: `runnerctl:
+# unknown option: <flag>` on stderr, exit 1. Such a host is asked again
+# WITHOUT that flag in the same fan-out, so it shows its full-width table
+# rather than a `remote exit 1` row, and it is remembered in
+# FLEET_OPTIONAL_REJECTED, per host and per flag, so a watch does not pay that
+# second round trip on every tick. A parser stops at the FIRST word it does
+# not know, so a host too old for two of them refuses one per call and is
+# asked once more for each. Detected by the refusal itself rather than by a
+# minimum version: release-please assigns a change its version AFTER it
+# merges, so a number written here would be a guess, and a probe would cost a
+# round trip per host before the first frame.
+FLEET_OPTIONAL_ARGS=""
 FLEET_OPTIONAL_REJECTED=" "
 # Per-host budgets for the fan-out in flight, indexed like FLEET_HOSTS (GHR-81).
 # Empty for a read-only fan-out, which leaves every host on FLEET_TIMEOUT; a
@@ -6820,11 +6879,12 @@ fleet_fanout() { # REMOTE-ARGS...
   # under `fleet watch` a host's background fetch may still be out, and a
   # bare wait would sit through that one's budget as well.
   wait "${pids[@]}" 2>/dev/null || true
-  # GHR-88: one optional word per round, at most two rounds — the view flag
-  # and the origin — since a host can refuse one, be asked again, and only
-  # then refuse the other.
+  # GHR-88: one optional word per round, since a host can refuse one, be
+  # asked again, and only then refuse the next. At most three rounds (GHR-90):
+  # the two view flags a status read carries — --narrow, --with-json — and
+  # the origin a mutating call carries; no call carries more.
   local round a
-  for round in 1 2; do
+  for round in 1 2 3; do
     fleet_optional_any "$@" || return 0
     retry=()
     for i in "${!FLEET_HOSTS[@]}"; do
@@ -6854,16 +6914,16 @@ fleet_fanout() { # REMOTE-ARGS...
     : "$round"
   done
 }
-# The optional words (GHR-56, generalised for GHR-88): FLEET_OPTIONAL_ARG, the
-# view flag a read would like (`--narrow`), and FLEET_ORIGIN_WORD, the
-# `--origin=OPERATOR@HOST` every call that changes a host carries. A host too
-# old for one rejects it the way every runnerctl rejects what it does not
-# know — `unknown option: --narrow` from a command's parser, `unknown command
-# '--origin…'` from main, where a global flag lands — and is asked again
-# without it. Only these two are ever dropped: a word a host refuses for any
-# other reason is that host's answer.
+# The optional words (GHR-56, generalised for GHR-88 and GHR-90):
+# FLEET_OPTIONAL_ARGS, the flags a read would like (`--narrow`,
+# `--with-json`), and FLEET_ORIGIN_WORD, the `--origin=OPERATOR@HOST` every
+# call that changes a host carries. A host too old for one rejects it the way
+# every runnerctl rejects what it does not know — `unknown option: --narrow`
+# from a command's parser, `unknown command '--origin…'` from main, where a
+# global flag lands — and is asked again without it. Only these are ever
+# dropped: a word a host refuses for any other reason is that host's answer.
 fleet_optional_is() { # WORD
-  [ -n "$1" ] && { [ "$1" = "$FLEET_OPTIONAL_ARG" ] || [ "$1" = "$FLEET_ORIGIN_WORD" ]; }
+  [ -n "$1" ] && { [[ " $FLEET_OPTIONAL_ARGS " == *" $1 "* ]] || [ "$1" = "$FLEET_ORIGIN_WORD" ]; }
 }
 fleet_optional_any() { # WORDS...
   local a
@@ -6891,6 +6951,9 @@ fleet_fanout_one() { # INDEX REMOTE-ARGS...
     if fleet_optional_is "$a" && fleet_optional_skip "$host" "$a"; then continue; fi
     args+=("$a")
   done
+  # GHR-90: a payload left by this host's earlier try in the same fan-out (one
+  # it refused a flag on) is not this call's answer.
+  rm -f "$FLEET_DIR/$i.json" "$FLEET_DIR/$i.jrc"
   # `|| hrc=$?` rather than a bare call plus `echo $?`: under `set -e` a
   # non-zero ssh_run kills this subshell before the status can be
   # recorded, so every failure would read as the missing-file fallback
@@ -6915,6 +6978,11 @@ fleet_fanout_one() { # INDEX REMOTE-ARGS...
       ssh_run "$host" "${args[@]}" || hrc=$?
   fi
   echo $(($(now_ms) - t0)) >"$FLEET_DIR/$i.ms"
+  # GHR-90: the JSON a `--with-json` table carries goes where the summary's
+  # second call would have put it, before the table is relayed.
+  if fleet_args_with_json "${args[@]}"; then
+    fleet_with_json_split "$FLEET_DIR/$i.out" "$FLEET_DIR/$i.json" "$FLEET_DIR/$i.jrc" "$hrc"
+  fi
   # GHR-101: the one place a fan-out's answer lands, so every reader after it
   # — the table, the reports, the error rows — has relayable text and none
   # has the raw bytes to get wrong. A `--json` payload is data for a program,
@@ -6999,6 +7067,50 @@ fleet_args_json() { # ARGS...
   local a
   for a in "$@"; do [ "$a" != --json ] || return 0; done
   return 1
+}
+# Whether it asks for `--with-json` (GHR-90) — a host that refused the flag
+# was asked again without it, so this is per call, not per fan-out.
+fleet_args_with_json() { # ARGS...
+  local a
+  for a in "$@"; do [ "$a" != --with-json ] || return 0; done
+  return 1
+}
+
+# GHR-90: one `status --with-json` answer in OUT, split in place. Everything
+# before the first line that starts with 0x1e (STATUS_JSON_SEP) stays in OUT —
+# the table, read as any table answer is — and everything after it goes to
+# JSON, with JRC the status a separate `status --json` call would have left:
+#
+#   0  the call exited 0 and JSON is a whole object: it opens with `{` and
+#      its last line is the object's closing `]}`
+#   1  the call exited 0 but there is no separator, or the object after it
+#      was cut short — the host answered, its table is what it is, and it
+#      has no summary to give this time (as a `status --json` that exited
+#      non-zero has none)
+#
+# A call that exited non-zero leaves neither file: its table call failed, and
+# nothing reads a payload for it. The separator is matched on its first byte
+# alone, so a host that appends to every line it prints (a wrapper, a login
+# banner's tail) still splits where it should.
+fleet_with_json_split() { # OUT JSON JRC RC
+  local at
+  at="$(LC_ALL=C grep -an -m1 $'^\x1e' -- "$1" 2>/dev/null || true)"
+  at="${at%%:*}"
+  if [ -n "$at" ]; then
+    tail -n "+$((at + 1))" -- "$1" >"$2"
+    head -n "$((at - 1))" -- "$1" >"$1.table"
+    mv -f -- "$1.table" "$1"
+  fi
+  if [ "$4" != 0 ]; then
+    rm -f -- "$2"
+    return 0
+  fi
+  if [ -n "$at" ] && [ "$(head -c 1 -- "$2")" = "{" ] && [[ "$(tail -n 1 -- "$2")" == "]}"* ]]; then
+    echo 0 >"$3"
+  else
+    : >"$2"
+    echo 1 >"$3"
+  fi
 }
 
 fleet_rc() { # INDEX
@@ -7552,27 +7664,25 @@ fleet_status_table() {
 # The counts come from each host's `status --json`, NEVER from the table the
 # line sits next to: that table is not parsed by column position (see
 # fleet_status_table), and a count read off a painted cell would be exactly
-# that. So the summary costs a second remote call per host, and the choice was
-# between that and one call returning both. The second call it is:
+# that. GHR-90: the table call is `status --with-json`, so a host answers both
+# in ONE call from ONE collection — the rows and the counts describe the same
+# moment, and the host walks its slots once. fleet_with_json_split leaves that
+# payload in <i>.json / <i>.jrc, exactly where the second call below would.
 #
-#   * one call needs a new remote flag, which no host has until it is
-#     released and upgraded — and a host without it would be asked a second
-#     time anyway, so the second pass has to exist either way (and
-#     FLEET_OPTIONAL_ARG, the skew mechanism, carries one flag: --narrow);
-#   * the other one-call form, two commands on one remote command line,
-#     depends on what the remote login shell makes of the line;
-#   * the pass is TARGETED: only a host whose table call exited 0 is asked, so
-#     a host that is down is waited on once per tick, not twice. Under `fleet
-#     watch` it is one more channel on the connection already held, per tick
-#     and never per key. A one-shot `fleet status` holds no connection, so
-#     there it is a second ssh login per answering host.
-#
-# `status --json` has been there since long before `fleet`, so every host
-# that can draw the table can answer it.
+# The second call stays, as the fallback for a host too old for the flag: it
+# refused it, was asked again without it (fleet_fanout's skew rule), and so
+# has a table and no payload. Only such a host is asked — one whose table call
+# exited 0 and left no <i>.jrc — so a host that is down is waited on once per
+# tick, not twice. (The other one-call form, two commands on one remote
+# command line, depends on what the remote login shell makes of the line and
+# still collects twice — GHR-72 rejected it.) `status --json` has been there
+# since long before `fleet`, so every host that can draw the table can
+# answer it.
 fleet_summary_fetch() { # STATUS-ARGS...
   local i running=0
   for i in "${!FLEET_HOSTS[@]}"; do
     [ "$(fleet_rc "$i")" = 0 ] || continue
+    [ ! -e "$FLEET_DIR/$i.jrc" ] || continue
     fleet_summary_fetch_one "$i" "$@" &
     running=$((running + 1))
     if [ "$running" -ge "$FLEET_PARALLEL" ]; then
@@ -9108,7 +9218,7 @@ cmd_fleet_health() { # [--quiet] [--json] [--max-restarts N] [--stall-after N] [
     esac
   done
   ! { $json && $quiet; } || die "--quiet cannot be combined with --json; the object is the whole answer, and the exit code is the same either way"
-  if $json; then FLEET_OPTIONAL_ARG=--json; fwd+=(--json); fi
+  if $json; then FLEET_OPTIONAL_ARGS=--json; fwd+=(--json); fi
   require_fleet
   FLEET_BUDGETS=()
   if [ -n "$FLEET_HEALTH_MUTATING" ]; then
@@ -9532,7 +9642,7 @@ cmd_fleet_status() { # [--json [--watch|-w] [--interval N] [--iterations N]] [--
       # would cost a second fan-out, and a one-shot table is as likely to be
       # piped as read, which is why the local `status` never narrows itself
       # either. A host too old for the flag answers full-width (fleet_fanout).
-      --narrow) narrow=true; fwd+=(--narrow); FLEET_OPTIONAL_ARG=--narrow; shift ;;
+      --narrow) narrow=true; fwd+=(--narrow); FLEET_OPTIONAL_ARGS+=" --narrow"; shift ;;
       # GHR-80: the stream. See fleet_status_stream.
       --watch|-w) watch=true; shift ;;
       --interval)
@@ -9565,7 +9675,10 @@ cmd_fleet_status() { # [--json [--watch|-w] [--interval N] [--iterations N]] [--
     color_setup "$COLOR_MODE"
     # --color never on the remote: the fleet renderer paints locally, and a
     # remote SGR sequence would be measured as visible width by the prefix.
-    fleet_fanout "$FLEET_RUNNERCTL" status --color never ${fwd[@]+"${fwd[@]}"}
+    # GHR-90: --with-json, so the summary's payload rides on the table call;
+    # fleet_summary_fetch then asks only a host too old for the flag.
+    FLEET_OPTIONAL_ARGS+=" --with-json"
+    fleet_fanout "$FLEET_RUNNERCTL" status --color never ${fwd[@]+"${fwd[@]}"} --with-json
     fleet_summary_fetch ${stall[@]+"${stall[@]}"}
     fleet_status_table || rc=$?
     fleet_summary_line
@@ -9606,8 +9719,9 @@ cmd_fleet_status() { # [--json [--watch|-w] [--interval N] [--iterations N]] [--
 # assembled from whatever each host LAST returned:
 #
 #   * One job per host, and never two for the same host at once. A job makes
-#     the tick's two calls — the table, then (to a host that answered) the
-#     summary's `status --json` — each on FLEET_WATCH_TIMEOUT rather than
+#     the tick's call — the table with the summary's JSON behind it (GHR-90;
+#     a host too old for that is asked a second time, for `status --json`) —
+#     on FLEET_WATCH_TIMEOUT rather than
 #     FLEET_TIMEOUT, and publishes them TOGETHER: it writes into `<i>.new/`
 #     and renames that to `<i>.done/`, so the loop only ever sees a whole
 #     answer and a redraw can never read half of one.
@@ -9645,28 +9759,44 @@ FW_STATE="" FW_POLL="0.2" FW_NEXT=0 FW_INTERVAL=5 FW_DIRTY=false FW_JSON_ONLY=fa
 FW_PID=() FW_AGAIN=() FW_TABLE_ARGS=() FW_JSON_ARGS=()
 
 # One host's tick, in the background: nothing it sets survives, which is why a
-# host found too old for --narrow is remembered as a file. See fleet_fanout
-# for that skew rule — the same one, with the second call in the same job.
+# host found too old for a flag of FLEET_OPTIONAL_ARGS (--narrow, --with-json)
+# is remembered as a file, `<i>.refuses<flag>`, one per flag. See fleet_fanout
+# for that skew rule — the same one, with the retries in the same job: a
+# refusal names one flag, so a host too old for both is asked once more for
+# each, on its first tick, and never again in this session.
 fleet_watch_fetch_one() { # INDEX
-  local i="$1" host d a hrc=0 t0
+  local i="$1" host d a hrc=0 t0 refused round
   local -a args=()
   host="${FLEET_HOSTS[$i]}" d="$FW_STATE/$i.new"
   rm -rf "$d"
   mkdir "$d"
-  for a in "${FW_TABLE_ARGS[@]}"; do
-    if [ "$a" != "$FLEET_OPTIONAL_ARG" ] || [ ! -e "$FW_STATE/$i.plain" ]; then args+=("$a"); fi
-  done
-  # GHR-80: `duration_ms`, timed as fleet_fanout_one times it.
-  t0="$(now_ms)"
-  FLEET_CALL_TIMEOUT="${FLEET_BUDGETS[$i]:-}" ssh_run "$host" "$FLEET_RUNNERCTL" "${args[@]}" >"$d/out" 2>"$d/err" || hrc=$?
-  if [ "$hrc" = 1 ] && [ -n "$FLEET_OPTIONAL_ARG" ] && [ ! -e "$FW_STATE/$i.plain" ] && grep -qF -- "unknown option: $FLEET_OPTIONAL_ARG" "$d/err"; then
-    : >"$FW_STATE/$i.plain"
-    args=() hrc=0
-    for a in "${FW_TABLE_ARGS[@]}"; do [ "$a" = "$FLEET_OPTIONAL_ARG" ] || args+=("$a"); done
+  for round in 0 1 2; do
+    if [ "$round" -gt 0 ]; then
+      # Asked again only when the call refused a flag it is allowed to drop.
+      [ "$hrc" = 1 ] || break
+      refused=""
+      for a in "${args[@]}"; do
+        if fleet_optional_is "$a" && fleet_optional_rejects "$d/err" "$a"; then refused="$a"; break; fi
+      done
+      [ -n "$refused" ] || break
+      : >"$FW_STATE/$i.refuses$refused"
+      hrc=0
+    fi
+    args=()
+    for a in "${FW_TABLE_ARGS[@]}"; do
+      if fleet_optional_is "$a" && [ -e "$FW_STATE/$i.refuses$a" ]; then continue; fi
+      args+=("$a")
+    done
+    # GHR-80: `duration_ms`, timed as fleet_fanout_one times it.
     t0="$(now_ms)"
     FLEET_CALL_TIMEOUT="${FLEET_BUDGETS[$i]:-}" ssh_run "$host" "$FLEET_RUNNERCTL" "${args[@]}" >"$d/out" 2>"$d/err" || hrc=$?
-  fi
+  done
   echo $(($(now_ms) - t0)) >"$d/ms"
+  # GHR-90: the summary's payload, when it came with the table — split off
+  # before the table is relayed, into the files the second call would fill.
+  if fleet_args_with_json "${args[@]}"; then
+    fleet_with_json_split "$d/out" "$d/json" "$d/jrc" "$hrc"
+  fi
   # GHR-101: filtered here, in the job, before the answer is published — so
   # the flat files fleet_watch_collect moves it into, and every frame, view,
   # pane and age line drawn from them on every redraw after, only ever hold
@@ -9679,8 +9809,9 @@ fleet_watch_fetch_one() { # INDEX
   echo "$hrc" >"$d/rc"
   # GHR-72's summary pass, to a host whose table call exited 0 and no other:
   # one that is down is dialled once per tick, not twice. The stream's one
-  # call already was the payload.
-  if [ "$hrc" = 0 ] && ! $FW_JSON_ONLY; then
+  # call already was the payload, and so was a --with-json table's (GHR-90):
+  # only a host too old for that flag gets here.
+  if [ "$hrc" = 0 ] && ! $FW_JSON_ONLY && [ ! -e "$d/jrc" ]; then
     FLEET_CALL_TIMEOUT="${FLEET_BUDGETS[$i]:-}" ssh_run "$host" "$FLEET_RUNNERCTL" status --json ${FW_JSON_ARGS[@]+"${FW_JSON_ARGS[@]}"} >"$d/json" 2>/dev/null || hrc=$?
     echo "$hrc" >"$d/jrc"
   fi
@@ -12182,7 +12313,7 @@ fleet_watch_cmd_key() {
 # budgets are its own, there is no optional --narrow, and the remote paints
 # nothing the pager would show as escapes.
 fleet_watch_cmd_sub() (
-  FLEET_EXIT_OWNED=false FLEET_BUDGETS=() FLEET_OPTIONAL_ARG="" FLEET_REMOTE_COLOR=false FLEET_DIR=""
+  FLEET_EXIT_OWNED=false FLEET_BUDGETS=() FLEET_OPTIONAL_ARGS="" FLEET_REMOTE_COLOR=false FLEET_DIR=""
   case "${FW_CMD_ARGV[0]}" in
     status|health) [ "${#FW_CMD_HOSTS[@]}" -eq 0 ] || fleet_select_hosts "${FW_CMD_HOSTS[@]}" ;;
   esac
@@ -12356,9 +12487,10 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
   # GHR-86: whether `%` (every watched host) is the fleet or a part of it.
   if [ "${#hosts[@]}" -gt 0 ]; then fleet_select_hosts "${hosts[@]}"; FW_HOSTS_NARROWED=true; fi
   stdout_is_tty || die "fleet watch needs a terminal (stdout is not a tty); use 'runnerctl fleet status'"
-  # For the whole session, so a host that rejects --narrow once is asked
-  # without it on every later tick instead of twice per tick (fleet_fanout).
-  FLEET_OPTIONAL_ARG=--narrow
+  # For the whole session, so a host that rejects --narrow or --with-json
+  # (GHR-90) once is asked without it on every later tick instead of twice
+  # per tick (fleet_watch_fetch_one).
+  FLEET_OPTIONAL_ARGS="--narrow --with-json"
   color_setup "$COLOR_MODE"
   # Whether the REMOTE paints is the same question as whether this end does:
   # under --color never a remote SGR sequence would be the one thing in the
@@ -12401,7 +12533,7 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
     if [ -n "$fetch" ]; then
       narrow_arg=()
       ! $narrow || narrow_arg=(--narrow)
-      FW_TABLE_ARGS=(status --color "$remote_color" ${fwd[@]+"${fwd[@]}"} ${narrow_arg[@]+"${narrow_arg[@]}"})
+      FW_TABLE_ARGS=(status --color "$remote_color" ${fwd[@]+"${fwd[@]}"} ${narrow_arg[@]+"${narrow_arg[@]}"} --with-json)
       fleet_watch_round "$fetch"
       fetch="" launched=true
       [ -z "$iterations" ] || fleet_watch_settle

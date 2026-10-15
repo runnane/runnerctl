@@ -2769,8 +2769,8 @@ case_fleet_status_table_one_header_rows_per_host() {
   expect_out_count '^build-1 +[0-9]+ +example\.slot-' 3
   expect_out_count '^build-2 +[0-9]+ +example\.slot-' 3
   # one round trip per host, and nothing reached ssh itself
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 1
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --with-json$' 1
   expect_no_log '^direct:ssh '
   # the remote host's own runnerctl header is folded away, not repeated
   expect_no_out '^build-1 runnerctl '
@@ -2917,8 +2917,8 @@ case_fleet_status_json_rejects_a_non_object_payload() {
 case_fleet_status_forwards_stall_after_to_the_remote_table() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status --stall-after 600
   expect_rc 0
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --stall-after 600$' 1
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --stall-after 600$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --stall-after 600 --with-json$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --stall-after 600 --with-json$' 1
   expect_out_count '^build-1 +0 +example\.slot-1 .* my-app:test \(12m\) STALLED$' 1
   expect_out_count '^build-2 +0 +example\.slot-1 .* my-app:test \(12m\) STALLED$' 1
   # one deduped note for the fleet, not one per host
@@ -4247,18 +4247,17 @@ case_fleet_watch_polls_every_host_over_one_held_connection() {
   expect_out_count '^HOST +IDX +RUNNER +PROFILE .* WORKING-ON$' 3
   expect_out_count '^build-1 +0 +example\.slot-1 .* my-app:test \(12m\)$' 3
   expect_out_count '^build-2 +0 +example\.slot-1 .* my-app:test \(12m\)$' 3
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 3
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 3
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 3
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --with-json$' 3
   expect_log_count '^probe:pause 4$' 3
-  # GHR-72: plus the summary's --json pass, once per host per tick
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 3
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 3
-  expect_log_count '^probe:ssh_run ' 12
-  # the session: master options on EVERY call (12: table and summary, two
-  # hosts, three ticks), opened once, closed once
+  # GHR-90: the summary's payload rides on the table call — no --json pass
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl status --json'
+  expect_log_count '^probe:ssh_run ' 6
+  # the session: master options on EVERY call (6: two hosts, three ticks),
+  # opened once, closed once
   # per host. ControlPersist comfortably exceeds the 4 s interval, or the gap
   # between two redraws would drop the connection the next redraw reuses.
-  expect_log_count '^probe:ssh_control_opts -o ControlMaster=auto -o ControlPath=/.+/%C -o ControlPersist=64$' 12
+  expect_log_count '^probe:ssh_control_opts -o ControlMaster=auto -o ControlPath=/.+/%C -o ControlPersist=64$' 6
   expect_log_count '^probe:ssh_control build-1 exit$' 1
   expect_log_count '^probe:ssh_control build-2 exit$' 1
   expect_log_order '^probe:term_cursor hide$' '^probe:pause 4$' '^probe:term_cursor show$' '^probe:ssh_control build-1 exit$'
@@ -4281,8 +4280,8 @@ case_fleet_watch_colour_comes_from_the_remote_and_notes_still_dedupe() {
     run fleet watch --iterations 1 --color always --stall-after 600
   expect_rc 0
   # --stall-after is forwarded: STALLED is drawn at the far end or not at all
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color always --stall-after 600$' 1
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color always --stall-after 600$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color always --stall-after 600 --with-json$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color always --stall-after 600 --with-json$' 1
   expect_out_count "${FRAME_PREFIX}$ESC\[1mrunnerctl fleet watch — 2 host\(s\) — .* — every 5s \(q to quit\)$ESC\[0m\$" 1
   # HOST is ours and ends its bold; the remote's header follows with its own
   expect_out_count "^$ESC\[1mHOST   $ESC\[0m $ESC\[1mIDX +RUNNER .* WORKING-ON$ESC\[0m\$" 1
@@ -4318,10 +4317,9 @@ case_fleet_watch_host_narrows_the_fleet() {
   expect_out '— 1 host\(s\) —'
   expect_out_count '^build-2 +0 +example\.slot-1 ' 1
   expect_no_out '^build-1 '
-  # the table and (GHR-72) the summary's --json pass, to build-2 alone
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 1
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 1
-  expect_log_count '^probe:ssh_run build-2 -- ' 2
+  # the table, with (GHR-90) the summary's payload, to build-2 alone
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --with-json$' 1
+  expect_log_count '^probe:ssh_run build-2 -- ' 1
   expect_no_log '^probe:ssh_run build-1 -- '
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet watch --host nope
   expect_rc 1
@@ -4340,9 +4338,9 @@ case_fleet_watch_q_quits_and_the_default_interval_is_five() {
   expect_out '— every 5s \(q to quit\)$'
   expect_out "$FLEET_WATCH_LEGEND"
   expect_log_order '^probe:term_cursor hide$' '^probe:tty_read_char 5 q$' '^probe:term_cursor show$' '^probe:ssh_control build-1 exit$'
-  # one fan-out: the table, and (GHR-72) the summary's --json pass
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 1
-  expect_log_count '^probe:ssh_run build-1 -- ' 2
+  # one fan-out: the table, the summary's payload with it (GHR-90)
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 1
+  expect_log_count '^probe:ssh_run build-1 -- ' 1
   # a key that is not q redraws rather than quitting: one more frame, then Q
   # ends it (uppercase counts too). GHR-55: a key redraws the frame in hand —
   # only a tick (the `-`) or an action that ran costs another fan-out
@@ -4350,8 +4348,8 @@ case_fleet_watch_q_quits_and_the_default_interval_is_five() {
     run fleet watch --color never
   expect_rc 0
   expect_out_count "$FRAME_PREFIX" 3
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 2
-  expect_log_count '^probe:ssh_run build-1 -- ' 4
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 2
+  expect_log_count '^probe:ssh_run build-1 -- ' 2
 }
 
 # The control session itself, driven directly: opened it exists and carries
@@ -4506,12 +4504,12 @@ case_fleet_watch_cursor_walks_host_slot_pairs() {
   expect_out_count "$(fw_row build-2 1 2)" 1
   expect_out_count "$(fw_row build-2 2 3)" 3
   expect_out_count '^build-2 +0 +example\.slot-1 .*my-app:test \(12m\)$' 9
-  # eleven frames off ONE fan-out: the table and (GHR-72) the summary's
-  # --json pass, each once per host
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 1
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 1
-  expect_log_count '^probe:ssh_run build-1 -- ' 2
-  expect_log_count '^probe:ssh_run build-2 -- ' 2
+  # eleven frames off ONE fan-out: one call per host, the table with the
+  # summary's payload (GHR-90)
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --with-json$' 1
+  expect_log_count '^probe:ssh_run build-1 -- ' 1
+  expect_log_count '^probe:ssh_run build-2 -- ' 1
   expect_no_log '^direct:'
 }
 
@@ -4544,13 +4542,11 @@ case_fleet_watch_cursor_survives_a_host_dropping_out() {
   expect_no_out "^${REV}build-2 +no answer"
   expect_no_out "^(${REV})?build-2 +unreachable"
   expect_no_out '\[y/n\]'
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 3
-  # every --json call here is the summary's pass (GHR-72), one per tick to a
-  # host that ANSWERED that tick — three for build-1, and two for build-2,
-  # which is not asked again on the tick it was unreachable
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 3
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 2
-  expect_log_count '^probe:ssh_run ' 11
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --with-json$' 3
+  # the summary's payload rides on those calls (GHR-90): no --json pass, so
+  # the unreachable tick is dialled once like every other
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl status --json'
+  expect_log_count '^probe:ssh_run ' 6
   expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap|logs) '
   # The age line is not a stop. The run above cannot show that: its cursor is
   # already on one of build-2's slots, and the cursor's own pair is found
@@ -4602,17 +4598,16 @@ case_fleet_watch_S_stops_the_selected_pair_on_its_own_host() {
   expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap) ' 1
   expect_log_order '^probe:tty_read_char 5 S$' '^probe:ssh_run build-2 -- runnerctl status --json$' \
                    '^probe:ssh_run build-[12] -- runnerctl status --json$' '^probe:tty_read_char 5 y$' \
-                   '^probe:ssh_run build-2 -- runnerctl stop example\.slot-1$' '^probe:ssh_run build-2 -- runnerctl status --color never$'
-  # one facts read of build-2, plus the floor's read of both hosts — and
-  # (GHR-72) the summary's pass to both, once per fan-out: the first frame's
-  # and the one after the stop
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 4
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 3
+                   '^probe:ssh_run build-2 -- runnerctl stop example\.slot-1$' '^probe:ssh_run build-2 -- runnerctl status --color never --with-json$'
+  # one facts read of build-2, plus the floor's read of both hosts; the
+  # summary's payload rides on the table calls (GHR-90)
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 2
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 1
   # and what the watch shows afterwards: the stop landed on build-2 alone,
   # with the cursor still on it
   expect_out_count "^${REV}build-2 +0 +example\.slot-1 +[^ ]+ +inactive/dead " 1
   expect_no_out '^build-1 +0 +example\.slot-1 +[^ ]+ +inactive/dead '
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 2
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --with-json$' 2
   expect_no_log '^direct:'
 }
 
@@ -4629,8 +4624,9 @@ case_fleet_watch_K_decides_on_facts_read_at_the_key() {
   expect_out_count "^${REV}build-1 +0 +example\\.slot-1 .*my-app:test \\(12m\\)$ESC\\[0m\$" 2
   expect_out_count '^example\.slot-1 on build-1: no job running — nothing to kill$' 1
   expect_no_out '\[y/n\]'
-  # the facts read at the key, and (GHR-72) the first frame's summary pass
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 2
+  # the facts read at the key, and nothing else (GHR-90: the first frame's
+  # summary came with its table)
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 1
   expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl kill '
   # with the job still running: the confirm quotes it, `y` kills on build-1
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='KyRnq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
@@ -4702,11 +4698,10 @@ case_fleet_watch_T_starts_and_P_reaps_on_the_selected_host() {
   expect_out_count "^Reap 2 leaked process\(es\) on example\.slot-2 on build-2\? runs on build-2: runnerctl reap example\.slot-2 — TERM, then KILL what is still alive after the grace  \[y/n\]\$" 1
   expect_log_count '^probe:ssh_run build-2 -- runnerctl reap example\.slot-2$' 1
   expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl (stop|start|restart|kill|reap) ' 2
-  # T and P never read the fleet for a floor: the only --json reads of build-1
-  # are the facts read for the T pressed on its own slot and (GHR-72) the
-  # summary's pass, once per fan-out — the first frame, and after each of the
-  # two actions that ran
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 4
+  # T and P never read the fleet for a floor: the only --json read of build-1
+  # is the facts read for the T pressed on its own slot (GHR-90: each
+  # fan-out's summary came with its tables)
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 1
 }
 
 # L pages the selected slot's journal FROM ITS HOST through the local pager,
@@ -4722,7 +4717,7 @@ case_fleet_watch_L_pages_the_remote_journal() {
   expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl logs ' 1
   expect_out_count '^-- journal of example\.slot-1 on build-2 \(-n 50\) --$' 1
   expect_log_order '^probe:tty_read_char 5 L$' '^probe:term_cursor show$' '^probe:page$' '^probe:term_cursor hide$' '^probe:tty_read_char 5 q$'
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --with-json$' 1
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_NOSUDO=build-2 RUNNERCTL_STUB_KEYS='jjjLq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
     run fleet watch --color never
   expect_rc 0
@@ -4740,7 +4735,7 @@ case_fleet_watch_a_failed_action_is_a_notice_not_an_exit() {
   # on the frame after the action, and still on the tick after that
   expect_out_count '^example\.slot-2 on build-1: restart failed — remote exit 1 — sudo: a password is required — the ssh login needs passwordless sudo on that host; see the fleet section of the README for the exact sudoers line$' 2
   # the watch went on: the tick after it fanned out again
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 3
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 3
   expect_log_order '^probe:tty_read_char 5 q$' '^probe:term_cursor show$' '^probe:ssh_control build-1 exit$'
 }
 
@@ -4782,8 +4777,8 @@ case_status_narrow_drops_max_high_envfile() {
 case_fleet_status_narrow_is_forwarded_and_arrives() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_COLS=80 run fleet status --narrow
   expect_rc 0
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --narrow$' 1
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --narrow$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --narrow --with-json$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --narrow --with-json$' 1
   expect_out_count "^HOST +$HDR_NARROW" 1
   expect_out '^build-2 +1 +example\.slot-2 .* +always +idle 2h31m \(2 jobs\)$'
   expect_no_out 'MAX|HIGH|ENVFILE|/etc/x'
@@ -4830,20 +4825,19 @@ case_fleet_watch_narrows_on_the_next_tick_and_holds() {
   expect_out_count "^HOST +$HDR_NARROW" 3
   expect_out_count '^build-1 +1 +example\.slot-2 .* +always +idle 2h31m \(2 jobs\)$' 3
   expect_out_count '^build-1 +1 +example\.slot-2 .* /etc/x \(ignore_errors=no\) idle 2h31m \(2 jobs\)$' 1
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 1
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --narrow$' 3
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --narrow$' 3
-  # one table fan-out per tick: narrowing never costs a second round trip.
-  # The other eight are the summary's --json pass (GHR-72), which is never
-  # handed --narrow
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --narrow --with-json$' 3
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --narrow --with-json$' 3
+  # one table fan-out per tick: narrowing never costs a second round trip,
+  # and (GHR-90) the summary's payload rides on it
   expect_log_count '^probe:ssh_run build-[12] -- runnerctl status --color ' 8
-  expect_log_count '^probe:ssh_run build-[12] -- runnerctl status --json$' 8
-  expect_log_count '^probe:ssh_run build-[12] -- ' 16
+  expect_no_log '^probe:ssh_run build-[12] -- runnerctl status --json'
+  expect_log_count '^probe:ssh_run build-[12] -- ' 8
   # measured with colour on it is the same decision: SGR is stripped first
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_COLS=180 \
     run fleet watch --iterations 2 --color always
   expect_rc 0
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color always --narrow$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color always --narrow --with-json$' 1
   expect_out_count "^$ESC\[1mHOST +$ESC\[0m $ESC\[1mIDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +USED " 1
 }
 
@@ -4854,16 +4848,16 @@ case_fleet_watch_widens_again_and_narrow_pins_it() {
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_COLS=150,150,300 \
     run fleet watch --iterations 4 --color never
   expect_rc 0
-  expect_log_order '^probe:ssh_run build-1 -- runnerctl status --color never$' \
-                   '^probe:ssh_run build-1 -- runnerctl status --color never --narrow$' \
-                   '^probe:ssh_run build-1 -- runnerctl status --color never --narrow$' \
-                   '^probe:ssh_run build-1 -- runnerctl status --color never$'
+  expect_log_order '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' \
+                   '^probe:ssh_run build-1 -- runnerctl status --color never --narrow --with-json$' \
+                   '^probe:ssh_run build-1 -- runnerctl status --color never --narrow --with-json$' \
+                   '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$'
   expect_out_count "^HOST +$HDR_FULL" 2
   expect_out_count "^HOST +$HDR_NARROW" 2
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_COLS=400 \
     run fleet watch --narrow --iterations 2 --color never
   expect_rc 0
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --narrow$' 2
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --narrow --with-json$' 2
   expect_out_count "^HOST +$HDR_NARROW" 2
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
     run fleet watch --iterations 2 --color never
@@ -4891,9 +4885,9 @@ case_fleet_narrow_an_old_host_renders_full_width_not_an_error() {
   expect_out_count '^gw-norunners +remote exit 1 — ' 3
   expect_out_count '^note: gw-oldver runs 0\.0\.1 \(behind\) — this node runs ' 3
   # asked with the flag ONCE, then without it for the rest of the session
-  expect_log_count '^probe:ssh_run gw-oldver -- runnerctl status --color never --narrow$' 1
-  expect_log_count '^probe:ssh_run gw-oldver -- runnerctl status --color never$' 3
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --narrow$' 3
+  expect_log_count '^probe:ssh_run gw-oldver -- runnerctl status --color never --narrow --with-json$' 1
+  expect_log_count '^probe:ssh_run gw-oldver -- runnerctl status --color never --with-json$' 3
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --narrow --with-json$' 3
   expect_log_count '^probe:ssh_run gw-norunners -- ' 3
   # the one-shot takes the same path, and its exit code is not spoiled by it
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-oldver" run fleet status --narrow
@@ -4901,10 +4895,10 @@ case_fleet_narrow_an_old_host_renders_full_width_not_an_error() {
   expect_out '^gw-oldver +0 +example\.slot-1 .* 26\.0G +22\.0G .* my-app:test \(12m\)$'
   expect_out '^build-1 +0 +example\.slot-1 .* +enabled +1\.0G/25\.0G .* my-app:test \(12m\)$'
   expect_no_out 'remote exit'
-  # with the flag, without it, and (GHR-72) the summary's --json pass
+  # with the flag, then without it — carrying the summary's payload (GHR-90)
   expect_log_count '^probe:ssh_run gw-oldver -- runnerctl status --color never' 2
-  expect_log_count '^probe:ssh_run gw-oldver -- runnerctl status --json$' 1
-  expect_log_count '^probe:ssh_run gw-oldver -- ' 3
+  expect_no_log '^probe:ssh_run gw-oldver -- runnerctl status --json'
+  expect_log_count '^probe:ssh_run gw-oldver -- ' 2
 }
 
 # --- GHR-44: capacity budgets ------------------------------------------------
@@ -7654,7 +7648,7 @@ case_fleet_status_host_line_above_each_hosts_slots() {
 case_fleet_status_host_line_painted_locally() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_FULL="build-2" run fleet status --color always
   expect_rc 0
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --with-json$' 1
   # the version cell of a level host is plain (GHR-77): the paint starts at the
   # first partition, right after the separator
   expect_out_count "^build-1 +${HV}Disk: $ESC\\[32m/ \\[docker,work\\] 24% \\(353\\.9G free\\)$ESC\\[0m\$" 1
@@ -7876,10 +7870,12 @@ case_fleet_summary_healthy_fleet_is_a_short_line() {
   expect_rc 0
   expect_last_line "$SUM_OK"
   expect_out_count ' hosts? answering' 1
-  # its cost: one --json call per answering host on top of the table's
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 1
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 1
-  expect_log_count '^probe:ssh_run ' 4
+  # its cost (GHR-90): nothing on top of the table's call — the payload came
+  # with it, so no host is asked `status --json`
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --with-json$' 1
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl status --json'
+  expect_log_count '^probe:ssh_run ' 2
   # and `fleet status --json` carries no line: its summary is an object
   # (GHR-80), counted from the same payloads, with no call of its own
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status --json
@@ -7896,12 +7892,22 @@ case_fleet_summary_counts_a_stalled_job() {
   expect_rc 0
   expect_out '^build-1 +0 +example\.slot-1 .* my-app:test \(12m\) STALLED$'
   expect_last_line '1/1 host answering · 3 slots: 1 idle, 1 STALLED, 1 disabled · capacity 1 free of 2'
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json --stall-after 600$' 1
+  # GHR-90: the one call carries the threshold for the table and the payload
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --stall-after 600 --with-json$' 1
+  expect_log_count '^probe:ssh_run ' 1
   RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet status
   expect_rc 0
   expect_last_line '1/1 host answering · 3 slots: 1 busy, 1 idle, 1 disabled · capacity 1 free of 2'
-  # --narrow belongs to the table: the --json call must not be handed it
+  # --narrow belongs to the table; the payload has no columns to drop and
+  # counts the same
   RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet status --narrow --stall-after 600
+  expect_rc 0
+  expect_last_line '1/1 host answering · 3 slots: 1 idle, 1 STALLED, 1 disabled · capacity 1 free of 2'
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --narrow --stall-after 600 --with-json$' 1
+  expect_log_count '^probe:ssh_run ' 1
+  # a host too old for --with-json is summarised through the second call,
+  # which carries the threshold and not --narrow
+  RUNNERCTL_STUB_FLEET_NOWITHJSON="build-1" RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet status --narrow --stall-after 600
   expect_rc 0
   expect_last_line '1/1 host answering · 3 slots: 1 idle, 1 STALLED, 1 disabled · capacity 1 free of 2'
   expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json --stall-after 600$' 1
@@ -7920,7 +7926,7 @@ case_fleet_summary_unreachable_host_counts_as_a_host_only() {
   expect_log_count '^probe:ssh_run gw-unreachable -- ' 1
   expect_log_count '^probe:ssh_run gw-timeout -- ' 1
   expect_log_count '^probe:ssh_run gw-norunners -- ' 1
-  expect_log_count '^probe:ssh_run build-1 -- ' 2
+  expect_log_count '^probe:ssh_run build-1 -- ' 1
   # nobody answering: the host count alone, and no slot arithmetic at all
   RUNNERCTL_STUB_FLEET_HOSTS="gw-unreachable" run fleet status
   expect_rc 1
@@ -8023,7 +8029,7 @@ case_ghr77_fleet_watch_problems_and_collapse_carry_the_version() {
   expect_frame 2 '^note: build-2 runs 0\.1\.0 \(behind\) — this node runs '
   expect_frame_line 4 4 "^(${REV})?build-1 +3 slots: 1 busy, 1 idle, 1 disabled · $V_DISK"
   expect_frame_line 4 5 "^(${REV})?build-2 +3 slots: 1 busy, 1 idle, 1 disabled · v0\\.1\\.0 · Disk: / "
-  expect_log_count '^probe:ssh_run ' 4
+  expect_log_count '^probe:ssh_run ' 2
 }
 
 # The slot pane's host block draws the version as the host line does: `?` for
@@ -8346,7 +8352,9 @@ case_fleet_watch_summary_sits_under_the_header() {
     run fleet watch --color never --stall-after 600
   expect_rc 0
   expect_under_header '2/2 hosts answering · 6 slots: 2 idle, 2 STALLED, 2 disabled · capacity 2 free of 4' 2
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json --stall-after 600$' 1
+  # GHR-90: the threshold rides on the one call the payload comes back on
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --stall-after 600 --with-json$' 1
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl status --json'
   expect_out_count "^${REV}" 2
   expect_no_out "^${REV}[0-9]+/"
   # a host that drops out of a tick leaves the count for that tick only
@@ -8817,8 +8825,8 @@ case_fleet_watch_tall_frame_is_cut_and_scrolls() {
   expect_frame_line 11 5 "$(fw_row build-1 1 2)"
   expect_frame_line 11 7 "$(down_mark 4)"
   # every one of those frames off the first fan-out; the tick is the second
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 2
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 2
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 2
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --with-json$' 2
 }
 
 # viewport_frame itself, on frames the stub cannot produce. Each expected
@@ -9010,10 +9018,10 @@ case_fleet_watch_a_hung_host_holds_up_neither_the_frame_nor_a_key() {
   expect_log_order '^probe:fleet_poll landed=1 hung=1$' '^probe:fleet_poll landed=0 hung=1$' \
                    '^probe:tty_read_char 0\.2 j$' '^probe:fleet_poll landed=0 hung=1$' '^probe:tty_read_char 0\.2 q$'
   # slow-1 was dialled once, for its table, and that call never came back
-  expect_log_count '^probe:ssh_run slow-1 -- runnerctl status --color never$' 1
+  expect_log_count '^probe:ssh_run slow-1 -- runnerctl status --color never --with-json$' 1
   expect_log_count '^probe:ssh_run slow-1 -- ' 1
   expect_no_log '^probe:ssh_run_done slow-1$'
-  expect_log_count '^probe:ssh_run build-1 -- ' 2
+  expect_log_count '^probe:ssh_run build-1 -- ' 1
 }
 
 # Before any host has answered there is still a frame: nobody answering, each
@@ -9132,9 +9140,9 @@ case_fleet_watch_a_call_still_out_at_the_next_tick_is_late() {
   expect_frame_line 3 9 '^build-2 +0 +example\.slot-1 .* my-app:test \(12m\)$'
   expect_frame_line 3 11 '^build-2 +2 +example\.slot-3 '
   # build-1 three ticks; build-2 two — the one that answered, the one still out
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 3
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 2
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 3
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --with-json$' 2
+  expect_no_log '^probe:ssh_run build-2 -- runnerctl status --json'
 }
 
 # PINNED SEPARATELY, because it is the claim the kept rows rest on: rows that
@@ -9202,10 +9210,10 @@ case_fleet_watch_summary_counts_nothing_for_a_host_with_kept_rows() {
   expect_frame_line 2 10 '^build-2 +1 +example\.slot-2 '
   expect_frame_line 2 11 '^build-2 +2 +example\.slot-3 '
   expect_frame_line 3 2 "^${SUM_OK}\$"
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 3
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 2
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 3
-  expect_log_count '^probe:ssh_run ' 11
+  # GHR-90: one call per host per tick, the payload with the table
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl status --json'
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --with-json$' 3
+  expect_log_count '^probe:ssh_run ' 6
 }
 
 # FLEET_WATCH_TIMEOUT: the watch's reads have a budget of their own, 10 s by
@@ -9266,7 +9274,7 @@ case_fleet_watch_fetches_respect_fleet_parallel() {
     RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 build-3" run fleet watch --iterations 1 --color never
   expect_rc 0
   expect_out_count '^build-[123] +0 +example\.slot-1 ' 3
-  expect_log_count '^probe:ssh_run ' 6
+  expect_log_count '^probe:ssh_run ' 3
   expect_no_log '^probe:ssh_run_overlap '
   RUNNERCTL_STUB_DETECT_OVERLAP=1 RUNNERCTL_STUB_TTY=1 \
     RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 build-3" run fleet watch --iterations 1 --color never
@@ -9430,7 +9438,7 @@ case_fleet_watch_problems_view_hides_a_healthy_host_and_keeps_a_stalled_slot() {
   expect_frame 3 "$(fw_row build-2 0 1)"
   expect_log_count '^probe:tty_read_char 5 \\!$' 1
   expect_no_log '^probe:sig'
-  expect_log_count '^probe:ssh_run ' 4
+  expect_log_count '^probe:ssh_run ' 2
   expect_no_log '^direct:'
 }
 
@@ -9480,7 +9488,7 @@ case_fleet_watch_problem_hosts_and_hosts_that_stopped_answering() {
   expect_frame_count_of 3 "$V_ROW" 2
   # the tick's round and nothing else: build-2 failed its table call at tick
   # 2 and is not asked for a payload
-  expect_log_count '^probe:ssh_run ' 7
+  expect_log_count '^probe:ssh_run ' 4
   # folded, a host that stopped answering is its age line and nothing else
   TZ=UTC RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='-cq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
     RUNNERCTL_STUB_FLEET_DOWN="build-2:2,3" run fleet watch --color never
@@ -9522,7 +9530,7 @@ case_fleet_watch_collapse_is_one_line_per_host() {
   expect_frame_line 6 5 "^${REV}build-2 +3 slots: "
   expect_frame_count_of 6 "^(${REV})?build-[12] " 2
   expect_log_count '^probe:tty_read_char 5 \$.\\n.$' 1
-  expect_log_count '^probe:ssh_run ' 4
+  expect_log_count '^probe:ssh_run ' 2
   expect_no_out '\[y/n\]'
 }
 
@@ -9545,7 +9553,7 @@ case_fleet_watch_an_empty_view_prints_the_hint() {
   expect_frame_line 4 1 "$(view_hdr '')"
   expect_frame_count_of 4 "$V_ROW" 6
   expect_frame 4 "$(fw_row build-1 0 1)"
-  expect_log_count '^probe:ssh_run ' 4
+  expect_log_count '^probe:ssh_run ' 2
 }
 
 # An action key under a view acts on the row the cursor is ON. Each run is
@@ -9606,7 +9614,7 @@ case_fleet_watch_views_count_what_the_summary_counts() {
   expect_frame_line 4 1 "$(view_hdr ' — view: idle only · collapsed')"
   expect_frame_line 4 4 "^${REV}build-1 +3 slots: 1 busy, 1 idle, 1 disabled · "
   expect_frame_line 4 5 "^build-2 +3 slots: 1 idle, 1 STALLED, 1 disabled · "
-  expect_log_count '^probe:ssh_run ' 4
+  expect_log_count '^probe:ssh_run ' 2
 }
 
 # What a problem IS, pinned on the classifier itself — one `status --json`
@@ -9676,7 +9684,7 @@ case_fleet_watch_sort_cycles_and_flattens_the_table() {
   expect_frame_line 4 1 "$(view_hdr '')"
   expect_frame_line 4 4 "^build-1 +$V_DISK\$"
   expect_frame_line 4 8 "^build-2 +$V_DISK\$"
-  expect_log_count '^probe:ssh_run ' 4
+  expect_log_count '^probe:ssh_run ' 2
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --sort job --iterations 1 --color never
   expect_rc 0
   expect_out_count "${FRAME_PREFIX}runnerctl fleet watch — 2 host\(s\) — [0-9:]{8} — every 5s \(q to quit\) — view: longest job first\$" 1
@@ -9812,7 +9820,7 @@ case_fleet_watch_slash_filters_by_text_as_it_is_typed() {
   expect_no_frame 6 '^filter: '
   expect_log_count '^probe:tty_read_char 5 3$' 1
   expect_log_count '^probe:tty_read_char 5 ' 6
-  expect_log_count '^probe:ssh_run ' 4
+  expect_log_count '^probe:ssh_run ' 2
   # repo:job whatever its case; q is text; Esc puts the old text back; Ctrl-U
   # empties it; the host matches too, and the text is ANDed with b
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=$'/APP:T\n/q\e-/\x152\nbq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
@@ -9839,7 +9847,7 @@ case_fleet_watch_slash_filters_by_text_as_it_is_typed() {
   expect_frame_line 16 1 "$(view_hdr ' — view: busy only · matching "2"')"
   expect_frame_count_of 16 "$V_ROW" 1
   expect_frame 16 '^(.\[7m)?build-2 +0 +example\.slot-1 '
-  expect_log_count '^probe:ssh_run ' 4
+  expect_log_count '^probe:ssh_run ' 2
 }
 
 # `?`: every key, where the table was, between the same header, summary and
@@ -9879,7 +9887,7 @@ case_fleet_watch_question_mark_lists_every_key() {
   expect_frame 3 "$(fw_row build-1 0 1)"
   expect_frame 5 "$(fw_row build-1 0 1)"
   expect_frame_count_of 3 "$V_ROW" 6
-  expect_log_count '^probe:ssh_run ' 4
+  expect_log_count '^probe:ssh_run ' 2
 }
 
 # A view goes through the viewport like any frame (GHR-73): two hosts of nine
@@ -10933,8 +10941,10 @@ case_fleet_watch_O_prints_the_cursors_run_url() {
   expect_out_count '^example\.slot-3 on build-2: no job running — no run URL to print$' 1
   expect_out_count 'actions/runs/' 3
   expect_no_out '\[y/n\]'
-  expect_log_count '^probe:ssh_run ' 4
-  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl status --json' 2
+  expect_log_count '^probe:ssh_run ' 2
+  # the payload in hand is the one the tick's table call brought (GHR-90)
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl status --color never --with-json$' 2
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl status --json'
 }
 
 # What O does with a payload it cannot take a URL from, on the function: an
@@ -11397,13 +11407,14 @@ EOF
 }
 
 # The acceptance case, on a fleet. The pane is the host's own `status --json`
-# as the last tick brought it — and ONLY that: two rounds of a table and a
-# payload are the four calls of the whole run, so opening the pane dialled
-# nobody. The tick's answer refreshes it: the job the first payload has
-# running is finished in the second (RUNNERCTL_STUB_BUSY_POLLS), and the pane
-# says idle without a key being pressed. q goes back to the table.
+# as the last tick brought it — and ONLY that: two rounds of a table with its
+# payload (GHR-90) are the two calls of the whole run, so opening the pane
+# dialled nobody. The tick's answer refreshes it: the job the first payload
+# has running is finished in the second (RUNNERCTL_STUB_BUSY_POLLS=1: busy to
+# the first collection, idle to every one after), and the pane says idle
+# without a key being pressed. q goes back to the table.
 case_fleet_watch_enter_opens_the_slot_pane_from_the_payload_in_hand() {
-  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_PRESSURE=1 RUNNERCTL_STUB_BUSY_POLLS=2 \
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_PRESSURE=1 RUNNERCTL_STUB_BUSY_POLLS=1 \
     RUNNERCTL_STUB_KEYS=$'\n-qq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
   expect_rc 0
   frames
@@ -11420,9 +11431,9 @@ case_fleet_watch_enter_opens_the_slot_pane_from_the_payload_in_hand() {
   expect_frame_count_of 3 '^  (workflow|running for) ' 0
   expect_frame 4 "$(fw_row build-1 0 1)"
   expect_frame 4 "$FLEET_WATCH_LEGEND"
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 2
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 2
-  expect_log_count '^probe:ssh_run ' 4
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 2
+  expect_no_log '^probe:ssh_run build-1 -- runnerctl status --json'
+  expect_log_count '^probe:ssh_run ' 2
   expect_log_count '^probe:tty_read_char 5 q$' 2
   expect_no_log '^direct:'
 }
@@ -11433,9 +11444,10 @@ case_fleet_watch_enter_opens_the_slot_pane_from_the_payload_in_hand() {
 # build-1/slot-1: O prints build-2's run, R then names build-2's slot-1 on the
 # confirm line, `y` runs the restart on build-2 and nowhere else, the frame
 # after it is the pane again with the result, and Esc puts the busy view back
-# with the cursor on build-2/slot-1. Ten calls: the first round's four, the
-# facts read R makes of build-2, the restart, and the round an action asks
-# for — O, like the pane, reads the payload in hand.
+# with the cursor on build-2/slot-1. Six calls: the first round's two (GHR-90:
+# each table with its payload), the facts read R makes of build-2, the
+# restart, and the round an action asks for — O, like the pane, reads the
+# payload in hand.
 case_fleet_watch_pane_keeps_the_cursor_and_acts_on_its_pair() {
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_KEYS=$'bj\nkORy\e-q' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
     run fleet watch --color never
@@ -11458,9 +11470,9 @@ case_fleet_watch_pane_keeps_the_cursor_and_acts_on_its_pair() {
   expect_frame_line 9 1 "$(view_hdr ' — view: busy only')"
   expect_frame 9 "$(fw_row build-2 0 1)"
   expect_frame_count_of 9 "^${REV}" 1
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 3
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 2
-  expect_log_count '^probe:ssh_run ' 10
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 1
+  expect_no_log '^probe:ssh_run build-1 -- runnerctl status --json'
+  expect_log_count '^probe:ssh_run ' 6
 }
 
 # h switches the pane to its host's block and back; the block is pinned. The
@@ -11495,7 +11507,7 @@ $PANE_KEYS_HOST" "$(frame_from 6 2)"
   expect_frame 14 "$FLEET_WATCH_LEGEND"
   expect_no_out '\[y/n\]'
   expect_no_out '^filter: '
-  expect_log_count '^probe:ssh_run ' 4
+  expect_log_count '^probe:ssh_run ' 2
 }
 
 # The three ways a host is not simply answering. A host with no rows is one
@@ -11526,7 +11538,7 @@ $PANE_KEYS_DOWN" "$(frame_from 5 3)"
   expect_frame 6 '^gw-unreachable: the host block — K R S T P L O act on a slot, and this host is showing none$'
   expect_frame_line 7 3 '^gw-unreachable — host details$'
   expect_frame 8 "^${REV}gw-unreachable +unreachable — "
-  expect_log_count '^probe:ssh_run ' 3
+  expect_log_count '^probe:ssh_run ' 2
   # stops answering with the pane up
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=$'jjj\n-hqq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
     RUNNERCTL_STUB_FLEET_DOWN="build-2:2" run fleet watch --color never
@@ -11542,7 +11554,7 @@ $PANE_KEYS_DOWN" "$(frame_from 5 3)"
   expect_frame 7 '^  answer        no answer for 0s — '
   expect_frame 7 '^  cores         16$'
   expect_frame 8 "$(fw_row build-2 0 1)"
-  expect_log_count '^probe:ssh_run ' 7
+  expect_log_count '^probe:ssh_run ' 4
   # scaled away with the pane up
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=$'jjjjj\n-q' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
     RUNNERCTL_STUB_FLEET_SCALED="build-2:2" run fleet watch --color never
@@ -12511,10 +12523,14 @@ case_ghr89_fleet_sudo_mutating_calls_go_through_sudo() {
 case_ghr89_fleet_sudo_reads_never_use_sudo() {
   RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status
   expect_rc 0
-  expect_log '^probe:ssh_run build-1 -- runnerctl status --color never$'
-  expect_log '^probe:ssh_run build-1 -- runnerctl status --json$'
+  expect_log '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$'
   expect_no_log ' -- sudo'
   expect_no_log '^probe:remote_sudo '
+  # and the second call a host too old for --with-json gets (GHR-90)
+  RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_NOWITHJSON="build-1" RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status
+  expect_rc 0
+  expect_log '^probe:ssh_run build-1 -- runnerctl status --json$'
+  expect_no_log ' -- sudo'
   RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status --json
   expect_rc 0
   expect_log '^probe:ssh_run build-2 -- runnerctl status --json$'
@@ -12530,7 +12546,7 @@ case_ghr89_fleet_sudo_reads_never_use_sudo() {
   RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jRn-q' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
     run fleet watch --color never
   expect_rc 0
-  expect_log '^probe:ssh_run build-1 -- runnerctl status --color never$'
+  expect_log '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$'
   expect_log '^probe:ssh_run build-1 -- runnerctl status --json$'
   expect_no_log ' -- sudo'
 }
@@ -13375,7 +13391,7 @@ case_ghr88_reads_and_dry_runs_record_nothing() {
   expect_rc 0
   expect_no_log '^probe:audit'
   RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet status
-  expect_log '^probe:ssh_run build-1 -- runnerctl status --color never$'
+  expect_log '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$'
   expect_no_log '^probe:(audit|ssh_origin)'
   expect_no_file /fleet.log
 }
@@ -14694,10 +14710,10 @@ case_ghr125_a_slow_action_holds_up_no_key() {
   expect_out_count '^running on build-1: runnerctl restart example\.slot-1$' 1
   expect_log_order '^probe:tty_read_char 5 y$' '^probe:ssh_run build-1 -- runnerctl restart example\.slot-1$' \
                    '^probe:remote_held build-1$' '^probe:act_poll landed=0 held=1$' '^probe:tty_read_char 0\.2 j$' \
-                   '^probe:release$' '^probe:remote_released build-1$' '^probe:ssh_run build-1 -- runnerctl status --color never$' \
+                   '^probe:release$' '^probe:remote_released build-1$' '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' \
                    '^probe:tty_read_char 5 k$'
   expect_log_count '^probe:ssh_run build-1 -- runnerctl restart ' 1
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never$' 2
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 2
   expect_no_log '^probe:remote_(signal|hold_gave_up) '
   expect_cfg_count "$WRITES/fleet.log" '.' 1
   expect_cfg "$WRITES/fleet.log" "${GHR125_LOG}0\$"
@@ -14767,9 +14783,9 @@ case_ghr125_one_action_per_host_and_another_hosts_starts() {
   expect_frame 9 "^${GHR125_DONE} · example\.slot-1 on build-2: restart done\.\$"
   expect_log_count '^probe:ssh_run build-1 -- runnerctl restart ' 1
   expect_log_count '^probe:ssh_run build-2 -- runnerctl restart example\.slot-1$' 1
-  # build-1's --json: the first frame's summary, the R that started the
-  # restart, and the round after the two ended — nothing for the refused R
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 3
+  # build-1's --json: the R that started the restart — nothing for the
+  # refused R, and (GHR-90) nothing for a round's summary
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json$' 1
   expect_no_log '^probe:remote_signal '
   expect_cfg_count "$WRITES/fleet.log" '.' 2
   # the notice that landed under build-2's confirm line
@@ -15658,8 +15674,8 @@ case_ghr86_a_read_runs_at_once_into_the_pager() {
   expect_out_count '^ran: runnerctl fleet status --stall-after 60 \(on build-1\)$' 1
   expect_out_count '^ran: runnerctl fleet status --stall-after 60$' 1
   expect_log_count '^probe:page$' 2
-  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --stall-after 60$' 2
-  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --stall-after 60$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --stall-after 60 --with-json$' 2
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --stall-after 60 --with-json$' 1
   expect_log_count '^probe:tty_read_line : 0 - status\\ --stall-after\\ 60$' 1
   expect_log_count '^probe:tty_read_line : 2 %status\\ --stall-after\\ 60 '"''"'$' 1
   expect_out_count '^cancelled — nothing run$' 1
@@ -15890,6 +15906,168 @@ t "GHR-87: timer status says installed, not installed or unreachable per host"  
 t "GHR-87: timer install keeps its per-host refusal, as a row"                    case_ghr87_timer_install_is_refused_per_host_as_a_row
 t "GHR-87: fleet watch C pages the cursor's host's dry run"                        case_ghr87_watch_C_pages_the_hosts_dry_run
 t "GHR-87: the : prompt reads compose-reap and asks before --apply"                case_ghr87_the_prompt_reads_compose_reap_and_asks_for_apply
+
+# --- GHR-90: the table and the JSON from one collection in one call ------------
+# `status --with-json` prints the table, a line starting with 0x1e, then the
+# `status --json` object — formatted from ONE collect_slot per slot — and the
+# fleet renderer asks every host for it, so the summary line needs no second
+# call. A host too old for the flag takes the old two-call path, asked with
+# the flag once per watch session.
+GHR90_SEP=$'\x1e'
+# OUT split at the separator line into GHR90_TABLE and GHR90_JSON.
+ghr90_split() {
+  GHR90_TABLE="${OUT%%$'\n'"$GHR90_SEP"*}"
+  GHR90_JSON="${OUT#*$'\n'"$GHR90_SEP"*$'\n'}"
+}
+
+# Locally: the table is `status`'s, byte for byte, the object is `status
+# --json`'s, byte for byte, and the slots were collected once — three
+# unit_props reads, where the table and the object apart take three each.
+case_ghr90_status_with_json_is_both_from_one_collection() {
+  local table json
+  run status
+  table="$OUT"
+  run status --json
+  json="$OUT"
+  run status --with-json
+  expect_rc 0
+  expect_out_count "^$GHR90_SEP" 1
+  expect_out_count "^${GHR90_SEP}runnerctl status --json follows\$" 1
+  ghr90_split
+  expect_text "the table before the separator" "$table" "$GHR90_TABLE"
+  expect_text "the object after the separator" "$json" "$GHR90_JSON"
+  expect_log_count '^probe:unit_props ' 3
+  expect_no_log "$READ_ONLY_LOG"
+  # the separate forms collect once each — the count above is the saving
+  run status --json
+  expect_log_count '^probe:unit_props ' 3
+  # refusals: a one-shot form, and never with --json
+  run status --with-json --json
+  expect_rc 1
+  expect_err "^runnerctl: --with-json cannot be combined with --json; "
+  expect_no_log '^probe:unit_props '
+  run status --with-json --watch
+  expect_rc 1
+  expect_err "^runnerctl: --with-json cannot be combined with --watch; "
+  # a host with no runner units dies as the table does, and sends no object
+  RUNNERCTL_STUB_NO_UNITS=1 run status --with-json
+  expect_rc 1
+  expect_no_out "^$GHR90_SEP"
+}
+
+# Every host takes the flag: ONE remote call per host per tick, no `status
+# --json` at all, and the summary line is the one GHR-72 pinned.
+case_ghr90_watch_one_call_per_host_per_tick() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --iterations 3 --interval 4 --color never
+  expect_rc 0
+  expect_under_header "$SUM_OK" 3
+  expect_out_count '^build-1 +0 +example\.slot-1 .* my-app:test \(12m\)$' 3
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 3
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --with-json$' 3
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl status --json'
+  expect_log_count '^probe:ssh_run ' 6
+  # the separator and the object never reach the screen
+  expect_no_out "$GHR90_SEP"
+  expect_no_out '"slots":'
+  # the one-shot: one login per host, the same line
+  RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet status
+  expect_rc 0
+  expect_last_line "$SUM_OK"
+  expect_log_count '^probe:ssh_run ' 2
+  expect_no_out "$GHR90_SEP"
+}
+
+# A host too old for the flag is still summarised, through the second call,
+# and is asked WITH the flag only on its first tick. Under --narrow, a host too
+# old for both refuses one per call, and each is remembered on its own.
+case_ghr90_watch_old_host_falls_back_and_is_asked_once() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_NOWITHJSON="build-2" RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --iterations 3 --color never
+  expect_rc 0
+  expect_no_out 'unknown option'
+  expect_under_header "$SUM_OK" 3
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --with-json$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never$' 3
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 3
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 3
+  expect_no_log '^probe:ssh_run build-1 -- runnerctl status --json'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_NOWITHJSON="gw-oldver" RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-oldver" \
+    run fleet watch --narrow --iterations 3 --color never
+  expect_rc 0
+  expect_no_out 'unknown option'
+  expect_under_header '2/2 hosts answering · 6 slots: 2 busy, 2 idle, 2 disabled · capacity 2 free of 4 · 2 versions' 3
+  expect_log_count '^probe:ssh_run gw-oldver -- runnerctl status --color never --narrow --with-json$' 1
+  expect_log_count '^probe:ssh_run gw-oldver -- runnerctl status --color never --with-json$' 1
+  expect_log_count '^probe:ssh_run gw-oldver -- runnerctl status --color never$' 3
+  expect_log_count '^probe:ssh_run gw-oldver -- runnerctl status --json$' 3
+  expect_log_count '^probe:ssh_run gw-oldver -- ' 8
+  # the one-shot takes the same path: refused, asked again, then the payload
+  RUNNERCTL_STUB_FLEET_NOWITHJSON="build-2" RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet status
+  expect_rc 0
+  expect_last_line "$SUM_OK"
+  expect_log_count '^probe:ssh_run build-2 -- ' 3
+  expect_log_count '^probe:ssh_run build-1 -- ' 1
+}
+
+# The table and the summary in one frame come from the SAME collection. The
+# flip knob changes build-1's slot-1 on every collection of it, so the rows
+# and the line agree on it in every frame only when they are one collection:
+# tick 1 finds it running, tick 2 finds it inactive — both places, each time.
+# The control is a host too old for the flag, whose table and payload are two
+# collections: there the line contradicts the rows in every frame.
+case_ghr90_table_and_summary_are_one_collection() {
+  local busy='1/1 host answering · 3 slots: 1 busy, 1 idle, 1 disabled · capacity 1 free of 2'
+  local down='1/1 host answering · 3 slots: 1 idle, 1 down, 1 disabled · capacity 1 free of 1'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_FLIP="build-1" RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run fleet watch --iterations 2 --color never
+  expect_rc 0
+  frames
+  expect_frame_count 2
+  expect_frame_line 1 2 "^$busy\$"
+  expect_frame 1 '^build-1 +0 +example\.slot-1 .* active/running .* my-app:test \(12m\)$'
+  expect_frame_line 2 2 "^$down\$"
+  expect_frame 2 '^build-1 +0 +example\.slot-1 .* inactive/dead '
+  expect_cfg "$WRITES/remote/build-1.flip" '^2$'
+  # the control: two collections a tick, so the line is the OTHER moment
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_FLIP="build-1" RUNNERCTL_STUB_FLEET_NOWITHJSON="build-1" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --iterations 2 --color never
+  expect_rc 0
+  frames
+  expect_frame_line 1 2 "^$down\$"
+  expect_frame 1 '^build-1 +0 +example\.slot-1 .* active/running .* my-app:test \(12m\)$'
+  expect_frame_line 2 2 "^$down\$"
+  expect_frame 2 '^build-1 +0 +example\.slot-1 .* active/running '
+  expect_cfg "$WRITES/remote/build-1.flip" '^4$'
+  # and the one-shot fleet status is one moment too
+  RUNNERCTL_STUB_FLEET_FLIP="build-1" RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet status
+  expect_rc 0
+  expect_last_line "$busy"
+  expect_out '^build-1 +0 +example\.slot-1 .* active/running '
+}
+
+# An answer cut before the separator, or inside the object, is a host that
+# answered with its rows and has no summary to give: it counts as answering
+# and nothing else, and it is not dialled again for one.
+case_ghr90_a_cut_answer_is_a_host_without_a_summary() {
+  local m
+  for m in before after; do
+    RUNNERCTL_STUB_FLEET_CUT="build-2:$m" RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet status
+    expect_rc 0
+    expect_out '^build-2 +0 +example\.slot-1 .* my-app:test \(12m\)$'
+    expect_out '^build-2 +2 +example\.slot-3 .* inactive/dead '
+    expect_last_line '2/2 hosts answering · 3 slots: 1 busy, 1 idle, 1 disabled · capacity 1 free of 2'
+    expect_no_out "$GHR90_SEP"
+    expect_no_out '"slots":|^\]\}'
+    expect_log_count '^probe:ssh_run build-2 -- ' 1
+  done
+}
+
+t "GHR-90: status --with-json is the table and the object from one collection"     case_ghr90_status_with_json_is_both_from_one_collection
+t "GHR-90: fleet watch makes one call per host per tick; the summary is unchanged" case_ghr90_watch_one_call_per_host_per_tick
+t "GHR-90: a host too old for --with-json falls back, asked with it once"          case_ghr90_watch_old_host_falls_back_and_is_asked_once
+t "GHR-90: the rows and the summary in a frame are one collection"                 case_ghr90_table_and_summary_are_one_collection
+t "GHR-90: a cut answer is a host that answered without a summary"                 case_ghr90_a_cut_answer_is_a_host_without_a_summary
 
 # --- Summary ------------------------------------------------------------------
 echo
