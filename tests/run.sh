@@ -9940,10 +9940,11 @@ case_fleet_watch_question_mark_lists_every_key() {
   # GHR-129: `a` joined `b i`'s line, and the marks took the line it had
   # GHR-86: `:` joined O's line, which keeps the count at 17
   # GHR-87: C joined them, the line reworded to fit
-  for k in '!' 'b i a' '/' 'space \* u' 's' 'c' 'Enter' 'K R S T P L' 'D W E X U' 'O : C' 'q \?' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
+  # GHR-118: and H, the line reworded again, still 80 columns
+  for k in '!' 'b i a' '/' 'space \* u' 's' 'c' 'Enter' 'K R S T P L' 'D W E X U' 'O : C H' 'q \?' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
     expect_frame 2 "^  $k   +[a-z]"
   done
-  expect_frame 2 "^  O : C   job run URL; a typed fleet command; its host's compose-reap dry run\$"
+  expect_frame 2 "^  O : C H   job run URL; a typed fleet command; the host's compose-reap, history\$"
   expect_frame 2 '^  K R S T P L   kill job, restart, stop, start, reap, logs; R S: w = when idle$'
   # GHR-127: the host keys took the line `?` had; `?` folded into q's
   # GHR-128: U joined them, in the same line
@@ -15407,6 +15408,206 @@ t "GHR-128: an unreachable host refuses U"                                      
 t "GHR-128: U runs in the background, one action per host"                                    case_ghr128_U_runs_in_the_background_one_per_host
 t "GHR-128: U carries FLEET_SUDO and --origin on the write alone"                             case_ghr128_U_carries_sudo_and_origin
 t "GHR-128: the help lists U (the line count is pinned by the help case)"                     case_ghr128_the_help_lists_U
+
+# --- GHR-118: fleet watch's history pane --------------------------------------
+# H, on a row, replaces the table with that row's host's `history -n 50`; H
+# again shows every host's records merged by time. The records are the stub's
+# per-host history files ($GHR88_HIST.<host>). build-2's rows are the fourth
+# of $FW2's: the cursor starts on build-1's first slot, `jjj` is build-2's.
+ghr118_fixture() {
+  printf '%s\n' \
+    '2026-10-14T09:00:01.000100+00:00 build-1 runnerctl[101]: restart example.slot-2 by deploy via fleet from alice@central-1 — ok' \
+    '2026-10-14T09:00:09.000500+00:00 build-1 runnerctl[103]: stop example.slot-1 by deploy — ok' >"$GHR88_HIST.build-1"
+  printf '%s\n' \
+    '2026-10-14T09:00:03.000200+00:00 build-2 runnerctl[201]: kill example.slot-1 by deploy — ok' \
+    "2026-10-14T09:00:07.000400+00:00 build-2 runnerctl[202]: drain ${ESC}[2Jall by deploy — failed (exit 1)" >"$GHR88_HIST.build-2"
+}
+# The frames the history pane drew: GHR118_FIRST and GHR118_LAST are the
+# indexes of the first and last whose title line is the pane's.
+ghr118_pane_frames() {
+  local k
+  GHR118_FIRST="" GHR118_LAST=""
+  for k in "${!FRAMES[@]}"; do
+    [[ "${FRAMES[$k]}" == *$'\n'"history — "* ]] || continue
+    [ -n "$GHR118_FIRST" ] || GHR118_FIRST="$k"
+    GHR118_LAST="$k"
+  done
+}
+
+# The acceptance case: H on a build-2 row dials build-2 ONLY, on the read path,
+# and draws its records — the control character in one of them is gone — in
+# place of the table; q is back to the table.
+case_ghr118_H_shows_the_cursors_hosts_records() {
+  ghr118_fixture
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_HISTORY="$GHR88_HIST" RUNNERCTL_STUB_KEYS='jjjHqq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl history ' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl history -n 50$' 1
+  # the read path: the plain login, no sudo, no origin, no confirm
+  expect_no_log '^probe:ssh_run [^ ]+ -- sudo'
+  expect_no_log '^probe:ssh_origin '
+  expect_no_out '\[y/n\]'
+  frames
+  ghr118_pane_frames
+  [ -n "$GHR118_LAST" ] || FAILS+=("no frame drew the history pane")
+  # the pane replaces the table, then q brings it back
+  expect_frame "$GHR118_LAST" '^history — build-2 — the last 50 runnerctl records$'
+  expect_frame "$GHR118_LAST" '^  2026-10-14T09:00:03\.000200Z build-2 kill example\.slot-1 by deploy — ok$'
+  expect_frame "$GHR118_LAST" '^  2026-10-14T09:00:07\.000400Z build-2 drain all by deploy — failed \(exit 1\)$'
+  expect_no_frame "$GHR118_LAST" ' build-1 '
+  expect_no_frame "$GHR118_LAST" '^HOST +IDX|example\.slot-1 +(active|busy)'
+  expect_frame "$GHR118_LAST" '^q/Esc/Enter back  H whole fleet  jk scroll'
+  expect_frame_plain "$GHR118_LAST"
+  expect_frame_count_of "$((GHR118_LAST + 1))" '^HOST +IDX' 1
+}
+
+# H a second time: the whole fleet, merged by time, each record led by its
+# host; a third goes back to the one host. Every call is a read.
+case_ghr118_H_twice_shows_the_fleet_merged_by_time() {
+  ghr118_fixture
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_HISTORY="$GHR88_HIST" RUNNERCTL_STUB_KEYS='jjjHHHqq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  # one host, the fleet (both hosts), the one host again
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl history -n 50$' 3
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl history -n 50$' 1
+  expect_no_log '^probe:ssh_run [^ ]+ -- sudo'
+  frames
+  local k fleet=""
+  for k in "${!FRAMES[@]}"; do
+    [[ "${FRAMES[$k]}" == *$'\n'"history — the whole fleet, merged by time — "* ]] && fleet="$k"
+  done
+  [ -n "$fleet" ] || FAILS+=("no frame drew the fleet's history")
+  expect_frame_line "$fleet" 3 '^history — the whole fleet, merged by time — the last 50 runnerctl records$'
+  expect_text "the fleet's records, by time" '  2026-10-14T09:00:01.000100Z build-1 restart example.slot-2 by deploy via fleet from alice@central-1 — ok
+  2026-10-14T09:00:03.000200Z build-2 kill example.slot-1 by deploy — ok
+  2026-10-14T09:00:07.000400Z build-2 drain all by deploy — failed (exit 1)
+  2026-10-14T09:00:09.000500Z build-1 stop example.slot-1 by deploy — ok' "$(grep -E '^  2026-' <<<"${FRAMES[$fleet]}")"
+  expect_frame "$fleet" '^q/Esc/Enter back  H this host  jk scroll'
+  # the third press is back on the one host
+  ghr118_pane_frames
+  expect_frame "$GHR118_LAST" '^history — build-2 — the last 50 runnerctl records$'
+}
+
+# A host from before `history` predates it — said as `fleet history` says it,
+# in the pane and not as an error — and one that cannot be reached is its
+# error text, with the read budget's name for a timeout.
+case_ghr118_a_host_that_predates_history_is_a_line_not_an_error() {
+  ghr118_fixture
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_HISTORY="$GHR88_HIST" RUNNERCTL_STUB_KEYS='jjjHq-q' \
+    RUNNERCTL_STUB_FLEET_NOHISTORY="build-2" RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  frames
+  ghr118_pane_frames
+  expect_frame "$GHR118_LAST" "^  build-2: its runnerctl predates history — 'runnerctl fleet upgrade' brings it up to date\$"
+  expect_no_frame "$GHR118_LAST" 'unknown command'
+  expect_no_frame "$GHR118_LAST" 'remote exit'
+  # the fleet: the host that has it still shows its records
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_HISTORY="$GHR88_HIST" RUNNERCTL_STUB_KEYS='jjjHHqq' \
+    RUNNERCTL_STUB_FLEET_NOHISTORY="build-2" RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  frames
+  ghr118_pane_frames
+  expect_frame "$GHR118_LAST" ' build-1 stop example\.slot-1 by deploy — ok$'
+  expect_frame "$GHR118_LAST" "^  build-2: its runnerctl predates history"
+}
+
+# The call is on the watch's READ budget: a delay between the watch's
+# (FLEET_WATCH_TIMEOUT, 10) and the one-shot's (FLEET_TIMEOUT, 30) is cut off.
+case_ghr118_the_read_is_on_the_watch_budget() {
+  ghr118_fixture
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_HISTORY="$GHR88_HIST" RUNNERCTL_STUB_KEYS='jjjHq-q' \
+    RUNNERCTL_STUB_FLEET_DELAY="build-2:20:history" RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  frames
+  ghr118_pane_frames
+  expect_frame "$GHR118_LAST" '^  build-2: timed out after 10s'
+  expect_no_frame "$GHR118_LAST" 'kill example'
+}
+
+# A login that cannot read other users' records gets `history`'s own note on
+# stderr and no records: the pane says so rather than draw an empty list.
+case_ghr118_a_restricted_login_is_told_so() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Hq-q' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  frames
+  ghr118_pane_frames
+  expect_frame "$GHR118_LAST" '^  no records came back — see below$'
+  expect_frame "$GHR118_LAST" '^  build-1: no runnerctl records in the journal this login can read — a record written under sudo is root.s, and reading it needs the systemd-journal or adm group$'
+  expect_no_frame "$GHR118_LAST" '^  20[0-9]{2}-'
+}
+
+# A host named *hostile* answers with a clear, a title and a painted word on
+# every line: none of it is drawn, and the pane carries no control byte.
+case_ghr118_a_hostile_hosts_records_are_relayed() {
+  ghr118_fixture
+  cp "$GHR88_HIST.build-1" "$GHR88_HIST.box-hostile"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_HISTORY="$GHR88_HIST" RUNNERCTL_STUB_KEYS='Hq-q' RUNNERCTL_STUB_FLEET_HOSTS="box-hostile" \
+    run fleet watch --color never
+  expect_rc 0
+  frames
+  ghr118_pane_frames
+  expect_frame "$GHR118_LAST" '^  2026-10-14T09:00:09\.000500Z box-hostile stop example\.slot-1 by deploy — ok HOT$'
+  expect_frame_plain "$GHR118_LAST"
+  expect_no_hostile_rest
+}
+
+# The pane's own filter, on a record that reached it with an escape sequence
+# in it (no stub host sends one past the relays upstream): handed to the
+# builder as a file, drawn plain.
+case_ghr118_the_pane_draws_a_record_plain() {
+  local d="$TMP/ghr118.hist"
+  mkdir -p "$d"
+  printf '%s\n' "2026-10-14T09:00:07.000400Z build-2 drain ${ESC}[2Jall${ESC}]0;owned$(printf '\a') by deploy" >"$d/rec"
+  printf '%s\n' "build-2: ${ESC}[31mnote${ESC}[2J" >"$d/notes"
+  # shellcheck disable=SC2016
+  GHR118_D="$d" run_fn eval 'FW_HIST_DIR="$GHR118_D" FW_HIST_SCOPE=host FW_HIST_HOST=build-2
+    fleet_watch_hist_build; printf "%s\n" "$PANE_OUT"'
+  expect_rc 0
+  expect_text "the pane" 'history — build-2 — the last 50 runnerctl records
+
+  2026-10-14T09:00:07.000400Z build-2 drain all by deploy
+
+  build-2: note' "$OUT"
+}
+
+# q and Esc go back to the table with the cursor where it was, and nothing
+# more is asked of a host: a read that has not landed is ended with the pane.
+case_ghr118_q_and_Esc_go_back_to_the_table() {
+  ghr118_fixture
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_HISTORY="$GHR88_HIST" RUNNERCTL_STUB_KEYS=$'jjjHq-jHq-HQ-q' \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl history -n 50$' 3
+  frames
+  ghr118_pane_frames
+  expect_frame "$GHR118_LAST" '^history — build-2 — '
+  expect_log_count '^probe:ssh_run [^ ]+ -- (sudo|runnerctl (restart|stop|kill))' 0
+  # Esc is a lone escape (read_key looks for the rest of a sequence)
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_HISTORY="$GHR88_HIST" RUNNERCTL_STUB_KEYS=$'H\e-q' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  frames
+  ghr118_pane_frames
+  expect_frame_count_of "$((GHR118_LAST + 1))" '^HOST +IDX' 1
+}
+
+# The key is in the `?` list, on a line that fits it.
+case_ghr118_the_help_lists_H() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='?qq' RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
+  expect_rc 0
+  expect_out_count "^  O : C H   job run URL; a typed fleet command; the host's compose-reap, history\$" 1
+}
+
+t "GHR-118: H shows the cursor's host's records, relayed, read path only"           case_ghr118_H_shows_the_cursors_hosts_records
+t "GHR-118: H twice shows the fleet merged by time; a third goes back to the host"  case_ghr118_H_twice_shows_the_fleet_merged_by_time
+t "GHR-118: a host that predates history is a line, not an error"                   case_ghr118_a_host_that_predates_history_is_a_line_not_an_error
+t "GHR-118: the read is on the watch's budget"                                      case_ghr118_the_read_is_on_the_watch_budget
+t "GHR-118: a restricted login's note is drawn, not an empty list"                  case_ghr118_a_restricted_login_is_told_so
+t "GHR-118: a hostile host's records are relayed"                                   case_ghr118_a_hostile_hosts_records_are_relayed
+t "GHR-118: the pane draws a record and a note plain"                               case_ghr118_the_pane_draws_a_record_plain
+t "GHR-118: q and Esc go back to the table"                                         case_ghr118_q_and_Esc_go_back_to_the_table
+t "GHR-118: the help lists H"                                                       case_ghr118_the_help_lists_H
 
 # --- GHR-129: marked rows -----------------------------------------------------
 # Space marks the cursor's slot row, * every slot row the view shows, u clears.

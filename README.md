@@ -1190,6 +1190,14 @@ the records by time with each host's name after the time, and prints the
 last N. A host that does not answer is a line under the list and makes the
 exit status 1; one too old for `history` says so.
 
+In `fleet watch`, `H` shows the same records in place of the table: the
+cursor's host's, and the whole fleet merged by time on a second press (a third
+goes back to the host); `q`, `Esc` or `Enter` return to the table. It is read
+in the background on the watch's own budget (`FLEET_WATCH_TIMEOUT`, no sudo),
+so the table keeps refreshing. A host too old for `history` says so, and a
+login that cannot read other users' records gets the note `history` prints
+instead of an empty list.
+
 ### Several hosts from one place: `fleet status`
 
 Everything above is one host. `fleet` runs the same tool from a central node
