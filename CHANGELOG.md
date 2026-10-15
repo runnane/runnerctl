@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.24.0](https://github.com/runnane/runnerctl/compare/v0.23.0...v0.24.0) (2026-10-15)
+
+
+### Features
+
+* fleet status and fleet health take a repeatable --host, and the timed-out wording names the host (GHR-93) ([#142](https://github.com/runnane/runnerctl/issues/142)) ([8d5bb03](https://github.com/runnane/runnerctl/commit/8d5bb03bb2919589f1661b8a9d8331f144fb1d1f))
+* status --with-json prints the table and the JSON from one collection, and fleet status/watch ask for it so the summary costs no second call (GHR-90) ([#140](https://github.com/runnane/runnerctl/issues/140)) ([b02337e](https://github.com/runnane/runnerctl/commit/b02337ee7c57177679d72b03d756ff33e2ccf8ea))
+
 ## [0.23.0](https://github.com/runnane/runnerctl/compare/v0.22.0...v0.23.0) (2026-10-15)
 
 
