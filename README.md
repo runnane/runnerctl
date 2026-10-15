@@ -733,8 +733,11 @@ The redraws keep coming at `--interval` while a confirm line is up, so the
 table under it is current when you answer. On a terminal narrower than the
 table the `MAX`, `HIGH`, `CPU` and `ENVFILE` columns are dropped, never
 `WORKING-ON` — its `idle 2h31m (7 jobs)` is what tells you a slot is safe to
-act on. They come back once the full table fits with 22 columns to spare, so
-a terminal near the edge does not flip the table on every redraw.
+act on. They come back once the full table fits again, with a few columns to
+spare, so a terminal near the edge does not flip the table on every redraw.
+The width they come back at is measured — the wide table against the narrow
+one, at the moment it narrowed — rather than assumed, so a wide `ENVFILE`
+path does not make the two decisions contradict each other.
 `--narrow` asks for that narrow table outright — `status --narrow` prints it
 once, and `watch --narrow` keeps it whatever the width. It is a table shape,
 so `status --json --narrow` is refused.
@@ -772,8 +775,8 @@ rendered from one collector, so they cannot disagree on a value:
 Keys, per slot: `idx`, `unit`, `name` (the `RUNNER` column), `active`,
 `sub`, `enabled` (systemd's `ActiveState` / `SubState` / `UnitFileState`),
 `memory_max`, `memory_high`, `memory_current`, `memory_peak` (bytes),
-`restart` (the `Restart=` policy), `env_file` (the raw `EnvironmentFiles`
-value), `since` (epoch second the slot entered its current state — what
+`restart` (the `Restart=` policy), `env_file` (the `EnvironmentFiles` path(s),
+without systemd's ` (ignore_errors=…)` rendering), `since` (epoch second the slot entered its current state — what
 `SINCE` counts from), `restarts` (`NRestarts`), `result` (the current
 invocation's `Result`), `last_restart_reason` (`oom-kill` / `exit-code N` /
 `signal NAME`, looked up under the same condition as the table's

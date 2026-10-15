@@ -3306,10 +3306,18 @@ STATUS_WIDTHS=(3 40 8 19 8 9 6 6 12 6 5 8 7)
 # The flag is deliberately a boolean rather than a list of column indices:
 # which columns are dispensable is a fact about the table the REMOTE draws,
 # and an index list chosen by a central node on another version would drop
-# the wrong columns the first time a column is added. STATUS_NARROW_MARGIN is
-# the hysteresis both watches use to put the columns back: the table has to
-# fit with this many columns to spare, or a terminal a few columns either
-# side of the threshold would flip the table on every redraw.
+# the wrong columns the first time a column is added. The hysteresis both
+# watches use to put the columns back is MEASURED, not assumed (GHR-157):
+# STATUS_NARROW_GAVE is how many columns narrowing gave back, the width of
+# the wide table minus the width of the narrow one, taken at the transition.
+# The table widens again only once the narrow table plus that width fits,
+# with STATUS_NARROW_MARGIN columns to spare for a terminal a few columns
+# either side of the threshold. It used to be a constant 22 — the dropped
+# columns at their header widths — and a slot with an EnvironmentFile made
+# the real figure ~60: the narrow table then fit with 22 to spare on exactly
+# the terminals the wide one overflowed, and both watches flipped the table
+# on every tick. Until the first transition has measured it, the old constant
+# (STATUS_NARROW_GAVE_FALLBACK) stands in.
 #
 # STATUS_COLS (GHR-78): the width of the terminal the table is being drawn ON,
 # 0 when it is not going to one or the width is unknown. Set by the caller —
@@ -3321,10 +3329,24 @@ STATUS_WIDTHS=(3 40 8 19 8 9 6 6 12 6 5 8 7)
 STATUS_DROP=""
 STATUS_NARROW_DROP="6 7 10 12"
 STATUS_CPU_COL=10
-STATUS_NARROW_MARGIN=22
+STATUS_NARROW_MARGIN=4
+STATUS_NARROW_GAVE=""
+STATUS_NARROW_GAVE_FALLBACK=22
 STATUS_COLS=0
 status_narrow() { # [true|false]
   if "${1:-true}"; then STATUS_DROP="$STATUS_NARROW_DROP"; else STATUS_DROP=""; fi
+}
+# `systemctl show -p EnvironmentFiles` prints each file as
+# `<path> (ignore_errors=no)` — `yes` for a `-`-prefixed optional file —
+# space-separated. The ENVFILE cell and the JSON carry the paths alone
+# (GHR-157): the suffix is systemd's rendering of the leading `-`, which the
+# path keeps, and it made a 21-character path a 40-character cell. Pure, so
+# it is unit-testable (`run_fn`).
+env_file_paths() { # VALUE
+  local v="$1"
+  v="${v// (ignore_errors=no)/}"
+  v="${v// (ignore_errors=yes)/}"
+  printf '%s\n' "$v"
 }
 status_row() {
   local w v n c=0 out=""
@@ -3630,7 +3652,7 @@ collect_slot() { # UNIT IDX
       MemoryCurrent)                    SLOT[memory_current]="$v" ;;
       MemoryPeak)                       SLOT[memory_peak]="$v" ;;
       Restart)                          SLOT[restart]="$v" ;;
-      EnvironmentFiles)                 SLOT[env_file]="$v" ;;
+      EnvironmentFiles)                 SLOT[env_file]="$(env_file_paths "$v")" ;;
       ControlGroup)                     SLOT[cgroup]="$v" ;;
       InvocationID)                     SLOT[invocation]="$v" ;;
       ActiveEnterTimestampMonotonic)    SLOT[active_enter]="$v" ;;
@@ -4804,16 +4826,27 @@ watch_table_width() { # TABLE [PREFIX-RE]
 }
 # Whether a table of WIDTH should be narrow on a terminal of COLS, given
 # whether it is narrow now (true/false): too wide narrows it, and it only
-# widens again once it fits with STATUS_NARROW_MARGIN columns to spare. The
-# local watch and `fleet watch` both decide through this, so the two cannot
-# disagree about when a table flips. A width of 0 (unknown) never narrows.
+# widens again once the wide table would fit — the narrow width plus what
+# narrowing gave back (STATUS_NARROW_GAVE, measured by narrow_gave at the
+# transition; the fallback until then) — with STATUS_NARROW_MARGIN columns to
+# spare. The local watch and `fleet watch` both decide through this, so the
+# two cannot disagree about when a table flips. A width of 0 (unknown) never
+# narrows.
 narrow_wanted() { # NARROW-NOW WIDTH COLS
   [ "$3" -gt 0 ] || return 1
   if "$1"; then
-    [ $(($2 + STATUS_NARROW_MARGIN)) -gt "$3" ]
+    [ $(($2 + ${STATUS_NARROW_GAVE:-$STATUS_NARROW_GAVE_FALLBACK} + STATUS_NARROW_MARGIN)) -gt "$3" ]
   else
     [ "$2" -gt "$3" ]
   fi
+}
+# Record what narrowing gave back, from the wide table's width and the narrow
+# one's. A difference of 0 or less is not a measurement — `fleet watch` can
+# see one when a slow host still answers with its wide rows on the first
+# narrow tick — and leaves the fallback standing for the next tick to try.
+narrow_gave() { # WIDE-WIDTH NARROW-WIDTH
+  [ "$1" -gt "$2" ] || return 0
+  STATUS_NARROW_GAVE=$(($1 - $2))
 }
 # The table for one frame, into WATCH_TABLE (not stdout: STATUS_DROP has to
 # outlive the call). Narrower than the terminal, or MAX/HIGH/ENVFILE are
@@ -4824,7 +4857,7 @@ narrow_wanted() { # NARROW-NOW WIDTH COLS
 WATCH_TABLE=""
 WATCH_NARROW_FORCED=false
 watch_table() {
-  local now=false want=false
+  local now=false want=false w
   # GHR-78: the width is read once per frame, BEFORE the render, which draws
   # the long WORKING-ON cell by it; the narrow decision below reads the same
   # number, so the two cannot be taken on different sizes mid-resize.
@@ -4832,10 +4865,14 @@ watch_table() {
   WATCH_TABLE="$(render_status)"
   ! $WATCH_NARROW_FORCED || return 0
   [ -z "$STATUS_DROP" ] || now=true
-  if narrow_wanted "$now" "$(watch_table_width "$WATCH_TABLE")" "$STATUS_COLS"; then want=true; fi
+  w="$(watch_table_width "$WATCH_TABLE")"
+  if narrow_wanted "$now" "$w" "$STATUS_COLS"; then want=true; fi
   [ "$now" != "$want" ] || return 0
   status_narrow "$want"
   WATCH_TABLE="$(render_status)"
+  # GHR-157: the wide and the narrow table of one frame, so the measurement
+  # is exact here; `fleet watch` has to take it across two ticks.
+  ! $want || narrow_gave "$w" "$(watch_table_width "$WATCH_TABLE")"
 }
 
 # --- Viewport (GHR-73) ----------------------------------------------------------
@@ -13370,7 +13407,7 @@ fleet_watch_handle_key() { # KEY
 
 cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] [--stall-after N] [--narrow] [--min-available K] [--problems] [--sort ORDER]
   local interval=5 iterations="" tick=0 header="" frame="" summary="" remote_color=never
-  local narrow=false forced=false wide fetch=tick launched draw=false hl lead tail step left polling i
+  local narrow=false forced=false wide wide_last="" fetch=tick launched draw=false hl lead tail step left polling i
   local head legend status
   local -a hosts=() fwd=() narrow_arg=()
   while [ $# -gt 0 ]; do
@@ -13510,8 +13547,16 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
         # every host to redraw one frame is the cost this command exists to
         # avoid. The same hysteresis as the local watch, so a terminal near
         # the threshold does not flip the table on every tick. --narrow pins it.
+        # GHR-157: what narrowing gave back is measured across the two ticks
+        # — the last wide frame's width against the first narrow frame's —
+        # since the two tables are never in hand together here.
         if ! $forced; then
           wide="$(watch_table_width "$frame" '[^ ]+ +')"
+          if $narrow; then
+            [ -n "$STATUS_NARROW_GAVE" ] || narrow_gave "${wide_last:-0}" "$wide"
+          else
+            wide_last="$wide"; STATUS_NARROW_GAVE=""
+          fi
           if narrow_wanted "$narrow" "$wide" "$(term_cols)"; then narrow=true; else narrow=false; fi
         fi
       fi
