@@ -8708,13 +8708,40 @@ case_fleet_watch_legend_names_the_keys_overlay_in_80_columns() {
   expect_text "the default legend: one row, 80 columns" "1 80" "$OUT"
   run_snippet "$STUB" "viewport_rows \"\${FLEET_WATCH_LEGEND}x\" 80; echo \"\$VIEW_ROWS\""
   expect_text "the same legend one column longer wraps (the measure bites)" "2" "$OUT"
-  run_snippet "$STUB" "printf \"%s\\n\" \"\$FLEET_WATCH_VIEW_LEGEND\""
-  expect_out '  a all  \? keys  q quit$'
-  expect_out_count '\? keys' 1
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='q' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
     run fleet watch --color never --interval 4
   expect_rc 0
   expect_out '^↑↓/jk select  K kill  R restart  S stop  T start  P reap  L logs  \? keys  q quit$'
+}
+
+# GHR-141: every other legend state is one row at 80 columns too, measured as
+# GHR-98's case measures: the hints of the states on, then "? keys". Worst
+# realistic case assumed: a THREE-digit marked count (999). Each line is
+# "state rows width legend" for the script's own fleet_watch_legend.
+case_fleet_watch_legend_states_fit_80_columns() {
+  # shellcheck disable=SC2016  # the child shell expands these, not this one
+  run_snippet "$STUB" '
+    st() { fleet_watch_legend 999; viewport_rows "$FW_LEGEND" 80; echo "$1 $VIEW_ROWS ${#SGR_STRIPPED} $FW_LEGEND"; }
+    st none
+    FW_FILTER=problems; st view; FW_FILTER=all
+    FW_MARKS=($(seq 999)); st marked
+    FW_ACT_PID=([0]=123) FW_ACT_DETACHED=([0]=""); st marked+attached
+    FW_FILTER=problems; st view+marked+attached
+    FW_MARKS=(); st view+attached
+    FW_FILTER=all; st attached
+    FW_ACT_PID=(); FW_FILTER=problems; FW_SORT=job; FW_COLLAPSE=true; FW_SEARCH=x; FW_MARKS=($(seq 999)); st view-everything
+    FW_FILTER=all; FW_SORT=config; FW_COLLAPSE=false; FW_SEARCH=""; FW_MARKS=(); FW_ACT_PID=([0]=123)
+    FW_ACT_DETACHED=([0]=1); st detached'
+  expect_rc 0
+  expect_out '^none 1 80 ↑↓/jk select  K kill  R restart  S stop  T start  P reap  L logs  \? keys  q quit$'
+  expect_out '^view 1 13 a all  \? keys$'
+  expect_out '^marked 1 28 999 marked, u clears  \? keys$'
+  expect_out '^marked\+attached 1 40 999 marked, u clears  Esc detach  \? keys$'
+  expect_out '^view\+marked\+attached 1 47 a all  999 marked, u clears  Esc detach  \? keys$'
+  expect_out '^view\+attached 1 25 a all  Esc detach  \? keys$'
+  expect_out '^attached 1 18 Esc detach  \? keys$'
+  expect_out '^view-everything 1 35 a all  999 marked, u clears  \? keys$'
+  expect_out '^detached 1 80 .*  \? keys  q quit$'
 }
 
 # The acceptance case: a 16-line frame on an 11-row terminal is exactly 11
@@ -9571,7 +9598,7 @@ EOF
 SUM_MIX='2/2 hosts answering · 6 slots: 1 busy, 2 idle, 1 STALLED, 2 disabled · capacity 2 free of 4'
 V_ROW="^(${REV})?[^ ]+ +[0-9]+ +example\.slot-"
 V_DISK="${HV}Disk: / \[docker,work\] 24% \(353\.9G free\)"
-V_LEGEND='^↑↓/jk select  K kill  R restart  S stop  T start  P reap  L logs  a all  \? keys  q quit$'
+V_LEGEND='^a all  \? keys$'
 # The header of a frame, with the view it names after it (nothing for none).
 view_hdr() { # VIEW-SUFFIX [HOSTS]
   echo "^runnerctl fleet watch — ${2:-2} host\(s\) — [0-9]{2}:[0-9]{2}:[0-9]{2} — every 5s \(q to quit\)$1\$"
@@ -10495,7 +10522,8 @@ t "fleet watch: a failed remote action is a notice, the watch goes on"  case_fle
 t "watch: unknown height (0) is the frame of before, byte for byte"       case_watch_unknown_height_draws_the_frame_of_before
 t "fleet watch: unknown height (0) is the frame of before, byte for byte" case_fleet_watch_unknown_height_draws_the_frame_of_before
 t "fleet watch: the legend names ? and fits 80 columns"                  case_fleet_watch_legend_names_the_keys_overlay_in_80_columns
-t "watch: the legend names ? and fits 80 columns"                        case_watch_legend_names_the_keys_overlay_in_80_columns
+t "fleet watch: every legend state (view, marked, attached) fits 80 columns" case_fleet_watch_legend_states_fit_80_columns
+t "watch: the legend names ? and fits 80 columns"                      case_watch_legend_names_the_keys_overlay_in_80_columns
 t "watch: ? lists every key, naming Enter and O; a key closes the list"  case_watch_question_mark_lists_every_key
 t "watch: a tall frame is cut to the height, chrome and cursor row kept"   case_watch_tall_frame_is_cut_to_the_terminal_height
 t "watch: the window scrolls with the cursor; PgUp/PgDn, g/G, Home/End"   case_watch_window_scrolls_with_the_cursor
@@ -14984,7 +15012,7 @@ case_ghr125_a_slow_action_holds_up_no_key() {
   expect_frame 2 '^Restart example\.slot-1 on build-1\? runs on build-1: runnerctl restart example\.slot-1  \[y/n\]'
   expect_frame 3 "$(fw_row build-1 1 2)"
   expect_frame 3 "^example\.slot-1 on build-1: restart running — ${GHR125_PROGRESS}\$"
-  expect_frame 3 "${FLEET_WATCH_LEGEND%\$}  Esc detach\$"
+  expect_frame 3 "^Esc detach  \? keys\$"
   expect_no_frame 3 'restart done'
   expect_frame 4 "^${GHR125_DONE}\$"
   expect_frame 4 "$(fw_row build-1 1 2)"
@@ -15127,7 +15155,7 @@ case_ghr125_a_fitted_frame_makes_room_for_the_progress_line() {
   expect_frame_line 3 4 '^↑ 2 more'
   expect_frame_line 3 5 "$(fw_row build-1 1 2)"
   expect_frame_line 3 8 "^example\.slot-1 on build-1: restart running — ${GHR125_PROGRESS}\$"
-  expect_frame_line 3 9 "${FLEET_WATCH_LEGEND%\$}  Esc detach\$"
+  expect_frame_line 3 9 "^Esc detach  \? keys\$"
   expect_frame_count_of 3 "^${REV}" 1
   expect_frame_lines 4 10
   expect_frame_line 4 5 '^build-1 +0 +example\.slot-1 '
@@ -15905,7 +15933,7 @@ case_ghr129_three_marks_issue_three_commands_after_one_confirm() {
   expect_out '^\* build-1 +0 +example\.slot-1 '
   expect_out '^\* build-1 +1 +example\.slot-2 '
   expect_out "^${REV}\\* build-2 +0 +example\\.slot-1 "
-  expect_out '  3 marked, u clears$'
+  expect_out '^3 marked, u clears  \? keys$'
   expect_out_count "$GHR129_THREE_RESTART" 1
   expect_out_count '\[y/n\]' 1
   expect_out_count '^warning: a job is running \(example\.slot-1 on build-1 \(my-app:test[^)]*\)\), example\.slot-1 on build-2 \(my-app:test[^)]*\)\)\) — y kills it ' 1
@@ -15945,7 +15973,7 @@ case_ghr129_star_under_the_problems_filter_marks_the_problem_rows() {
   expect_out "^${REV}\\* build-1 +0 +example\\.slot-1 "
   expect_out '^\* build-2 +0 +example\.slot-1 '
   expect_no_out '^(.\[7m)?\* build-[12] +[12] '
-  expect_out '  2 marked, u clears$'
+  expect_out '^2 marked, u clears  \? keys$'
   expect_out_count '^Kill the job on 2 marked slot\(s\)\? runs on build-1: runnerctl kill example\.slot-1; on build-2: runnerctl kill example\.slot-1  \[y/n\]$' 1
   expect_no_out '^skipped:'
   expect_log_count '^probe:ssh_run build-1 -- runnerctl kill example\.slot-1$' 1
@@ -15963,7 +15991,7 @@ case_ghr129_a_mark_survives_a_refresh_in_which_rows_reorder() {
   expect_out 'view: longest job first'
   expect_out "^${REV}\\* build-1 +1 +example\\.slot-2 "
   expect_no_out '^(.\[7m)?\* build-(1 +0|1 +2|2 +[012]) '
-  expect_out '  1 marked, u clears$'
+  expect_out '^1 marked, u clears  \? keys$'
   expect_out_count '^Restart 1 marked slot\(s\)\? runs on build-1: runnerctl restart example\.slot-2  \[y/n\]$' 1
   expect_no_log "$GHR129_SLOTKEYS"
 }
@@ -15995,7 +16023,7 @@ case_ghr129_a_vanished_slot_is_dropped_and_said() {
   expect_rc 0
   expect_out '^\* build-2 +2 +example\.slot-3 |^.\[7m\* build-2 +2 +example\.slot-3 '
   expect_out_count '^mark dropped: example\.slot-3 on build-2 — no longer on that host$' 1
-  expect_out '  1 marked, u clears$'
+  expect_out '^1 marked, u clears  \? keys$'
   expect_out_count '^Start 1 marked slot\(s\)\? runs on build-1: runnerctl start example\.slot-3  \[y/n\]$' 1
   expect_no_out '^skipped:'
   expect_log_count '^probe:ssh_run build-1 -- runnerctl start example\.slot-3$' 1
@@ -16009,7 +16037,7 @@ case_ghr129_with_no_marks_keys_act_on_the_cursor_as_before() {
   expect_rc 0
   expect_out_count '^marks cleared — 1 slot\(s\) unmarked; keys act on the cursor.s row again$' 1
   expect_out_count '^  HOST +IDX ' 1
-  expect_out_count '  1 marked, u clears$' 1
+  expect_out_count '^1 marked, u clears  \? keys$' 1
   expect_out_count "$GHR126_RESTART_LINE" 1
   expect_out_count "$GHR126_IDLE_RESTART" 1
   expect_no_out 'marked slot'
