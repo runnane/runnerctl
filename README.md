@@ -2209,7 +2209,9 @@ re-running.
 
 **A host that says it is alive is not held to a total.** Every
 call above — the fan-out, a `--max-unavailable` / `--min-available` walk's
-slot calls, a `fleet watch` action key and its `:` commands — also asks the
+slot calls, a `fleet watch` action key and its `:` commands, `fleet upgrade`'s
+write (and `--rollback`), `fleet upgrade --push`'s install and `fleet health
+--restart-stalled` — also asks the
 host for `--heartbeat=N`, with N a quarter of `FLEET_MUTATE_IDLE` (default
 120 s, so N = 30). A runnerctl that knows the flag then prints a line at least
 every N s of every phase that can block, and at most about 2N apart across two
@@ -2230,8 +2232,11 @@ must be 10 or more (0 turns this off and puts every host back on the total);
 not shown — they only say the host is alive. A host whose runnerctl predates
 the flag refuses it (`unknown command '--heartbeat…'`, nothing done), is asked
 again without it — once per run, and once per `fleet watch` session — and
-stays on the total above. `fleet upgrade` and `fleet health
---restart-stalled` do not ask for it yet, and stay on that total too.
+stays on the total above. `fleet upgrade --push` is the exception that has no
+older host: the flag rides inside the install command, where the script being
+pushed — this node's own — reads it, so every pushed host is on the two limits,
+whatever runnerctl it had before. `fleet upgrade --check` is a read and is
+not asked.
 
 **What the host does once its caller has gone.** The same happens when you
 press Ctrl-C on the central node, quit `fleet watch` with an action still

@@ -3186,6 +3186,8 @@ case_fleet_upgrade_applies_and_says_what_changed() {
 # which host is still behind is the failure that matters, so a bad host is a
 # row and the rest still upgrade.
 case_fleet_upgrade_failed_host_is_a_row_not_an_abort() {
+  # GHR-156: the GHR-81 wording is a host on the total, one before --heartbeat
+  local -x RUNNERCTL_STUB_FLEET_NOHB="slow-timeout"
   RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver gw-unreachable slow-timeout" run fleet upgrade
   expect_rc 1
   expect_out '^build-2-oldver +0\.0\.1 -> 9\.9\.9 +upgraded$'
@@ -3695,9 +3697,10 @@ case_fleet_upgrade_push_installs_the_central_bytes() {
                    "^probe:ssh_run_stdin build-1 -- $PUSH_INSTALL_RE" \
                    "^probe:ssh_run build-1 -- $PUSH_PROBE_RE"
   # the install is an ordinary FILE install of the pushed temp file, with this
-  # node's origin — never `bash -s`, the piped branch that downloads
-  expect_log "^probe:remote_push_sudo build-1 -- -n bash $(push_dir build-1)/tmp/tmp\\.[A-Za-z0-9]+ --origin=$ME@stub-host-1 install\$"
-  expect_log "^probe:remote_push_sudo box-absent -- -n bash $(push_dir box-absent)/tmp/tmp\\.[A-Za-z0-9]+ --origin=$ME@stub-host-1 install\$"
+  # node's origin — never `bash -s`, the piped branch that downloads — and,
+  # since GHR-156, the default heartbeat (FLEET_MUTATE_IDLE 120 / 4)
+  expect_log "^probe:remote_push_sudo build-1 -- -n bash $(push_dir build-1)/tmp/tmp\\.[A-Za-z0-9]+ --origin=$ME@stub-host-1 --heartbeat=30 install\$"
+  expect_log "^probe:remote_push_sudo box-absent -- -n bash $(push_dir box-absent)/tmp/tmp\\.[A-Za-z0-9]+ --origin=$ME@stub-host-1 --heartbeat=30 install\$"
   expect_no_log '^probe:remote_push_piped '
   expect_no_log '^probe:remote_push_curl '
   expect_same_file "$(push_dir build-1)/sudo-saw" "$RUNNERCTL"
@@ -17576,6 +17579,114 @@ t "GHR-150: an older host stays on GHR-81's total, asked once per run"          
 t "GHR-150: the budget walk cuts on silence, under a ceiling"                     case_ghr150_the_budget_walk_cuts_on_silence_under_a_ceiling
 t "GHR-150: a watch action cuts on silence, under a ceiling"                      case_ghr150_a_watch_action_cuts_on_silence_under_a_ceiling
 t "GHR-150: FLEET_MUTATE_IDLE and FLEET_MUTATE_MAX are validated"                 case_ghr150_the_limits_are_validated
+
+# --- GHR-156: fleet upgrade and fleet health --restart-stalled on the watchdog ---
+# The two command paths GHR-150 left on GHR-81's total. The same limits and
+# timelines as GHR-150's cases (a total of 30 s, IDLE 12 so --heartbeat=3,
+# MAX 60), keyed to each path's own subcommand:
+#   LIVE   a line every 2 s for 50 s — past the 30 s total — then done;
+#   QUIET  lines up to 10 s, then nothing: cut at 22 (10 + IDLE).
+ghr156_still() { echo "the command may still be running on that host; 'runnerctl fleet status --host $1' shows where it got to"; }
+ghr156_idle_text() { echo "timed out — no line from it for 12s \\(FLEET_MUTATE_IDLE\\) — $(ghr156_still "$1")"; }
+
+# `fleet upgrade`'s write: a host that takes the flag is let finish past the
+# total and cut on silence; one from before the flag (*preheartbeat*) is asked
+# again without it and stays on the total, in GHR-81's words.
+case_ghr156_fleet_upgrade_cuts_on_silence() {
+  ghr150_config
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_LINES="build-2-oldver:2:50:50:upgrade" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" run_cfg "$GHR150_CFG" fleet upgrade
+  expect_rc 0
+  expect_out '^build-2-oldver +0\.0\.1 -> 9\.9\.9 +upgraded$'
+  expect_log_count '^probe:ssh_heartbeat build-2-oldver 3$' 1
+  expect_log '^probe:timeline build-2-oldver every=2 last=50 end=50 budget=60$'
+  expect_log '^probe:timeline_end build-2-oldver 50$'
+  expect_no_out 'heartbeat|timed out'
+  # the read-back is a read: no heartbeat, no watchdog
+  expect_log_count '^probe:ssh_heartbeat ' 1
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_LINES="build-2-oldver:2:10:50:upgrade" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" run_cfg "$GHR150_CFG" fleet upgrade
+  expect_rc 1
+  expect_out "^build-2-oldver +— +$(ghr156_idle_text build-2-oldver)\$"
+  expect_text "the clock at the cut" 22 "$(ghr150_clock)"
+  expect_no_log '^probe:timeline_(end|timeout) '
+  expect_cfg "$WRITES/fleet.log" ' — build-2-oldver=124$'
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_LINES="gw-preheartbeat-oldver:2:50:50:upgrade" \
+    RUNNERCTL_STUB_FLEET_HOSTS="gw-preheartbeat-oldver" run_cfg "$GHR150_CFG" fleet upgrade
+  expect_rc 1
+  expect_out "^gw-preheartbeat-oldver +— +timed out after 30s — $(ghr156_still gw-preheartbeat-oldver)\$"
+  expect_no_out 'FLEET_MUTATE_(IDLE|MAX)'
+  expect_log_count '^probe:ssh_heartbeat gw-preheartbeat-oldver 3$' 1
+  expect_log_count '^probe:ssh_run gw-preheartbeat-oldver -- runnerctl upgrade$' 2
+  expect_no_log '^probe:timeline gw-preheartbeat-oldver '
+}
+
+# `fleet upgrade --push`'s install: the flag rides inside the install text,
+# where the PUSHED script — this node's, which knows it — reads it, so there
+# is no older host to fall back for: the host's own runnerctl (0.0.1 here)
+# never sees the flag. The probe and the read-back are reads, on no watchdog.
+case_ghr156_fleet_upgrade_push_cuts_on_silence() {
+  local v
+  v="$(push_ver)"
+  ghr150_config
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_LINES="build-1:2:50:50:push-install" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet upgrade --push
+  expect_rc 0
+  expect_out "^build-1 +0\\.0\\.1 -> ${v//./\\.} +upgraded\$"
+  expect_same_file "$(push_dir build-1)/bin/runnerctl" "$RUNNERCTL"
+  expect_log '^probe:timeline build-1 every=2 last=50 end=50 budget=60$'
+  expect_log '^probe:timeline_end build-1 50$'
+  expect_log_count '^probe:timeline ' 1
+  expect_log "^probe:remote_push_sudo build-1 -- -n bash $(push_dir build-1)/tmp/tmp\\.[A-Za-z0-9]+ --origin=$ME@stub-host-1 --heartbeat=3 install\$"
+  expect_no_out 'heartbeat|timed out'
+  expect_push_tmp_clean build-1
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_LINES="build-1:2:10:50:push-install" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet upgrade --push
+  expect_rc 1
+  expect_out "^build-1 +0\\.0\\.1 -> ${v//./\\.} +$(ghr156_idle_text build-1)\$"
+  expect_text "the clock at the cut" 22 "$(ghr150_clock)"
+  expect_no_log '^probe:remote_push_sudo '
+  expect_same_file "$(push_dir build-1)/bin/runnerctl" "$(push_dir build-1)/before"
+}
+
+# `fleet health --restart-stalled`, buffered rather than streamed: the same
+# three outcomes, and a --json answer carries no heartbeat line.
+case_ghr156_fleet_health_restart_stalled_cuts_on_silence() {
+  ghr150_config
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_LINES="build-1:2:50:50:health" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet health --restart-stalled
+  expect_rc 0
+  expect_log_count '^probe:ssh_heartbeat build-1 3$' 1
+  expect_log '^probe:timeline build-1 every=2 last=50 end=50 budget=60$'
+  expect_log '^probe:timeline_end build-1 50$'
+  expect_no_out 'heartbeat|timed out'
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_LINES="build-1:2:50:50:health" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet health --restart-stalled --json
+  expect_rc 0
+  expect_log '^probe:timeline_end build-1 50$'
+  expect_no_out 'heartbeat|timed out'
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_LINES="build-1:2:10:50:health" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet health --restart-stalled
+  expect_rc 1
+  expect_out "^build-1: $(ghr156_idle_text build-1)\$"
+  expect_text "the clock at the cut" 22 "$(ghr150_clock)"
+  expect_no_log '^probe:timeline_(end|timeout) '
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_LINES="gw-preheartbeat:2:50:50:health" \
+    RUNNERCTL_STUB_FLEET_HOSTS="gw-preheartbeat" run_cfg "$GHR150_CFG" fleet health --restart-stalled
+  expect_rc 1
+  expect_out "^gw-preheartbeat: timed out after 30s — $(ghr156_still gw-preheartbeat)\$"
+  expect_no_out 'FLEET_MUTATE_(IDLE|MAX)'
+  expect_log_count '^probe:ssh_heartbeat gw-preheartbeat 3$' 1
+  expect_log_count '^probe:ssh_run gw-preheartbeat -- runnerctl health --restart-stalled$' 2
+  expect_no_log '^probe:timeline gw-preheartbeat '
+  # a plain `fleet health` changes nothing: no heartbeat asked for
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet health
+  expect_no_log '^probe:ssh_heartbeat '
+}
+
+t "GHR-156: fleet upgrade cuts on silence; an older host stays on the total"       case_ghr156_fleet_upgrade_cuts_on_silence
+t "GHR-156: fleet upgrade --push's install cuts on silence, the flag inline"       case_ghr156_fleet_upgrade_push_cuts_on_silence
+t "GHR-156: fleet health --restart-stalled cuts on silence; an older host doesn't" case_ghr156_fleet_health_restart_stalled_cuts_on_silence
 
 # --- Summary ------------------------------------------------------------------
 echo

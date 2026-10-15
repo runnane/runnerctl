@@ -539,6 +539,16 @@ Traps:
   - `probe:timeline_gave_up T` means no watchdog looked at second T (a
     mutant that dropped it), `probe:timeline_unseen T` that no tap stamped the
     line printed then.
+  - `fleet upgrade` and `fleet health --restart-stalled` carry the flag too
+    (GHR-156), so a GHR-81 case about either one's total names its host in
+    `RUNNERCTL_STUB_FLEET_NOHB`. A stub host like `slow-timeout` that answers
+    124 at once would otherwise be worded as the 7200 s ceiling.
+  - `fleet upgrade --push` puts the flag INSIDE its install text
+    (`… --origin=… --heartbeat=N install`). The pushed script reads it, so
+    no host refuses it: assert it on `probe:remote_push_sudo`, not on
+    `probe:ssh_heartbeat`. A push call's timeline is keyed by the SUB-ERE
+    `push-install` or `push-probe`. Without the watchdog, it follows the
+    instant model there too.
 - **`relay_safe` clobbers `BASH_REMATCH`** (it matches regexes of its own).
   Take every capture you need into a variable BEFORE calling it — the first
   `history` parser read the time after relaying the message and died
