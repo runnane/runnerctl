@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.26.0](https://github.com/runnane/runnerctl/compare/v0.25.1...v0.26.0) (2026-10-15)
+
+
+### Features
+
+* a mutating fleet call to a heartbeat-capable host is cut on silence (FLEET_MUTATE_IDLE) under a FLEET_MUTATE_MAX ceiling (GHR-150) ([#158](https://github.com/runnane/runnerctl/issues/158)) ([c82879f](https://github.com/runnane/runnerctl/commit/c82879fd4c1a88d3cc162fd8c83b1cd198fa2ecc))
+* a remote --heartbeat=N global flag makes every phase that can block print a line at most N s apart (GHR-149) ([#156](https://github.com/runnane/runnerctl/issues/156)) ([0ff1f0d](https://github.com/runnane/runnerctl/commit/0ff1f0dc6f7c87e8bf811490d9d4ead1dfa92a1b))
+
+
+### Bug Fixes
+
+* fleet watch runs a marked-rows U's upgrade checks in the background and raises one confirm when the last lands (GHR-151) ([#160](https://github.com/runnane/runnerctl/issues/160)) ([5285272](https://github.com/runnane/runnerctl/commit/5285272bfa9c3003c4cc5ecc9d7c43b7b4d8d132))
+
 ## [0.25.1](https://github.com/runnane/runnerctl/compare/v0.25.0...v0.25.1) (2026-10-15)
 
 
