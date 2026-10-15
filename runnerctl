@@ -5069,6 +5069,12 @@ pane_put() { # LABEL VALUE [SGR]
   printf -v pad '%-*s' "$PANE_LABEL_W" "$1"
   PANE_OUT+="${PANE_OUT:+$'\n'}  $pad ${3-}${RELAY_SAFE:-—}${3:+$C_RESET}"
 }
+# A line with no label (GHR-118: a record, a note), made safe as pane_put's
+# value is, and painted SGR when one is given.
+pane_line() { # TEXT [SGR]
+  relay_safe "${1-}" plain
+  PANE_OUT+="${PANE_OUT:+$'\n'}  ${2-}${RELAY_SAFE}${2:+$C_RESET}"
+}
 # A heading: the pane's title, or a section's name.
 pane_head() { # TEXT
   relay_safe "$1" plain
@@ -9493,8 +9499,31 @@ fleet_health_json() {
 # is not merged. A host that did not answer is a line under the list, and the
 # exit status is 1, as `fleet status` does for one.
 FLEET_HISTORY_RE='^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,9})?Z) (.*)$'
+# GHR-118: the same lines and the same wording serve fleet watch's history pane.
+FLEET_HISTORY_PREDATES="its runnerctl predates history — 'runnerctl fleet upgrade' brings it up to date"
+# One host's `history` answer (FILE) as merge lines, `<time> <host> <record>`.
+# A record is never painted: no SGR is kept either. The time is taken first —
+# relay_safe matches regexes of its own.
+fleet_history_lines() { # HOST FILE
+  local line ts
+  while IFS= read -r line || [ -n "$line" ]; do
+    [[ "$line" =~ $FLEET_HISTORY_RE ]] || continue
+    ts="${BASH_REMATCH[1]}"
+    relay_safe "${BASH_REMATCH[3]}" plain
+    printf '%s %s %s\n' "$ts" "$1" "$RELAY_SAFE"
+  done <"$2"
+}
+# Why one host's `history` call failed: a host from before the command says
+# so, anything else is fleet_error_text's. BUDGET is the call's, as there.
+fleet_history_failure() { # RC ERRFILE [BUDGET]
+  if grep -qF "unknown command 'history'" "$2" 2>/dev/null; then
+    printf '%s\n' "$FLEET_HISTORY_PREDATES"
+  else
+    fleet_error_text "$1" "$2" ${3:+"$3"}
+  fi
+}
 cmd_fleet_history() { # [-n N] [--host H]...
-  local n=20 rc=0 i host line err ts
+  local n=20 rc=0 i host
   local -a hosts=()
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
@@ -9511,25 +9540,13 @@ cmd_fleet_history() { # [-n N] [--host H]...
   for i in "${!FLEET_HOSTS[@]}"; do
     host="${FLEET_HOSTS[$i]}"
     [ "$(fleet_rc "$i")" = 0 ] || continue
-    while IFS= read -r line || [ -n "$line" ]; do
-      [[ "$line" =~ $FLEET_HISTORY_RE ]] || continue
-      # A record is never painted: no SGR is kept either. The time is taken
-      # first — relay_safe matches regexes of its own.
-      ts="${BASH_REMATCH[1]}"
-      relay_safe "${BASH_REMATCH[3]}" plain
-      printf '%s %s %s\n' "$ts" "$host" "$RELAY_SAFE"
-    done <"$FLEET_DIR/$i.out"
+    fleet_history_lines "$host" "$FLEET_DIR/$i.out"
   done | LC_ALL=C sort -s -k1,1 | tail -n "$n"
   for i in "${!FLEET_HOSTS[@]}"; do
     host="${FLEET_HOSTS[$i]}"
     [ "$(fleet_rc "$i")" != 0 ] || continue
     rc=1
-    if grep -qF "unknown command 'history'" "$FLEET_DIR/$i.err" 2>/dev/null; then
-      err="its runnerctl predates history — 'runnerctl fleet upgrade' brings it up to date"
-    else
-      err="$(fleet_error_text "$(fleet_rc "$i")" "$FLEET_DIR/$i.err")"
-    fi
-    printf '%s: %s\n' "$host" "$err"
+    printf '%s: %s\n' "$host" "$(fleet_history_failure "$(fleet_rc "$i")" "$FLEET_DIR/$i.err")"
   done
   fleet_cleanup
   return "$rc"
@@ -10042,6 +10059,7 @@ fleet_watch_cleanup() {
   viewport_close
   # GHR-125: the actions still out, before their directory goes.
   fleet_watch_act_quit
+  fleet_watch_hist_stop
   fleet_watch_reap
   fleet_cleanup
   [ -z "$FW_TMP" ] || rm -rf "$FW_TMP"
@@ -10921,6 +10939,161 @@ fleet_watch_compose_key() {
   { printf "compose-reap on %s — a dry run, nothing removed ('runnerctl fleet compose-reap --apply --host %s' reaps)\n\n" "$host" "$host"
     cat "$FW_TMP/compose"; } | page
   term_cursor hide
+}
+
+# --- Fleet watch: H shows the recent records (GHR-118) --------------------------
+# H replaces the table with `history -n FW_HIST_LINES` of the cursor's host
+# (GHR-88's records: what changed on it, by whom); H again, in the pane, shows
+# the whole fleet merged by time as `fleet history` does, and once more goes
+# back to the one host. q, Esc and Enter go back to the table.
+#   * A READ, in the background as a tick's fetch is (GHR-74): a job of its own
+#     over the host's held connection, as the plain login on FLEET_WATCH_TIMEOUT
+#     — never FLEET_SUDO, no --origin, no confirm. The watch goes on around it,
+#     and the pane says it is reading until the job lands. One job at a time:
+#     H, q and a quit end the one out, and its directory goes with it.
+#   * Drawn as the detail pane is: through pane_line (relay_safe's plain form),
+#     windowed by viewport_draw, scrolled by pane_scroll. The records were
+#     relayed where they landed and the merge lines are made plain again.
+#   * What the pane says besides the records is each host's own words, under
+#     them: a host from before `history` predates it (fleet_history_failure,
+#     as `fleet history` says it), a failure is fleet_error_text's, and a
+#     login outside systemd-journal/adm — whose `history` answers on stderr —
+#     has that note drawn, so an empty list is never "nothing happened".
+FW_HIST_LINES=50 FW_HIST_SCOPE="" FW_HIST_HOST="" FW_HIST_PID="" FW_HIST_DIR="" FW_HIST_SEQ=0
+FW_HIST_LEGEND_HOST="q/Esc/Enter back  H whole fleet  jk scroll  PgUp PgDn g G  Ctrl-C quits"
+FW_HIST_LEGEND_FLEET="q/Esc/Enter back  H this host  jk scroll  PgUp PgDn g G  Ctrl-C quits"
+
+fleet_watch_hist_out() { [ -n "$FW_HIST_PID" ]; }
+
+# One host's call into DIR/K.{out,err,rc}.
+fleet_watch_hist_one() { # DIR K HOST N
+  local rc=0
+  (FLEET_CALL_TIMEOUT="$FLEET_WATCH_TIMEOUT" ssh_run "$3" "$FLEET_RUNNERCTL" history -n "$4") >"$1/$2.out" 2>"$1/$2.err" || rc=$?
+  relay_file "$1/$2.out"
+  relay_file "$1/$2.err"
+  echo "$rc" >"$1/$2.rc"
+}
+
+# The job: the host's call, or every host's at most FLEET_PARALLEL at a time,
+# then DIR/rec (the merged records, the last N), DIR/notes (a line per host
+# that has something to say) and DIR/rc LAST, so the loop never takes half.
+fleet_watch_hist_job() { # DIR SCOPE HOST N
+  local d="$1" n="$4" k rc line running=0
+  local -a hs=() pids=()
+  if [ "$2" = host ]; then hs=("$3"); else hs=("${FLEET_HOSTS[@]}"); fi
+  for k in "${!hs[@]}"; do
+    fleet_watch_hist_one "$d" "$k" "${hs[$k]}" "$n" &
+    pids+=("$!")
+    running=$((running + 1))
+    if [ "$running" -ge "$FLEET_PARALLEL" ]; then
+      wait -n 2>/dev/null || true
+      running=$((running - 1))
+    fi
+  done
+  wait "${pids[@]}" 2>/dev/null || true
+  : >"$d/raw"
+  : >"$d/notes"
+  for k in "${!hs[@]}"; do
+    rc="$(cat "$d/$k.rc" 2>/dev/null || echo 255)"
+    if [ "$rc" = 0 ]; then
+      fleet_history_lines "${hs[$k]}" "$d/$k.out" >>"$d/raw"
+      while IFS= read -r line || [ -n "$line" ]; do
+        [ -z "$line" ] || printf '%s: %s\n' "${hs[$k]}" "$line" >>"$d/notes"
+      done <"$d/$k.err"
+    else
+      printf '%s: %s\n' "${hs[$k]}" "$(fleet_history_failure "$rc" "$d/$k.err" "$FLEET_WATCH_TIMEOUT")" >>"$d/notes"
+    fi
+  done
+  LC_ALL=C sort -s -k1,1 "$d/raw" | tail -n "$n" >"$d/rec"
+  echo 0 >"$d/rc.new"
+  mv -f "$d/rc.new" "$d/rc"
+}
+
+# Start the read for SCOPE (host|fleet), the one before it ended.
+fleet_watch_hist_start() { # SCOPE
+  fleet_watch_hist_stop
+  FW_HIST_SCOPE="$1"
+  FW_HIST_SEQ=$((FW_HIST_SEQ + 1))
+  FW_HIST_DIR="$FW_TMP/hist.$FW_HIST_SEQ"
+  mkdir "$FW_HIST_DIR"
+  fleet_watch_hist_job "$FW_HIST_DIR" "$FW_HIST_SCOPE" "$FW_HIST_HOST" "$FW_HIST_LINES" </dev/null >/dev/null 2>&1 &
+  FW_HIST_PID="$!"
+  # The loop's first look at it is one FW_POLL on, as for a round's fetches.
+  FW_ACT_LAUNCHED=true
+}
+
+# End the read in flight, with what it started, and drop its directory. Only a
+# pid this process started and still has as a child (as fleet_watch_reap).
+fleet_watch_hist_stop() {
+  local pid="$FW_HIST_PID"
+  FW_HIST_PID=""
+  if [[ "$pid" == [0-9]* ]] && [ "$(proc_ppid "$pid")" = "$$" ]; then proc_tree_kill "$pid"; fi
+  [ -z "$FW_HIST_DIR" ] || rm -rf "$FW_HIST_DIR"
+  FW_HIST_DIR=""
+}
+
+# 0 when the read has just landed (the pane wants a draw). A job that is gone
+# without having published is an answer too, as for a fetch.
+fleet_watch_hist_collect() {
+  fleet_watch_hist_out || return 1
+  if [ ! -e "$FW_HIST_DIR/rc" ]; then
+    ! kill -0 "$FW_HIST_PID" 2>/dev/null || return 1
+    if [ ! -e "$FW_HIST_DIR/rc" ]; then
+      : >"$FW_HIST_DIR/rec"
+      echo "the call ended without an answer" >"$FW_HIST_DIR/notes"
+      echo 255 >"$FW_HIST_DIR/rc"
+    fi
+  fi
+  FW_HIST_PID=""
+  return 0
+}
+
+# The pane into PANE_OUT: the title, then the records or that the read is out,
+# then each host's own words.
+fleet_watch_hist_build() {
+  local line what="$FW_HIST_HOST" any=false
+  PANE_OUT=""
+  [ "$FW_HIST_SCOPE" = host ] || what="the whole fleet, merged by time"
+  pane_head "history — $what — the last $FW_HIST_LINES runnerctl records"
+  PANE_OUT+=$'\n'
+  if fleet_watch_hist_out; then
+    pane_line "reading the journal over ssh (FLEET_WATCH_TIMEOUT ${FLEET_WATCH_TIMEOUT}s) ..." "$C_DIM"
+    return 0
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    pane_line "$line"
+    any=true
+  done <"$FW_HIST_DIR/rec"
+  $any || pane_line "no records came back — see below" "$C_DIM"
+  if [ -s "$FW_HIST_DIR/notes" ]; then
+    PANE_OUT+=$'\n'
+    while IFS= read -r line || [ -n "$line" ]; do pane_line "$line" "$C_YELLOW"; done <"$FW_HIST_DIR/notes"
+  fi
+}
+
+# H, on the row the cursor is on: that row's host, a folded line or a host that
+# is not answering included — the journal is asked, not the table.
+fleet_watch_hist_open() {
+  FW_NOTICE="" FW_PROMPT="" FW_ACTION=""
+  if [ "$FW_POS" -lt 0 ] || [ -z "$FW_HOST" ]; then FW_NOTICE="no host to look at"; return 0; fi
+  FW_HIST_HOST="$FW_HOST" FW_MODE=history
+  pane_enter
+  fleet_watch_hist_start host
+}
+fleet_watch_hist_close() {
+  fleet_watch_hist_stop
+  FW_MODE="" FW_HIST_SCOPE=""
+  pane_leave
+}
+# A key while the history pane is up: back, the other scope, the window.
+fleet_watch_hist_key() { # KEY
+  case "$1" in
+    esc|enter|q|Q) fleet_watch_hist_close ;;
+    H)
+      VIEW_TOP=0
+      if [ "$FW_HIST_SCOPE" = host ]; then fleet_watch_hist_start fleet; else fleet_watch_hist_start host; fi ;;
+    *) pane_scroll "$1" || true ;;
+  esac
 }
 
 # --- Fleet watch: U upgrades the cursor's host (GHR-128) ------------------------
@@ -11804,7 +11977,8 @@ FLEET_WATCH_EMPTY="nothing matches — a shows all"
 # `?` in the frame a reader sees first, and is 80 columns exactly (the
 # host-scoped keys are in the overlay, not here: no room — and so is GHR-86's
 # `:`, on O's line there, and GHR-87's `C` beside it: the legend has not a
-# column to spare for either, and making room is GHR-141's decision for every
+# column to spare for either — nor for GHR-118's `H`, which is in the list
+# too — and making room is GHR-141's decision for every
 # legend variant). With a view on it
 # also names `a`, ahead of `? keys`, which it says once.
 FLEET_WATCH_LEGEND_HEAD="$WATCH_LEGEND_HEAD"
@@ -11826,7 +12000,7 @@ FLEET_WATCH_HELP="fleet watch — keys
           shows the host alone, ↑ ↓ PgUp PgDn scroll, K R S T P L O act on it
   K R S T P L   kill job, restart, stop, start, reap, logs; R S: w = when idle
   D W E X U   the row's host: drain, restart when idle, enable, disable, upgrade
-  O : C   job run URL; a typed fleet command; its host's compose-reap dry run
+  O : C H   job run URL; a typed fleet command; the host's compose-reap, history
   q ?   quit, this list; Esc stops following a running action, which carries on
 ! b i / a s c ask no host anything, and the summary counts the whole fleet."
 
@@ -12494,6 +12668,8 @@ fleet_watch_handle_key() { # KEY
   # GHR-76: with the pane up every key is the pane's — `q` goes back to the
   # table rather than quitting, and no key moves the cursor or changes a view.
   if [ "$FW_MODE" = pane ]; then fleet_watch_pane_key "$1"; return 0; fi
+  # GHR-118: likewise the history pane's.
+  if [ "$FW_MODE" = history ]; then fleet_watch_hist_key "$1"; return 0; fi
   case "$1" in
     q|Q)    return 1 ;;
     down|j) [ "$FW_POS" -lt 0 ] || [ "$FW_POS" -ge $((n - 1)) ] || fleet_watch_select $((FW_POS + 1)) ;;
@@ -12512,6 +12688,8 @@ fleet_watch_handle_key() { # KEY
     # GHR-87: page the row's host's compose-reap dry run (a read, like L —
     # the cursor's host, marks or not).
     C) fleet_watch_compose_key ;;
+    # GHR-118: the row's host's recent runnerctl records, in place of the table.
+    H) fleet_watch_hist_open ;;
     # GHR-129: mark the row, every row the view shows, none.
     ' '|'*'|u) fleet_watch_mark_key "$1" ;;
     # GHR-125: Esc stops following an action; it never cancels one.
@@ -12645,6 +12823,8 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
       # is drawn with what that round brings back — the action's effect.
       if fleet_watch_act_collect; then fetch=refresh; continue; fi
       if $FW_ACT_DRAW; then FW_ACT_DRAW=false draw=true; fi
+      # GHR-118: the history pane's read, once it has landed.
+      if fleet_watch_hist_collect; then draw=true; fi
       if $FW_DIRTY; then
         FW_DIRTY=false draw=true
         # Unpainted: the view's name is added when the frame is drawn, since a
@@ -12711,6 +12891,14 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
       fi
       viewport_draw "$head"$'\n'"$summary" "$PANE_OUT" \
         $'\n'"$FW_ACT_FOOT$(paint "$C_DIM" "$legend")"$'\n'"${FW_PROMPT:-$FW_NOTICE}" 0 0 0
+    elif $draw && ! $launched && [ "$FW_MODE" = history ]; then
+      # GHR-118: rebuilt on every draw, as the detail pane is.
+      draw=false
+      fleet_watch_hist_build
+      legend="$FW_HIST_LEGEND_HOST"
+      [ "$FW_HIST_SCOPE" = host ] || legend="$FW_HIST_LEGEND_FLEET"
+      viewport_draw "$head"$'\n'"$summary" "$PANE_OUT" \
+        $'\n'"$FW_ACT_FOOT$(paint "$C_DIM" "$legend")"$'\n'"${FW_PROMPT:-$FW_NOTICE}" 0 0 0
     elif $draw && ! $launched && [ "$FW_MODE" = help ]; then
       # GHR-75: the keys, where the table was, until a key. Chrome and all
       # through the viewport, so the terminal is left as any frame leaves it;
@@ -12753,7 +12941,7 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
     polling=false
     # GHR-125: an action out is polled for as a fetch is — its lines and its
     # end are drawn within a step of arriving.
-    if fleet_watch_busy || fleet_watch_act_out; then
+    if fleet_watch_busy || fleet_watch_act_out || fleet_watch_hist_out; then
       polling=true step="$FW_POLL"
     else
       left=$((FW_NEXT - $(now_ms)))
