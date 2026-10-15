@@ -1295,7 +1295,10 @@ read-only call, default 30), `FLEET_WATCH_TIMEOUT` (per-host seconds for a
 read made by [`fleet watch`](#a-live-fleet-view-fleet-watch), default 10),
 `FLEET_MUTATE_TIMEOUT` (per-host seconds for a
 call that changes things, default 900 — see [the mutating
-fan-out](#changing-things-the-mutating-fan-out)), `FLEET_SSH_OPTS` and
+fan-out](#changing-things-the-mutating-fan-out)), `FLEET_MUTATE_IDLE` and
+`FLEET_MUTATE_MAX` (the silence, default 120 s, and the ceiling, default
+7200 s, that replace that total for a host whose runnerctl takes
+`--heartbeat` — same section), `FLEET_SSH_OPTS` and
 `FLEET_RUNNERCTL` (where the remote command lives, if it is not on the ssh
 user's `PATH`).
 
@@ -2200,6 +2203,32 @@ may still be running on that host; 'runnerctl fleet status --host H' shows where
 it got to` (with the host's own name for `H`), and it means that: the timeout stops the local ssh, not the remote
 `runnerctl`. The fan-out then moves on to the next host, so check before
 re-running.
+
+**A host that says it is alive is not held to a total.** Every
+call above — the fan-out, a `--max-unavailable` / `--min-available` walk's
+slot calls, a `fleet watch` action key and its `:` commands — also asks the
+host for `--heartbeat=N`, with N a quarter of `FLEET_MUTATE_IDLE` (default
+120 s, so N = 30). A runnerctl that knows the flag then prints a line at least
+every N s of every phase that can block, and at most about 2N apart across two
+phases, so for such a host the budget above is replaced by two limits:
+
+- **`FLEET_MUTATE_IDLE`** — the call is cut once the host has printed no line
+  for that long. The row says `timed out — no line from it for 120s
+  (FLEET_MUTATE_IDLE) — the command may still be running on that host; …`,
+  with the same `fleet status --host H` pointer as above.
+- **`FLEET_MUTATE_MAX`** (default 7200 s) — a call that keeps printing is cut
+  there all the same (`timed out after 7200s, the FLEET_MUTATE_MAX ceiling —
+  …`), or at the budget above where that is longer, so a long `--when-idle`
+  drain is never held to less than it was.
+
+Half of `FLEET_MUTATE_IDLE` is left for the ssh round trip, which is why it
+must be 10 or more (0 turns this off and puts every host back on the total);
+`FLEET_MUTATE_MAX` must be more than it. The heartbeat lines themselves are
+not shown — they only say the host is alive. A host whose runnerctl predates
+the flag refuses it (`unknown command '--heartbeat…'`, nothing done), is asked
+again without it — once per run, and once per `fleet watch` session — and
+stays on the total above. `fleet upgrade` and `fleet health
+--restart-stalled` do not ask for it yet, and stay on that total too.
 
 **What the host does once its caller has gone.** The same happens when you
 press Ctrl-C on the central node, quit `fleet watch` with an action still

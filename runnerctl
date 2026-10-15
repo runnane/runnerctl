@@ -566,6 +566,15 @@ FLEET_WATCH_TIMEOUT="10"
 # sits out the unit's TimeoutStopSec, one slot after another. A --when-idle
 # wait is added on top of this, per slot — see fleet_mutate_budget.
 FLEET_MUTATE_TIMEOUT="900"
+# GHR-150: a host that takes `--heartbeat` (GHR-149) is not held to that total.
+# Its call is cut when it has printed no line for FLEET_MUTATE_IDLE seconds
+# (0 = off: every host on the total above), and only a call that keeps
+# printing for FLEET_MUTATE_MAX seconds — or the total above, if that is
+# longer — is cut regardless. Every mutating call asks for a line at least
+# every FLEET_MUTATE_IDLE/4 s, and a silence that spans two of the remote's
+# phases can reach twice that, so the limit leaves half of itself for ssh.
+FLEET_MUTATE_IDLE="120"
+FLEET_MUTATE_MAX="7200"
 # The remote command. Fleet mode requires runnerctl installed on each host
 # (see the fleet section of the README for why); point this at an absolute
 # path where it is not on the ssh user's PATH.
@@ -1413,6 +1422,14 @@ load_config() {
   [[ "$FLEET_PARALLEL" =~ ^[1-9][0-9]*$ ]] || die "FLEET_PARALLEL '$FLEET_PARALLEL' set in $CONFIG_FILE is invalid — want a whole number of hosts, 1 or more"
   [[ "$FLEET_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "FLEET_TIMEOUT '$FLEET_TIMEOUT' set in $CONFIG_FILE is invalid — want a whole number of seconds, 1 or more"
   [[ "$FLEET_MUTATE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "FLEET_MUTATE_TIMEOUT '$FLEET_MUTATE_TIMEOUT' set in $CONFIG_FILE is invalid — want a whole number of seconds, 1 or more"
+  # GHR-150: 10 at least, so the heartbeat it asks for (a quarter of it) is
+  # 2 s or more and half of it is left for the ssh round trip.
+  if ! [[ "$FLEET_MUTATE_IDLE" =~ ^(0|[1-9][0-9]{0,5})$ ]] || { [ "$FLEET_MUTATE_IDLE" != 0 ] && [ "$FLEET_MUTATE_IDLE" -lt 10 ]; }; then
+    die "FLEET_MUTATE_IDLE '$FLEET_MUTATE_IDLE' set in $CONFIG_FILE is invalid — want 0 (off) or a whole number of seconds, 10 or more"
+  fi
+  if ! [[ "$FLEET_MUTATE_MAX" =~ ^[1-9][0-9]{0,6}$ ]] || [ "$FLEET_MUTATE_MAX" -le "$FLEET_MUTATE_IDLE" ]; then
+    die "FLEET_MUTATE_MAX '$FLEET_MUTATE_MAX' set in $CONFIG_FILE is invalid — want a whole number of seconds, more than FLEET_MUTATE_IDLE ($FLEET_MUTATE_IDLE)"
+  fi
   [[ "$FLEET_WATCH_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || die "FLEET_WATCH_TIMEOUT '$FLEET_WATCH_TIMEOUT' set in $CONFIG_FILE is invalid — want a whole number of seconds, 1 or more"
   [ -n "$FLEET_RUNNERCTL" ] || die "FLEET_RUNNERCTL set in $CONFIG_FILE is empty — want the remote command name or an absolute path"
   [[ "$FLEET_SUDO" =~ ^[01]$ ]] || die "FLEET_SUDO '$FLEET_SUDO' set in $CONFIG_FILE is invalid — want 0 or 1"
@@ -6904,6 +6921,9 @@ cmd_history() { # [-n N]
 # command because a budget walk interleaves status reads (short) with the
 # slot actions (long) and must not lend the reads the long budget.
 FLEET_CALL_TIMEOUT=""
+# GHR-150: set (to FLEET_MUTATE_IDLE) around one call that is cut on silence
+# rather than on its budget alone — see fleet_into.
+FLEET_IDLE_ARM=""
 ssh_run() { # HOST COMMAND...
   local host="$1"; shift
   timeout "${FLEET_CALL_TIMEOUT:-$FLEET_TIMEOUT}" ssh \
@@ -7039,33 +7059,83 @@ fleet_origin() {
     FLEET_ORIGIN_WORD="" FLEET_ORIGIN=()
   fi
 }
+# The heartbeat every call that changes a host asks for (GHR-150):
+# `--heartbeat=N`, after the origin, into FLEET_HB (and FLEET_HB_WORD, its one
+# word), with N a quarter of FLEET_MUTATE_IDLE (3600 at most, the most the
+# flag takes). Within one of the remote's phases a line then comes at most N s
+# apart, and across two of them at most about 2N (GHR-149), so half of the
+# limit is left for the ssh round trip. Empty under FLEET_MUTATE_IDLE=0. An
+# older host refuses it as it refuses --origin, and is asked again without it
+# — which also puts that host back on GHR-81's total budget.
+FLEET_HB=() FLEET_HB_WORD=""
+fleet_heartbeat() {
+  local n
+  FLEET_HB=() FLEET_HB_WORD=""
+  [ "$FLEET_MUTATE_IDLE" != 0 ] || return 0
+  n=$((FLEET_MUTATE_IDLE / 4))
+  [ "$n" -le 3600 ] || n=3600
+  FLEET_HB_WORD="--heartbeat=$n" FLEET_HB=("$FLEET_HB_WORD")
+}
+# The budget of one mutating call whose argv is WORDS, into FLEET_CALL_TIMEOUT
+# and FLEET_IDLE_ARM (the caller's locals). A call carrying the heartbeat is
+# cut on FLEET_MUTATE_IDLE seconds of silence (FLEET_IDLE_ARM, read by
+# fleet_into) and runs on a ceiling of FLEET_MUTATE_MAX — or BUDGET, GHR-81's
+# total, when that is longer, so a long --when-idle drain is never held to
+# less than it was. Any other call is on BUDGET alone, as it always was.
+fleet_idle_arm() { # BUDGET WORDS...
+  local b="$1" a
+  shift
+  FLEET_CALL_TIMEOUT="$b" FLEET_IDLE_ARM=""
+  [ -n "$FLEET_HB_WORD" ] || return 0
+  for a in "$@"; do
+    [ "$a" = "$FLEET_HB_WORD" ] || continue
+    FLEET_IDLE_ARM="$FLEET_MUTATE_IDLE"
+    if [ -z "$b" ] || [ "$b" -lt "$FLEET_MUTATE_MAX" ]; then FLEET_CALL_TIMEOUT="$FLEET_MUTATE_MAX"; fi
+    return 0
+  done
+}
 # One call that changes HOST, outside a fan-out — a budget walk's slot, a
-# `fleet watch` key: FLEET_PRIV, the origin, SUBCOMMAND and ARGS, stdout into
-# OUT and stderr into ERR (each relayed, GHR-101), on BUDGET seconds. A host
-# too old for --origin is asked again without it, as a fan-out asks it, and
-# remembered. The exit status is left in FLEET_CALL_RC.
+# `fleet watch` key: FLEET_PRIV, the origin, the heartbeat, SUBCOMMAND and
+# ARGS, stdout into OUT and stderr into ERR (each relayed, GHR-101), on BUDGET
+# seconds (fleet_idle_arm). A host too old for one of the optional words is
+# asked again without it, as a fan-out asks it — one word per round, since a
+# parser stops at the first it does not know — and remembered. The exit
+# status is left in FLEET_CALL_RC.
 FLEET_CALL_RC=0
 fleet_in_subshell() { ( "$@" ); }
 fleet_call_mutating() { # HOST OUT ERR BUDGET SUBCOMMAND [ARGS...]
-  local host="$1" out="$2" err="$3" budget="$4" rc=0 stream=false
-  local FLEET_CALL_TIMEOUT="$budget"
+  local host="$1" out="$2" err="$3" budget="$4" rc=0 stream=false w round dropped
+  local FLEET_CALL_TIMEOUT FLEET_IDLE_ARM
   shift 4
-  local -a origin=(${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"})
+  local -a words=() kept=()
   fleet_priv_cmd
-  if [ "${#origin[@]}" -gt 0 ] && fleet_optional_skip "$host" "${origin[0]}"; then origin=(); fi
+  for w in ${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"} ${FLEET_HB[@]+"${FLEET_HB[@]}"}; do
+    fleet_optional_skip "$host" "$w" || words+=("$w")
+  done
   # GHR-92: streamed (the budget walk's slot calls) when the caller said so
   # with FLEET_STREAM; `fleet watch`'s action keys never do — their terminal
   # is the watch's.
   if $FLEET_STREAM && ! fleet_args_json "$@"; then stream=true; fi
-  # In a subshell, as it always was: this runs in the caller's own shell.
-  fleet_into "$stream" "${FLEET_STREAM_LABEL:-$host}" "$out" "$err" \
-    fleet_in_subshell ssh_run "$host" "${FLEET_PRIV[@]}" ${origin[@]+"${origin[@]}"} "$@" || rc=$?
-  if [ "$rc" = 1 ] && [ "${#origin[@]}" -gt 0 ] && fleet_optional_rejects "$err" "${origin[0]}"; then
-    FLEET_OPTIONAL_REJECTED+="$host=--origin "
+  for round in 0 1 2; do
     rc=0
+    fleet_idle_arm "$budget" ${words[@]+"${words[@]}"}
+    # In a subshell, as it always was: this runs in the caller's own shell.
     fleet_into "$stream" "${FLEET_STREAM_LABEL:-$host}" "$out" "$err" \
-      fleet_in_subshell ssh_run "$host" "${FLEET_PRIV[@]}" "$@" || rc=$?
-  fi
+      fleet_in_subshell ssh_run "$host" "${FLEET_PRIV[@]}" ${words[@]+"${words[@]}"} "$@" || rc=$?
+    [ "$rc" = 1 ] || break
+    kept=() dropped=false
+    for w in ${words[@]+"${words[@]}"}; do
+      if ! $dropped && fleet_optional_rejects "$err" "$w"; then
+        FLEET_OPTIONAL_REJECTED+="$host=${w%%=*} "
+        dropped=true
+      else
+        kept+=("$w")
+      fi
+    done
+    $dropped || break
+    words=(${kept[@]+"${kept[@]}"})
+    : "$round"
+  done
   if ! $stream; then
     relay_file "$out"
     relay_file "$err"
@@ -7140,8 +7210,9 @@ fleet_fanout() { # REMOTE-ARGS...
   wait "${pids[@]}" 2>/dev/null || true
   # GHR-88: one optional word per round, since a host can refuse one, be
   # asked again, and only then refuse the next. At most three rounds (GHR-90):
-  # the two view flags a status read carries — --narrow, --with-json — and
-  # the origin a mutating call carries; no call carries more.
+  # the two view flags a status read carries — --narrow, --with-json — or the
+  # origin and the heartbeat (GHR-150) a mutating call carries; no call
+  # carries more.
   local round a
   for round in 1 2 3; do
     fleet_optional_any "$@" || return 0
@@ -7184,7 +7255,7 @@ fleet_fanout() { # REMOTE-ARGS...
 # A word that carries a value (`--cpu-prev=…`, GHR-115) is one of them by its
 # flag name, which is also what the refusal names and what is remembered.
 fleet_optional_is() { # WORD
-  [ -n "$1" ] && { [[ " $FLEET_OPTIONAL_ARGS " == *" ${1%%=*} "* ]] || [ "$1" = "$FLEET_ORIGIN_WORD" ]; }
+  [ -n "$1" ] && { [[ " $FLEET_OPTIONAL_ARGS " == *" ${1%%=*} "* ]] || [ "$1" = "$FLEET_ORIGIN_WORD" ] || [ "$1" = "$FLEET_HB_WORD" ]; }
 }
 fleet_optional_any() { # WORDS...
   local a
@@ -7195,6 +7266,17 @@ fleet_optional_any() { # WORDS...
 # case it is not offered again — a watch pays the second round trip once.
 fleet_optional_skip() { # HOST WORD
   [[ "$FLEET_OPTIONAL_REJECTED" == *" $1=${2%%=*} "* ]]
+}
+# Take in what a background job found its hosts refusing (its own copy of
+# FLEET_OPTIONAL_REJECTED, in FILE), so this process does not ask again.
+fleet_optional_learn() { # FILE
+  local w
+  local -a ws=()
+  [ -s "$1" ] || return 0
+  read -ra ws <"$1" || true
+  for w in ${ws[@]+"${ws[@]}"}; do
+    [[ "$FLEET_OPTIONAL_REJECTED" == *" $w "* ]] || FLEET_OPTIONAL_REJECTED+="$w "
+  done
 }
 fleet_optional_rejects() { # ERRFILE WORD
   local name="${2%%=*}"
@@ -7230,7 +7312,9 @@ fleet_fanout_one() { # INDEX REMOTE-ARGS...
   # `--json` call never does, its payload is for a program.
   local stream=false
   if $FLEET_STREAM && ! fleet_args_json "${args[@]}"; then stream=true; fi
-  local FLEET_CALL_TIMEOUT="${FLEET_BUDGETS[$i]:-}"
+  # GHR-150: a call carrying the heartbeat is cut on silence, under a ceiling.
+  local FLEET_CALL_TIMEOUT FLEET_IDLE_ARM
+  fleet_idle_arm "${FLEET_BUDGETS[$i]:-}" ${args[@]+"${args[@]}"}
   if [ -n "$FLEET_STDIN_FILE" ]; then
     fleet_into "$stream" "$host" "$FLEET_DIR/$i.out" "$FLEET_DIR/$i.err" \
       ssh_run_stdin "$host" "$FLEET_STDIN_FILE" -- "${args[@]}" || hrc=$?
@@ -7300,9 +7384,18 @@ fleet_stream_lines() { # LABEL FILE out|err
 # only returns once both streams have drained, so a reader of the files never
 # sees them part-written. The descriptors are closed for the command itself, so
 # nothing it starts (an ssh master that outlives it) can hold a stream open.
+#
+# GHR-150: with FLEET_IDLE_ARM set (fleet_idle_arm) the call is cut on silence
+# instead — fleet_into_idle. Either way ERR.cut, beside the stderr file, is
+# left saying how a call on the watchdog ended, and nothing for any other.
 fleet_into() { # STREAM LABEL OUT ERR COMMAND...
   local stream="$1" label="$2" out="$3" err="$4" rc=0 ofd efd p1="" p2=""
   shift 4
+  [ "$err" = /dev/null ] || rm -f -- "$err.cut"
+  if [ -n "$FLEET_IDLE_ARM" ]; then
+    fleet_into_idle "$stream" "$label" "$out" "$err" "$@" || rc=$?
+    return "$rc"
+  fi
   if [ "$stream" = true ]; then
     exec {ofd}> >(fleet_stream_lines "$label" "$out" out); p1=$!
     exec {efd}> >(fleet_stream_lines "$label" "$err" err); p2=$!
@@ -7313,6 +7406,143 @@ fleet_into() { # STREAM LABEL OUT ERR COMMAND...
   exec {ofd}>&- {efd}>&-
   [ -z "$p1" ] || wait "$p1" "$p2" 2>/dev/null || true
   return "$rc"
+}
+
+
+# --- Cutting a call on silence (GHR-150) -----------------------------------------
+# A host that took `--heartbeat=N` prints a line at least every N s of every
+# phase that can block (GHR-149), so a call that has printed nothing for
+# FLEET_MUTATE_IDLE seconds has gone wrong — whatever its total so far. A call
+# that keeps printing is let run, up to the ceiling `timeout` holds it to
+# (fleet_idle_arm). Three parts:
+#   * the TAP — each stream goes through fleet_idle_lines, which stamps the
+#     instant of every line it reads into ERR.seen, then writes it on exactly
+#     as fleet_into would have (streamed, or into the file as it came). A
+#     `heartbeat: … (Ns)` line is a sign of life and nothing else: it is
+#     stamped and dropped, so no report, no watch line and no `--json`
+#     payload carries it;
+#   * the WATCHDOG — fleet_idle_watch, beside the call, waits (fleet_idle_wait,
+#     a hook the sim models on its clock) until the last stamp is
+#     FLEET_MUTATE_IDLE old; if it still is when it wakes, it writes
+#     `idle SECS` into ERR.cut and ends the call's whole process tree
+#     (proc_tree_kill: `timeout` puts ssh in a group of its own);
+#   * the CALL — in the background, so the watchdog has a pid to end, with
+#     the caller's own SIGINT/SIGQUIT (an async command would otherwise ignore
+#     them, and a budget walk's ssh has always taken an operator's Ctrl-C).
+# ERR.cut says `armed CEILING [max]` from the start (`max` when the ceiling is
+# FLEET_MUTATE_MAX rather than a longer GHR-81 total), so a 124 without an
+# `idle` is the ceiling's, and fleet_error_text words each.
+#
+# The remote is not signalled — as for GHR-81's timeout, only the local ssh
+# ends — so the wording says it may still be running.
+FLEET_HB_LINE_RE='^heartbeat: .* \([0-9]+s\)$'
+fleet_idle_note() { # FILE TEXT
+  printf '%s\n' "$2" >"$1.$BASHPID"
+  mv -f -- "$1.$BASHPID" "$1"
+}
+fleet_into_idle() { # STREAM LABEL OUT ERR COMMAND...
+  local stream="$1" label="$2" out="$3" err="$4" rc=0 ofd efd p1 p2 cpid wpid ign
+  shift 4
+  local FLEET_IDLE_STAMP="$err.seen"
+  if [ "$FLEET_CALL_TIMEOUT" = "$FLEET_MUTATE_MAX" ]; then
+    fleet_idle_note "$err.cut" "armed $FLEET_CALL_TIMEOUT max"
+  else
+    fleet_idle_note "$err.cut" "armed $FLEET_CALL_TIMEOUT"
+  fi
+  fleet_idle_note "$FLEET_IDLE_STAMP" "$(now_epoch)"
+  ign="$(fleet_sig_ignored)"
+  exec {ofd}> >(fleet_idle_lines "$stream" "$label" "$out" out "$FLEET_IDLE_STAMP"); p1=$!
+  exec {efd}> >(fleet_idle_lines "$stream" "$label" "$err" err "$FLEET_IDLE_STAMP"); p2=$!
+  fleet_idle_run "$ign" "$@" >&"$ofd" 2>&"$efd" {ofd}>&- {efd}>&- &
+  cpid=$!
+  fleet_idle_watch "$cpid" "$FLEET_IDLE_ARM" "$FLEET_IDLE_STAMP" "$err.cut" </dev/null >/dev/null 2>&1 {ofd}>&- {efd}>&- &
+  wpid=$!
+  wait "$cpid" || rc=$?
+  kill -KILL "$wpid" 2>/dev/null || true
+  wait "$wpid" 2>/dev/null || true
+  exec {ofd}>&- {efd}>&-
+  wait "$p1" "$p2" 2>/dev/null || true
+  if [ "$rc" != 0 ] && [[ "$(cat "$err.cut" 2>/dev/null || true)" == "idle "* ]]; then rc=124; fi
+  rm -f -- "$FLEET_IDLE_STAMP"
+  return "$rc"
+}
+# Which of SIGINT and SIGQUIT this process ignores: `int`, `quit`, both or
+# neither, from /proc (neither where it cannot be read).
+fleet_sig_ignored() {
+  local k v out=""
+  while read -r k v; do
+    [ "$k" = SigIgn: ] || continue
+    [ $((16#$v & 2)) = 0 ] || out+=" int"
+    [ $((16#$v & 4)) = 0 ] || out+=" quit"
+  done <"/proc/$BASHPID/status" 2>/dev/null || true
+  echo "$out"
+}
+# COMMAND with the dispositions IGNORED names (fleet_sig_ignored) and every
+# other one of SIGINT/SIGQUIT back at its default.
+fleet_idle_run() { # IGNORED COMMAND...
+  [[ "$1" == *int* ]] || builtin trap - INT
+  [[ "$1" == *quit* ]] || builtin trap - QUIT
+  shift
+  "$@"
+}
+# One stream of a call on the watchdog: every line stamped into STAMP, a
+# heartbeat line dropped, the rest written on as fleet_into writes it — with
+# STREAM = true as fleet_stream_lines does (made safe, kept in FILE, shown as
+# `LABEL: line`), else into FILE as it came, a last line without its newline
+# included (relay_file makes it safe once the call is over).
+fleet_idle_lines() { # STREAM LABEL FILE out|err STAMP
+  local stream="$1" label="$2" stamp="$5" fh line nl
+  exec {fh}>"$3"
+  while :; do
+    nl=true
+    if ! IFS= read -r line; then
+      [ -n "$line" ] || break
+      nl=false
+    fi
+    fleet_idle_note "$stamp" "$(now_epoch)"
+    [[ ! "$line" =~ $FLEET_HB_LINE_RE ]] || continue
+    if [ "$stream" != true ]; then
+      if $nl; then printf '%s\n' "$line" >&"$fh"; else printf '%s' "$line" >&"$fh"; fi
+      continue
+    fi
+    relay_safe "$line"
+    printf '%s\n' "$RELAY_SAFE" >&"$fh"
+    [ -n "$RELAY_SAFE" ] || continue
+    if [ "$4" = err ]; then
+      printf '%s: %s\n' "$label" "$RELAY_SAFE" >&2
+    else
+      printf '%s: %s\n' "$label" "$RELAY_SAFE"
+    fi
+  done
+  exec {fh}>&-
+}
+# The watchdog: until the last line in STAMP is IDLE seconds old, then (CPID
+# still running) `idle SECS` into MARK and CPID's tree ended. Returns as soon
+# as CPID is gone; fleet_into_idle ends it once the call has.
+fleet_idle_watch() { # CPID IDLE STAMP MARK
+  local last now
+  while :; do
+    last="$(cat "$3" 2>/dev/null || true)"
+    [[ "$last" =~ ^[0-9]+$ ]] || return 0
+    fleet_idle_wait $((last + $2)) "$1" "$3" || return 0
+    now="$(now_epoch)"
+    last="$(cat "$3" 2>/dev/null || true)"
+    [[ "$last" =~ ^[0-9]+$ ]] || return 0
+    [ $((now - last)) -ge "$2" ] || continue
+    kill -0 "$1" 2>/dev/null || return 0
+    fleet_idle_note "$4" "idle $((now - last))"
+    proc_tree_kill "$1"
+    return 0
+  done
+}
+# Until the clock reaches EPOCH; 1 at once when CPID has gone. A hook, so the
+# sim can model the wait on its stub clock, in step with the remote's lines
+# (STAMP names the call; tests/stub.config).
+fleet_idle_wait() { # EPOCH CPID STAMP
+  while [ "$(now_epoch)" -lt "$1" ]; do
+    kill -0 "$2" 2>/dev/null || return 1
+    sleep 1 >/dev/null 2>&1
+  done
 }
 
 # fleet_fanout with its lines streamed. Only for a fan-out that changes hosts.
@@ -7470,7 +7700,19 @@ fleet_error_text() { # RC ERRFILE [BUDGET [MUTATING [HOST]]]
   case "$rc" in
     0)   echo "" ;;
     late) echo "waiting for its first answer" ;;
-    124) echo "timed out after ${budget}s$still${err:+ — $err}" ;;
+    124)
+      # GHR-150: a call on the watchdog says which limit it met — the
+      # silence, or the ceiling — from ERRFILE.cut (fleet_into_idle).
+      local cut=""
+      [ ! -s "$2.cut" ] || cut="$(head -1 "$2.cut")"
+      case "$cut" in
+        "idle "*)  echo "timed out — no line from it for ${cut#idle }s (FLEET_MUTATE_IDLE)$still${err:+ — $err}" ;;
+        "armed "*" max")
+          cut="${cut#armed }"
+          echo "timed out after ${cut% max}s, the FLEET_MUTATE_MAX ceiling$still${err:+ — $err}" ;;
+        "armed "*) echo "timed out after ${cut#armed }s$still${err:+ — $err}" ;;
+        *)         echo "timed out after ${budget}s$still${err:+ — $err}" ;;
+      esac ;;
     255)
       # GHR-138: ssh's own keepalive giving up (GHR-91), as opposed to a
       # connect failure. For a call that changes things the connection was up
@@ -8427,7 +8669,7 @@ fleet_resolve_budget() { # VALUE TOTAL
 # same reason FLEET_DIR (above) is global rather than local to fleet_fanout.
 FLEET_BUDGET_TMP=""
 fleet_budget_cleanup() {
-  [ -z "$FLEET_BUDGET_TMP" ] || rm -f "$FLEET_BUDGET_TMP" "$FLEET_BUDGET_TMP.err"
+  [ -z "$FLEET_BUDGET_TMP" ] || rm -f "$FLEET_BUDGET_TMP" "$FLEET_BUDGET_TMP.err" "$FLEET_BUDGET_TMP.err.cut" "$FLEET_BUDGET_TMP.err.seen"
   FLEET_BUDGET_TMP=""
 }
 
@@ -8501,7 +8743,8 @@ fleet_budget_walk() { # SUBCOMMAND MODE BUDGET [REMOTE-ARGS...]
     elif [ "$rc1" = 124 ]; then
       # Not "(exit 124)": the slot is not known to have failed, only not known
       # to have finished, and the walk is about to move on past it.
-      nbad=$((nbad + 1)); echo "$host slot $idx: $sub FAILED ($(fleet_error_text 124 /dev/null "$budget1" mutating "$host"))"
+      # GHR-150: the stderr file is read for its ERR.cut alone (which limit).
+      nbad=$((nbad + 1)); echo "$host slot $idx: $sub FAILED ($(fleet_error_text 124 "$FLEET_BUDGET_TMP.err" "$budget1" mutating "$host"))"
     else
       nbad=$((nbad + 1)); echo "$host slot $idx: $sub FAILED ($(fleet_error_text "$rc1" "$FLEET_BUDGET_TMP.err" "$budget1" mutating "$host"))"
     fi
@@ -8631,6 +8874,7 @@ cmd_fleet_run() { # SUBCOMMAND [--host H]... [--all-hosts] [REMOTE-ARGS...]
     esac
   fi
   fleet_origin
+  fleet_heartbeat
   if [ -n "$max_unavail" ]; then
     fleet_budget_walk "$sub" ceiling "$max_unavail" ${fwd[@]+"${fwd[@]}"} || rc=$?
     fleet_log_finish
@@ -8657,7 +8901,7 @@ cmd_fleet_run() { # SUBCOMMAND [--host H]... [--all-hosts] [REMOTE-ARGS...]
   # GHR-92: streamed — each line a host prints is shown, `host: line`, as it
   # arrives (they run one at a time, so there is nothing to interleave).
   # fleet_run_report then does not print them again.
-  fleet_fanout_stream "${FLEET_PRIV[@]}" ${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"} "$sub" ${fwd[@]+"${fwd[@]}"}
+  fleet_fanout_stream "${FLEET_PRIV[@]}" ${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"} ${FLEET_HB[@]+"${FLEET_HB[@]}"} "$sub" ${fwd[@]+"${fwd[@]}"}
   fleet_log_results
   if fleet_args_json ${fwd[@]+"${fwd[@]}"}; then
     fleet_run_report "$sub" || rc=$?
@@ -11532,8 +11776,10 @@ fleet_watch_act_start() { # HOST LABEL VERB LOG-TEXT BUDGET REMOTE-ARGS...
   FW_ACT_LABEL[i]="$2" FW_ACT_VERB[i]="$3" FW_ACT_LOG[i]="$4" FW_ACT_BUDGET[i]="$5"
   FW_ACT_DETACHED[i]="" FW_ACT_SHOWN[i]=""
   shift 5
-  # GHR-88: the origin the call carries, read here so the job inherits it.
+  # GHR-88: the origin the call carries, read here so the job inherits it —
+  # and GHR-150's heartbeat.
   fleet_origin
+  fleet_heartbeat
   # Nothing to say on the terminal, and nothing to read from it: every byte
   # it has is in its files.
   fleet_watch_act_job "$i" "${FW_ACT_BUDGET[$i]}" "$@" </dev/null >/dev/null 2>&1 &
@@ -11571,6 +11817,9 @@ fleet_watch_act_job() { # INDEX BUDGET REMOTE-ARGS...
     relay_file "$d/rb.err"
     echo "$rb" >"$d/rb.rc"
   fi
+  # GHR-150: what the host was found to refuse, for the session to remember
+  # (the job is a subshell): it is asked once per watch, not once per key.
+  echo "$FLEET_OPTIONAL_REJECTED" >"$d/rejected"
   echo "$FLEET_CALL_RC" >"$d/rc.new"
   mv -f "$d/rc.new" "$d/rc"
 }
@@ -11650,6 +11899,7 @@ fleet_watch_act_collect() {
       fi
     fi
     rc="$(cat "$d/rc" 2>/dev/null || echo 255)"
+    fleet_optional_learn "$d/rejected"
     logrc="$rc"
     if fleet_watch_act_is_read "${FW_ACT_VERB[$i]}"; then
       # GHR-136: a read. Its slot is free before the confirm is raised; it
@@ -12966,6 +13216,8 @@ fleet_watch_cmd_start() {
 fleet_watch_cmd_job() { # DIR
   local rc=0
   fleet_watch_cmd_sub >"$1/out" 2>&1 || rc=$?
+  # GHR-150: as an action's job (fleet_watch_act_job) does.
+  echo "$FLEET_OPTIONAL_REJECTED" >"$1/rejected"
   echo "$rc" >"$1/rc.new"
   mv -f "$1/rc.new" "$1/rc"
 }
@@ -13003,6 +13255,7 @@ fleet_watch_cmd_collect() {
     fi
   fi
   rc="$(cat "$d/rc" 2>/dev/null || echo 255)"
+  fleet_optional_learn "$d/rejected"
   fleet_watch_cmd_result "$d/out" "$FW_CMD_JOB" "$rc"
   if [ "$CMD_LINES" -gt 1 ] && [ -n "$FW_CMD_DETACHED" ]; then
     CMD_NOTICE+=" (detached: its $CMD_LINES lines of output were not paged)"
@@ -14518,6 +14771,16 @@ cmd_config_example() {
 # wait is added on top automatically: --timeout (else WAIT_TIMEOUT above) per
 # slot on the host.
 #FLEET_MUTATE_TIMEOUT="900"
+
+# A host whose runnerctl takes --heartbeat is not held to that total: such a
+# call is cut once the host has printed no line for FLEET_MUTATE_IDLE seconds
+# (it is asked for one at least every FLEET_MUTATE_IDLE/4 s; 0 = off, every
+# host on FLEET_MUTATE_TIMEOUT), and a call that keeps printing is cut at
+# FLEET_MUTATE_MAX seconds, or at the total above where that is longer. An
+# older host is on FLEET_MUTATE_TIMEOUT as before. IDLE: 0 or 10 and up;
+# MAX: more than IDLE.
+#FLEET_MUTATE_IDLE="120"
+#FLEET_MUTATE_MAX="7200"
 
 # The remote command, for hosts where runnerctl is not on the ssh user's PATH.
 #FLEET_RUNNERCTL="runnerctl"
