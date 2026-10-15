@@ -39,12 +39,24 @@ comment (`uses: owner/repo@<sha> # vX.Y.Z`), never a floating tag. Dependabot
 (`.github/dependabot.yml`, `github-actions`, weekly, `ci:` commit prefix)
 opens the bump PRs; review the diff there rather than editing a SHA by hand.
 
-Runs at `-S style` over `runnerctl`, `tests/run.sh` and `tests/stub.config`
-(the stub has no shebang because it is sourced, so the set is linted with
-`-s bash`), so info-level findings fail the gate. Fix the code rather than
-adding `disable` directives; the existing directives are all SC1090 (sourcing
-a path only known at runtime) and inherent to the design — the config file,
-the legacy script `migrate` reads, and the config `migrate` just wrote.
+Runs at `-S style` over six files: `runnerctl`, `tests/run.sh`,
+`tests/migrate-test.sh`, `tests/install-test.sh`, `tests/upgrade-test.sh` and
+`tests/stub.config` (the stub has no shebang because it is sourced, so the set
+is linted with `-s bash`). Info-level findings fail the gate. A new test script
+the gate runs must be added to the `lint` target in the same change.
+
+Fix the code rather than adding `disable` directives. A directive is accepted
+only in these shapes, each with a reason comment on the same line:
+
+- `SC1090` in `runnerctl`: sourcing a path only known at runtime (the config
+  file, the legacy script `migrate` reads, the config `migrate` just wrote).
+- `# shellcheck disable=SC2016  # <reason>` where a single-quoted snippet is
+  deliberately expanded by a child shell (the `run_snippet` bodies in
+  `tests/run.sh`, the stub `getent` that `tests/install-test.sh` writes).
+- `SC2086` on deliberate word-splitting in a test.
+
+Anything else (an unassigned variable, a literal `$` in a pattern that can be
+written in double quotes) is fixed in code.
 
 ## example-drift
 

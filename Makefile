@@ -7,7 +7,7 @@ gates: lint example-drift version-drift smoke sim migrate-test install-test upgr
 
 # tests/stub.config has no shebang (it is sourced), hence -s bash for the set.
 lint:
-	$(SHELLCHECK) -S style -s bash runnerctl tests/run.sh tests/stub.config
+	$(SHELLCHECK) -S style -s bash runnerctl tests/run.sh tests/migrate-test.sh tests/install-test.sh tests/upgrade-test.sh tests/stub.config
 
 # config.example is generated from `runnerctl config-example`; keep them equal.
 example-drift:
