@@ -2861,8 +2861,12 @@ render_dropin() {
 
 apply_to() {
   local u="$1" dir="$SYSTEMD_DIR/$1.d"
-  run_priv mkdir -p "$dir"
+  # An explicit mode on both: slot_profile reads this file without privilege,
+  # and root's umask (077 on a hardened host) would leave a new directory 0700
+  # and the file 0600 (GHR-142). -m reaches only the last component.
+  run_priv mkdir -p -m 755 "$dir"
   render_dropin | run_priv tee "$dir/$DROPIN_NAME" >/dev/null
+  run_priv chmod 644 "$dir/$DROPIN_NAME"
 }
 
 # A profile with an EnvironmentFile hard-fails to start without it, so refuse
