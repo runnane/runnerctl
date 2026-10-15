@@ -245,7 +245,7 @@ runnerctl provision N [--url URL] [--token TOK | --pat TOK] [--labels a,b] \
 runnerctl deprovision <unit|slot-index|name>... [--token TOK | --pat TOK] \
                       [--url URL] [--local-only] [--when-idle] [--timeout N] \
                       [--yes] [--dry-run]
-runnerctl status [--json] [--watch|-w] [--interval N] [--once] \
+runnerctl status [--json | --with-json] [--watch|-w] [--interval N] [--once] \
                  [--color auto|always|never] [--stall-after N] [--narrow]
 runnerctl watch  [--interval N] [--color auto|always|never] [--stall-after N] \
                  [--narrow]
@@ -854,6 +854,22 @@ before its runners are installed, is a legitimate state, and exiting non-zero
 there would be indistinguishable from the host being unreachable. Typing
 `runnerctl status` on such a box still gets the error, because that is
 usually a wrong-box mistake rather than a fact worth recording.
+
+#### Both at once: `status --with-json`
+
+`runnerctl status --with-json` prints the table, then one separator line, then
+the `--json` object — both rendered from **one** look at the slots, so they
+describe the same moment and the host does the work once. It is the form
+`fleet status` and `fleet watch` ask every host for: the rows come from the
+table, the summary line from the object, in one call per host. It is a
+machine form rather than one to read: a program wanting only the facts should
+use `--json`.
+
+The separator line starts with the byte `0x1e` (ASCII record separator),
+which no table line can start with; split on the first line that begins with
+it and ignore the rest of that line. `--with-json` is a table option like
+`--color` and `--narrow`, so a host with no runner units dies as the table
+does and prints no object. It refuses `--json` and `--watch`.
 ### Health checks for cron / uptime monitors: `health`
 
 `runnerctl status` always exits 0, so nothing on the host can notice "slot
@@ -1195,11 +1211,15 @@ A host that did not answer is in the host count and in nothing else: its
 slots are unknown, not down. Each segment takes the colour the table uses for
 that state.
 
-The numbers come from each host's `status --json` — never from the table
-beside them — so the summary costs one more call to every host that answered
-the first. Under `fleet watch` that is another channel on the connection
-already held. For a one-shot `fleet status` it is a second ssh login per
-answering host; a host that did not answer is not dialled again.
+The numbers come from each host's `status --json` object — never from the
+table beside them. Each host is asked for `status --with-json` (see *Both at once*), so it
+sends the table and that object in one answer, from one look at its slots:
+the summary costs no extra call, and the rows and the counts describe the
+same moment. A host on a runnerctl older than `--with-json` refuses it as an
+unknown option; it is asked again without it, as for `--narrow`, and then
+once more for `status --json` alone — under `fleet watch` that host is
+remembered and sent the plain table call from then on, so it costs two calls
+per tick rather than one. A host that did not answer is not dialled again.
 `fleet status --json` carries the same numbers as its `summary` object (below),
 counted by the same code from the payloads it already has — no second call.
 
@@ -1499,7 +1519,10 @@ A host on a runnerctl older than `--narrow` refuses the flag as an unknown
 option. That host is asked again without it in the same fan-out, so it shows
 its full-width rows (under its own column header) rather than a
 `remote exit 1` row, and a `fleet watch` remembers it and stops sending it the
-flag. `runnerctl upgrade` on that host gives it the narrow table too.
+flag. `runnerctl upgrade` on that host gives it the narrow table too. The same
+holds for `--with-json`, each flag remembered on its own: a host too old for
+both refuses one per call, so on its first tick it is asked for its table
+three times, and from then on sent neither.
 
 `--host H` (repeatable) narrows the watch to named hosts, validated against
 `FLEET_HOSTS` exactly as it is for the mutating commands. A host that does not
