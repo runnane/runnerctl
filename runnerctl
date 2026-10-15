@@ -203,6 +203,11 @@
 # separator line starting with the byte 0x1e, then the `status --json` object,
 # all from one collection, so a reader gets both views of the same moment for
 # the cost of one. It refuses --json and --watch.
+# `status --cpu-prev=SPEC` (GHR-115) is another, for `fleet watch`: the CPU
+# samples the host's previous payload carried (`invocation_id`,
+# `cpu_usage_usec`, `cpu_usage_at_us`, as INVOCATION:USAGE:AT,…) are taken as
+# each slot's first sample, so the table draws its CPU column without the
+# one-shot CPU_SAMPLE_MS wait, as `watch` does from its previous tick.
 # An idle slot whose cgroup still holds processes that are not the runner's
 # own — a dev server or watcher a finished job left behind — shows `+N
 # leaked` in WORKING-ON, `leaked_procs` in --json and a `health` problem;
@@ -3311,14 +3316,27 @@ cpu_rate() { # USAGE-1 US-1 USAGE-2 US-2
 # CPU_SAMPLE_MS old (a second render inside one tick — the narrow re-render —
 # would otherwise divide by a few milliseconds). Into CPU_MEMO_USAGE and
 # CPU_MEMO_US; 1 when there is none.
+#
+# GHR-115: a one-shot table called every tick by `fleet watch` gets the same
+# saving from CPU_PREV — the samples the caller read out of this host's own
+# previous payload and handed back (`status --cpu-prev=…`, status_cpu_prev),
+# keyed by invocation ID alone: an invocation names one run of one unit, and
+# the sample and its instant are this host's own, so they are this host's
+# clock. A supplied sample is held to the same age rule; one that is missing
+# or too young leaves the slot to the one-shot window.
 CPU_MEMO_DIR=""
 CPU_MEMO_USAGE="" CPU_MEMO_US=""
+declare -A CPU_PREV=()
 cpu_memo_get() { # UNIT INVOCATION NOW-US
   local inv usage us
   CPU_MEMO_USAGE="" CPU_MEMO_US=""
-  [ -n "$CPU_MEMO_DIR" ] && [ -f "$CPU_MEMO_DIR/$1" ] || return 1
-  read -r inv usage us <"$CPU_MEMO_DIR/$1" || return 1
-  [ "$inv" = "${2:-none}" ] || return 1
+  if [ -n "${2:-}" ] && [ -n "${CPU_PREV[$2]+set}" ]; then
+    read -r usage us <<<"${CPU_PREV[$2]}"
+  else
+    [ -n "$CPU_MEMO_DIR" ] && [ -f "$CPU_MEMO_DIR/$1" ] || return 1
+    read -r inv usage us <"$CPU_MEMO_DIR/$1" || return 1
+    [ "$inv" = "${2:-none}" ] || return 1
+  fi
   num_int "$us"; us="$NUM_INT"
   num_int "${3-}"
   [ -n "$us" ] && [ -n "$NUM_INT" ] || return 1
@@ -3328,6 +3346,46 @@ cpu_memo_get() { # UNIT INVOCATION NOW-US
 cpu_memo_put() { # UNIT INVOCATION USAGE US
   [ -n "$CPU_MEMO_DIR" ] || return 0
   printf '%s %s %s\n' "${2:-none}" "$3" "$4" >"$CPU_MEMO_DIR/$1"
+}
+# GHR-115: `status --cpu-prev=SPEC` into CPU_PREV. SPEC is what
+# fleet_cpu_prev_spec builds from this host's previous payload: comma-separated
+# INVOCATION:USAGE-USEC:AT-US, the slot's `invocation_id`, `cpu_usage_usec`
+# and `cpu_usage_at_us`. A caller that sends anything else has a bug, so it
+# dies rather than drawing rates from half of it; empty is no samples.
+status_cpu_prev() { # SPEC
+  local e inv usage us
+  local -a ents=()
+  CPU_PREV=()
+  IFS=, read -r -a ents <<<"${1-}"
+  for e in ${ents[@]+"${ents[@]}"}; do
+    IFS=: read -r inv usage us <<<"$e"
+    num_int "$usage"; usage="$NUM_INT"
+    num_int "$us"; us="$NUM_INT"
+    [[ "$inv" =~ ^[0-9a-f]{32}$ ]] && [ -n "$usage" ] && [ -n "$us" ] && [ "$e" = "$inv:$usage:$us" ] \
+      || die "--cpu-prev '$e' is invalid — want INVOCATION:USAGE-USEC:AT-US, comma-separated"
+    CPU_PREV[$inv]="$usage $us"
+  done
+}
+# The caller's half: the --cpu-prev word for one host, built from that host's
+# previous payload (a `status --json` object, one slot per line), or nothing
+# when no slot of it carries all three keys — a host from before GHR-115
+# sends no `invocation_id`, and a slot without CPU accounting no usage. Every
+# value is a remote's, so the numbers go through num_int and the invocation is
+# held to systemd's 32 hex digits; a slot that fails either is left out, and
+# that slot alone takes the one-shot window.
+fleet_cpu_prev_spec() { # JSON-FILE
+  local line inv usage us spec=""
+  [ -s "$1" ] || return 0
+  while IFS= read -r line; do
+    [[ "$line" == *'"idx":'* ]] || continue
+    json_line_get "$line" invocation_id; inv="$JF"
+    [[ "$inv" =~ ^[0-9a-f]{32}$ ]] || continue
+    json_line_get "$line" cpu_usage_usec; num_int "$JF"; usage="$NUM_INT"
+    json_line_get "$line" cpu_usage_at_us; num_int "$JF"; us="$NUM_INT"
+    [ -n "$usage" ] && [ -n "$us" ] || continue
+    spec+="${spec:+,}$inv:$usage:$us"
+  done <"$1"
+  [ -z "$spec" ] || printf -- '--cpu-prev=%s\n' "$spec"
 }
 # The CPU cell: `3.2` (cores), `—` when the rate is unknown.
 cpu_cell() { # HUNDREDTHS
@@ -4006,7 +4064,8 @@ host_events_json() {
 # `memory_pressure` {"full_avg10","full_avg60","full_total"} from its
 # memory.pressure, each object null when nothing could be read (GHR-31).
 # After `profile`, before `job` (GHR-79): `cpu_usage_usec`, cpu.stat's cumulative
-# usage_usec (null with CPU accounting off — never 0), and `cpu_pressure`
+# usage_usec (null with CPU accounting off — never 0), `cpu_usage_at_us` and
+# `invocation_id` (GHR-115: when it was read, and the run it is of), and `cpu_pressure`
 # {"some_avg10","some_avg60","some_total"} from cpu.pressure, null likewise.
 # `host` carries `name` (the host's own hostname, null when it cannot be
 # read — GHR-38) alongside `cores`, `mem_total`, `mem_available` and `load`
@@ -4089,6 +4148,13 @@ status_json_slot() { # SEP IDX UNIT
     # first occurrence json_line_get finds. Cumulative and unsampled: --json
     # never waits, a poller computes its own rate from two payloads.
     printf ',"cpu_usage_usec":%s' "$(json_num "${SLOT[cpu_usage]}")"
+    # GHR-115: the instant that counter was read (this host's clock, epoch
+    # µs; null with the counter) and the run it belongs to, so a reader of
+    # two payloads can tell a rate from a restart — `fleet watch` hands both
+    # back on its next tick (status_cpu_prev) instead of the host waiting.
+    printf ',"cpu_usage_at_us":%s,"invocation_id":%s' \
+      "$(if [ -n "${SLOT[cpu_usage]}" ]; then json_num "${SLOT[cpu_us]}"; else echo null; fi)" \
+      "$(json_strn "${SLOT[invocation]}")"
     if [ -n "${SLOT[cpu_pressure_some_avg10]}${SLOT[cpu_pressure_some_avg60]}${SLOT[cpu_pressure_some_total]}" ]; then
       printf ',"cpu_pressure":{"some_avg10":%s,"some_avg60":%s,"some_total":%s}' \
         "$(json_dec "${SLOT[cpu_pressure_some_avg10]}")" "$(json_dec "${SLOT[cpu_pressure_some_avg60]}")" "$(json_num "${SLOT[cpu_pressure_some_total]}")"
@@ -4357,8 +4423,8 @@ cmd_logs() {
 # (GHR-16) prints the same facts as one JSON object instead of the table; it
 # is a one-shot format, so it refuses --watch rather than streaming frames.
 # --color and --stall-after (GHR-27) are parsed here for both shapes.
-cmd_status() { # [--json | --with-json] [--watch|-w] [--once] [--interval N] [--color WHEN] [--stall-after N] [--narrow]
-  local watch=false json=false narrow=false with_json=false args=()
+cmd_status() { # [--json | --with-json] [--watch|-w] [--once] [--interval N] [--color WHEN] [--stall-after N] [--narrow] [--cpu-prev=SPEC]
+  local watch=false json=false narrow=false with_json=false args=() cpu_prev="" has_prev=false
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     view_opt "$@"
@@ -4370,6 +4436,8 @@ cmd_status() { # [--json | --with-json] [--watch|-w] [--once] [--interval N] [--
       --narrow)   narrow=true; shift ;;
       # GHR-90: the table AND the JSON from one collection (render_status).
       --with-json) with_json=true; shift ;;
+      # GHR-115: CPU samples from this host's previous payload (fleet watch).
+      --cpu-prev) [ $# -ge 2 ] || die "--cpu-prev needs a value"; cpu_prev="$2"; has_prev=true; shift 2 ;;
       *)          args+=("$1"); shift ;;
     esac
   done
@@ -4377,9 +4445,12 @@ cmd_status() { # [--json | --with-json] [--watch|-w] [--once] [--interval N] [--
   # there would be a flag that silently does nothing.
   ! { $json && $narrow; } || die "--narrow cannot be combined with --json; the JSON object has no columns to drop"
   ! { $json && $with_json; } || die "--with-json cannot be combined with --json; --with-json prints the table and then the same object"
+  # GHR-115: --json never samples twice, and a watch keeps its own last tick.
+  ! { $json && $has_prev; } || die "--cpu-prev cannot be combined with --json; the object never waits for a second sample"
   if $watch; then
     ! $json || die "--json cannot be combined with --watch; poll 'runnerctl status --json' instead"
     ! $with_json || die "--with-json cannot be combined with --watch; it is a one-shot form for a program reading both"
+    ! $has_prev || die "--cpu-prev cannot be combined with --watch; a watch takes its previous tick as the first sample"
     ! $narrow || args+=(--narrow)
     cmd_watch ${args[@]+"${args[@]}"}
   else
@@ -4392,6 +4463,7 @@ cmd_status() { # [--json | --with-json] [--watch|-w] [--once] [--interval N] [--
       # GHR-78: only a table going to a terminal may use its width.
       if stdout_is_tty; then STATUS_COLS="$(term_cols)"; fi
       STATUS_WITH_JSON="$with_json"
+      status_cpu_prev "$cpu_prev"
       render_status
     fi
   fi
@@ -6929,8 +7001,10 @@ fleet_fanout() { # REMOTE-ARGS...
 # from a command's parser, `unknown command '--origin…'` from main, where a
 # global flag lands — and is asked again without it. Only these are ever
 # dropped: a word a host refuses for any other reason is that host's answer.
+# A word that carries a value (`--cpu-prev=…`, GHR-115) is one of them by its
+# flag name, which is also what the refusal names and what is remembered.
 fleet_optional_is() { # WORD
-  [ -n "$1" ] && { [[ " $FLEET_OPTIONAL_ARGS " == *" $1 "* ]] || [ "$1" = "$FLEET_ORIGIN_WORD" ]; }
+  [ -n "$1" ] && { [[ " $FLEET_OPTIONAL_ARGS " == *" ${1%%=*} "* ]] || [ "$1" = "$FLEET_ORIGIN_WORD" ]; }
 }
 fleet_optional_any() { # WORDS...
   local a
@@ -9782,27 +9856,38 @@ FW_PID=() FW_AGAIN=() FW_TABLE_ARGS=() FW_JSON_ARGS=()
 # for that skew rule — the same one, with the retries in the same job: a
 # refusal names one flag, so a host too old for both is asked once more for
 # each, on its first tick, and never again in this session.
+#
+# GHR-115: the table call also hands the host back the CPU samples of its own
+# previous payload (`--cpu-prev=…`, fleet_cpu_prev_spec), so from its second
+# tick on it draws the CPU column without the one-shot wait. Read here, in the
+# job, from the flat `<i>.json` — which the loop replaces only when it takes
+# in THIS job's answer, so nothing moves it while the job reads it. Remembered
+# by flag name (`<i>.refuses--cpu-prev`) like the others; a host that refuses
+# it waits for its sample as it always did. Never on the stream
+# (FW_JSON_ONLY): `status --json` takes no second sample to save.
 fleet_watch_fetch_one() { # INDEX
-  local i="$1" host d a hrc=0 t0 refused round
-  local -a args=()
+  local i="$1" host d a hrc=0 t0 refused round cpu_prev=""
+  local -a args=() table=("${FW_TABLE_ARGS[@]}")
   host="${FLEET_HOSTS[$i]}" d="$FW_STATE/$i.new"
   rm -rf "$d"
   mkdir "$d"
-  for round in 0 1 2; do
+  $FW_JSON_ONLY || cpu_prev="$(fleet_cpu_prev_spec "$FW_STATE/$i.json")"
+  [ -z "$cpu_prev" ] || table+=("$cpu_prev")
+  for round in 0 1 2 3; do
     if [ "$round" -gt 0 ]; then
       # Asked again only when the call refused a flag it is allowed to drop.
       [ "$hrc" = 1 ] || break
       refused=""
       for a in "${args[@]}"; do
-        if fleet_optional_is "$a" && fleet_optional_rejects "$d/err" "$a"; then refused="$a"; break; fi
+        if fleet_optional_is "$a" && fleet_optional_rejects "$d/err" "$a"; then refused="${a%%=*}"; break; fi
       done
       [ -n "$refused" ] || break
       : >"$FW_STATE/$i.refuses$refused"
       hrc=0
     fi
     args=()
-    for a in "${FW_TABLE_ARGS[@]}"; do
-      if fleet_optional_is "$a" && [ -e "$FW_STATE/$i.refuses$a" ]; then continue; fi
+    for a in "${table[@]}"; do
+      if fleet_optional_is "$a" && [ -e "$FW_STATE/$i.refuses${a%%=*}" ]; then continue; fi
       args+=("$a")
     done
     # GHR-80: `duration_ms`, timed as fleet_fanout_one times it.
@@ -12501,8 +12586,9 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
   stdout_is_tty || die "fleet watch needs a terminal (stdout is not a tty); use 'runnerctl fleet status'"
   # For the whole session, so a host that rejects --narrow or --with-json
   # (GHR-90) once is asked without it on every later tick instead of twice
-  # per tick (fleet_watch_fetch_one).
-  FLEET_OPTIONAL_ARGS="--narrow --with-json"
+  # per tick (fleet_watch_fetch_one). And --cpu-prev (GHR-115), the samples a
+  # tick hands back to the host they came from.
+  FLEET_OPTIONAL_ARGS="--narrow --with-json --cpu-prev"
   color_setup "$COLOR_MODE"
   # Whether the REMOTE paints is the same question as whether this end does:
   # under --color never a remote SGR sequence would be the one thing in the

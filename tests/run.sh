@@ -13078,9 +13078,9 @@ case_ghr79_missing_cpu_accounting_is_a_dash_and_null() {
   expect_out "${GHR79_ROW1}— +always "
   RUNNERCTL_STUB_CPU="1:3200" run status --json
   expect_rc 0
-  expect_out '"name":"example\.slot-1".*"profile":null,"cpu_usage_usec":9000000000,"cpu_pressure":\{"some_avg10":12\.50,"some_avg60":8\.00,"some_total":5555\},"job":\{'
-  expect_out '"name":"example\.slot-2".*"profile":null,"cpu_usage_usec":null,"cpu_pressure":null,"job":null,'
-  expect_out '"name":"example\.slot-3".*"profile":null,"cpu_usage_usec":null,"cpu_pressure":null,"job":null,'
+  expect_out '"name":"example\.slot-1".*"profile":null,"cpu_usage_usec":9000000000,"cpu_usage_at_us":1000000720000000,"invocation_id":"1111aaaa1111aaaa1111aaaa1111aaaa","cpu_pressure":\{"some_avg10":12\.50,"some_avg60":8\.00,"some_total":5555\},"job":\{'
+  expect_out '"name":"example\.slot-2".*"profile":null,"cpu_usage_usec":null,"cpu_usage_at_us":null,"invocation_id":"2222bbbb2222bbbb2222bbbb2222bbbb","cpu_pressure":null,"job":null,'
+  expect_out '"name":"example\.slot-3".*"profile":null,"cpu_usage_usec":null,"cpu_usage_at_us":null,"invocation_id":null,"cpu_pressure":null,"job":null,'
   expect_no_log '^probe:cpu_window_wait'
   expect_log_count '^probe:cgroup_cpu_facts ' 2
   if ! $HAVE_PYTHON3; then skip "python3 not on PATH: the cpu keys' parse assertions not run"; return 0; fi
@@ -16216,6 +16216,160 @@ case_ghr99_watch_help_list_scrolls_on_a_short_terminal() {
 t "GHR-99: fleet watch ? list scrolls on a short terminal, another key closes it" case_ghr99_fleet_help_list_scrolls_on_a_short_terminal
 t "GHR-99: fleet watch ? list is whole on 24 rows, with no marker"                case_ghr99_fleet_help_list_whole_on_24_rows
 t "GHR-99: watch ? list scrolls on a short terminal"                              case_ghr99_watch_help_list_scrolls_on_a_short_terminal
+
+# --- GHR-115: fleet watch hands each host its own previous CPU sample --------
+# A one-shot table waits CPU_SAMPLE_MS for its second CPU sample. `fleet watch`
+# asks every host for one on every tick, so from the second tick on it passes
+# the samples of that host's previous payload back (`--cpu-prev=INV:USAGE:AT,…`)
+# and the host takes them as the first sample, as `watch` takes its last tick.
+# The invocation IDs are the stub's (unit_props): slot-1's and slot-2's.
+GHR115_INV1=1111aaaa1111aaaa1111aaaa1111aaaa
+GHR115_INV2=2222bbbb2222bbbb2222bbbb2222bbbb
+GHR115_PREV="--cpu-prev=$GHR115_INV1:[0-9]+:[0-9]+,$GHR115_INV2:[0-9]+:[0-9]+"
+GHR115_B1='^build-1 +0 +example\.slot-1 .* +1\.0G/25\.0G +— +'
+GHR115_B2='^build-1 +1 +example\.slot-2 .* +1\.0G +— +'
+
+# The remote half, locally: supplied samples of the same invocations, a second
+# old, are the first sample — one read per slot and no wait; the payload
+# carries what the next call hands back; a sample too young, or of another
+# invocation, leaves that slot to the window; and the flag's refusals.
+case_ghr115_status_takes_supplied_samples_as_the_first() {
+  # the stub's clock is 1000000720 s; a second earlier, 3.2 and 1.5 cores ago
+  local at=1000000719000000
+  local good="--cpu-prev=$GHR115_INV1:8996800000:$at,$GHR115_INV2:998500000:$at"
+  RUNNERCTL_STUB_CPU="1:3200 2:1500" run status "$good"
+  expect_rc 0
+  expect_out "${GHR79_ROW1}3\\.2 +always +— +my-app:test \\(12m\\)\$"
+  expect_out '^1 +example\.slot-2 .* +1\.0G +— +1\.5 +always '
+  expect_no_log '^probe:cpu_window_wait'
+  expect_log_count '^probe:cgroup_cpu_facts ' 2
+  # the payload's keys: the read's instant on this host's clock, the run
+  RUNNERCTL_STUB_CPU="1:3200" run status --json
+  expect_rc 0
+  expect_out "\"name\":\"example\\.slot-1\".*\"cpu_usage_usec\":9000000000,\"cpu_usage_at_us\":1000000720000000,\"invocation_id\":\"$GHR115_INV1\",\"cpu_pressure\":"
+  expect_out "\"name\":\"example\\.slot-2\".*\"cpu_usage_usec\":null,\"cpu_usage_at_us\":null,\"invocation_id\":\"$GHR115_INV2\",\"cpu_pressure\":null,"
+  expect_out '"name":"example\.slot-3".*"cpu_usage_usec":null,"cpu_usage_at_us":null,"invocation_id":null,"cpu_pressure":null,'
+  # slot-1's sample is a tenth of a second old and slot-2's names another
+  # run: both wait, once, and both still draw their rate
+  RUNNERCTL_STUB_CPU="1:3200 2:1500" run status "--cpu-prev=$GHR115_INV1:8999680000:1000000719900000,3333cccc3333cccc3333cccc3333cccc:998500000:$at"
+  expect_rc 0
+  expect_out "${GHR79_ROW1}3\\.2 +always "
+  expect_out '^1 +example\.slot-2 .* +1\.0G +— +1\.5 +always '
+  expect_log_count '^probe:cpu_window_wait 250$' 1
+  expect_log_count '^probe:cgroup_cpu_facts ' 4
+  # a value the parser does not take is refused, never half-used
+  local bad
+  for bad in "$GHR115_INV1:08:$at" "$GHR115_INV1:1:$at:9" "../x:1:$at" "$GHR115_INV1:1"; do
+    RUNNERCTL_STUB_CPU="1:3200" run status "--cpu-prev=$bad"
+    expect_rc 1
+    expect_err "^runnerctl: --cpu-prev '.*' is invalid — want INVOCATION:USAGE-USEC:AT-US"
+    expect_no_log '^probe:unit_props '
+  done
+  run status --json "$good"
+  expect_rc 1
+  expect_err '^runnerctl: --cpu-prev cannot be combined with --json; '
+  run status --watch "$good"
+  expect_rc 1
+  expect_err '^runnerctl: --cpu-prev cannot be combined with --watch; '
+}
+
+# The caller's half: what one payload hands back. Only a slot with all three
+# keys, each held to what it has to be — an older host's slot (no
+# invocation_id), a hostile invocation, a number num_int does not take and a
+# slot without accounting are left out, and a payload with none is no flag.
+case_ghr115_the_spec_is_built_from_held_values_only() {
+  local f="$TMP/ghr115.json"
+  {
+    echo '{"runnerctl":"0.0.0","host":{"name":"h"},'
+    echo ' "slots":['
+    echo "  {\"idx\":0,\"cpu_usage_usec\":500,\"cpu_usage_at_us\":7000,\"invocation_id\":\"$GHR115_INV1\",\"job\":null},"
+    echo '  {"idx":1,"cpu_usage_usec":500,"cpu_usage_at_us":7000,"job":null},'
+    echo '  {"idx":2,"cpu_usage_usec":500,"cpu_usage_at_us":7000,"invocation_id":"x;rm -rf /","job":null},'
+    echo "  {\"idx\":3,\"cpu_usage_usec\":0500,\"cpu_usage_at_us\":7000,\"invocation_id\":\"$GHR115_INV2\",\"job\":null},"
+    echo "  {\"idx\":4,\"cpu_usage_usec\":null,\"cpu_usage_at_us\":null,\"invocation_id\":\"3333cccc3333cccc3333cccc3333cccc\",\"job\":null},"
+    echo "  {\"idx\":5,\"cpu_usage_usec\":0,\"cpu_usage_at_us\":7001,\"invocation_id\":\"4444dddd4444dddd4444dddd4444dddd\",\"job\":null}"
+    echo ']}'
+  } >"$f"
+  run_fn fleet_cpu_prev_spec "$f"
+  expect_rc 0
+  expect_text "the spec from one payload" "--cpu-prev=$GHR115_INV1:500:7000,4444dddd4444dddd4444dddd4444dddd:0:7001" "$OUT"
+  sed -i '/"idx":[05]/d' "$f"
+  run_fn fleet_cpu_prev_spec "$f"
+  expect_rc 0
+  expect_text "a payload with no usable slot" "" "$OUT"
+}
+
+# Under fleet watch: every host waits on its first tick (there is no payload
+# before it) and never after; from the second tick each call carries its
+# host's samples, and every frame draws the rates.
+case_ghr115_fleet_watch_waits_on_the_first_tick_only() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_CPU="1:3200 2:1500" RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --iterations 3 --interval 4 --color never
+  expect_rc 0
+  expect_under_header "$SUM_OK" 3
+  frames
+  local n
+  for n in 1 2 3; do
+    expect_frame "$n" "${GHR115_B1}3\\.2 +always "
+    expect_frame "$n" "${GHR115_B2}1\\.5 +always "
+    expect_frame "$n" '^build-2 +0 +example\.slot-1 .* +3\.2 +always '
+  done
+  expect_log_count '^probe:cpu_window_wait 250$' 2
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --with-json$' 1
+  expect_log_count "^probe:ssh_run build-1 -- runnerctl status --color never --with-json $GHR115_PREV\$" 2
+  expect_log_count "^probe:ssh_run build-2 -- runnerctl status --color never --with-json $GHR115_PREV\$" 2
+  expect_log_count '^probe:ssh_run ' 6
+  # one read per slot per tick after the first, two on it
+  expect_log_count '^probe:cgroup_cpu_facts ' 16
+  expect_no_out 'unknown option|invalid'
+  # without CPU accounting no slot has a sample: no flag, as before
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --iterations 2 --color never
+  expect_rc 0
+  expect_no_log 'cpu-prev'
+  # the one-shot fleet status is unchanged: no payload before it, one wait
+  RUNNERCTL_STUB_CPU="1:3200" RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet status
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 1
+  expect_log_count '^probe:cpu_window_wait 250$' 1
+}
+
+# A host too old for the flag refuses it once, is remembered, and waits for
+# its sample on every tick as it always did — its rates still drawn.
+case_ghr115_a_host_too_old_for_the_flag_waits_as_before() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_CPU="1:3200 2:1500" RUNNERCTL_STUB_FLEET_NOCPUPREV="build-2" \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --iterations 4 --interval 4 --color never
+  expect_rc 0
+  expect_no_out 'unknown option'
+  expect_under_header "$SUM_OK" 4
+  expect_out_count '^build-2 +0 +example\.slot-1 .* +3\.2 +always ' 4
+  expect_out_count '^build-2 +1 +example\.slot-2 .* +1\.5 +always ' 4
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --with-json --cpu-prev=' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --with-json$' 4
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json --cpu-prev=' 3
+  # build-1 once, build-2 on every tick
+  expect_log_count '^probe:cpu_window_wait 250$' 5
+}
+
+# A counter that went backwards between two ticks (the stub's reset: every
+# read after the clock moves is 100) draws `—`, never a negative rate — and
+# with the previous payload as its first sample it takes no wait to find out.
+case_ghr115_a_counter_backwards_between_ticks_is_a_dash() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_CPU="1:3200" RUNNERCTL_STUB_CPU_RESET=1 \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --iterations 2 --interval 4 --color never
+  expect_rc 0
+  frames
+  expect_frame 2 "${GHR115_B1}— +always +— +my-app:test \\(12m\\)\$"
+  expect_no_out ' -[0-9]'
+  expect_log_count "^probe:ssh_run build-1 -- runnerctl status --color never --with-json --cpu-prev=$GHR115_INV1:9000000000:[0-9]+\$" 1
+  expect_log_count '^probe:cpu_window_wait ' 1
+}
+
+t "GHR-115: status takes supplied CPU samples as the first; the flag's refusals"  case_ghr115_status_takes_supplied_samples_as_the_first
+t "GHR-115: the --cpu-prev spec is built from held values only"                   case_ghr115_the_spec_is_built_from_held_values_only
+t "GHR-115: fleet watch waits for a CPU sample on the first tick only"            case_ghr115_fleet_watch_waits_on_the_first_tick_only
+t "GHR-115: a host too old for --cpu-prev waits as before, asked with it once"    case_ghr115_a_host_too_old_for_the_flag_waits_as_before
+t "GHR-115: a CPU counter backwards between fleet watch ticks is —"               case_ghr115_a_counter_backwards_between_ticks_is_a_dash
 
 # --- Summary ------------------------------------------------------------------
 echo

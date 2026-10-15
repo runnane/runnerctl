@@ -757,7 +757,8 @@ rendered from one collector, so they cannot disagree on a value:
    "memory_max":27917287424,"memory_high":23622320128,"memory_current":3328599552,"memory_peak":26743545600,
    "restart":"always","env_file":null,"since":1757622000,
    "restarts":0,"result":"success","last_restart_reason":null,"profile":"ci",
-   "cpu_usage_usec":81234567890,"cpu_pressure":{"some_avg10":3.20,"some_avg60":2.75,"some_total":123456789},
+   "cpu_usage_usec":81234567890,"cpu_usage_at_us":1757707415123456,
+   "invocation_id":"0123456789abcdef0123456789abcdef","cpu_pressure":{"some_avg10":3.20,"some_avg60":2.75,"some_total":123456789},
    "job":{"repo":"my-app","name":"test","since":1757707200,"stalled":false,
           "workflow":"CI","run_id":1234567890,"run_attempt":1,"run_number":57,"ref":"main",
           "sha":"0123456789abcdef0123456789abcdef01234567","actor":"octocat","event":"push",
@@ -792,7 +793,11 @@ many processes a finished job left in an idle slot's cgroup (the table's
 read), `cpu_usage_usec` (the cgroup's cumulative CPU time from `cpu.stat`,
 microseconds — a poller divides the difference of two payloads by the time
 between them for the `CPU` column's rate; null with CPU accounting off, never
-0) and `cpu_pressure` (`{"some_avg10","some_avg60","some_total"}` from
+0), `cpu_usage_at_us` (when that counter was read, the host's own clock in
+epoch microseconds — the "time between them"; null with the counter),
+`invocation_id` (systemd's `InvocationID` of the run the counter belongs to:
+two payloads with different ones are two runs, and no rate; null when the unit
+has none) and `cpu_pressure` (`{"some_avg10","some_avg60","some_total"}` from
 `cpu.pressure`, null likewise), `memory_events` (`{"high","max","oom_kill"}` from the cgroup's
 `memory.events`, counts since the unit started) and `memory_pressure`
 (`{"full_avg10","full_avg60","full_total"}` from `memory.pressure` —
@@ -870,6 +875,17 @@ which no table line can start with; split on the first line that begins with
 it and ignore the rest of that line. `--with-json` is a table option like
 `--color` and `--narrow`, so a host with no runner units dies as the table
 does and prints no object. It refuses `--json` and `--watch`.
+
+A one-shot table waits up to `CPU_SAMPLE_MS` for the second CPU sample its
+`CPU` column needs. `fleet watch` asks every host for one on every tick, so
+from the second tick on it hands each host back the samples of that host's
+own previous payload — `status --cpu-prev=INVOCATION:USAGE:AT,…`, built from
+each slot's `invocation_id`, `cpu_usage_usec` and `cpu_usage_at_us` — and
+the host takes them as the first sample, the way `watch` takes its previous
+tick: no wait, one read per slot. A sample of another invocation (the unit
+restarted) or younger than `CPU_SAMPLE_MS` is not used, and a counter that
+went backwards is `—`. A host too old for the flag refuses it once and waits
+as before. `--cpu-prev` refuses `--json` and `--watch`.
 ### Health checks for cron / uptime monitors: `health`
 
 `runnerctl status` always exits 0, so nothing on the host can notice "slot
