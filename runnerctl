@@ -2954,6 +2954,14 @@ save_write_as() { # FILE
   write_as "$(dirname "$1")" "save $1" "$1" "$1.bak"
 }
 
+# One line when a config was written as WRITE_USER (GHR-139): the file is that
+# user's, and a later run as root refuses to source a config owned by neither
+# root nor the invoking user (config_trust_problem), so say so at write time.
+config_owner_notice() { # FILE USER
+  [ -n "$2" ] || return 0
+  echo "note: $1 now belongs to $2, and a run as root (sudo) will refuse to source it — run runnerctl against it without sudo as $2, or keep the config in a root-owned directory such as /etc/runnerctl/ (chown root:root $1; chmod 644 $1)."
+}
+
 save_profile() { # COMMAND
   local cmd="$1" f="$CONFIG_FILE" tmpd blk cand head_line start end existed=false
   tmpd="$(mktemp -d)"; blk="$tmpd/block"; cand="$tmpd/config"
@@ -3044,6 +3052,7 @@ save_profile() { # COMMAND
   # opened by this shell, on stdin, so the user's tee never opens it.
   save_write_as "$f"
   [ "${#WRITE_AS[@]}" -eq 0 ] || priv=("${WRITE_AS[@]}")
+  local wuser="$WRITE_USER"
   [ -z "$WRITE_USER" ] || newroot=false
   if $existed; then
     # tee onto the existing file keeps its inode, owner and mode — the ones
@@ -3068,6 +3077,7 @@ save_profile() { # COMMAND
     echo "Created $f with profile '$PROFILE'."
   fi
   echo "  verified: $f re-renders the drop-in just applied."
+  config_owner_notice "$f" "$wuser"
 }
 
 # What profile (if any) manages this slot, read from the first line of its
@@ -14548,6 +14558,7 @@ cmd_migrate() {
     # are root's only in a directory nobody else can write (write_as).
     write_as "$(dirname "$out")" "write $out" "$out"
     [ "${#WRITE_AS[@]}" -eq 0 ] || priv=("${WRITE_AS[@]}")
+    local wuser="$WRITE_USER"
     [ -z "$WRITE_USER" ] || newroot=false
     "${priv[@]}" mkdir -p -m 755 "$(dirname "$out")"
     printf '%s\n' "$cfg" | "${priv[@]}" tee "$out" >/dev/null
@@ -14555,6 +14566,7 @@ cmd_migrate() {
     "${priv[@]}" chmod 644 "$out"
     written="$out"
     echo "Wrote $out"
+    config_owner_notice "$out" "$wuser"
     case "$out" in *.migrated) echo; diff -u "${out%.migrated}" "$out" || true ;; esac
   fi
 
@@ -14906,7 +14918,13 @@ write_as() { # DIR WHAT [NAME...]
       why="$dir is owned by uid $uid, which has no user name to write as"
     fi
   fi
-  die "refusing to $what as root: $why — whoever can write $dir could swap a name in it between root's calls (GHR-117). Move the copy to a directory only root can write, such as /usr/local/bin, or run this as the user who owns $dir, without sudo"
+  # The remedy follows WHAT (GHR-139): a config write belongs in a root-only
+  # config directory, not in the binary's.
+  local fix="Move the copy to a directory only root can write, such as /usr/local/bin"
+  case "$what" in
+    save\ *|write\ *) fix="Keep the config in a directory only root can write, such as /etc/runnerctl/" ;;
+  esac
+  die "refusing to $what as root: $why — whoever can write $dir could swap a name in it between root's calls (GHR-117). $fix, or run this as the user who owns $dir, without sudo"
 }
 
 # Rename a copy out of the way: OLD to NEW, in OLD's directory. -T (GHR-111): a
