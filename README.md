@@ -2407,6 +2407,15 @@ nothing else: no path, config, command or decision depends on it, so it
 cannot widen the grant. One that fails the check is dropped and the record
 says `origin invalid`.
 
+Taken as given too: the global `--heartbeat N` (GHR-149), whole seconds from
+1 to 3600 and refused otherwise. It changes only how often a command that is
+already allowed prints a progress line while it blocks — a `heartbeat: …
+(Ns)` line beside a systemctl call or a download, and the `waiting for …`
+line of a `--when-idle` or `drain` wait at least every min(60, N) s. It
+decides nothing else. A host whose runnerctl predates it refuses it as an
+unknown command and does nothing, which is how a caller learns that the host
+has no heartbeat.
+
 Under any sudo, opted in or not, it also pins `PATH` and `HOME`, drops the
 caller's pager and every `RUNNERCTL_*` variable, and runs a pager in secure
 mode. Sudo is detected as uid 0 with a non-zero `SUDO_UID`, which a root
