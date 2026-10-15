@@ -7119,17 +7119,27 @@ fleet_heartbeat() {
 # fleet_into) and runs on a ceiling of FLEET_MUTATE_MAX — or BUDGET, GHR-81's
 # total, when that is longer, so a long --when-idle drain is never held to
 # less than it was. Any other call is on BUDGET alone, as it always was.
+#
+# GHR-156: FLEET_HB_INLINE=true says the heartbeat rides INSIDE the one word
+# of shell text the call is (`fleet upgrade --push`'s install, where the
+# pushed script's own main reads it), so it is not a word to find here — and
+# not one a host can refuse: the script that reads it is this node's.
+FLEET_HB_INLINE=false
 fleet_idle_arm() { # BUDGET WORDS...
-  local b="$1" a
+  local b="$1" a armed=false
   shift
   FLEET_CALL_TIMEOUT="$b" FLEET_IDLE_ARM=""
   [ -n "$FLEET_HB_WORD" ] || return 0
-  for a in "$@"; do
-    [ "$a" = "$FLEET_HB_WORD" ] || continue
-    FLEET_IDLE_ARM="$FLEET_MUTATE_IDLE"
-    if [ -z "$b" ] || [ "$b" -lt "$FLEET_MUTATE_MAX" ]; then FLEET_CALL_TIMEOUT="$FLEET_MUTATE_MAX"; fi
-    return 0
-  done
+  if [ "$FLEET_HB_INLINE" = true ]; then
+    armed=true
+  else
+    for a in "$@"; do
+      [ "$a" != "$FLEET_HB_WORD" ] || { armed=true; break; }
+    done
+  fi
+  $armed || return 0
+  FLEET_IDLE_ARM="$FLEET_MUTATE_IDLE"
+  if [ -z "$b" ] || [ "$b" -lt "$FLEET_MUTATE_MAX" ]; then FLEET_CALL_TIMEOUT="$FLEET_MUTATE_MAX"; fi
 }
 # One call that changes HOST, outside a fan-out — a budget walk's slot, a
 # `fleet watch` key: FLEET_PRIV, the origin, the heartbeat, SUBCOMMAND and
@@ -7248,8 +7258,9 @@ fleet_fanout() { # REMOTE-ARGS...
   # GHR-88: one optional word per round, since a host can refuse one, be
   # asked again, and only then refuse the next. At most three rounds (GHR-90):
   # the two view flags a status read carries — --narrow, --with-json — or the
-  # origin and the heartbeat (GHR-150) a mutating call carries; no call
-  # carries more.
+  # origin and the heartbeat (GHR-150) a mutating call carries, plus --json
+  # on `fleet health --restart-stalled --json` (GHR-156); no call carries
+  # more.
   local round a
   for round in 1 2 3; do
     fleet_optional_any "$@" || return 0
@@ -9262,10 +9273,18 @@ fleet_upgrade_stage() { # CHECK INDEX...
   # GHR-89: the write (and a rollback) changes the host; --check writes
   # nothing and runs as the login, as the read-back below does.
   FLEET_PRIV=("$FLEET_RUNNERCTL") FLEET_ORIGIN=() FLEET_ORIGIN_WORD=""
+  FLEET_HB=() FLEET_HB_WORD=""
   if ! $check; then
     fleet_priv_cmd
     # GHR-88: the write carries the origin and is recorded here, per stage.
     fleet_origin
+    # GHR-156: and the heartbeat, so a host that takes it is cut on silence
+    # (GHR-150) rather than on the total — its download prints one (GHR-149).
+    # A host still on a runnerctl from before the flag refuses it, is asked
+    # again without it by the fan-out's optional-word round, and stays on the
+    # total; the version it upgrades TO is not asked anything more this run
+    # (the read-back is a read).
+    fleet_heartbeat
     fleet_log_begin "$(fleet_log_argv)"
   fi
   # GHR-92: the write (and a rollback) streams, `host: line` as each host
@@ -9275,7 +9294,7 @@ fleet_upgrade_stage() { # CHECK INDEX...
   if $check; then
     fleet_fanout "${FLEET_PRIV[@]}" ${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"} "${args[@]}"
   else
-    fleet_fanout_stream "${FLEET_PRIV[@]}" ${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"} "${args[@]}"
+    fleet_fanout_stream "${FLEET_PRIV[@]}" ${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"} ${FLEET_HB[@]+"${FLEET_HB[@]}"} "${args[@]}"
   fi
   $check || fleet_log_results
   for j in "${!idx[@]}"; do
@@ -9564,13 +9583,15 @@ fleet_push_probe_cmd() {
   printf "exec /bin/sh -c '%s'\n" "$s"
 }
 
-# The install, as one word: ORIGIN-WORD is `--origin=…` or empty. An absolute
+# The install, as one word: ORIGIN-WORD is `--origin=…` or empty, HB-WORD
+# `--heartbeat=N` (GHR-156) or empty. An absolute
 # FLEET_RUNNERCTL named runnerctl is installed where it points (--prefix);
 # anything else lands where `install` decides, and the read-back says whether
 # the fleet path then runs it.
-fleet_push_install_cmd() { # [ORIGIN-WORD]
+fleet_push_install_cmd() { # [ORIGIN-WORD] [HB-WORD]
   local s extra="" prefix=""
   [ -z "${1:-}" ] || extra=" $1"
+  [ -z "${2:-}" ] || extra+=" $2"
   case "$FLEET_RUNNERCTL" in /*/runnerctl) prefix=" --prefix ${FLEET_RUNNERCTL%/runnerctl}" ;; esac
   # shellcheck disable=SC2016  # the remote shell expands these, not this one
   s='t=$(mktemp) || exit 3; trap "rm -f -- \"\$t\"" EXIT; trap "exit 129" HUP INT TERM; cat >"$t" || exit 3; s=$(sha256sum <"$t") || exit 3; s=${s%% *}; if [ "$s" != "'"$FLEET_PUSH_SHA"'" ]; then echo "runnerctl push: the bytes received have sha256 $s, not '"$FLEET_PUSH_SHA"' - refusing to install them" >&2; exit 4; fi; sudo -n bash "$t"'"$extra"' install'"$prefix"
@@ -9599,7 +9620,7 @@ fleet_push_probe_read() { # FILE
 # it is the probe alone: `same`, `differs`, `absent`, `newer`, and nothing
 # written.
 fleet_push_stage() { # CHECK INDEX...
-  local check="$1" j k oword=""
+  local check="$1" j k oword="" hword=""
   shift
   local -a idx=("$@") send=() wrote=()
   FLEET_HOSTS=() FLEET_BUDGETS=()
@@ -9625,11 +9646,21 @@ fleet_push_stage() { # CHECK INDEX...
     fleet_origin
     oword="$FLEET_ORIGIN_WORD"
     FLEET_ORIGIN=() FLEET_ORIGIN_WORD=""
+    # GHR-156: the heartbeat rides inside it too. There is no version skew
+    # to handle: the runnerctl that reads it is the one being pushed — this
+    # node's, which knows the flag, since this node is the one asking — and
+    # never the host's old copy, which the install text does not run. So the
+    # call is on the watchdog for every host (FLEET_HB_INLINE), and its
+    # install's slow phases (each systemctl) print a line (GHR-149). Off,
+    # like every other call's, under FLEET_MUTATE_IDLE=0.
+    fleet_heartbeat
+    hword="$FLEET_HB_WORD"
     # GHR-88: the record says this was a push, and of which bytes.
     fleet_log_begin "$(fleet_log_argv) (push sha256 $FLEET_PUSH_SHA)"
-    FLEET_STDIN_FILE="$FLEET_PUSH_SRC"
-    fleet_fanout_stream "$(fleet_push_install_cmd "$oword")"
-    FLEET_STDIN_FILE=""
+    FLEET_STDIN_FILE="$FLEET_PUSH_SRC" FLEET_HB_INLINE=true
+    fleet_fanout_stream "$(fleet_push_install_cmd "$oword" "$hword")"
+    FLEET_STDIN_FILE="" FLEET_HB_INLINE=false
+    FLEET_HB=() FLEET_HB_WORD=""
     fleet_log_results
     for j in "${!send[@]}"; do
       k="${send[$j]}"
@@ -9789,9 +9820,15 @@ cmd_fleet_health() { # [--host H]... [--quiet] [--json] [--max-restarts N] [--st
     # GHR-88: it may restart something, so it carries the origin and is
     # recorded — each host's own exit status, 1 being "had problems".
     fleet_origin
+    # GHR-156: and the heartbeat, so a host that takes it is cut on silence
+    # (GHR-150) — each restart prints one (GHR-149) — rather than on the
+    # total; a host from before the flag refuses it, is asked again without
+    # it, and stays on the total. With --json that is three optional words,
+    # the most fleet_fanout's rounds take.
+    fleet_heartbeat
     fleet_log_begin "$(fleet_log_argv)"
   fi
-  fleet_fanout "${FLEET_PRIV[@]}" ${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"} health ${fwd[@]+"${fwd[@]}"}
+  fleet_fanout "${FLEET_PRIV[@]}" ${FLEET_ORIGIN[@]+"${FLEET_ORIGIN[@]}"} ${FLEET_HB[@]+"${FLEET_HB[@]}"} health ${fwd[@]+"${fwd[@]}"}
   [ -z "$FLEET_HEALTH_MUTATING" ] || fleet_log_results
   if $json; then
     fleet_health_json || rc=$?
