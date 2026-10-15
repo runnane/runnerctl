@@ -67,6 +67,20 @@ Only exercises commands that need neither systemd nor sudo (`version`, `help`,
 `profiles`, config loading, unknown-command exit code). Everything that touches
 units is covered by `sim`.
 
+**A checkout made under `umask 002` fails smoke locally**, with `config.example
+is group-writable by group <gid>, not root — refusing to source it`. That is the
+config-ownership guard working as intended on a file git checked out
+group-writable; CI checks out under 022 and never sees it. Git tracks only the
+executable bit, so `chmod -R g-w .` in the checkout or worktree fixes it without
+a diff. That is not enough on its own: `sim` cases that write a config into a
+`mktemp` directory (`apply --save`, `scale --save`, the `EVENTS_SEC` /
+`DISK_*` status cases) inherit the same umask and fail with exit 1 for the same
+reason. Run the whole gate as CI does — `umask 022 && make gates` — and do not
+loosen the guard to get past it. Every rebase, checkout or pull rewrites the
+files it touches under the shell's umask, so `chmod -R g-w .` again after each
+one: a rebased `tests/stub.config` left group-writable fails nearly every `sim`
+case with exit 1, which looks like a broken branch rather than a file mode.
+
 ## sim — stubbed systemd
 
 `make sim` runs `tests/run.sh`: every command that touches the host (`apply`,
