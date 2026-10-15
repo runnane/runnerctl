@@ -56,7 +56,7 @@
 #                  [<unit|slot-index|name> ...]
 #   runnerctl compose-reap [--apply] [--standalone] [--project NAME] \
 #                          [--max-age-hours N] [--grace-minutes N]
-#   runnerctl compose-reap-timer install|status|remove
+#   runnerctl compose-reap-timer install|status [--brief]|remove
 #   runnerctl health [--quiet|--json] [--max-restarts N] [--stall-after N] [--restart-stalled]
 #   runnerctl history [-n N]
 #   runnerctl fleet history [-n N] [--host H]...
@@ -77,6 +77,9 @@
 #                    remove-limits|enable|disable> [--host H]... \
 #                   [--all-hosts] [--max-unavailable N|N%] [--min-available K] \
 #                   [<the command's own flags and targets>]
+#   runnerctl fleet compose-reap [--host H]... [--apply] [--standalone] \
+#                                [--project NAME] [--max-age-hours N] [--grace-minutes N]
+#   runnerctl fleet compose-reap-timer status|install|remove [--host H]...
 #   runnerctl profiles
 #   runnerctl config-example
 #   runnerctl migrate [--from PATH] [--output PATH] [--dry-run]
@@ -5769,6 +5772,25 @@ compose_running_counts() {
 
 docker_available() { command -v docker >/dev/null 2>&1; }
 
+# GHR-87: why the daemon will not answer this user, or nothing when it does.
+# Every reader above sends docker's stderr to /dev/null, so a login outside
+# the docker group used to read as an EMPTY daemon — `projects=0`, exit 0 —
+# which is the one answer a dry run must never give for a host it could not
+# see. So one probe asks first, and its first stderr line is what is said:
+# docker's own words (`permission denied while trying to connect to the
+# docker API at unix:///var/run/docker.sock`, `Cannot connect to the Docker
+# daemon … Is the docker daemon running?`) are the fact; the remedy is ours.
+docker_daemon_problem() {
+  local err
+  err="$(docker version --format '{{.Server.Version}}' 2>&1 >/dev/null)" && return 0
+  err="${err%%$'\n'*}"
+  echo "${err:-docker version failed with no message}"
+}
+# The text a host's `compose-reap` dies with when docker is not installed
+# there — matched by the fleet form (fleet_no_docker), which reports such a
+# host as information rather than a failure, so keep the two in step.
+COMPOSE_REAP_NO_DOCKER="docker not found on PATH — compose-reap has nothing to inspect"
+
 # ID|IMAGE-ID|CREATED|STARTED|NAME|IMAGE|KEEP, one line per container WITHOUT
 # a compose label, in any state — docker's fields first, then what a job chose
 # as JSON, as compose_containers does (GHR-109): the keep label is a label,
@@ -5851,7 +5873,22 @@ cmd_compose_reap() { # [--apply] [--standalone] [--project NAME] [--max-age-hour
   done
   [[ "$max_age" =~ ^[0-9]+$ ]] || die "--max-age-hours must be a whole number of hours, got '$max_age'"
   [[ "$grace" =~ ^[0-9]+$ ]] || die "--grace-minutes must be a whole number of minutes, got '$grace'"
-  docker_available || die "docker not found on PATH — compose-reap has nothing to inspect"
+  docker_available || die "$COMPOSE_REAP_NO_DOCKER"
+  local problem
+  problem="$(docker_daemon_problem)"
+  if [ -n "$problem" ]; then
+    case "$problem" in
+      *[Pp]"ermission denied"*)
+        # The remedy on a line of its own: a fleet row reads the first line
+        # and names the remedy for the ssh login itself (fleet_error_text).
+        local me
+        me="$(id -un 2>/dev/null || echo USER)"
+        echo "runnerctl: cannot talk to the docker daemon as $me: $problem" >&2
+        die "fix: add $me to the docker group ('sudo usermod -aG docker $me', effective at its next login), or run compose-reap as root" ;;
+      *)
+        die "cannot talk to the docker daemon: $problem" ;;
+    esac
+  fi
 
   local now u wd wf cg pid start
   now="$(now_epoch)"
@@ -6177,9 +6214,28 @@ runner_root_chain_problem() { # DIR
   printf '%s' "$r"
 }
 
-cmd_compose_reap_timer() { # install|status|remove
-  local sub="${1:-status}" self problem
+# GHR-87: whether the timer is installed here, as one line: `not installed`,
+# or `installed (ENABLED, ACTIVE)` with systemctl's own words for each (empty
+# answers read `unknown`). Installed means the timer's unit file is in
+# SYSTEMD_DIR, which is where install writes it and remove deletes it from —
+# so it needs no privilege, and `fleet compose-reap-timer status` asks it as
+# the plain login.
+compose_reap_timer_state() {
+  local en act
+  if [ ! -f "$SYSTEMD_DIR/$COMPOSE_REAP_UNIT.timer" ]; then
+    echo "not installed"
+    return 0
+  fi
+  en="$(systemctl is-enabled "$COMPOSE_REAP_UNIT.timer" 2>/dev/null)" || true
+  act="$(systemctl is-active "$COMPOSE_REAP_UNIT.timer" 2>/dev/null)" || true
+  en="${en%%$'\n'*}" act="${act%%$'\n'*}"
+  echo "installed (${en:-unknown}, ${act:-unknown})"
+}
+
+cmd_compose_reap_timer() { # install|status [--brief]|remove
+  local sub="${1:-status}" self problem brief=false
   shift || true
+  if [ "$sub" = status ] && [ "${1:-}" = --brief ]; then brief=true; shift; fi
   [ $# -eq 0 ] || die "compose-reap-timer $sub takes no arguments"
   case "$sub" in
     install)
@@ -6192,11 +6248,17 @@ cmd_compose_reap_timer() { # install|status|remove
       render_compose_reap_timer | run_priv tee "$SYSTEMD_DIR/$COMPOSE_REAP_UNIT.timer" >/dev/null
       run_priv systemctl daemon-reload
       echo "Installed $COMPOSE_REAP_UNIT.{service,timer}. What the first run would do:"
-      cmd_compose_reap || true
+      # In a subshell: a daemon that does not answer yet is the dry run's
+      # `die` (GHR-87), and the timer is still worth enabling for it.
+      (cmd_compose_reap) || true
       run_priv systemctl enable --now "$COMPOSE_REAP_UNIT.timer"
       echo "Timer enabled (hourly, compose-reap --apply). Check it with: runnerctl compose-reap-timer status"
       ;;
     status)
+      # --brief (GHR-87): the state line alone, which needs no privilege —
+      # what `fleet compose-reap-timer status` asks each host for.
+      echo "timer: $(compose_reap_timer_state)"
+      $brief && return 0
       systemctl list-timers --all --no-pager "$COMPOSE_REAP_UNIT.timer" 2>/dev/null || true
       run_priv journalctl -u "$COMPOSE_REAP_UNIT.service" -n 40 --no-pager
       ;;
@@ -7008,6 +7070,12 @@ fleet_error_text() { # RC ERRFILE [BUDGET [MUTATING]]
       hint=" — a multicall binary answered to that name instead of runnerctl; check what FLEET_RUNNERCTL resolves to on that host, and that the real runnerctl is readable by the ssh login" ;;
     126:*)
       hint=" — runnerctl is installed on that host but the ssh login cannot execute it; 'sudo chmod 755' the path it names, or re-run the installer" ;;
+    *"ermission denied while trying to connect to the "[Dd]ocker*)
+      # GHR-87: docker's own words for a user outside the docker group (the
+      # socket is root:docker 0660), which compose-reap passes on. Ahead of
+      # the sudo row: the fix is a group, not a sudoers line. A call that
+      # went through FLEET_SUDO=1 runs as root and never gets this.
+      hint=" — the ssh login is not in that host's docker group: add it there ('sudo usermod -aG docker <login>', effective at its next login); a compose-reap --apply under FLEET_SUDO=1 runs as root and needs no group" ;;
     *sudo:*|*"a password is required"*|*"may not run"*|*"no tty present"*)
       # The single most likely failure of a mutating fan-out. BatchMode=yes is
       # what makes this a failure to report at all rather than a fan-out hung
@@ -7820,6 +7888,10 @@ cmd_fleet() {
     upgrade) cmd_fleet_upgrade "$@" ;;
     apply|scale|start|stop|restart|drain|kill|reap|remove-limits|enable|disable)
              cmd_fleet_run "$sub" "$@" ;;
+    # GHR-87: a dry run fans out read-only and in parallel; --apply goes
+    # through cmd_fleet_run like every other command that changes a host.
+    compose-reap)       cmd_fleet_compose_reap "$@" ;;
+    compose-reap-timer) cmd_fleet_compose_reap_timer "$@" ;;
     # env-init is PERMANENTLY excluded, not merely unimplemented: it writes an
     # EnvironmentFile of secrets, and fanning it out means pushing secrets
     # over ssh. `logs` stays per-host because it streams (`fleet watch`'s L
@@ -7841,7 +7913,7 @@ cmd_fleet() {
              die "fleet deprovision is not supported: it takes a removal token (fanning it out copies a credential to every host), it is irreversible, and a slot index or name means a different runner on each host. Run 'runnerctl deprovision <slot>' on the host." ;;
     logs)
              die "fleet logs is not supported: logs streams from one journal and only makes sense against one host. In 'runnerctl fleet watch', L on a slot pages its recent journal from its host; or ssh to the host." ;;
-    *)       die "unknown fleet command '$sub' (status watch health history upgrade apply scale start stop restart drain kill reap remove-limits enable disable)" ;;
+    *)       die "unknown fleet command '$sub' (status watch health history upgrade apply scale start stop restart drain kill reap remove-limits enable disable compose-reap compose-reap-timer)" ;;
   esac
 }
 
@@ -7873,6 +7945,12 @@ fleet_select_hosts() { # NAME...
 # (a bounded target) or --all-hosts (an acknowledgement). restart and kill
 # are transient — the unit comes back — and apply/scale/reap/remove-limits/
 # enable/start do not remove capacity, so none of them need this.
+#
+# Nor do `compose-reap --apply` and `compose-reap-timer install|remove`
+# (GHR-87), and that is a decision, not an omission: they remove a dead job's
+# compose leftovers, or add and remove the timer that does, and never touch
+# a runner slot — so a fleet-wide run takes no capacity away. compose-reap
+# judges a stack alive by its job, so a running job's stack is kept.
 fleet_capacity_gate() { # SUBCOMMAND HOST-COUNT ALL-HOSTS
   case "$1" in stop|drain|disable) ;; *) return 0 ;; esac
   [ "$2" -eq 0 ] || return 0
@@ -8224,10 +8302,18 @@ fleet_log_results() {
 # of its stderr, the hint, and the may-still-be-running sentence for a
 # timeout) and the count, which are the same words as before.
 fleet_run_report() { # SUBCOMMAND [STREAMED]
-  local sub="$1" i host rc line ok=0 bad=0
+  local sub="$1" i host rc line ok=0 bad=0 nodocker=0
   for i in "${!FLEET_HOSTS[@]}"; do
     host="${FLEET_HOSTS[$i]}"
     rc="$(fleet_rc "$i")"
+    # GHR-87: a host without docker has nothing for compose-reap to do — a
+    # fleet where only some hosts run compose is the normal case — so it is
+    # a row of information and does not count as failed.
+    if [ "$rc" != 0 ] && [ "$sub" = compose-reap ] && fleet_no_docker "$FLEET_DIR/$i.err"; then
+      nodocker=$((nodocker + 1))
+      printf '%s: %s\n' "$host" "$FLEET_NO_DOCKER_ROW"
+      continue
+    fi
     if [ "$rc" = 0 ]; then ok=$((ok + 1)); else bad=$((bad + 1)); fi
     # stdout first even when the host failed: a command that got part way
     # through says so there, and losing that would hide a half-applied host.
@@ -8237,7 +8323,9 @@ fleet_run_report() { # SUBCOMMAND [STREAMED]
     done <"$FLEET_DIR/$i.out"
     [ "$rc" = 0 ] || printf '%s: %s\n' "$host" "$(fleet_error_text "$rc" "$FLEET_DIR/$i.err" "${FLEET_BUDGETS[$i]:-}" mutating)"
   done
-  echo "fleet $sub: $ok host(s) ok, $bad failed"
+  line="fleet $sub: $ok host(s) ok, $bad failed"
+  [ "$nodocker" -eq 0 ] || line+=", $nodocker without docker"
+  echo "$line"
   [ "$bad" -eq 0 ]
 }
 
@@ -9248,6 +9336,176 @@ cmd_fleet_history() { # [-n N] [--host H]...
   done
   fleet_cleanup
   return "$rc"
+}
+
+# --- fleet compose-reap and compose-reap-timer (GHR-87) ------------------------
+# The per-host Disk line says a host's docker filesystem is full; the next
+# question is what holds it and whether it can go, which is compose-reap's dry
+# run — so the dry run fans out like every other read: in parallel, as the
+# plain login (the docker reads need the docker group, not sudo), each host's
+# lines prefixed, then one total for the fleet. `--apply` changes hosts, so it
+# goes through cmd_fleet_run: serial, FLEET_SUDO, --origin, the record and the
+# usual per-host report — and no capacity gate (see fleet_capacity_gate).
+#
+# A host without docker is not a failure: a fleet where only some hosts run
+# compose is the normal case, so its row says so and the exit code ignores it.
+# A login that is not in the docker group is a failure, with the remedy on the
+# row (fleet_error_text), because the dry run could not see that host at all.
+FLEET_NO_DOCKER_ROW="no docker on this host — nothing for compose-reap to inspect (information, not a failure)"
+fleet_no_docker() { # ERRFILE
+  grep -qF -- "$COMPOSE_REAP_NO_DOCKER" "$1" 2>/dev/null
+}
+
+cmd_fleet_compose_reap() { # [--host H]... [--apply] [--standalone] [--project NAME] [--max-age-hours N] [--grace-minutes N]
+  local apply=false rc=0 q
+  local -a hosts=() fwd=() all=("$@")
+  while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    case "$1" in
+      --apply)      apply=true; shift ;;
+      --dry-run)    apply=false; shift ;;
+      --host)       need_val "$@"; hosts+=("$2"); shift 2 ;;
+      # Taken, as every mutating fan-out takes it, and asks nothing of it:
+      # there is no capacity gate here to acknowledge.
+      --all-hosts)  shift ;;
+      --standalone) fwd+=(--standalone); shift ;;
+      # Quoted for the remote shell, as cmd_fleet_run quotes what it forwards:
+      # a project is a label, and a label is any text.
+      --project)    need_val "$@"; printf -v q %q "$2"; fwd+=(--project "$q"); shift 2 ;;
+      # Checked here as each host checks them, so a typo fails once, before
+      # anything is dialled.
+      --max-age-hours)
+        need_val "$@"
+        [[ "$2" =~ ^[0-9]+$ ]] || die "--max-age-hours must be a whole number of hours, got '$2'"
+        fwd+=(--max-age-hours "$2"); shift 2 ;;
+      --grace-minutes)
+        need_val "$@"
+        [[ "$2" =~ ^[0-9]+$ ]] || die "--grace-minutes must be a whole number of minutes, got '$2'"
+        fwd+=(--grace-minutes "$2"); shift 2 ;;
+      *) die "unknown option for fleet compose-reap: $1" ;;
+    esac
+  done
+  if $apply; then
+    cmd_fleet_run compose-reap ${all[@]+"${all[@]}"}
+    return
+  fi
+  require_fleet
+  [ "${#hosts[@]}" -eq 0 ] || fleet_select_hosts "${hosts[@]}"
+  fleet_fanout "$FLEET_RUNNERCTL" compose-reap ${fwd[@]+"${fwd[@]}"}
+  fleet_compose_reap_report || rc=$?
+  fleet_cleanup
+  return "$rc"
+}
+
+# Each host's lines, prefixed, then the fleet total of what WOULD be reaped:
+# stacks (projects) with their containers, networks and volumes, plus the
+# --standalone containers, and "up to" the images those free — whether an
+# image is still used by something else is only asked by --apply. Read off the
+# host's own per-project lines, the counts through num_int (GHR-104).
+FLEET_CR_PROJECT_RE='^reap .* containers=([0-9]+) networks=([0-9]+) volumes=([0-9]+)$'
+FLEET_CR_STANDALONE_RE='^reap container [A-Za-z0-9][A-Za-z0-9_.-]* reason=[^ ]+ idle=[0-9]+m image=(.*)$'
+fleet_compose_reap_report() {
+  local i host rc line answered=0 nodocker=0 bad=0 stacks=0 ctr=0 net=0 vol=0 img=0 tail="" nc nn nv
+  local -A imgs=()
+  for i in "${!FLEET_HOSTS[@]}"; do
+    host="${FLEET_HOSTS[$i]}"
+    rc="$(fleet_rc "$i")"
+    if [ "$rc" != 0 ] && fleet_no_docker "$FLEET_DIR/$i.err"; then
+      nodocker=$((nodocker + 1))
+      printf '%s: %s\n' "$host" "$FLEET_NO_DOCKER_ROW"
+      continue
+    fi
+    imgs=()
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ -n "$line" ] || continue
+      printf '%s: %s\n' "$host" "$line"
+      [ "$rc" = 0 ] || continue
+      if [[ "$line" =~ $FLEET_CR_STANDALONE_RE ]]; then
+        ctr=$((ctr + 1))
+        imgs["${BASH_REMATCH[1]}"]=1
+      elif [[ "$line" =~ $FLEET_CR_PROJECT_RE ]]; then
+        stacks=$((stacks + 1))
+        # Taken out first: num_int matches a regex of its own.
+        nc="${BASH_REMATCH[1]}" nn="${BASH_REMATCH[2]}" nv="${BASH_REMATCH[3]}"
+        num_int "$nc"; ctr=$((ctr + ${NUM_INT:-0}))
+        num_int "$nn"; net=$((net + ${NUM_INT:-0}))
+        num_int "$nv"; vol=$((vol + ${NUM_INT:-0}))
+      fi
+    done <"$FLEET_DIR/$i.out"
+    if [ "$rc" = 0 ]; then
+      answered=$((answered + 1))
+      img=$((img + ${#imgs[@]}))
+    else
+      bad=$((bad + 1))
+      printf '%s: %s\n' "$host" "$(fleet_error_text "$rc" "$FLEET_DIR/$i.err")"
+    fi
+  done
+  [ "$nodocker" -eq 0 ] || tail+="; $nodocker host(s) without docker"
+  [ "$bad" -eq 0 ] || tail+="; $bad host(s) failed"
+  echo "fleet compose-reap (dry run, nothing removed): would reap $stacks stack(s) — $ctr container(s), $net network(s), $vol volume(s), up to $img image(s) — on $answered host(s)$tail"
+  [ "$bad" -eq 0 ]
+}
+
+# `fleet compose-reap-timer status|install|remove`. status asks each host for
+# `compose-reap-timer status --brief` (one line, no privilege) in parallel and
+# says per host: installed, not installed, or why it could not be asked;
+# install and remove change hosts, so cmd_fleet_run runs them — and each
+# host's install keeps its own refusal (a root timer only runs a runnerctl
+# that root owns and nobody else can write), which comes back as that host's
+# row. The exit code is 0 when every host answered, installed or not.
+cmd_fleet_compose_reap_timer() { # status|install|remove [--host H]...
+  local sub="" h rc=0
+  local -a hosts=() args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    case "$1" in
+      --host) need_val "$@"; hosts+=("$2"); shift 2 ;;
+      status|install|remove)
+        [ -z "$sub" ] || die "fleet compose-reap-timer takes one of status, install or remove, not '$sub $1'"
+        sub="$1"; shift ;;
+      *) die "unknown fleet compose-reap-timer argument '$1' (status install remove, --host H)" ;;
+    esac
+  done
+  sub="${sub:-status}"
+  if [ "$sub" != status ]; then
+    args=("$sub")
+    for h in ${hosts[@]+"${hosts[@]}"}; do args+=(--host "$h"); done
+    cmd_fleet_run compose-reap-timer "${args[@]}"
+    return
+  fi
+  require_fleet
+  [ "${#hosts[@]}" -eq 0 ] || fleet_select_hosts "${hosts[@]}"
+  fleet_fanout "$FLEET_RUNNERCTL" compose-reap-timer status --brief
+  fleet_compose_reap_timer_report || rc=$?
+  fleet_cleanup
+  return "$rc"
+}
+
+fleet_compose_reap_timer_report() {
+  local i host rc line inst=0 none=0 down=0 bad=0 tail=""
+  for i in "${!FLEET_HOSTS[@]}"; do
+    host="${FLEET_HOSTS[$i]}"
+    rc="$(fleet_rc "$i")"
+    line="$(head -n 1 "$FLEET_DIR/$i.out" 2>/dev/null || true)"
+    case "$rc:$line" in
+      "0:timer: installed"*)
+        inst=$((inst + 1)); printf '%s: %s\n' "$host" "${line#timer: }" ;;
+      "0:timer: not installed")
+        none=$((none + 1)); printf '%s: not installed\n' "$host" ;;
+      0:*)
+        bad=$((bad + 1)); printf '%s: an answer this node does not read: %s\n' "$host" "${line:-(nothing)}" ;;
+      *)
+        if [ "$(fleet_reachable "$rc")" = false ]; then down=$((down + 1)); else bad=$((bad + 1)); fi
+        if grep -qF "compose-reap-timer status takes no arguments" "$FLEET_DIR/$i.err" 2>/dev/null; then
+          printf "%s: its runnerctl predates 'compose-reap-timer status --brief' — 'runnerctl fleet upgrade' brings it up to date\n" "$host"
+        else
+          printf '%s: %s\n' "$host" "$(fleet_error_text "$rc" "$FLEET_DIR/$i.err")"
+        fi ;;
+    esac
+  done
+  [ "$bad" -eq 0 ] || tail=", $bad failed"
+  echo "fleet compose-reap-timer: $inst installed, $none not installed, $down unreachable$tail"
+  [ $((down + bad)) -eq 0 ]
 }
 
 cmd_fleet_status() { # [--json [--watch|-w] [--interval N] [--iterations N]] [--color WHEN] [--stall-after N] [--narrow]
@@ -10401,6 +10659,36 @@ fleet_watch_run_host_action() {
   FW_ACT_EACH=() FW_ACT_SLOTS=() FW_ACTION="" FW_PROMPT="" FW_ACT_SCOPE=slot
 }
 
+# --- Fleet watch: C pages the cursor's host's compose-reap dry run (GHR-87) ----
+# The host line's Disk fragment says a docker filesystem is full; C answers
+# what holds it: that host's `compose-reap` dry run, in the pager, as L pages a
+# slot's journal. A READ — as the plain login, never FLEET_SUDO, no --origin,
+# no confirm — on FLEET_TIMEOUT, the budget a one-shot `fleet compose-reap`
+# gives it. On the HOST of whatever row the cursor is on, a folded line or a
+# host that is not answering included: compose-reap asks the daemon, not the
+# table, so the host is simply asked. A host without docker, and any failure,
+# is the notice.
+fleet_watch_compose_key() {
+  local host="$FW_HOST" rc=0
+  FW_NOTICE="" FW_PROMPT="" FW_ACTION=""
+  if [ "$FW_POS" -lt 0 ] || [ -z "$host" ]; then FW_NOTICE="no host to look at"; return 0; fi
+  (FLEET_CALL_TIMEOUT="$FLEET_TIMEOUT" ssh_run "$host" "$FLEET_RUNNERCTL" compose-reap) >"$FW_TMP/compose" 2>"$FW_TMP/err" || rc=$?
+  relay_file "$FW_TMP/compose"
+  relay_file "$FW_TMP/err"
+  if [ "$rc" != 0 ]; then
+    if fleet_no_docker "$FW_TMP/err"; then
+      FW_NOTICE="$host: $FLEET_NO_DOCKER_ROW"
+    else
+      FW_NOTICE="$host: compose-reap — $(fleet_error_text "$rc" "$FW_TMP/err")"
+    fi
+    return 0
+  fi
+  term_cursor show
+  { printf "compose-reap on %s — a dry run, nothing removed ('runnerctl fleet compose-reap --apply --host %s' reaps)\n\n" "$host" "$host"
+    cat "$FW_TMP/compose"; } | page
+  term_cursor hide
+}
+
 # --- Fleet watch: U upgrades the cursor's host (GHR-128) ------------------------
 # U acts on the HOST of the row the cursor is on, like the host keys, and is the
 # one key that asks the host a question before it builds a confirm line:
@@ -11281,8 +11569,9 @@ FLEET_WATCH_EMPTY="nothing matches — a shows all"
 # GHR-98: fleet watch's legend (GHR-105: its head is the local watch's). Names
 # `?` in the frame a reader sees first, and is 80 columns exactly (the
 # host-scoped keys are in the overlay, not here: no room — and so is GHR-86's
-# `:`, on O's line there: the legend has not a column to spare for it, and
-# making room is GHR-141's decision for every legend variant). With a view on it
+# `:`, on O's line there, and GHR-87's `C` beside it: the legend has not a
+# column to spare for either, and making room is GHR-141's decision for every
+# legend variant). With a view on it
 # also names `a`, ahead of `? keys`, which it says once.
 FLEET_WATCH_LEGEND_HEAD="$WATCH_LEGEND_HEAD"
 FLEET_WATCH_LEGEND="$FLEET_WATCH_LEGEND_HEAD  ? keys  q quit"
@@ -11303,7 +11592,7 @@ FLEET_WATCH_HELP="fleet watch — keys
           shows the host alone, ↑ ↓ PgUp PgDn scroll, K R S T P L O act on it
   K R S T P L   kill job, restart, stop, start, reap, logs; R S: w = when idle
   D W E X U   the row's host: drain, restart when idle, enable, disable, upgrade
-  O :   print the run URL of the cursor's job; a prompt for any fleet command
+  O : C   job run URL; a typed fleet command; its host's compose-reap dry run
   q ?   quit, this list; Esc stops following a running action, which carries on
 ! b i / a s c ask no host anything, and the summary counts the whole fleet."
 
@@ -11788,6 +12077,16 @@ fleet_watch_cmd_reads() { # SUBCOMMAND [WORD...]
     reap)
       for a in "$@"; do [ "$a" != --dry-run ] || return 0; done
       return 1 ;;
+    # GHR-87: compose-reap is a dry run unless --apply, and the timer's
+    # status a one-line read per host.
+    compose-reap)
+      for a in "$@"; do [ "$a" != --apply ] || return 1; done
+      return 0 ;;
+    compose-reap-timer)
+      for a in "$@"; do
+        case "$a" in install|remove) return 1 ;; esac
+      done
+      return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -11816,7 +12115,7 @@ fleet_watch_cmd_key() {
     watch)
       FW_NOTICE=":watch — this is fleet watch already; nothing run"
       return 0 ;;
-    status|health|history|upgrade|apply|scale|start|stop|restart|drain|kill|reap|remove-limits|enable|disable) ;;
+    status|health|history|upgrade|apply|scale|start|stop|restart|drain|kill|reap|remove-limits|enable|disable|compose-reap|compose-reap-timer) ;;
     *)
       # A command no host is asked to run: one fleet mode excludes for good
       # (env-init, provision, deprovision, logs) or a word it does not know.
@@ -11982,6 +12281,9 @@ fleet_watch_handle_key() { # KEY
       if fleet_watch_marks_on; then fleet_watch_set_host_key "$1"; else fleet_watch_host_key "$1"; fi ;;
     # GHR-128: upgrade the row's host, after an `upgrade --check`.
     U) if fleet_watch_marks_on; then fleet_watch_set_upgrade_key; else fleet_watch_upgrade_key; fi ;;
+    # GHR-87: page the row's host's compose-reap dry run (a read, like L —
+    # the cursor's host, marks or not).
+    C) fleet_watch_compose_key ;;
     # GHR-129: mark the row, every row the view shows, none.
     ' '|'*'|u) fleet_watch_mark_key "$1" ;;
     # GHR-125: Esc stops following an action; it never cancels one.

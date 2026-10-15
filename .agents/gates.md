@@ -547,6 +547,26 @@ Traps:
   `tests/run.sh` than the cases cannot be used by them: `t` runs a case where
   it is registered (`expect_no_control_bytes` is one such).
 
+- **A fleet host's `compose-reap` and `compose-reap-timer` run the REAL
+  commands (GHR-87)** over the one docker model, which every stub host shares:
+  `RUNNERCTL_STUB_COMPOSE` / `_STANDALONE` are read once, when the stub is
+  sourced, so they cannot differ per host. What can, by host name:
+  `*nodocker*` (no docker on PATH), `*dockerdenied*` (the daemon refuses the
+  login — `RUNNERCTL_STUB_DOCKER_DENIED=1`, the knob for a local run — unless
+  the call came through `sudo -n`) and `*rootexecbad*` (the timer's
+  root-exec refusal even under `RUNNERCTL_STUB_ROOT_EXEC_OK=1`). Each host's
+  timer units live in `$WRITES/remote/<host>/etc/systemd/system` (that call's
+  `SYSTEMD_DIR`); `RUNNERCTL_STUB_FLEET_TIMER="host…"` installs one there
+  first. The stub's `systemctl` safety net answers exactly two read-only
+  questions — `is-enabled` / `is-active runnerctl-compose-reap.timer` — as
+  `probe:systemctl …` (`RUNNERCTL_STUB_TIMER_STATE="ENABLED ACTIVE"`); any
+  other call is still `direct:`. The dry run's "changed nothing" claim is
+  asserted as `GHR87_NOT_A_PROBE` in `tests/run.sh`: a log line that is not a
+  `probe:` is a `run_priv` argv or the stub's `docker rm`. Note that a
+  local `compose-reap-timer status` (not `--brief`) runs `systemctl
+  list-timers`, which IS `direct:` — the older cases only pass because a later
+  `run` in the same case resets the log.
+
 ## migrate-test
 
 `bash tests/migrate-test.sh`. Runs `runnerctl migrate` against
