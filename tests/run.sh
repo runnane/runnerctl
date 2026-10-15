@@ -15428,6 +15428,69 @@ t "GHR-128: U runs in the background, one action per host"                      
 t "GHR-128: U carries FLEET_SUDO and --origin on the write alone"                             case_ghr128_U_carries_sudo_and_origin
 t "GHR-128: the help lists U (the line count is pinned by the help case)"                     case_ghr128_the_help_lists_U
 
+# --- GHR-136: U's `upgrade --check` is a background read -----------------------
+# RUNNERCTL_STUB_FLEET_HOLD_CHECK holds the check alone. While it is out the
+# watch reads keys and draws `checking <host> …`; the confirm rises when it
+# lands, and only if the cursor is still on the host that asked.
+
+# The acceptance case: a held check does not block the j after it (the key is
+# read on the poll step, while the check is held), the progress line is drawn,
+# and once released the confirm names the versions and y issues one upgrade.
+case_ghr136_a_slow_check_does_not_block_the_keys() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD_CHECK=build-2-oldver RUNNERCTL_STUB_KEYS="Uj${REL}yq" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" run fleet watch --color never
+  expect_rc 0
+  expect_out '^checking build-2-oldver …$'
+  expect_out_count "$GHR128_PROMPT" 1
+  expect_out_count '^build-2-oldver: upgraded 0\.0\.1 -> 9\.9\.9, read back 9\.9\.9$' 1
+  expect_log_order '^probe:ssh_run build-2-oldver -- runnerctl upgrade --check$' '^probe:remote_held build-2-oldver$' \
+                   '^probe:act_poll landed=0 held=1$' '^probe:tty_read_char 0\.2 j$' '^probe:release$' \
+                   '^probe:remote_released build-2-oldver$' '^probe:tty_read_char 5 y$' '^probe:ssh_run build-2-oldver -- runnerctl upgrade$'
+  expect_log_count '^probe:ssh_run build-2-oldver -- runnerctl upgrade --check$' 1
+  expect_log_count "$GHR128_UPGRADE" 1
+  # The read is not an action: one FLEET_LOG line, the upgrade's.
+  expect_cfg_count "$WRITES/fleet.log" '.' 1
+}
+
+# The check holds the host's one action slot while it is out: a second U on the
+# host is refused as busy, and nothing but one check is sent.
+case_ghr136_a_check_holds_the_hosts_slot() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD_CHECK=build-2-oldver RUNNERCTL_STUB_KEYS="UjU${REL}nq" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^build-2-oldver: busy — upgrade-check of build-2-oldver is still running there; one action per host at a time, nothing issued$' 1
+  expect_log_count '^probe:ssh_run build-2-oldver -- runnerctl upgrade --check$' 1
+  expect_no_log "$GHR128_UPGRADE"
+}
+
+# The cursor moved to another host before the check landed: no confirm, a
+# notice naming the versions, and the y after it issues nothing.
+case_ghr136_a_moved_cursor_gets_a_notice_not_a_confirm() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD_CHECK=build-2-oldver RUNNERCTL_STUB_KEYS="jjjUkkkkkk${REL}yq" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^build-2-oldver: upgrade available \(0\.0\.1 -> 9\.9\.9\) — the cursor moved on, so nothing is asked and nothing issued$' 1
+  expect_no_out '\[y/n\]'
+  expect_log_count '^probe:ssh_run build-2-oldver -- runnerctl upgrade --check$' 1
+  expect_no_log "$GHR128_UPGRADE"
+  expect_no_log '^probe:ssh_run [^ ]+ -- (sudo -n )?runnerctl upgrade$'
+}
+
+# q while a check is out ends it silently: no still-running message, no record.
+case_ghr136_quitting_with_a_check_out_is_silent() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD_CHECK=build-2-oldver RUNNERCTL_STUB_KEYS="Uq" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" run fleet watch --color never
+  expect_rc 0
+  expect_no_out 'still running when the watch ended'
+  expect_no_log "$GHR128_UPGRADE"
+  expect_no_path "$WRITES/fleet.log"
+}
+
+t "GHR-136: a slow upgrade --check does not block the keys; the confirm rises when it lands" case_ghr136_a_slow_check_does_not_block_the_keys
+t "GHR-136: a check holds the host's one action slot"                                        case_ghr136_a_check_holds_the_hosts_slot
+t "GHR-136: a cursor that moved on gets a notice, not a confirm, and y issues nothing"       case_ghr136_a_moved_cursor_gets_a_notice_not_a_confirm
+t "GHR-136: quitting with a check out says nothing and logs nothing"                          case_ghr136_quitting_with_a_check_out_is_silent
+
 # --- GHR-118: fleet watch's history pane --------------------------------------
 # H, on a row, replaces the table with that row's host's `history -n 50`; H
 # again shows every host's records merged by time. The records are the stub's
