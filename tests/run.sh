@@ -7490,7 +7490,7 @@ case_compose_reap_in_usage() {
   run help
   expect_rc 0
   expect_out 'runnerctl compose-reap \[--apply\]'
-  expect_out 'runnerctl compose-reap-timer install\|status\|remove'
+  expect_out 'runnerctl compose-reap-timer install\|status \[--brief\]\|remove'
   run bogus
   expect_err 'compose-reap compose-reap-timer'
 }
@@ -9864,10 +9864,11 @@ case_fleet_watch_question_mark_lists_every_key() {
   # header, the summary and the three lines under it
   # GHR-129: `a` joined `b i`'s line, and the marks took the line it had
   # GHR-86: `:` joined O's line, which keeps the count at 17
-  for k in '!' 'b i a' '/' 'space \* u' 's' 'c' 'Enter' 'K R S T P L' 'D W E X U' 'O :' 'q \?' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
+  # GHR-87: C joined them, the line reworded to fit
+  for k in '!' 'b i a' '/' 'space \* u' 's' 'c' 'Enter' 'K R S T P L' 'D W E X U' 'O : C' 'q \?' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
     expect_frame 2 "^  $k   +[a-z]"
   done
-  expect_frame 2 "^  O :   print the run URL of the cursor's job; a prompt for any fleet command\$"
+  expect_frame 2 "^  O : C   job run URL; a typed fleet command; its host's compose-reap dry run\$"
   expect_frame 2 '^  K R S T P L   kill job, restart, stop, start, reap, logs; R S: w = when idle$'
   # GHR-127: the host keys took the line `?` had; `?` folded into q's
   # GHR-128: U joined them, in the same line
@@ -15690,6 +15691,205 @@ t "GHR-86: :%stop is refused by the capacity gate and the watch goes on"        
 t "GHR-86: :provision 2 shows the exclusion message, nothing dialled"             case_ghr86_an_excluded_command_shows_its_refusal
 t "GHR-86: a read runs at once into the pager, on the cursor's host or with % all" case_ghr86_a_read_runs_at_once_into_the_pager
 t "GHR-86: a word with shell metacharacters reaches the host as one argument"     case_ghr86_a_metacharacter_word_reaches_the_host_literally
+
+# --- GHR-87: fleet compose-reap and compose-reap-timer ------------------------
+# The stub's hosts answer compose-reap with the real command over the shared
+# docker model (RUNNERCTL_STUB_COMPOSE=1); per host, *nodocker*, *dockerdenied*
+# and *rootexecbad* change one fact, and RUNNERCTL_STUB_FLEET_TIMER installs the
+# timer on the hosts it names. What one host of the fixture would reap: six
+# stacks — five containers, three networks, one volume.
+GHR87_TOTAL_RE='^fleet compose-reap \(dry run, nothing removed\): would reap '
+# A line in the case's log that is not a probe is a call that changed
+# something — a run_priv argv, or the stub's `docker rm`.
+GHR87_NOT_A_PROBE='^([^p]|p[^r]|pr[^o]|pro[^b])'
+
+# The acceptance case: the dry run asks every host at once, as the login, and
+# changes nothing anywhere; each host's lines carry its name, then one total.
+case_ghr87_the_dry_run_fans_out_read_only_with_a_fleet_total() {
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet compose-reap
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl compose-reap$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl compose-reap$' 1
+  expect_log_count '^probe:ssh_run ' 2
+  # read-only: no docker rm, no run_priv, no sudo, no origin, no record
+  expect_no_log '^docker rm '
+  expect_no_log "$GHR87_NOT_A_PROBE"
+  expect_no_log '^probe:remote_sudo '
+  expect_no_log '^probe:ssh_origin '
+  expect_no_log '^probe:audit '
+  expect_no_path "$WRITES/fleet.log"
+  expect_out_count '^build-1: reap stale reason=age idle=240m containers=1 networks=1 volumes=1$' 1
+  expect_out_count '^build-2: reap stale reason=age idle=240m containers=1 networks=1 volumes=1$' 1
+  expect_out_count '^build-[12]: compose-reap: mode=dry-run projects=12 reap=6 keep=6 removed=0 ' 2
+  expect_out_count "$GHR87_TOTAL_RE" 1
+  expect_out '^fleet compose-reap \(dry run, nothing removed\): would reap 12 stack\(s\) — 10 container\(s\), 6 network\(s\), 2 volume\(s\), up to 0 image\(s\) — on 2 host\(s\)$'
+  # the flags reach the host, the values checked here first; --host narrows
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_STANDALONE=1 RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet compose-reap --host build-2 --standalone --project stale --grace-minutes 5
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl compose-reap --standalone --project stale --grace-minutes 5$' 1
+  expect_log_count '^probe:ssh_run ' 1
+  expect_no_log "$GHR87_NOT_A_PROBE"
+  expect_out '^fleet compose-reap \(dry run, nothing removed\): would reap 1 stack\(s\) — 1 container\(s\), 1 network\(s\), 1 volume\(s\), up to 0 image\(s\) — on 1 host\(s\)$'
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_STANDALONE=1 RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet compose-reap --host build-1 --standalone
+  expect_rc 0
+  expect_out '— 7 container\(s\), 3 network\(s\), 1 volume\(s\), up to 2 image\(s\) — on 1 host\(s\)$'
+  RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet compose-reap --max-age-hours soon
+  expect_rc 1
+  expect_err "max-age-hours must be a whole number of hours, got 'soon'"
+  expect_no_log '^probe:ssh_run '
+}
+
+# --apply --host H changes H and nothing else, through the mutating path: the
+# origin, the record, the streamed lines and the usual per-host report.
+case_ghr87_apply_acts_on_the_named_host_only() {
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet compose-reap --apply --host build-2
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl compose-reap --apply$' 1
+  expect_log_count '^probe:ssh_run ' 1
+  expect_no_log '^probe:ssh_run build-1 '
+  expect_log_count "^probe:ssh_origin build-2 $GHR88_ORIGIN\$" 1
+  expect_log_count '^docker rm ' 9
+  expect_log_order '^probe:ssh_run build-2 ' '^docker rm container c-pidgone$' '^probe:ssh_run_done build-2$'
+  expect_out_count '^build-2: compose-reap: mode=apply projects=12 reap=6 keep=6 removed=9 failed=0 ' 1
+  expect_out_count '^build-1: ' 0
+  expect_out '^fleet compose-reap: 1 host\(s\) ok, 0 failed$'
+  expect_cfg "$WRITES/fleet.log" "^$GHR88_TS $ME fleet compose-reap --apply --host build-2 — build-2=0\$"
+  # under FLEET_SUDO=1 it runs as root there, so a login outside the docker
+  # group still reaps
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-dockerdenied" \
+    run fleet compose-reap --apply --host box-dockerdenied
+  expect_rc 0
+  expect_log_count '^probe:remote_sudo box-dockerdenied -- runnerctl compose-reap --apply$' 1
+  expect_log_count '^docker rm ' 9
+  expect_no_log '^probe:ssh_run build-1 '
+}
+
+# A host without docker is a row of information and leaves the exit code
+# alone, dry run and --apply; a login the daemon refuses is a failed row that
+# names the fix — never `projects=0`, which is what it used to read as.
+case_ghr87_no_docker_is_information_a_refused_login_is_a_failure() {
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-nodocker" run fleet compose-reap
+  expect_rc 0
+  expect_out_count '^box-nodocker: no docker on this host — nothing for compose-reap to inspect \(information, not a failure\)$' 1
+  expect_out '^fleet compose-reap \(dry run, nothing removed\): would reap 6 stack\(s\) — .* — on 1 host\(s\); 1 host\(s\) without docker$'
+  expect_no_out 'host\(s\) failed'
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-nodocker" run fleet compose-reap --apply --all-hosts
+  expect_rc 0
+  expect_out_count '^box-nodocker: no docker on this host — ' 1
+  expect_out '^fleet compose-reap: 1 host\(s\) ok, 0 failed, 1 without docker$'
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-dockerdenied" run fleet compose-reap
+  expect_rc 1
+  expect_out_count "^box-dockerdenied: remote exit 1 — runnerctl: cannot talk to the docker daemon as $ME: permission denied while trying to connect to the docker API at unix:///var/run/docker\\.sock — the ssh login is not in that host's docker group: add it there \\('sudo usermod -aG docker <login>', effective at its next login\\); a compose-reap --apply under FLEET_SUDO=1 runs as root and needs no group\$" 1
+  expect_out '; 1 host\(s\) failed$'
+  expect_no_out '^box-dockerdenied: (reap|keep|compose-reap:) '
+  # and on the host itself: the remedy on its own line, and no inventory
+  RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_DOCKER_DENIED=1 run compose-reap
+  expect_rc 1
+  expect_err "^runnerctl: cannot talk to the docker daemon as $ME: permission denied while trying"
+  expect_err "^runnerctl: fix: add $ME to the docker group \\('sudo usermod -aG docker $ME'"
+  expect_no_out 'projects='
+}
+
+# compose-reap-timer status says per host: installed, not installed, or why it
+# could not be asked — one line each, as the login, with no journal read.
+case_ghr87_timer_status_installed_not_installed_unreachable() {
+  RUNNERCTL_STUB_FLEET_TIMER="build-1" RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 gw-unreachable" \
+    run fleet compose-reap-timer status
+  expect_rc 1
+  expect_out_count '^build-1: installed \(enabled, active\)$' 1
+  expect_out_count '^build-2: not installed$' 1
+  expect_out_count '^gw-unreachable: unreachable — ssh: connect to host gw-unreachable port 22: No route to host$' 1
+  expect_out '^fleet compose-reap-timer: 1 installed, 1 not installed, 1 unreachable$'
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl compose-reap-timer status --brief$' 3
+  expect_log_count '^probe:systemctl is-(enabled|active) runnerctl-compose-reap\.timer$' 2
+  expect_no_log "$GHR87_NOT_A_PROBE"
+  expect_no_log '^probe:ssh_origin '
+  # every host answered: exit 0, installed or not; the default subcommand is status
+  RUNNERCTL_STUB_FLEET_TIMER="build-2" RUNNERCTL_STUB_TIMER_STATE="disabled inactive" RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet compose-reap-timer --host build-2
+  expect_rc 0
+  expect_out_count '^build-2: installed \(disabled, inactive\)$' 1
+  expect_out '^fleet compose-reap-timer: 1 installed, 0 not installed, 0 unreachable$'
+  expect_log_count '^probe:ssh_run ' 1
+  run compose-reap-timer status --brief
+  expect_rc 0
+  expect_out '^timer: not installed$'
+  expect_no_log '^journalctl'
+}
+
+# install and remove go through the mutating path; a host whose runnerctl a
+# root timer may not run keeps its refusal, as that host's row.
+case_ghr87_timer_install_is_refused_per_host_as_a_row() {
+  local unit="$WRITES/remote/build-1/etc/systemd/system/runnerctl-compose-reap"
+  RUNNERCTL_STUB_ROOT_EXEC_OK=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-rootexecbad" run fleet compose-reap-timer install
+  expect_rc 1
+  expect_file "$unit.service" '^ExecStart=/.*/runnerctl compose-reap --apply$'
+  expect_file "$unit.timer" '^OnCalendar=hourly$'
+  expect_log_count '^systemctl enable --now runnerctl-compose-reap\.timer$' 1
+  expect_no_path "$WRITES/remote/box-rootexecbad/etc/systemd/system/runnerctl-compose-reap.service"
+  expect_out '^box-rootexecbad: remote exit 1 — runnerctl: refusing to install a root timer that runs /.*/runnerctl: .* not root\.'
+  expect_out '^fleet compose-reap-timer: 1 host\(s\) ok, 1 failed$'
+  expect_log_count "^probe:ssh_origin [^ ]+ $GHR88_ORIGIN\$" 2
+  RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet compose-reap-timer remove --host build-2
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl compose-reap-timer remove$' 1
+  expect_log_count '^probe:ssh_run ' 1
+  expect_log_count '^systemctl disable --now runnerctl-compose-reap\.timer$' 1
+  expect_out '^fleet compose-reap-timer: 1 host\(s\) ok, 0 failed$'
+  RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet compose-reap-timer install remove
+  expect_rc 1
+  expect_err "takes one of status, install or remove, not 'install remove'"
+  expect_no_log '^probe:ssh_run '
+}
+
+# fleet watch: C pages the cursor's host's dry run — a read: no confirm, no
+# origin, no sudo, no removal; a host without docker is the notice.
+case_ghr87_watch_C_pages_the_hosts_dry_run() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_KEYS='jjjCq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_no_out '\[y/n\]'
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl compose-reap$' 1
+  expect_log_count '^probe:ssh_run [^ ]+ -- (sudo -n )?runnerctl compose-reap' 1
+  expect_log_order '^probe:tty_read_char 5 C$' '^probe:term_cursor show$' '^probe:page$' '^probe:term_cursor hide$'
+  expect_out_count "^compose-reap on build-2 — a dry run, nothing removed \\('runnerctl fleet compose-reap --apply --host build-2' reaps\\)\$" 1
+  expect_out_count '^reap stale reason=age idle=240m containers=1 networks=1 volumes=1$' 1
+  expect_no_log "$GHR87_NOT_A_PROBE"
+  expect_no_log '^probe:ssh_origin '
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jjjCq' RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-nodocker" \
+    run fleet watch --color never
+  expect_rc 0
+  expect_out '^box-nodocker: no docker on this host — nothing for compose-reap to inspect \(information, not a failure\)$'
+  expect_no_log '^probe:page$'
+}
+
+# The `:` prompt: compose-reap without --apply and compose-reap-timer status
+# are reads and run at once; --apply asks first.
+case_ghr87_the_prompt_reads_compose_reap_and_asks_for_apply() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_KEYS='::n:q' \
+    RUNNERCTL_STUB_PROMPT_IN=$'compose-reap\ncompose-reap --apply\ncompose-reap-timer status' \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_out_count '^ran: runnerctl fleet compose-reap --host build-1$' 1
+  expect_out_count '^runs: runnerctl fleet compose-reap --apply --host build-1  \[y/n\]$' 1
+  expect_out_count '^ran: runnerctl fleet compose-reap-timer status --host build-1$' 1
+  expect_out_count '^cancelled — nothing run$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl compose-reap$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl compose-reap-timer status --brief$' 1
+  expect_no_log '^probe:ssh_run [^ ]+ -- runnerctl compose-reap --apply'
+  expect_log_count '^probe:page$' 2
+  expect_no_log "$GHR87_NOT_A_PROBE"
+  expect_no_log '^probe:ssh_origin '
+}
+
+t "GHR-87: the dry run fans out read-only and prints a fleet total"             case_ghr87_the_dry_run_fans_out_read_only_with_a_fleet_total
+t "GHR-87: --apply --host H acts on H only"                                       case_ghr87_apply_acts_on_the_named_host_only
+t "GHR-87: no docker is information; a refused login is a failed row with the fix" case_ghr87_no_docker_is_information_a_refused_login_is_a_failure
+t "GHR-87: timer status says installed, not installed or unreachable per host"    case_ghr87_timer_status_installed_not_installed_unreachable
+t "GHR-87: timer install keeps its per-host refusal, as a row"                    case_ghr87_timer_install_is_refused_per_host_as_a_row
+t "GHR-87: fleet watch C pages the cursor's host's dry run"                        case_ghr87_watch_C_pages_the_hosts_dry_run
+t "GHR-87: the : prompt reads compose-reap and asks before --apply"                case_ghr87_the_prompt_reads_compose_reap_and_asks_for_apply
 
 # --- Summary ------------------------------------------------------------------
 echo

@@ -268,7 +268,10 @@ runnerctl kill [--dry-run] [--if-stalled] [--stall-after N] \
                [<unit|slot-index|name> ...]
 runnerctl compose-reap [--apply] [--standalone] [--project NAME] \
                        [--max-age-hours N] [--grace-minutes N]
-runnerctl compose-reap-timer install|status|remove
+runnerctl compose-reap-timer install|status [--brief]|remove
+runnerctl fleet compose-reap [--host H]... [--apply] [--standalone] \
+                             [--project NAME] [--max-age-hours N] [--grace-minutes N]
+runnerctl fleet compose-reap-timer status|install|remove [--host H]...
 runnerctl health [--quiet|--json] [--max-restarts N] [--stall-after N] [--restart-stalled]
 runnerctl profiles
 runnerctl config-example
@@ -542,8 +545,16 @@ form is the timer: `runnerctl compose-reap-timer install` writes
 enables it and prints a dry run of the first pass. The unit runs as root and
 executes this runnerctl, so `install` refuses unless the file is root-owned
 and writable by nobody else — which is what `runnerctl install` leaves at
-`/usr/local/bin`. `compose-reap-timer status` shows the timer and the last
-runs' journal; `remove` takes both units away.
+`/usr/local/bin`. `compose-reap-timer status` says whether the timer is
+installed (`timer: installed (enabled, active)` or `timer: not installed`),
+then shows it and the last runs' journal; `status --brief` is that first line
+alone, which needs no privilege. `remove` takes both units away.
+
+The dry run asks the daemon first, and a user it refuses — one outside the
+`docker` group — is an error naming the fix, never `projects=0`: every docker
+read otherwise sends its errors to `/dev/null`, so a host the dry run could
+not see would read as an empty one. Across hosts, see [`fleet
+compose-reap`](#compose-leftovers-across-the-fleet-fleet-compose-reap).
 
 ### Colour
 
@@ -1514,6 +1525,7 @@ has its own `slot-1`:
 | `L` | page the slot's last 50 journal lines through your `$PAGER` |
 | `O` | print the URL of the running job's run on the status line; no round trip |
 | `:` | a prompt for **any fleet command** — `scale 3`, `health`, `apply --profile ci` — on the cursor's host, the marked rows' hosts, or with `%` every watched host — below |
+| `C` | page the **host's** `compose-reap` dry run through your `$PAGER` — what a full docker disk on the host line is holding, and whether it can go. A read, as the login: no confirm, nothing removed. A host without docker says so on the status line |
 | `Enter` | show the selected slot in full, in place of the table; no round trip — below |
 | `!` `b` `i` `/` `a` `s` `c` `?` | [view keys](#a-live-fleet-view-fleet-watch): filter, sort, collapse, help — below |
 | `Esc` | while an action runs: stop following it — the command carries on, its notice still comes — below |
@@ -1722,7 +1734,8 @@ watch already holds:
   `fleet health` take no `--host`, so they are run on the scope's hosts and the
   line says which: `runnerctl fleet health (on build-1)`.
 - **Reads run at once** — `status`, `health`, `history`, `upgrade --check`,
-  `reap --dry-run` — and their output opens in your `$PAGER`, as `L`'s does,
+  `reap --dry-run`, `compose-reap` without `--apply`, `compose-reap-timer
+  status` — and their output opens in your `$PAGER`, as `L`'s does,
   under a first line naming the command that ran.
 - **Everything else asks first**, with the command fully expanded:
 
@@ -1747,8 +1760,8 @@ watch already holds:
   refused — you are in it — and so is `:status --json --watch`, a stream that
   never ends.
 
-`:` is not in the one-line legend under the table, which has no column to spare
-at 80; `?` lists it.
+`:` and `C` are not in the one-line legend under the table, which has no column
+to spare at 80; `?` lists them.
 
 The cursor survives the frame changing under it. A host that stops answering
 keeps its rows, so the cursor stays on the slot it was on (the age line above
@@ -1756,7 +1769,7 @@ them is never a stop); a host with no rows to keep is one row, where keys act
 on nothing, and the cursor is back on its slot when the host answers. A slot
 that goes away drops the cursor to that host's first slot. `L` is not a stream: the host's
 `logs <slot> -n 50` runs to completion under `FLEET_TIMEOUT` and the result is
-paged locally. The keys that change something (`K` `R` `S` `T` `P`, and the
+paged locally, and so does `C`'s `compose-reap`. The keys that change something (`K` `R` `S` `T` `P`, and the
 host keys `D` `W` `E` `X` `U`) run under
 `FLEET_MUTATE_TIMEOUT` instead, in the background: a restart that sits out a
 wedged job's `TimeoutStopSec` is followed for those minutes rather than
@@ -2226,7 +2239,11 @@ hosts that cannot change yet, a grant of the binaries the fan-out uses:
 ```
 
 Add the `upgrade` set from the previous section if you also run `fleet
-upgrade`.
+upgrade`. `fleet compose-reap --apply` asks sudo for nothing under this line:
+the host's `compose-reap` talks to docker as the login, which needs the
+`docker` group there instead (a `docker` group member is root-equivalent on
+that host too). `fleet compose-reap-timer install` / `remove` use `tee`, `rm`
+and `systemctl`, which the line already grants.
 
 **This line is equivalent to root for that login, too.** Unrestricted root
 `tee` or `rm` writes or deletes any file, and unrestricted `systemctl` and
@@ -2284,12 +2301,17 @@ FLEET_RUNNERCTL="/usr/local/bin/runnerctl"   # the path the sudoers line names
 **What goes through sudo:** the mutating fan-outs (`fleet apply`, `scale`,
 `start`, `stop`, `restart`, `drain`, `kill`, `reap`, `remove-limits`,
 `enable`, `disable`, with or without a budget), `fleet health
---restart-stalled`, `fleet upgrade` and `fleet upgrade --rollback`, and
+--restart-stalled`, `fleet upgrade` and `fleet upgrade --rollback`, `fleet
+compose-reap --apply` and `fleet compose-reap-timer install` / `remove`, and
 `fleet watch`'s action keys and `L` (the host's `logs` reads the journal
 through sudo). **What does not:** `fleet status`, `fleet health`, `fleet
 watch`'s ticks and the reads its keys make first, the summary's `status
---json`, `fleet upgrade --check` and the read-back after an upgrade. Those
-still run as the plain login.
+--json`, `fleet upgrade --check` and the read-back after an upgrade, `fleet
+compose-reap` without `--apply` (and `fleet watch`'s `C`) and `fleet
+compose-reap-timer status`. Those still run as the plain login — the dry run
+needs the login in the host's `docker` group. On an opted-in host,
+`compose-reap --apply --standalone`, `--max-age-hours` and `--grace-minutes`
+are refused under sudo (below): that host's row says so.
 
 **What it bounds.** As root, the login can do what runnerctl's verbs do —
 units matching `UNIT_GLOB`, the managed drop-in, runnerctl's own file — and
@@ -2382,6 +2404,87 @@ sudoers line must grant NOPASSWD the exact absolute path sudo resolves
 narrow sudo contract' in the README
 ```
 
+##### Compose leftovers across the fleet: `fleet compose-reap`
+
+The host line's `Disk:` says a host's docker filesystem is filling; the next
+question is what holds it and whether it can go — which is
+[`compose-reap`](#removing-compose-stacks-a-dead-job-left-behind-compose-reap)'s
+dry run, now asked of every host at once:
+
+```
+$ runnerctl fleet compose-reap
+build-1: reap harness-123456 reason=gone:pid:123456 idle=120m containers=1 networks=1 volumes=0
+build-1: keep harness-4242 reason=live:pid:4242 idle=120m containers=1 networks=0 volumes=0
+build-1: compose-reap: mode=dry-run projects=2 reap=1 keep=1 removed=0 failed=0 …
+box-3: no docker on this host — nothing for compose-reap to inspect (information, not a failure)
+fleet compose-reap (dry run, nothing removed): would reap 1 stack(s) — 1 container(s), 1 network(s), 0 volume(s), up to 0 image(s) — on 1 host(s); 1 host(s) without docker
+```
+
+It takes `--host H` (repeatable) and forwards `--standalone`, `--project
+NAME`, `--max-age-hours N` and `--grace-minutes N` to each host. The dry run is
+a read: in parallel like `fleet status`, as the plain ssh login (never through
+`FLEET_SUDO`), and nothing is removed anywhere. Its verdicts are what that
+login can see: a slot whose processes it cannot read counts as idle, as for a
+dry run by hand. The total counts the stacks each host would reap with their
+containers, networks and volumes, plus `--standalone` containers, and *up to*
+the images those free — whether an image is still used elsewhere is only asked
+by `--apply`.
+
+`--apply` goes through the [mutating fan-out](#changing-things-the-mutating-fan-out)
+— one host at a time, streamed, recorded, `FLEET_SUDO` and the origin as for
+every command that changes a host:
+
+```
+$ runnerctl fleet compose-reap --apply --host build-1
+build-1: …
+build-1: compose-reap: mode=apply projects=2 reap=1 keep=1 removed=2 failed=0 …
+fleet compose-reap: 1 host(s) ok, 0 failed
+```
+
+**No capacity gate**, and that is a decision: it removes a dead job's
+leftovers and never touches a runner slot, and a running job's stack is kept
+because its job is alive. Each host's own `--apply` still refuses where there
+are no runner units.
+
+Two rows to know:
+
+- **A host without docker** is a row of information and does **not** make the
+  exit code non-zero — a fleet where only some hosts run compose is the normal
+  case. `--apply` counts it apart too: `fleet compose-reap: 2 host(s) ok, 0
+  failed, 1 without docker`.
+- **A login the daemon refuses** is a failed row naming the fix:
+
+  ```
+  box-2: remote exit 1 — runnerctl: cannot talk to the docker daemon as ci-fleet:
+  permission denied while trying to connect to the docker API at
+  unix:///var/run/docker.sock — the ssh login is not in that host's docker
+  group: add it there ('sudo usermod -aG docker <login>', effective at its next
+  login); a compose-reap --apply under FLEET_SUDO=1 runs as root and needs no
+  group
+  ```
+
+The hourly timer, per host:
+
+```
+$ runnerctl fleet compose-reap-timer status
+build-1: installed (enabled, active)
+build-2: not installed
+gw-1: unreachable — ssh: connect to host gw-1 port 22: No route to host
+fleet compose-reap-timer: 1 installed, 1 not installed, 1 unreachable
+```
+
+`status` (the default) asks each host for `compose-reap-timer status --brief`,
+as the login; it exits 0 when every host answered, installed or not. A host
+whose runnerctl predates `--brief` says so, with `fleet upgrade` as the fix.
+`install` and `remove` take `--host H` and go through the mutating fan-out;
+each host's `install` keeps its own refusal — the runnerctl a root timer runs
+must be root-owned and writable by nobody else — and it comes back as that
+host's row.
+
+In `fleet watch`, `C` pages the cursor's host's dry run, and the `:` prompt
+runs `compose-reap` (without `--apply`) and `compose-reap-timer status` at once,
+as reads.
+
 ##### What does not fan out
 
 - **`env-init` never will.** It writes an EnvironmentFile of secrets, and
@@ -2389,8 +2492,6 @@ narrow sudo contract' in the README
 - **`provision` and `deprovision`** take a GitHub token, so fanning them out
   copies a credential to every host — and a runner name or slot index means a
   different runner on each host. Run them on the host.
-- **`compose-reap` and `compose-reap-timer`** are per host for now: run them
-  on each host, or install the timer there once.
 - **`watch`** is interactive and **`logs -f`** is streaming; both only make
   sense against one host. Each says so rather than reporting "unknown
   command".
