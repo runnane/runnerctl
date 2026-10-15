@@ -1198,7 +1198,7 @@ out, so a healthy fleet is a short line:
 
 | segment | counts |
 | --- | --- |
-| `2/3 hosts answering` | hosts that answered, of those configured. Unreachable and timed-out hosts are not answering; a host whose `runnerctl` exited non-zero answered. |
+| `2/3 hosts answering` | hosts that answered, of those asked. Under `--host` that is the selected hosts, not `FLEET_HOSTS`: `fleet status --host build-1` says `1/1 host answering` however long the fleet is, and its `--json` `summary` counts the same hosts. Unreachable and timed-out hosts are not answering; a host whose `runnerctl` exited non-zero answered. |
 | `3 slots: 2 busy, 1 idle, …` | every slot, as exactly one of `busy`, `idle`, `STALLED` (a job past `--stall-after`) while its unit is active, and `down` or `disabled` when it is not. |
 | `N leaking` | slots whose finished job left processes behind. |
 | `N host(s) disk crit` / `disk warn` | hosts with a partition past this node's `DISK_CRIT_PCT` / `DISK_WARN_PCT`, each host once, at its worst partition. |
@@ -1222,6 +1222,12 @@ remembered and sent the plain table call from then on, so it costs two calls
 per tick rather than one. A host that did not answer is not dialled again.
 `fleet status --json` carries the same numbers as its `summary` object (below),
 counted by the same code from the payloads it already has — no second call.
+
+`fleet status --host H` (repeatable, like the mutating commands, and also taken
+by `fleet health`) asks only the named hosts: an unknown name dies, naming it,
+before anything is dialled. The table, the summary line and `--json` all cover
+those hosts alone, so `--host build-1` is how to read one host after a call to
+it timed out.
 
 Each host that answered gets a **host line** above its slots: the `runnerctl`
 version it runs, then the `load`, `Disk:` and `last 1h:` part of its own
@@ -2160,8 +2166,8 @@ than the central node can know, so pass `--timeout` explicitly there.
 `fleet upgrade` and `fleet health --restart-stalled` are on the same budget.
 
 If a host does run out of it, the row says `timed out after Ns — the command
-may still be running on that host; 'runnerctl fleet status' shows where it got
-to`, and it means that: the timeout stops the local ssh, not the remote
+may still be running on that host; 'runnerctl fleet status --host H' shows where
+it got to` (with the host's own name for `H`), and it means that: the timeout stops the local ssh, not the remote
 `runnerctl`. The fan-out then moves on to the next host, so check before
 re-running.
 

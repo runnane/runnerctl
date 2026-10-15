@@ -60,14 +60,14 @@
 #   runnerctl health [--quiet|--json] [--max-restarts N] [--stall-after N] [--restart-stalled]
 #   runnerctl history [-n N]
 #   runnerctl fleet history [-n N] [--host H]...
-#   runnerctl fleet status [--json] [--color auto|always|never] [--stall-after N] \
-#                          [--narrow]
+#   runnerctl fleet status [--host H]... [--json] [--color auto|always|never] \
+#                          [--stall-after N] [--narrow]
 #   runnerctl fleet status --json --watch [--interval N] [--stall-after N]
 #   runnerctl fleet watch  [--interval N] [--host H]... \
 #                          [--color auto|always|never] [--stall-after N] [--narrow] \
 #                          [--min-available K] [--problems] [--sort config|job|mem]
-#   runnerctl fleet health [--quiet|--json] [--max-restarts N] [--stall-after N] \
-#                          [--restart-stalled]
+#   runnerctl fleet health [--host H]... [--quiet|--json] [--max-restarts N] \
+#                          [--stall-after N] [--restart-stalled]
 #   runnerctl fleet upgrade [--check] [--ref <branch|tag>] [--sha256 SUM] \
 #                           [--host H]... [--canary [H]] [--serial] [--stop-on-failure]
 #   runnerctl fleet upgrade --push [--check] [--host H]... [--canary [H]] [--serial] \
@@ -7144,14 +7144,16 @@ fleet_reachable() { # RC
 # until it next writes to its closed stdout. Either way the host may be
 # part-way through or about to finish, and "nothing is known about it" is the
 # one thing an operator must not read into the row.
-FLEET_TIMEOUT_STILL_RUNNING="the command may still be running on that host; 'runnerctl fleet status' shows where it got to"
+FLEET_TIMEOUT_STILL_RUNNING="the command may still be running on that host; 'runnerctl fleet status --host @HOST@' shows where it got to"
 
 # BUDGET is the seconds the call was given, for the timed-out wording; empty
 # means FLEET_TIMEOUT, the read-only budget. MUTATING (any non-empty word)
 # says the call was changing things on the host, which adds the sentence above.
-fleet_error_text() { # RC ERRFILE [BUDGET [MUTATING]]
+fleet_error_text() { # RC ERRFILE [BUDGET [MUTATING [HOST]]]
   local rc="$1" err="" hint="" budget="${3:-$FLEET_TIMEOUT}" still=""
-  [ -z "${4:-}" ] || still=" — $FLEET_TIMEOUT_STILL_RUNNING"
+  # GHR-93: the wording names the host, so the command it points at can be
+  # pasted as it stands. HOST is the host the call ran on.
+  [ -z "${4:-}" ] || still=" — ${FLEET_TIMEOUT_STILL_RUNNING//@HOST@/${5:-H}}"
   [ ! -s "$2" ] || err="$(head -1 "$2")"
   # An accurate error that leaves the reader to work out the fix is half a
   # message. Name the remedy where it is read.
@@ -8235,9 +8237,9 @@ fleet_budget_walk() { # SUBCOMMAND MODE BUDGET [REMOTE-ARGS...]
     elif [ "$rc1" = 124 ]; then
       # Not "(exit 124)": the slot is not known to have failed, only not known
       # to have finished, and the walk is about to move on past it.
-      nbad=$((nbad + 1)); echo "$host slot $idx: $sub FAILED ($(fleet_error_text 124 /dev/null "$budget1" mutating))"
+      nbad=$((nbad + 1)); echo "$host slot $idx: $sub FAILED ($(fleet_error_text 124 /dev/null "$budget1" mutating "$host"))"
     else
-      nbad=$((nbad + 1)); echo "$host slot $idx: $sub FAILED ($(fleet_error_text "$rc1" "$FLEET_BUDGET_TMP.err" "$budget1" mutating))"
+      nbad=$((nbad + 1)); echo "$host slot $idx: $sub FAILED ($(fleet_error_text "$rc1" "$FLEET_BUDGET_TMP.err" "$budget1" mutating "$host"))"
     fi
   done <<<"$slots"
   fleet_budget_cleanup
@@ -8438,7 +8440,7 @@ fleet_run_report() { # SUBCOMMAND [STREAMED]
       [ -n "$line" ] || continue
       printf '%s: %s\n' "$host" "$line"
     done <"$FLEET_DIR/$i.out"
-    [ "$rc" = 0 ] || printf '%s: %s\n' "$host" "$(fleet_error_text "$rc" "$FLEET_DIR/$i.err" "${FLEET_BUDGETS[$i]:-}" mutating)"
+    [ "$rc" = 0 ] || printf '%s: %s\n' "$host" "$(fleet_error_text "$rc" "$FLEET_DIR/$i.err" "${FLEET_BUDGETS[$i]:-}" mutating "$host")"
   done
   line="fleet $sub: $ok host(s) ok, $bad failed"
   [ "$nodocker" -eq 0 ] || line+=", $nodocker without docker"
@@ -8780,7 +8782,7 @@ fleet_upgrade_classify() { # CHECK J K
   FLEET_UP_NOW[k]="" FLEET_UP_WANT[k]=""
   if [ "$rc" != 0 ]; then
     FLEET_UP_KIND[k]=bad FLEET_UP_VERS[k]="—"
-    FLEET_UP_STATE[k]="$(fleet_error_text "$rc" "$FLEET_DIR/$j.err" "${FLEET_BUDGETS[$j]:-}" "$mutating")"
+    FLEET_UP_STATE[k]="$(fleet_error_text "$rc" "$FLEET_DIR/$j.err" "${FLEET_BUDGETS[$j]:-}" "$mutating" "${FLEET_HOSTS[$j]}")"
     return 0
   fi
   cur="$(fleet_upgrade_field "$j" installed)"
@@ -9150,7 +9152,7 @@ fleet_push_sent() { # J K
     1:*sudo:*|1:*"a password is required"*|1:*"may not run"*|1:*"no tty present"*)
       FLEET_UP_STATE[k]="remote exit 1 — $err — --push installs with 'sudo -n bash <the pushed file> install', so the ssh login needs passwordless sudo for that on this host (FLEET_SUDO=1's grant for runnerctl alone does not cover it)" ;;
     *)
-      FLEET_UP_STATE[k]="$(fleet_error_text "$rc" "$FLEET_DIR/$j.err" "${FLEET_BUDGETS[$j]:-}" mutating)" ;;
+      FLEET_UP_STATE[k]="$(fleet_error_text "$rc" "$FLEET_DIR/$j.err" "${FLEET_BUDGETS[$j]:-}" mutating "${FLEET_HOSTS[$j]}")" ;;
   esac
 }
 
@@ -9190,12 +9192,15 @@ fleet_push_verify() { # J K
 # Non-empty when `fleet health` was asked to --restart-stalled (GHR-81). A
 # global rather than an argument: fleet_health_report's signature is QUIET.
 FLEET_HEALTH_MUTATING=""
-cmd_fleet_health() { # [--quiet] [--json] [--max-restarts N] [--stall-after N] [--restart-stalled]
+cmd_fleet_health() { # [--host H]... [--quiet] [--json] [--max-restarts N] [--stall-after N] [--restart-stalled]
   local quiet=false json=false rc=0 i
-  local -a fwd=()
+  local -a fwd=() hosts=()
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     case "$1" in
+      # GHR-93: as on `fleet status`; local only, never forwarded.
+      --host)
+        need_val "$@"; hosts+=("$2"); shift 2 ;;
       # --quiet is LOCAL only and deliberately not forwarded: the remote's
       # stdout is where the problem lines come from, so a quiet remote would
       # leave this command with an exit code and nothing to report.
@@ -9227,6 +9232,7 @@ cmd_fleet_health() { # [--quiet] [--json] [--max-restarts N] [--stall-after N] [
   ! { $json && $quiet; } || die "--quiet cannot be combined with --json; the object is the whole answer, and the exit code is the same either way"
   if $json; then FLEET_OPTIONAL_ARGS=--json; fwd+=(--json); fi
   require_fleet
+  [ "${#hosts[@]}" -eq 0 ] || fleet_select_hosts "${hosts[@]}"
   FLEET_BUDGETS=()
   if [ -n "$FLEET_HEALTH_MUTATING" ]; then
     for i in "${!FLEET_HOSTS[@]}"; do FLEET_BUDGETS[i]="$(fleet_mutate_budget restart 1)"; done
@@ -9290,11 +9296,11 @@ fleet_health_report() { # QUIET
         # exit 0 with the failure invisible: the exact hole this command
         # exists to close.
         if [ "${#problems[@]}" -eq "$before" ]; then
-          problems+=("$host: $(fleet_error_text "$rc" "$FLEET_DIR/$i.err" "${FLEET_BUDGETS[$i]:-}" "$FLEET_HEALTH_MUTATING")")
+          problems+=("$host: $(fleet_error_text "$rc" "$FLEET_DIR/$i.err" "${FLEET_BUDGETS[$i]:-}" "$FLEET_HEALTH_MUTATING" "$host")")
         fi
         ;;
       *)
-        problems+=("$host: $(fleet_error_text "$rc" "$FLEET_DIR/$i.err" "${FLEET_BUDGETS[$i]:-}" "$FLEET_HEALTH_MUTATING")")
+        problems+=("$host: $(fleet_error_text "$rc" "$FLEET_DIR/$i.err" "${FLEET_BUDGETS[$i]:-}" "$FLEET_HEALTH_MUTATING" "$host")")
         ;;
     esac
   done
@@ -9384,14 +9390,14 @@ fleet_health_json() {
         # Exit 1 with nothing to read is a die, as in fleet_health_report.
         if [ "$rc" = 1 ] && [ "${#pk[@]}" -eq "$before" ]; then
           ph+=("$host") ps+=("") pk+=(error)
-          pd+=("$(fleet_error_text "$rc" "$FLEET_DIR/$i.err" "${FLEET_BUDGETS[$i]:-}" "$FLEET_HEALTH_MUTATING")")
+          pd+=("$(fleet_error_text "$rc" "$FLEET_DIR/$i.err" "${FLEET_BUDGETS[$i]:-}" "$FLEET_HEALTH_MUTATING" "$host")")
         fi ;;
       *)
         k=error
         [ "$(fleet_reachable "$rc")" = true ] || k=unreachable
         counted=false
         ph+=("$host") ps+=("") pk+=("$k")
-        pd+=("$(fleet_error_text "$rc" "$FLEET_DIR/$i.err" "${FLEET_BUDGETS[$i]:-}" "$FLEET_HEALTH_MUTATING")") ;;
+        pd+=("$(fleet_error_text "$rc" "$FLEET_DIR/$i.err" "${FLEET_BUDGETS[$i]:-}" "$FLEET_HEALTH_MUTATING" "$host")") ;;
     esac
   done
   $counted || slots=""
@@ -9625,9 +9631,9 @@ fleet_compose_reap_timer_report() {
   [ $((down + bad)) -eq 0 ]
 }
 
-cmd_fleet_status() { # [--json [--watch|-w] [--interval N] [--iterations N]] [--color WHEN] [--stall-after N] [--narrow]
+cmd_fleet_status() { # [--host H]... [--json [--watch|-w] [--interval N] [--iterations N]] [--color WHEN] [--stall-after N] [--narrow]
   local json=false narrow=false rc=0 watch=false interval=5 iterations="" timed=false
-  local -a fwd=() stall=()
+  local -a fwd=() stall=() hosts=()
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     view_opt "$@"
@@ -9643,6 +9649,10 @@ cmd_fleet_status() { # [--json [--watch|-w] [--interval N] [--iterations N]] [--
       shift "$VIEW_SHIFT"; continue
     fi
     case "$1" in
+      # GHR-93: the same repeatable selection the mutating commands take, so
+      # the read-only view can be narrowed to the host a call just timed out
+      # on. Never forwarded — it picks who is dialled, not what they answer.
+      --host)   need_val "$@"; hosts+=("$2"); shift 2 ;;
       --json)   json=true; shift ;;
       # GHR-56: forwarded, because the columns are dropped where the table
       # is drawn. Never switched on by measuring, unlike `fleet watch`: that
@@ -9671,6 +9681,7 @@ cmd_fleet_status() { # [--json [--watch|-w] [--interval N] [--iterations N]] [--
     die "--interval and --iterations belong to the stream: 'runnerctl fleet status --json --watch'"
   fi
   require_fleet
+  [ "${#hosts[@]}" -eq 0 ] || fleet_select_hosts "${hosts[@]}"
   if $watch; then
     fleet_status_stream "$interval" "$iterations" ${fwd[@]+"${fwd[@]}"}
     return 0
@@ -11144,7 +11155,7 @@ fleet_watch_act_collect() {
       fleet_watch_act_last "$d/out"
       n="${FW_ACT_LABEL[$i]}: ${ACT_LAST:-${FW_ACT_VERB[$i]} done}"
     else
-      n="${FW_ACT_LABEL[$i]}: ${FW_ACT_VERB[$i]} failed — $(fleet_error_text "$rc" "$d/err" "${FW_ACT_BUDGET[$i]}" mutating)"
+      n="${FW_ACT_LABEL[$i]}: ${FW_ACT_VERB[$i]} failed — $(fleet_error_text "$rc" "$d/err" "${FW_ACT_BUDGET[$i]}" mutating "${FW_ACT_LABEL[$i]##* on }")"
     fi
     fleet_log_write "${FW_ACT_LOG[$i]}" "${FLEET_HOSTS[$i]}=$logrc"
     fleet_watch_act_notice "$n"
@@ -12187,7 +12198,7 @@ fleet_watch_page() { # KEY
 #     the foreground: the view is the command's until it ends.
 #   * The lines entered are kept for the session; ↑ ↓ in the prompt walk them.
 #     Esc, or an empty line, cancels.
-FW_CMD_HIST=() FW_CMD_ARGV=() FW_CMD_HOSTS=() FW_CMD_SHOWN="" FW_HOSTS_NARROWED=false
+FW_CMD_HIST=() FW_CMD_ARGV=() FW_CMD_SHOWN="" FW_HOSTS_NARROWED=false
 
 # ARGV as a command line, each word %q'd (so a word with a blank or a control
 # byte in it is shown as what it is), into CMD_WORDS.
@@ -12259,7 +12270,7 @@ fleet_watch_cmd_key() {
       # (env-init, provision, deprovision, logs) or a word it does not know.
       # cmd_fleet refuses each before anything is dialled, in its own words,
       # and those are what the notice says.
-      FW_CMD_ARGV=("${words[@]}") FW_CMD_HOSTS=()
+      FW_CMD_ARGV=("${words[@]}")
       fleet_watch_cmd_words "${words[@]}"
       FW_CMD_SHOWN="runnerctl fleet $CMD_WORDS"
       fleet_watch_cmd_exec refused
@@ -12290,16 +12301,10 @@ fleet_watch_cmd_key() {
     return 0
   fi
   argv=("${words[@]}")
-  case "$sub" in
-    status|health) ;;
-    *) for h in ${hosts[@]+"${hosts[@]}"}; do argv+=(--host "$h"); done ;;
-  esac
-  FW_CMD_ARGV=("${argv[@]}") FW_CMD_HOSTS=(${hosts[@]+"${hosts[@]}"})
+  for h in ${hosts[@]+"${hosts[@]}"}; do argv+=(--host "$h"); done
+  FW_CMD_ARGV=("${argv[@]}")
   fleet_watch_cmd_words "${argv[@]}"
   FW_CMD_SHOWN="runnerctl fleet $CMD_WORDS"
-  case "$sub" in
-    status|health) [ "${#hosts[@]}" -eq 0 ] || FW_CMD_SHOWN+=" (on ${hosts[*]})" ;;
-  esac
   if fleet_watch_cmd_reads "${words[@]}"; then
     fleet_watch_cmd_exec read
     return 0
@@ -12321,9 +12326,6 @@ fleet_watch_cmd_key() {
 # nothing the pager would show as escapes.
 fleet_watch_cmd_sub() (
   FLEET_EXIT_OWNED=false FLEET_BUDGETS=() FLEET_OPTIONAL_ARGS="" FLEET_REMOTE_COLOR=false FLEET_DIR=""
-  case "${FW_CMD_ARGV[0]}" in
-    status|health) [ "${#FW_CMD_HOSTS[@]}" -eq 0 ] || fleet_select_hosts "${FW_CMD_HOSTS[@]}" ;;
-  esac
   cmd_fleet "${FW_CMD_ARGV[@]}"
 )
 
