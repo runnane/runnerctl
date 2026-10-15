@@ -8880,6 +8880,99 @@ case_watch_tall_frame_is_cut_to_the_terminal_height() {
   expect_no_log '^(systemctl|journalctl|sudo|tee|rm|mkdir|chown|chmod|test|kill) '
 }
 
+# GHR-94: a line is measured in terminal COLUMNS, not characters. The repository
+# in slot-1's WORKING-ON cell is twenty double-width characters: the row is 154
+# characters but 174 columns. At 160 columns it fits by the character count and
+# wraps in fact, onto a second terminal row. The window must count that row: a
+# frame of 10 lines IS 11 rows on an 11-row terminal (header, version/host, blank,
+# column header, the 2-row slot-1, slot-2, the count of the hidden, blank,
+# legend, status line); counting characters it seats a third slot and the frame
+# is 11 lines, 12 rows, its header scrolled off. --narrow pins the table, so
+# the narrow-table decision (watch_table_width, next case) is not what shortens
+# the row.
+GHR94_WIDE='日日日日日日日日日日日日日日日日日日日日'
+case_ghr94_watch_counts_a_double_width_row_as_two_rows() {
+  local f
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_REPOSITORY="$GHR94_WIDE" RUNNERCTL_STUB_RUN_WORKFLOW='' RUNNERCTL_STUB_RUN_REF_NAME='' \
+    RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_SLOTS=9 RUNNERCTL_STUB_COLS=160 RUNNERCTL_STUB_LINES=11 RUNNERCTL_STUB_KEYS='kkq' \
+    run watch --narrow --color never --interval 1
+  expect_rc 0
+  frames
+  expect_frame_count 3
+  for f in 1 2; do
+    expect_frame_lines "$f" 10
+    expect_frame_line "$f" 1 '^runnerctl watch — '
+    expect_frame_line "$f" 4 '^IDX +RUNNER +PROFILE .* WORKING-ON$'
+    expect_frame_line "$f" 5 "example\\.slot-1 .* ${GHR94_WIDE}:test \\(12m\\)"
+    expect_frame_line "$f" 6 "$(w_row 1 2)"
+    expect_frame_line "$f" 7 "$(down_mark 7)"
+    expect_frame_line "$f" 9 "$LEGEND"
+    expect_no_frame "$f" 'example\.slot-3'
+  done
+}
+
+# GHR-94: watch_table_width returns the widest row in display columns (62 for
+# this one; a character count says 42), and a row of ASCII is unchanged.
+case_ghr94_watch_table_width_is_display_columns() {
+  local row="0 example.slot-1 $GHR94_WIDE:test" tbl
+  run_fn watch_table_width "$row"
+  expect_text "20 wide characters are 40 columns" "$((2 + 14 + 1 + 40 + 5))" "$OUT"
+  run_fn watch_table_width "0 example.slot-1 ${GHR94_WIDE//日/x}:test"
+  expect_text "the same row in ASCII is 20 columns shorter" "$((2 + 14 + 1 + 20 + 5))" "$OUT"
+  tbl="IDX  RUNNER"$'\n'"0    a${GHR94_WIDE}"$'\n'"1    é—·↻bb"
+  run_fn watch_table_width "$tbl"
+  expect_text "the widest row wins, and é — · ↻ are one column each" "$((5 + 1 + 40))" "$OUT"
+}
+
+# GHR-94: what display_width counts. Whatever the caller's locale — the helper
+# works on bytes — so each row is run under C and under C.UTF-8 where it exists.
+# Wide: CJK, Hangul, fullwidth, emoji. Zero: a combining mark, a variation
+# selector, a zero-width joiner. One: é, —, ↻ and plain ASCII.
+case_ghr94_display_width_is_columns_in_any_locale() {
+  local loc
+  for loc in C C.UTF-8; do
+    # shellcheck disable=SC2016  # the child shell expands these, not this one
+    LC_ALL="$loc" G_COMB=$'e\xcc\x81' G_VS=$'x\xef\xb8\x8f' G_ZWJ=$'a\xe2\x80\x8db' run_snippet "$STUB" '
+      w() { display_width "$2"; echo "$1 $DISPLAY_WIDTH"; }
+      w ascii "plain text"; w cjk "日本"; w mixed "a日b"; w hangul "한글"; w full "ＡＢ"; w emoji "🚀go"
+      w combining "$G_COMB"; w vs "$G_VS"; w zwj "$G_ZWJ"
+      w latin "é"; w dash "—x·↻"; w empty ""'
+    expect_rc 0
+    expect_text "display_width under LC_ALL=$loc" "ascii 10
+cjk 4
+mixed 4
+hangul 4
+full 4
+emoji 4
+combining 1
+vs 1
+zwj 2
+latin 1
+dash 4
+empty 0" "$OUT"
+  done
+}
+
+# GHR-94: an ordinary frame costs nothing extra. The table's `—`, `·` and `↻`
+# are non-ASCII and are counted as characters; only a line with a lead byte that
+# can start a wide or zero-width character reaches the range table, which
+# DISPLAY_WIDTH_SLOW counts. The stub status table (every row measured, both
+# ways) must leave it at 0; one wide row must raise it, so the zero is a
+# measurement and not a counter that never moves.
+case_ghr94_an_ordinary_frame_never_reaches_the_range_table() {
+  run status
+  expect_rc 0
+  # shellcheck disable=SC2016  # the child shell expands these, not this one
+  GHR94_TABLE="$OUT" run_snippet "$STUB" '
+    watch_table_width "$GHR94_TABLE" >/dev/null
+    while IFS= read -r l; do viewport_rows "$l" 80; done <<<"$GHR94_TABLE"
+    echo "ordinary $DISPLAY_WIDTH_SLOW"
+    viewport_rows "wide 日本" 80; echo "one wide row $DISPLAY_WIDTH_SLOW"'
+  expect_rc 0
+  expect_out '^ordinary 0$'
+  expect_out '^one wide row 1$'
+}
+
 # Every frame of a run: exactly HEIGHT lines, one cursor row, and the rows on
 # screen plus the two counts add up to the pool — a marker that is off by one
 # cannot hide behind a frame that happens to be the right length.
@@ -10633,6 +10726,10 @@ t "fleet watch: every legend state (view, marked, attached) fits 80 columns" cas
 t "watch: the legend names ? and fits 80 columns"                      case_watch_legend_names_the_keys_overlay_in_80_columns
 t "watch: ? lists every key, naming Enter and O; a key closes the list"  case_watch_question_mark_lists_every_key
 t "watch: a tall frame is cut to the height, chrome and cursor row kept"   case_watch_tall_frame_is_cut_to_the_terminal_height
+t "GHR-94: a double-width row is counted as the two terminal rows it takes" case_ghr94_watch_counts_a_double_width_row_as_two_rows
+t "GHR-94: watch_table_width measures display columns, not characters"     case_ghr94_watch_table_width_is_display_columns
+t "GHR-94: display_width is columns, in any locale"                        case_ghr94_display_width_is_columns_in_any_locale
+t "GHR-94: an ordinary frame never reaches the range table"                case_ghr94_an_ordinary_frame_never_reaches_the_range_table
 t "watch: the window scrolls with the cursor; PgUp/PgDn, g/G, Home/End"   case_watch_window_scrolls_with_the_cursor
 t "watch, fleet watch: the last row brings the notes under the table in"  case_watch_last_row_shows_the_notes_under_the_table
 t "watch: heights around the frame — too small, one short, exact, spare"  case_watch_heights_around_the_frame

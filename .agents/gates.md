@@ -187,6 +187,19 @@ Traps:
   frames before the tick's. A `%` in `RUNNERCTL_STUB_KEYS` is a real SIGWINCH
   sent from inside the key read. With the height unknown (the default, 0)
   nothing is fitted and every older case draws what it always drew.
+- **Widths are display columns, measured by `display_width` (GHR-94), and a
+  fitted frame's height is in terminal ROWS.** A wide character (CJK, most
+  emoji) is two columns and a combining mark or variation selector none, so
+  `${#text}` is wrong for them; `watch_table_width` and `viewport_rows` both
+  go through the helper. It is pure bash on bytes under a function-local
+  `LC_ALL=C` (no `wc -L`, no GNU dependency, the same answer in any locale),
+  with a range table, not a full wcwidth: U+2600-block symbols a terminal
+  draws as emoji still count 1. A case that wants a wide cell puts it in
+  `RUNNERCTL_STUB_RUN_REPOSITORY` (with `_WORKFLOW` and `_REF_NAME` empty, so
+  the short cell is drawn at any width) and pins `--narrow`, so that the
+  narrow-table decision does not shorten the row the viewport is being tested
+  on. `DISPLAY_WIDTH_SLOW` counts the lines that reached the range table; an
+  ordinary frame, `—` `·` `↻` included, must leave it at 0.
 - **`fleet watch` fetches each host in a background job (GHR-74), and the
   stub models the loop's poll step rather than sleeping through it.** While a
   fetch is out the loop's key read has `FW_POLL` (0.2) as its timeout; the
