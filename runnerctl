@@ -7336,7 +7336,17 @@ fleet_error_text() { # RC ERRFILE [BUDGET [MUTATING [HOST]]]
     0)   echo "" ;;
     late) echo "waiting for its first answer" ;;
     124) echo "timed out after ${budget}s$still${err:+ — $err}" ;;
-    255) echo "unreachable${err:+ — $err}" ;;
+    255)
+      # GHR-138: ssh's own keepalive giving up (GHR-91), as opposed to a
+      # connect failure. For a call that changes things the connection was up
+      # and the remote may have started acting, so "unreachable" (nothing is
+      # known) is the wrong word. The match is on ssh's text; a connect
+      # failure says "connect to host" / "Could not resolve" and keeps the row.
+      if [ -n "${4:-}" ] && [[ "$err" == *"Timeout, server "*" not responding"* ]]; then
+        echo "connection lost mid-call — the host may have acted; 'runnerctl fleet status --host ${5:-H}' shows where it got to and 'runnerctl fleet history --host ${5:-H}' what it recorded — $err"
+      else
+        echo "unreachable${err:+ — $err}"
+      fi ;;
     *)   echo "remote exit $rc${err:+ — $err}$hint" ;;
   esac
 }
