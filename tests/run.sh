@@ -8493,7 +8493,7 @@ case_watch_question_mark_lists_every_key() {
   expect_frame_count 3
   expect_frame 1 "$LEGEND"
   expect_frame_line 2 2 '^watch — keys$'
-  expect_frame 2 '^any key closes this list$'
+  expect_frame 2 '^scroll: .* any other key closes this list$'
   expect_frame_count_of 2 '^IDX |example\.slot-' 0
   for k in 'Enter' 'K R S T P L' 'O' 'q \?' '↑ ↓ j k   PgUp PgDn   g G Home End'; do
     expect_frame 2 "^  $k   +[a-z]"
@@ -9855,7 +9855,7 @@ case_fleet_watch_slash_filters_by_text_as_it_is_typed() {
 # nothing and a `q` there does not quit. No host is asked anything.
 case_fleet_watch_question_mark_lists_every_key() {
   local k
-  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='?j?qq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='?x?qq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
     run fleet watch --color never
   expect_rc 0
   frames
@@ -9864,7 +9864,7 @@ case_fleet_watch_question_mark_lists_every_key() {
     expect_frame_line "$k" 1 "$(view_hdr '')"
     expect_frame_line "$k" 2 "^${SUM_OK}\$"
     expect_frame_line "$k" 3 '^fleet watch — keys$'
-    expect_frame "$k" '^any key closes this list$'
+    expect_frame "$k" '^scroll: .* any other key closes this list$'
     expect_frame_count_of "$k" '^HOST +IDX|example\.slot-' 0
   done
   # a line per key, and the list short enough for a 24-row terminal: its 17
@@ -16068,6 +16068,83 @@ t "GHR-90: fleet watch makes one call per host per tick; the summary is unchange
 t "GHR-90: a host too old for --with-json falls back, asked with it once"          case_ghr90_watch_old_host_falls_back_and_is_asked_once
 t "GHR-90: the rows and the summary in a frame are one collection"                 case_ghr90_table_and_summary_are_one_collection
 t "GHR-90: a cut answer is a host that answered without a summary"                 case_ghr90_a_cut_answer_is_a_host_without_a_summary
+
+# --- GHR-99: the `?` list scrolls where the terminal cuts it ------------------
+# The list is drawn through the viewport like any body, so a short terminal
+# gets a window of it under a `↓ N more  PgDn/G` marker. The keys that marker
+# names scroll the list (the window is VIEW_TOP, as in a pane); every other
+# key closes it, and is spent doing so. Whole on a terminal tall enough.
+GHR99_FOOT='^scroll: .* PgUp PgDn g G · any other key closes this list$'
+GHR99_FLEET_LAST='^! b i / a s c ask no host anything, and the summary counts the whole fleet\.$'
+# 12 rows: ? PgDn G PgUp g j x. Frame 1 is the table, 2 the top of the list,
+# 3 a page down, 4 the end, 5 a page up, 6 the top, 7 one step down, 8 the
+# table again (x closed the list), 9 the tick's.
+case_ghr99_fleet_help_list_scrolls_on_a_short_terminal() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_LINES=12 RUNNERCTL_STUB_KEYS=$'?\e[6~G\e[5~gjx-q' \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 9
+  expect_frame_lines 2 12
+  expect_frame_line 2 3 '^fleet watch — keys$'
+  expect_frame 2 '^↓ [0-9]+ more  PgDn/G$'
+  expect_no_frame 2 "$GHR99_FLEET_LAST"
+  expect_frame 2 "$GHR99_FOOT"
+  # a page down: the list is still up, and has moved
+  expect_frame 3 '^↑ [0-9]+ more  PgUp/g$'
+  expect_no_frame 3 '^fleet watch — keys$'
+  expect_frame 3 "$GHR99_FOOT"
+  # G: the last line of the list is on screen, with nothing under it
+  expect_frame 4 "$GHR99_FLEET_LAST"
+  expect_no_frame 4 '^↓ [0-9]+ more'
+  expect_frame 4 "$GHR99_FOOT"
+  expect_frame_count_of 4 '^HOST +IDX|example\.slot-' 0
+  # PgUp leaves the end; g is the top again
+  expect_no_frame 5 "$GHR99_FLEET_LAST"
+  expect_frame 5 '^↑ [0-9]+ more  PgUp/g$'
+  expect_frame_line 6 3 '^fleet watch — keys$'
+  expect_no_frame 6 '^↑ '
+  # j scrolls too; x is not one of them: it closes the list
+  expect_frame 7 '^↑ [0-9]+ more  PgUp/g$'
+  expect_frame 7 "$GHR99_FOOT"
+  expect_frame 8 '^HOST +IDX'
+  expect_no_frame 8 "$GHR99_FOOT"
+}
+# 24 rows holds the whole list, so there is nothing to hide: no marker, and
+# the first and last lines of the list in one frame.
+case_ghr99_fleet_help_list_whole_on_24_rows() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_LINES=24 RUNNERCTL_STUB_KEYS='?x-q' \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame_count 4
+  expect_frame_lines 2 22
+  expect_frame_line 2 3 '^fleet watch — keys$'
+  expect_frame 2 "$GHR99_FLEET_LAST"
+  expect_no_frame 2 ' more  Pg'
+  expect_frame 2 "$GHR99_FOOT"
+}
+# The local watch's list had the same defect (GHR-105: any key closed it).
+case_ghr99_watch_help_list_scrolls_on_a_short_terminal() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_LINES=8 RUNNERCTL_STUB_KEYS=$'?Gx-q' run watch
+  expect_rc 0
+  frames
+  # 1 the table, 2 the top of the list, 3 after G, 4 the table (x closed it)
+  expect_frame_count 5
+  expect_frame_line 2 2 '^watch — keys$'
+  expect_frame 2 '^↓ [0-9]+ more  PgDn/G$'
+  expect_no_frame 2 '^  q \?   quit, this list'
+  expect_frame 2 "$GHR99_FOOT"
+  expect_frame 3 '^↑ [0-9]+ more  PgUp/g$'
+  expect_frame 3 '^  q \?   quit, this list; any key but '
+  expect_no_frame 3 '^↓ [0-9]+ more'
+  expect_frame 3 "$GHR99_FOOT"
+  expect_frame 4 '^IDX +RUNNER'
+  expect_no_frame 4 "$GHR99_FOOT"
+}
+t "GHR-99: fleet watch ? list scrolls on a short terminal, another key closes it" case_ghr99_fleet_help_list_scrolls_on_a_short_terminal
+t "GHR-99: fleet watch ? list is whole on 24 rows, with no marker"                case_ghr99_fleet_help_list_whole_on_24_rows
+t "GHR-99: watch ? list scrolls on a short terminal"                              case_ghr99_watch_help_list_scrolls_on_a_short_terminal
 
 # --- Summary ------------------------------------------------------------------
 echo

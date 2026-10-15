@@ -621,7 +621,7 @@ and the result becomes the status line under the legend:
 | `L` | show `logs <slot> -n 50` in `$PAGER` (`less`; `q` returns to the table). No confirm — it changes nothing | `journalctl -u <unit> -n 50` |
 | `O` | print the URL of the running job's run on the status line — `https://github.com/<owner>/<repo>/actions/runs/<id>/attempts/<n>` — to copy or click. It is printed, never opened: the node you watch from is usually a terminal with no browser. Says so when no job is running, or when the job's environment could not be read (between steps, a container job, no access to the slot's processes) | nothing |
 | `Enter` | show the selected slot in full, in place of the table — [below](#the-slot-in-full-enter) | nothing |
-| `?` | list every key `watch` reads, in place of the table, as [`fleet watch`](#a-live-fleet-view-fleet-watch)'s `?` does; any key closes the list, and is spent doing so. The legend under the table names it: `? keys` | nothing |
+| `?` | list every key `watch` reads, in place of the table, as [`fleet watch`](#a-live-fleet-view-fleet-watch)'s `?` does; ↑ ↓ PgUp PgDn g G scroll it where the terminal cuts it, and any other key closes it, and is spent doing so. The legend under the table names it: `? keys` | nothing |
 | `PgUp` / `PgDn` | move the cursor a page (a window less one row, so the row you left is still on screen) | |
 | `g` / `G`, `Home` / `End` | the first / last slot | |
 | `q` | quit | |
@@ -1814,7 +1814,7 @@ they redraw what the last tick brought.
 | `a` | all: clears `!` `b` `i`, the text and the collapse |
 | `s` | cycle the order: config order → longest-running job first → most memory used first |
 | `c` | collapse to one line per host (`build-1  4 slots: 3 busy, 1 idle · v0.21.0 · Disk: / 41% (…)`), carrying what its host line says; on a host, `c` or `Enter` opens it and `c` closes it again |
-| `?` | every key, in place of the table, until any key |
+| `?` | every key, in place of the table, until a key closes it (↑ ↓ PgUp PgDn g G scroll it) |
 
 ```
 $ runnerctl fleet watch --problems
