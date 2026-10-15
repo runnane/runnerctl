@@ -4384,6 +4384,39 @@ tty_read_char() { # TIMEOUT
   pause "$1"
   return 1
 }
+# One LINE from the terminal into LINE_TEXT (GHR-86: `fleet watch`'s `:`
+# prompt), with readline's editing — `read -e`, between two key reads, so the
+# terminal is in its normal mode as it is for a sudo prompt. HISTORY... are the
+# lines entered earlier in the session, oldest first: ↑ ↓ walk them. Shell
+# history is on for the read alone and holds those lines alone (nothing is
+# read from or written to a history file). A lone Escape empties the line and
+# ends it, which the caller reads as "cancelled": in readline Escape is the
+# Meta prefix, so it is bound for this read through an INPUTRC of its own —
+# the arrows' sequences still arrive whole, readline telling the two apart by
+# its key-sequence timeout. 1 on end of input (Ctrl-D) or without a terminal.
+# Behind a function so a test config can feed lines, as tty_read_char is.
+tty_read_line() { # PROMPT [HISTORY...]
+  local prompt="$1" rc=0 h rc_file="${FW_TMP:-${TMPDIR:-/tmp}}/inputrc"
+  local INPUTRC HISTFILE=""
+  shift
+  LINE_TEXT=""
+  [ -t 0 ] || return 1
+  # Readline reads INPUTRC when it first starts, so the binding goes in before
+  # the first read; the user's own file is included first, ours wins.
+  {
+    [ ! -r "$HOME/.inputrc" ] || printf "\$include %s\\n" "$HOME/.inputrc"
+    printf '"\\e": "\\C-a\\C-k\\C-m"\n'
+  } >"$rc_file"
+  INPUTRC="$rc_file"
+  set -o history
+  history -c
+  for h in "$@"; do history -s -- "$h"; done
+  printf '\r\033[K' >&2
+  IFS= read -e -r -p "$prompt" LINE_TEXT || rc=$?
+  history -c
+  set +o history
+  return "$rc"
+}
 # One key into KEY: `up` / `down` for the arrows (ESC [ A, ESC O A, …), `pgup`
 # / `pgdn` / `home` / `end` for the paging keys (GHR-73: ESC [ 5 ~, ESC [ 6 ~,
 # ESC [ H or 1 ~ or 7 ~, ESC [ F or 4 ~ or 8 ~), `esc` for a lone Escape,
@@ -8090,7 +8123,7 @@ fleet_set_budgets() { # SUBCOMMAND [REMOTE-ARGS...]
 
 cmd_fleet_run() { # SUBCOMMAND [--host H]... [--all-hosts] [REMOTE-ARGS...]
   local sub="$1"; shift
-  local all_hosts=false rc=0 max_unavail="" min_avail=""
+  local all_hosts=false rc=0 max_unavail="" min_avail="" q
   local -a hosts=() fwd=()
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
@@ -8103,7 +8136,14 @@ cmd_fleet_run() { # SUBCOMMAND [--host H]... [--all-hosts] [REMOTE-ARGS...]
       # untouched. Re-implementing each command's parser here would be a
       # second copy to keep in step, and the host that runs it is the one
       # that should reject a bad flag.
-      *)           fwd+=("$1"); shift ;;
+      #
+      # GHR-86: forwarded QUOTED. ssh hands its argv to the remote shell as
+      # one string, which that shell splits and expands again — so a word is
+      # %q'd here to reach the host's runnerctl as the one literal argument it
+      # was here (a plain word is unchanged), as fleet_watch_run_action has
+      # always quoted a slot name. `fleet watch`'s `:` prompt runs through
+      # here, and its words are whatever was typed.
+      *)           printf -v q %q "$1"; fwd+=("$q"); shift ;;
     esac
   done
   require_fleet
@@ -8260,7 +8300,7 @@ FLEET_UP_FWD=()
 FLEET_UP_ROLLBACK=false
 cmd_fleet_upgrade() { # [--check] [--push] [--ref REF] [--sha256 SUM] [--rollback] [--host H]... [--canary [H]] [--serial] [--stop-on-failure]
   local check=false canary=false canary_host="" serial=false stop=false
-  local rc=0 k n c="" halted="" names=""
+  local rc=0 k n c="" halted="" names="" ref
   local -a hosts=() all=() rest=() left=() would=()
   FLEET_UP_FWD=() FLEET_UP_ROLLBACK=false FLEET_UP_PUSH=false
   while [ $# -gt 0 ]; do
@@ -8268,7 +8308,8 @@ cmd_fleet_upgrade() { # [--check] [--push] [--ref REF] [--sha256 SUM] [--rollbac
     case "$1" in
       --check) check=true; shift ;;
       --push)  FLEET_UP_PUSH=true; shift ;;
-      --ref)   need_val "$@"; FLEET_UP_FWD+=(--ref "$2"); shift 2 ;;
+      # %q'd for the remote shell, as cmd_fleet_run forwards a word (GHR-86).
+      --ref)   need_val "$@"; printf -v ref %q "$2"; FLEET_UP_FWD+=(--ref "$ref"); shift 2 ;;
       # Validated here as the host would, so a typo fails once, before any
       # host is dialled, rather than once per host.
       --sha256)
@@ -11239,7 +11280,9 @@ declare -A FW_FACT=() FW_HOSTBAD=() FW_HOSTSUM=() FW_OPEN=()
 FLEET_WATCH_EMPTY="nothing matches — a shows all"
 # GHR-98: fleet watch's legend (GHR-105: its head is the local watch's). Names
 # `?` in the frame a reader sees first, and is 80 columns exactly (the
-# host-scoped keys are in the overlay, not here: no room). With a view on it
+# host-scoped keys are in the overlay, not here: no room — and so is GHR-86's
+# `:`, on O's line there: the legend has not a column to spare for it, and
+# making room is GHR-141's decision for every legend variant). With a view on it
 # also names `a`, ahead of `? keys`, which it says once.
 FLEET_WATCH_LEGEND_HEAD="$WATCH_LEGEND_HEAD"
 FLEET_WATCH_LEGEND="$FLEET_WATCH_LEGEND_HEAD  ? keys  q quit"
@@ -11260,7 +11303,7 @@ FLEET_WATCH_HELP="fleet watch — keys
           shows the host alone, ↑ ↓ PgUp PgDn scroll, K R S T P L O act on it
   K R S T P L   kill job, restart, stop, start, reap, logs; R S: w = when idle
   D W E X U   the row's host: drain, restart when idle, enable, disable, upgrade
-  O     print the run URL of the cursor's job — nothing is opened
+  O :   print the run URL of the cursor's job; a prompt for any fleet command
   q ?   quit, this list; Esc stops following a running action, which carries on
 ! b i / a s c ask no host anything, and the summary counts the whole fleet."
 
@@ -11683,6 +11726,202 @@ fleet_watch_page() { # KEY
   fleet_watch_select "$i"
 }
 
+# --- Fleet watch: the `:` command prompt (GHR-86) ------------------------------
+# The keys are a fixed set; the fleet layer is not. `:` reads one line at the
+# bottom of the view — a fleet subcommand and its flags, `scale 3`, `apply
+# --profile ci --restart --when-idle`, `health` — and runs it through cmd_fleet,
+# the command line's own code path, without leaving the view (or the held ssh
+# connections, which the command reuses).
+#
+#   * THE LINE IS SPLIT HERE, on blanks, and never handed to a shell: no
+#     quoting, no expansion, every other character is literal. The words go to
+#     cmd_fleet as an argv, and what it forwards to a host is %q'd for the
+#     remote shell (cmd_fleet_run), so a word reaches the host's runnerctl as
+#     the one literal argument it was here.
+#   * THE SCOPE is explicit, and shown before anything runs: the host under the
+#     cursor; the hosts of the marked rows while any are marked (GHR-129); every
+#     watched host with a `%` in front (`:%health`) — which on a watch narrowed
+#     with --host names each of them, and on an unnarrowed one adds nothing, so
+#     the command is exactly the one the command line would run. A --host or
+#     --all-hosts typed in the line is the scope as typed. `fleet status` and
+#     `fleet health` take no --host: they are run on the scope's hosts, and the
+#     line says which.
+#   * A READ — status, health, history, upgrade --check, reap --dry-run — runs
+#     at once and its output opens in the pager, as L's does. Anything else
+#     asks first: `runs: runnerctl fleet scale 3 --host build-1  [y/n]`, the
+#     command fully expanded, and only `y` runs it.
+#   * IT RUNS IN A SUBSHELL (fleet_watch_cmd_sub), as watch_run_action runs the
+#     local watch's keys: cmd_fleet `die`s on a refusal — the capacity gate,
+#     the budget flags, the excluded commands (env-init, provision,
+#     deprovision, logs), an unknown one — and outside a subshell that would
+#     end the watch. Here the refusal's own words are the notice. A command
+#     that changes hosts streams its lines while it runs (GHR-92), pages them
+#     all when it ends, and the table is fetched again afterwards. It runs in
+#     the foreground: the view is the command's until it ends.
+#   * The lines entered are kept for the session; ↑ ↓ in the prompt walk them.
+#     Esc, or an empty line, cancels.
+FW_CMD_HIST=() FW_CMD_ARGV=() FW_CMD_HOSTS=() FW_CMD_SHOWN="" FW_HOSTS_NARROWED=false
+
+# ARGV as a command line, each word %q'd (so a word with a blank or a control
+# byte in it is shown as what it is), into CMD_WORDS.
+CMD_WORDS=""
+fleet_watch_cmd_words() { # WORD...
+  local w q
+  CMD_WORDS=""
+  for w in "$@"; do printf -v q %q "$w"; CMD_WORDS+="${CMD_WORDS:+ }$q"; done
+}
+
+# Whether SUBCOMMAND WORDS... only reads, and so runs without a confirm.
+fleet_watch_cmd_reads() { # SUBCOMMAND [WORD...]
+  local sub="$1" a check=false
+  shift
+  case "$sub" in
+    status|history) return 0 ;;
+    health)
+      for a in "$@"; do [ "$a" != --restart-stalled ] || return 1; done
+      return 0 ;;
+    upgrade)
+      for a in "$@"; do
+        case "$a" in --check) check=true ;; --push|--rollback) return 1 ;; esac
+      done
+      $check ;;
+    reap)
+      for a in "$@"; do [ "$a" != --dry-run ] || return 0; done
+      return 1 ;;
+    *) return 1 ;;
+  esac
+}
+
+# `:` — read the line, work out the scope, and run a read, refuse, or put up
+# the confirm line (FW_ACTION=cmd).
+fleet_watch_cmd_key() {
+  local pct=false explicit=false sub w h n
+  local -a words=() hosts=() argv=() on=()
+  FW_NOTICE="" FW_PROMPT="" FW_ACTION="" FW_ACT_SCOPE=slot
+  term_cursor show
+  tty_read_line ":" ${FW_CMD_HIST[@]+"${FW_CMD_HIST[@]}"} || LINE_TEXT=""
+  term_cursor hide
+  IFS=$' \t' read -r -a words <<<"$LINE_TEXT" || true
+  n="${#FW_CMD_HIST[@]}"
+  if [ "${#words[@]}" -gt 0 ] && { [ "$n" -eq 0 ] || [ "${FW_CMD_HIST[$((n - 1))]}" != "$LINE_TEXT" ]; }; then
+    FW_CMD_HIST+=("$LINE_TEXT")
+  fi
+  if [ "${#words[@]}" -gt 0 ] && [[ "${words[0]}" == %* ]]; then
+    pct=true words[0]="${words[0]#%}"
+    [ -n "${words[0]}" ] || words=("${words[@]:1}")
+  fi
+  if [ "${#words[@]}" -eq 0 ]; then FW_NOTICE="cancelled — nothing run"; return 0; fi
+  sub="${words[0]}"
+  case "$sub" in
+    watch)
+      FW_NOTICE=":watch — this is fleet watch already; nothing run"
+      return 0 ;;
+    status|health|history|upgrade|apply|scale|start|stop|restart|drain|kill|reap|remove-limits|enable|disable) ;;
+    *)
+      # A command no host is asked to run: one fleet mode excludes for good
+      # (env-init, provision, deprovision, logs) or a word it does not know.
+      # cmd_fleet refuses each before anything is dialled, in its own words,
+      # and those are what the notice says.
+      FW_CMD_ARGV=("${words[@]}") FW_CMD_HOSTS=()
+      fleet_watch_cmd_words "${words[@]}"
+      FW_CMD_SHOWN="runnerctl fleet $CMD_WORDS"
+      fleet_watch_cmd_exec refused
+      return 0 ;;
+  esac
+  for w in "${words[@]:1}"; do
+    case "$w" in
+      --host|--host=*|--all-hosts) explicit=true ;;
+      # The JSON stream never ends, and the view would be its until it did.
+      --watch|-w)
+        if [ "$sub" = status ]; then
+          FW_NOTICE=":status $w is a stream that does not end — run 'runnerctl fleet status --json --watch' outside the watch; nothing run"
+          return 0
+        fi ;;
+    esac
+  done
+  if $explicit; then
+    :
+  elif $pct; then
+    ! $FW_HOSTS_NARROWED || hosts=("${FLEET_HOSTS[@]}")
+  elif fleet_watch_marks_on; then
+    fleet_watch_marked_hosts
+    hosts=("${SET_HOSTS[@]}")
+  elif [ "$FW_POS" -ge 0 ] && [ -n "$FW_HOST" ]; then
+    hosts=("$FW_HOST")
+  else
+    FW_NOTICE="no host under the cursor — : runs on the cursor's host, the marked rows' hosts, or with % every watched host; nothing run"
+    return 0
+  fi
+  argv=("${words[@]}")
+  case "$sub" in
+    status|health) ;;
+    *) for h in ${hosts[@]+"${hosts[@]}"}; do argv+=(--host "$h"); done ;;
+  esac
+  FW_CMD_ARGV=("${argv[@]}") FW_CMD_HOSTS=(${hosts[@]+"${hosts[@]}"})
+  fleet_watch_cmd_words "${argv[@]}"
+  FW_CMD_SHOWN="runnerctl fleet $CMD_WORDS"
+  case "$sub" in
+    status|health) [ "${#hosts[@]}" -eq 0 ] || FW_CMD_SHOWN+=" (on ${hosts[*]})" ;;
+  esac
+  if fleet_watch_cmd_reads "${words[@]}"; then
+    fleet_watch_cmd_exec read
+    return 0
+  fi
+  # One action per host (GHR-125): a host with one out is not handed another.
+  on=(${hosts[@]+"${hosts[@]}"})
+  [ "${#on[@]}" -gt 0 ] || on=("${FLEET_HOSTS[@]}")
+  for h in "${on[@]}"; do
+    ! fleet_watch_act_refuse "$h" || return 0
+  done
+  FW_ACTION=cmd FW_ACT_SCOPE=cmd
+  FW_PROMPT="runs: $FW_CMD_SHOWN  [y/n]"
+}
+
+# The command itself — in a subshell, which is the point: a `die` in cmd_fleet
+# ends this and not the watch. Everything a one-shot fleet command starts from
+# that the watch changed for itself is put back: a fan-out's EXIT trap and
+# budgets are its own, there is no optional --narrow, and the remote paints
+# nothing the pager would show as escapes.
+fleet_watch_cmd_sub() (
+  FLEET_EXIT_OWNED=false FLEET_BUDGETS=() FLEET_OPTIONAL_ARG="" FLEET_REMOTE_COLOR=false FLEET_DIR=""
+  case "${FW_CMD_ARGV[0]}" in
+    status|health) [ "${#FW_CMD_HOSTS[@]}" -eq 0 ] || fleet_select_hosts "${FW_CMD_HOSTS[@]}" ;;
+  esac
+  cmd_fleet "${FW_CMD_ARGV[@]}"
+)
+
+# Run FW_CMD_ARGV: KIND is `read` (into the pager), `mutate` (its lines shown as
+# they come, then paged) or `refused` (a refusal: the notice alone). The last
+# line it printed is the notice; output of more than one line is paged, under
+# a first line naming the command — a read asks no confirm, so the pager is
+# where its scope is shown.
+fleet_watch_cmd_exec() { # read|mutate|refused
+  local out="$FW_TMP/cmd" rc=0 line tail_line="" n=0 fd p=""
+  FW_ACTION="" FW_PROMPT="" FW_ACT_SCOPE=slot
+  term_cursor show
+  if [ "$1" = mutate ]; then
+    printf '\nrunning: %s\n' "$FW_CMD_SHOWN"
+    exec {fd}> >(tee "$out.run"); p=$!
+    fleet_watch_cmd_sub </dev/null >&"$fd" 2>&1 || rc=$?
+    exec {fd}>&-
+    wait "$p" 2>/dev/null || true
+  else
+    fleet_watch_cmd_sub </dev/null >"$out.run" 2>&1 || rc=$?
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    [ -n "$line" ] || continue
+    n=$((n + 1)) tail_line="$line"
+  done <"$out.run"
+  relay_safe "$tail_line" plain
+  FW_NOTICE="${RELAY_SAFE:-${FW_CMD_SHOWN#runnerctl }: no output (exit $rc)}"
+  if [ "$n" -gt 1 ]; then
+    { printf 'ran: %s\n\n' "$FW_CMD_SHOWN"; cat "$out.run"; } >"$out"
+    page <"$out"
+  fi
+  term_cursor hide
+  [ "$1" != mutate ] || FW_REFRESH=true
+}
+
 # One key against the watch. Returns 1 on `q`. At a confirm only `y` runs it
 # and anything else — `q` included — cancels, as in the local watch.
 #
@@ -11705,6 +11944,8 @@ fleet_watch_handle_key() { # KEY
              set)        fleet_watch_run_set ;;
              hostset)    fleet_watch_run_set_hosts ;;
              upgradeset) fleet_watch_run_set_upgrade ;;
+             # GHR-86: a mutating command from the `:` prompt.
+             cmd)        fleet_watch_cmd_exec mutate ;;
              *)       fleet_watch_run_action ;;
            esac ;;
       # GHR-126: the graceful form, offered by R and S alone — not by a host
@@ -11754,6 +11995,8 @@ fleet_watch_handle_key() { # KEY
     enter) fleet_watch_enter ;;
     /)   FW_MODE=search FW_SEARCH_WAS="$FW_SEARCH" ;;
     '?') FW_MODE=help ;;
+    # GHR-86: a fleet command, typed.
+    :)   fleet_watch_cmd_key ;;
   esac
   return 0
 }
@@ -11808,7 +12051,8 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
     esac
   done
   require_fleet
-  [ "${#hosts[@]}" -eq 0 ] || fleet_select_hosts "${hosts[@]}"
+  # GHR-86: whether `%` (every watched host) is the fleet or a part of it.
+  if [ "${#hosts[@]}" -gt 0 ]; then fleet_select_hosts "${hosts[@]}"; FW_HOSTS_NARROWED=true; fi
   stdout_is_tty || die "fleet watch needs a terminal (stdout is not a tty); use 'runnerctl fleet status'"
   # For the whole session, so a host that rejects --narrow once is asked
   # without it on every later tick instead of twice per tick (fleet_fanout).
