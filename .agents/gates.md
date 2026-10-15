@@ -600,10 +600,18 @@ Traps:
   `probe:systemctl …` (`RUNNERCTL_STUB_TIMER_STATE="ENABLED ACTIVE"`); any
   other call is still `direct:`. The dry run's "changed nothing" claim is
   asserted as `GHR87_NOT_A_PROBE` in `tests/run.sh`: a log line that is not a
-  `probe:` is a `run_priv` argv or the stub's `docker rm`. Note that a
-  local `compose-reap-timer status` (not `--brief`) runs `systemctl
-  list-timers`, which IS `direct:` — the older cases only pass because a later
-  `run` in the same case resets the log.
+  `probe:` is a `run_priv` argv or the stub's `docker rm`. A local
+  `compose-reap-timer status` (not `--brief`) reads its `list-timers` row
+  through the `compose_reap_timer_listing` hook (GHR-146), which the stub
+  answers with a fixed row, logged `probe:compose_reap_timer_listing`; a case
+  may end on it.
+- **The stub-leak check accumulates across a case's runs (GHR-146).** Every
+  `run`/`run_keep`/`run_fn` resets the call log, so `_log_reset` first moves
+  any `direct:` line the outgoing log holds into `$LOG.leaks`, and `_case`
+  fails the case on a `direct:` line in either file. A later run can no longer
+  hide an earlier leak. A new reset site writes `_log_reset`, not `: >"$LOG"`.
+  A case that deliberately runs the real `audit_logger` (`run_fn`) needs
+  `FAKE_LOGGER=record`, or the fake `logger` binary logs `direct:logger`.
 - **A fleet table call is `status … --with-json` (GHR-90)**, the flag LAST on
   the line, and the summary's payload comes back in the same answer — so a
   host that takes the flag is never asked `status --json` by `fleet status`

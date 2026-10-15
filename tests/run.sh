@@ -129,8 +129,17 @@ XFAIL_KEYS=""  # issue keys of the xfail cases that failed as expected
 # fails its case instead of hanging the gate.
 RUN_TIMEOUT="${RUN_TIMEOUT:-30}"
 
+# Every run starts a fresh call log, so the stub-leak check at the end of a
+# case would only see the LAST run's. _log_reset first moves any `direct:`
+# line the outgoing log holds into "$LOG.leaks" (GHR-146), which the case
+# runner reads as well and clears when a case starts.
+_log_reset() {
+  grep '^direct:' "$LOG" >>"$LOG.leaks" 2>/dev/null || true
+  : >"$LOG"
+}
+
 run() {
-  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
+  _log_reset; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
   rm -rf "$WRITES"; mkdir -p "$WRITES"
   RC=0
   OUT="$(RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
@@ -142,7 +151,7 @@ run() {
 # that seeds the writes-mirror tree with seed_dropin before running a
 # read-only command that reads it back (status's PROFILE column).
 run_keep() {
-  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
+  _log_reset; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
   RC=0
   OUT="$(RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
          timeout "$RUN_TIMEOUT" "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
@@ -166,7 +175,7 @@ seed_dropin() {
 # define its functions and return instead of running main, so nothing is
 # sourced from a config and nothing touches the host.
 run_fn() {
-  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
+  _log_reset; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
   RC=0
   OUT="$(RUNNERCTL_NO_MAIN=1 bash -c '. "$0" && "$@"' "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
   ERR="$(cat "$TMP/err")"
@@ -185,7 +194,7 @@ save_config() { # PATH   (further config body on stdin)
 
 run_cfg() { # CONFIG-PATH ARGS...
   local cfg="$1"; shift
-  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
+  _log_reset; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
   rm -rf "$WRITES"; mkdir -p "$WRITES"
   RC=0
   OUT="$(RUNNERCTL_CONFIG="$cfg" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
@@ -203,7 +212,7 @@ run_cfg() { # CONFIG-PATH ARGS...
 # never creates it until the call has returned, and the remote gives up
 # (`probe:remote_gave_up`) instead of seeing it.
 run_streamed() {
-  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
+  _log_reset; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
   rm -rf "$WRITES"; mkdir -p "$WRITES"
   RC=0
   OUT="$(RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
@@ -225,7 +234,7 @@ stream_reader() {
 # config file IS the stub and therefore always exists, and a run with no
 # config at all dies at require_runners long before the save.
 run_snippet() { # CONFIG-PATH SNIPPET
-  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
+  _log_reset; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
   RC=0
   # shellcheck disable=SC2016  # the child expands $1/$2/$3, not this shell
   OUT="$(RUNNERCTL_NO_MAIN=1 RUNNERCTL_CONFIG="$1" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
@@ -393,10 +402,10 @@ skip() { echo "skip  $*"; }
 _case() {
   local key="$1" name="$2" fn="$3"
   FAILS=(); ERRS=(); NEXPECT=0
-  OUT=""; ERR=""; RC=0; : >"$LOG"
+  OUT=""; ERR=""; RC=0; : >"$LOG"; rm -f "$LOG.leaks"
   "$fn"
-  if grep -q '^direct:' "$LOG"; then
-    ERRS+=("stub leak, a call bypassed run_priv: $(grep -m1 '^direct:' "$LOG")")
+  if grep -q '^direct:' "$LOG" "$LOG.leaks" 2>/dev/null; then
+    ERRS+=("stub leak, a call bypassed run_priv: $(cat "$LOG.leaks" "$LOG" 2>/dev/null | grep -m1 '^direct:')")
   fi
   [ "$NEXPECT" -gt 0 ] || ERRS+=("case makes no assertions")
 
@@ -7355,6 +7364,17 @@ case_compose_reap_timer_install_status_remove() {
   expect_err "unknown compose-reap-timer command 'frobnicate'"
 }
 
+# GHR-146: a plain (not --brief) status reads the timer's list-timers row
+# through a stub hook, so a case may end on it: the leak check reads this
+# run's log, and it holds no direct systemctl.
+case_compose_reap_timer_status_is_stubbed() {
+  run compose-reap-timer status
+  expect_rc 0
+  expect_out 'NEXT LEFT LAST PASSED UNIT ACTIVATES'
+  expect_log '^probe:compose_reap_timer_listing$'
+  expect_no_log '^direct:'
+}
+
 case_compose_reap_real_helpers() {
   # The stub shadows the docker hooks, so their real bodies are covered here.
   run_fn compose_epoch 2001-09-09T01:46:40.000000000Z
@@ -10641,6 +10661,7 @@ t "compose-reap: bad input and no docker refuse before any removal"    case_comp
 t "compose-reap: an empty daemon is a clean summary"                   case_compose_reap_empty_daemon
 t "compose-reap-timer: refuses to run a user-writable runnerctl"       case_compose_reap_timer_refuses_a_user_writable_runnerctl
 t "compose-reap-timer: install, status and remove"                     case_compose_reap_timer_install_status_remove
+t "compose-reap-timer status: the list-timers read is stubbed, as the last command" case_compose_reap_timer_status_is_stubbed
 t "compose-reap: the real epoch, work-folder, owner and docker hooks"  case_compose_reap_real_helpers
 t "compose-reap: listed in the usage and the unknown-command list"     case_compose_reap_in_usage
 t "compose-reap: standalone containers are untouched unless opted in" case_compose_reap_standalone_is_opt_in
@@ -12641,7 +12662,7 @@ t "GHR-109: compose_record holds a line to its shape"                  case_ghr1
 # decided before a config is looked at. Every use of it either refuses before
 # any command runs, or names a config that sources the stub.
 run_bare() { # ARGS...
-  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
+  _log_reset; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
   rm -rf "$WRITES"; mkdir -p "$WRITES"
   RC=0
   OUT="$(env -u RUNNERCTL_CONFIG RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" \
@@ -13666,7 +13687,10 @@ case_ghr88_no_credential_reaches_a_record() {
 # origin that is not one plain OPERATOR@HOST is not written at all.
 case_ghr88_a_record_cannot_be_forged() {
   # shellcheck disable=SC2016  # run_fn's child expands these
-  run_fn eval 'id() { if [ "$*" = -un ]; then echo alice; else command id "$@"; fi; }
+  # (the real audit_logger runs here, so the fake logger is told to record:
+  # left on its default it logs a `direct:` leak, which the accumulating
+  # check, GHR-146, no longer lets the next run's reset hide)
+  FAKE_LOGGER=record run_fn eval 'id() { if [ "$*" = -un ]; then echo alice; else command id "$@"; fi; }
     audit_begin restart "slot-1"$'"'"'\nrunnerctl: forged — ok'"'"' --when-idle$'"'"'\e[2J'"'"'
     audit_message "ok"$'"'"'\nrunnerctl: also forged'"'"''
   expect_rc 0
@@ -14119,7 +14143,7 @@ print WIFSIGNALED($st) ? "signal " . WTERMSIG($st) : "exit " . WEXITSTATUS($st),
 run_signalled() { # INT|TERM group|pid BLOCK-ERE ARGS...
   local sig="$1" whom="$2" block="$3" how
   shift 3
-  : >"$LOG"; rm -rf "$WRITES"; mkdir -p "$WRITES"
+  _log_reset; rm -rf "$WRITES"; mkdir -p "$WRITES"
   RC=0 SIGNALLED=""
   how="$(RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" RUNNERCTL_STUB_BLOCK="$block" \
          perl -e "$GHR119_PERL" "$sig" "$whom" "$WRITES/.blocked" "$TMP/sig.out" "$TMP/err" "$RUNNERCTL" "$@")" || how="perl failed"
@@ -14306,7 +14330,7 @@ t "GHR-119: history and fleet history show an interrupted record"          case_
 run_cut() { # N ARGS...
   local n="$1"
   shift
-  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
+  _log_reset; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
   rm -rf "$WRITES"; mkdir -p "$WRITES"
   : >"$TMP/cut.out"
   echo none >"$TMP/cut.rc"
@@ -14478,7 +14502,7 @@ case_ghr131_a_cut_pipe_interrupts_an_armed_command() {
 # does), and bash cannot trap a signal ignored when it started (GHR-75's trap,
 # for another signal).
 run_fn_sigdfl() {
-  : >"$LOG"; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
+  _log_reset; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
   RC=0
   OUT="$(RUNNERCTL_NO_MAIN=1 perl -e '$SIG{$_} = "DEFAULT" for qw(INT TERM HUP PIPE); exec @ARGV or exit 127' \
          bash -c '. "$0" && "$@"' "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
@@ -14766,7 +14790,7 @@ case_ghr80_stream_one_envelope_per_tick_over_held_connections() {
 case_ghr80_stream_ends_cleanly_when_the_reader_goes() {
   local d="$TMP/ghr80-tmp" rc
   rm -rf "$d"; mkdir -p "$d"
-  : >"$LOG"; rm -f "$LOG.clock"; rm -rf "$WRITES"; mkdir -p "$WRITES"
+  _log_reset; rm -f "$LOG.clock"; rm -rf "$WRITES"; mkdir -p "$WRITES"
   ( r=0
     TMPDIR="$d" RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_JSON_POLLS=1 RUNNERCTL_STUB_FLEET_HANG="slow-1" \
       RUNNERCTL_STUB_FLEET_HOSTS="build-1 slow-1" RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" \
@@ -14791,7 +14815,7 @@ case_ghr80_stream_ends_cleanly_on_sigterm() {
   local d="$TMP/ghr80-tmp" pid n=0 rc=0 out="$TMP/ghr80-term.out"
   rm -rf "$d"; mkdir -p "$d"
   rm -f "$out"
-  : >"$LOG"; rm -f "$LOG.clock"; rm -rf "$WRITES"; mkdir -p "$WRITES"
+  _log_reset; rm -f "$LOG.clock"; rm -rf "$WRITES"; mkdir -p "$WRITES"
   TMPDIR="$d" RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_JSON_POLLS=1 RUNNERCTL_STUB_FLEET_HANG="slow-1" \
     RUNNERCTL_STUB_FLEET_HOSTS="build-1 slow-1" RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" \
     RUNNERCTL_TEST_WRITES="$WRITES" "$RUNNERCTL" fleet status --json --watch --interval 1 >"$out" 2>"$TMP/err" &

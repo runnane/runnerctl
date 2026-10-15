@@ -6421,6 +6421,13 @@ compose_reap_timer_state() {
   echo "installed (${en:-unknown}, ${act:-unknown})"
 }
 
+# The timer's `list-timers` row, for a plain `compose-reap-timer status`. A
+# hook like unit_props: tests/stub.config shadows it, so the read never
+# reaches the real systemctl under test (GHR-146).
+compose_reap_timer_listing() {
+  systemctl list-timers --all --no-pager "$COMPOSE_REAP_UNIT.timer" 2>/dev/null || true
+}
+
 cmd_compose_reap_timer() { # install|status [--brief]|remove
   local sub="${1:-status}" self problem brief=false
   shift || true
@@ -6448,7 +6455,7 @@ cmd_compose_reap_timer() { # install|status [--brief]|remove
       # what `fleet compose-reap-timer status` asks each host for.
       echo "timer: $(compose_reap_timer_state)"
       $brief && return 0
-      systemctl list-timers --all --no-pager "$COMPOSE_REAP_UNIT.timer" 2>/dev/null || true
+      compose_reap_timer_listing
       run_priv journalctl -u "$COMPOSE_REAP_UNIT.service" -n 40 --no-pager
       ;;
     remove)
