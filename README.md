@@ -1732,7 +1732,7 @@ is `fleet upgrade --push`.
 on (on a marked row, it unmarks it), `*` marks every slot row the view shows —
 so `!` then `*` marks exactly the problem rows, and `/` then `*` every row
 matching the text — and `u` clears every mark. A marked row has `*` in a
-two-column gutter in front of the table, and the legend counts the marks; with
+two-column gutter in front of the table, and the legend counts the marks (`N marked, u clears`); with
 none marked the table is drawn exactly as before. A mark is the *(host, slot)*
 pair, never a position: a sort, a filter or a refresh that reorders the rows
 moves it with its slot, and a row a view hides keeps it. A marked slot its host
@@ -1890,8 +1890,8 @@ What to know about them:
 - `--problems` and `--sort config|job|mem` start a watch in a view, so a wall
   display nobody types at shows the right thing from the first frame.
 
-The one-line legend is the one it always was; with a view on it also names the
-two keys that lead out of it, `a` and `?`.
+The one-line legend is the one it always was. When a state is on it gives its
+place to that state's hints, still on one 80-column line: `a all` with a view on, `N marked, u clears` with rows marked, `Esc detach` with an action attached, in that order, and always `? keys` last (the rest of the keys are under `?`).
 
 `fleet logs` remains unsupported: it streams one journal, and that only makes
 sense against one host. For a slot's recent lines, `L` in `fleet watch`.

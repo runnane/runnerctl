@@ -11668,6 +11668,19 @@ fleet_watch_mark_id() { # POS
 }
 fleet_watch_marks_on() { [ "${#FW_MARKS[@]}" -gt 0 ]; }
 
+# GHR-141: the legend line for the states now on, into FW_LEGEND; $1 is the
+# marked count. None on: the default legend. Any on: those states' hints in a
+# fixed order, then "? keys" — the whole of it far under 80 columns (59 with a
+# view on, 999 marked and an action attached).
+fleet_watch_legend() {
+  local hints=""
+  FW_LEGEND="$FLEET_WATCH_LEGEND"
+  fleet_watch_view_plain || hints+="a all  "
+  ! fleet_watch_marks_on || hints+="$1 marked, u clears  "
+  ! fleet_watch_act_attached || hints+="Esc detach  "
+  [ -z "$hints" ] || FW_LEGEND="${hints}? keys"
+}
+
 # The marked set as "HOST<TAB>NAME" pairs, into FW_MARKED: hosts in config
 # order, each host's slots in the order they were marked.
 fleet_watch_marked() {
@@ -12107,12 +12120,15 @@ FLEET_WATCH_EMPTY="nothing matches — a shows all"
 # host-scoped keys are in the overlay, not here: no room — and so is GHR-86's
 # `:`, on O's line there, and GHR-87's `C` beside it: the legend has not a
 # column to spare for either — nor for GHR-118's `H`, which is in the list
-# too — and making room is GHR-141's decision for every
-# legend variant). With a view on it
-# also names `a`, ahead of `? keys`, which it says once.
+# too).
+# GHR-141: ONE rule for every other state. With a view on, rows marked or an
+# action attached, the legend is not the head with hints appended (87 to 105
+# columns: it wrapped, and a fitted frame lost a table row). The head gives way
+# to the hints of the states that are on, in this order, and `? keys` closes
+# it: `a all`, `N marked, u clears`, `Esc detach` (see fleet_watch_legend).
+# The head's keys are in `?`, which every variant names.
 FLEET_WATCH_LEGEND_HEAD="$WATCH_LEGEND_HEAD"
 FLEET_WATCH_LEGEND="$FLEET_WATCH_LEGEND_HEAD  ? keys  q quit"
-FLEET_WATCH_VIEW_LEGEND="$FLEET_WATCH_LEGEND_HEAD  a all  ? keys  q quit"
 # Seventeen lines, so that with the header, the summary and the three lines
 # under it the list fits a terminal of 24 rows; none is wider than 80 columns.
 FLEET_WATCH_HELP="fleet watch — keys
@@ -13055,10 +13071,8 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
       # The legend is the one of before unless a view is on, when it also
       # names the two keys that lead out of it; the status line is the text
       # being typed while / is open.
-      legend="$FLEET_WATCH_LEGEND" status="${FW_PROMPT:-$FW_NOTICE}"
-      fleet_watch_view_plain || legend="$FLEET_WATCH_VIEW_LEGEND"
-      ! fleet_watch_marks_on || legend+="  ${#FW_MARKS[@]} marked, u clears"
-      ! fleet_watch_act_attached || legend+="  Esc detach"
+      fleet_watch_legend "${#FW_MARKS[@]}"
+      legend="$FW_LEGEND" status="${FW_PROMPT:-$FW_NOTICE}"
       [ "$FW_MODE" != search ] || status="filter: /${FW_SEARCH}_ — Enter keeps it, Esc cancels, an empty one matches everything"
       viewport_draw "$head"$'\n'"$summary" "$(fleet_watch_highlight "$FW_VIEW" "$hl")" \
         $'\n'"$FW_ACT_FOOT$(paint "$C_DIM" "$legend")"$'\n'"$status" "$hl" "$lead" "$tail"
