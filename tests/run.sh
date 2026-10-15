@@ -3016,6 +3016,73 @@ case_fleet_health_unknown_option_dies() {
   expect_no_log '^probe:ssh_run '
 }
 
+# GHR-93: `fleet status` and `fleet health` take the repeatable --host the
+# mutating commands take, so the read-only view can be narrowed to the host a
+# call just timed out on. Only the selected host is dialled, the summary line
+# counts the selected hosts (not the configured ones), and --json carries
+# only them.
+case_ghr93_fleet_status_host_dials_only_the_selected_host() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status --host build-1
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --with-json$' 1
+  expect_no_log '^probe:ssh_run build-2 '
+  expect_log_count '^probe:ssh_run ' 1
+  expect_out '^build-1 '
+  expect_no_out '^build-2 '
+  # the selection is not forwarded: the host is asked what it always is
+  expect_no_log '^probe:ssh_run .*--host'
+  # the summary counts the selected hosts: 1/1, never 1/2
+  expect_out_count '^1/1 host answering · ' 1
+  expect_no_out '/2 hosts'
+  # repeatable, composed with --stall-after
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 box-ahead" run fleet status --host build-2 --host build-1 --stall-after 600
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --stall-after 600 --with-json$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --color never --stall-after 600 --with-json$' 1
+  expect_no_log '^probe:ssh_run box-ahead '
+  expect_out_count '^2/2 hosts answering · ' 1
+  # the --host=H spelling
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status --host=build-2
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-2 -- ' 1
+  expect_log_count '^probe:ssh_run ' 1
+}
+
+# An unknown host is the same refusal the mutating commands give, before
+# anything is dialled.
+case_ghr93_fleet_status_unknown_host_dies_naming_it_without_dialling() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status --host typo-1
+  expect_rc 1
+  expect_err "--host 'typo-1' is not in FLEET_HOSTS \\(configured: build-1 build-2\\)"
+  expect_no_log '^probe:ssh_run '
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status --json --host build-1 --host typo-1
+  expect_rc 1
+  expect_err "--host 'typo-1' is not in FLEET_HOSTS"
+  expect_no_log '^probe:ssh_run '
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet health --host typo-1
+  expect_rc 1
+  expect_err "--host 'typo-1' is not in FLEET_HOSTS \\(configured: build-1 build-2\\)"
+  expect_no_log '^probe:ssh_run '
+}
+
+case_ghr93_fleet_status_json_honours_the_selection() {
+  if ! $HAVE_PYTHON3; then skip "python3 not on PATH: fleet --json host-selection assertions not run"; return 0; fi
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet status --json --host build-2
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl status --json$' 1
+  expect_log_count '^probe:ssh_run ' 1
+  expect_json 'len(d["fleet"]) == 1 and d["fleet"][0]["host_name"] == "build-2"'
+}
+
+case_ghr93_fleet_health_host_dials_only_the_selected_host() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run fleet health --host build-1
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl health$' 1
+  expect_no_log '^probe:ssh_run build-2 '
+  expect_log_count '^probe:ssh_run ' 1
+  expect_out '^ok: 3 slot\(s\) healthy across 1 host\(s\)$'
+}
+
 case_fleet_upgrade_check_reports_each_host_and_counts() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2-oldver box-ahead" run fleet upgrade --check
   expect_rc 0
@@ -3070,7 +3137,7 @@ case_fleet_upgrade_failed_host_is_a_row_not_an_abort() {
   expect_out '^gw-unreachable +— +unreachable — '
   # GHR-81: an upgrade is a mutating call — its own budget, and a timeout that
   # says the host may have carried on rather than "nothing is known"
-  expect_out "^slow-timeout +— +timed out after 900s — the command may still be running on that host; 'runnerctl fleet status' shows where it got to\$"
+  expect_out "^slow-timeout +— +timed out after 900s — the command may still be running on that host; 'runnerctl fleet status --host slow-timeout' shows where it got to\$"
   expect_out '^3 host\(s\): 0 already level, 1 upgraded, 2 unreachable or unclear$'
 }
 
@@ -3915,7 +3982,7 @@ case_fleet_mutating_timeout_says_it_may_still_be_running() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_DELAY="build-1:900:restart" \
     run fleet restart
   expect_rc 1
-  expect_out "^build-1: timed out after 900s — the command may still be running on that host; 'runnerctl fleet status' shows where it got to\$"
+  expect_out "^build-1: timed out after 900s — the command may still be running on that host; 'runnerctl fleet status --host build-1' shows where it got to\$"
   expect_out '^build-2: restart done\.$'
   expect_out '^fleet restart: 1 host\(s\) ok, 1 failed$'
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_DELAY="build-1:899:restart" \
@@ -4009,7 +4076,7 @@ case_fleet_budget_walk_gives_each_slot_the_mutating_budget() {
     RUNNERCTL_STUB_FLEET_DELAY="build-1:960:restart" run fleet restart --max-unavailable 1 --when-idle --timeout 60
   expect_rc 1
   # not "(exit 124)": the slot is not known to have failed
-  expect_out_count "^build-1 slot [01]: restart FAILED \\(timed out after 960s — the command may still be running on that host; 'runnerctl fleet status' shows where it got to\\)\$" 2
+  expect_out_count "^build-1 slot [01]: restart FAILED \\(timed out after 960s — the command may still be running on that host; 'runnerctl fleet status --host build-1' shows where it got to\\)\$" 2
   expect_out '^build-2 slot 1: restart ok$'
   expect_out '^fleet restart: 2 slot\(s\) done, 2 failed$'
   # the negative control: a re-read that takes 45 s is still a host that did
@@ -4047,7 +4114,7 @@ case_fleet_other_mutating_callers_are_on_the_mutating_budget() {
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jRy-q' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
     RUNNERCTL_STUB_FLEET_DELAY="build-1:900:restart" run fleet watch --color never
   expect_rc 0
-  expect_out "^example\\.slot-2 on build-1: restart failed — timed out after 900s — the command may still be running on that host; 'runnerctl fleet status' shows where it got to\$"
+  expect_out "^example\\.slot-2 on build-1: restart failed — timed out after 900s — the command may still be running on that host; 'runnerctl fleet status --host build-1' shows where it got to\$"
   # upgrade: the remote's own download is allowed 30 s, which used to be the
   # whole budget around it
   RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" RUNNERCTL_STUB_FLEET_DELAY="build-2-oldver:45:upgrade" \
@@ -4071,7 +4138,7 @@ case_fleet_other_mutating_callers_are_on_the_mutating_budget() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_FLEET_DELAY="build-1:900:health" \
     run fleet health --restart-stalled
   expect_rc 1
-  expect_out "^build-1: timed out after 900s — the command may still be running on that host; 'runnerctl fleet status' shows where it got to\$"
+  expect_out "^build-1: timed out after 900s — the command may still be running on that host; 'runnerctl fleet status --host build-1' shows where it got to\$"
 }
 
 # --- GHR-92: a mutating host's lines are shown as they are printed ---------------
@@ -10179,6 +10246,10 @@ t "fleet status --json: each host's payload nested unchanged"          case_flee
 t "fleet status --json: exit 0 with no object is an explained error"   case_fleet_status_json_rejects_a_non_object_payload
 t "fleet status: --stall-after is forwarded to the remote table"       case_fleet_status_forwards_stall_after_to_the_remote_table
 t "fleet status --json: --stall-after is forwarded too"                case_fleet_status_json_forwards_stall_after_to_the_remote
+t "fleet status --host: dials only the selected hosts, summary counts them (GHR-93)" case_ghr93_fleet_status_host_dials_only_the_selected_host
+t "fleet status/health --host: an unknown host dies naming it, nothing dialled (GHR-93)" case_ghr93_fleet_status_unknown_host_dies_naming_it_without_dialling
+t "fleet status --json --host: only the selected hosts (GHR-93)" case_ghr93_fleet_status_json_honours_the_selection
+t "fleet health --host: dials only the selected host (GHR-93)" case_ghr93_fleet_health_host_dials_only_the_selected_host
 t "fleet health: all healthy is one summary line, exit 0"              case_fleet_health_all_healthy_is_one_line_exit_zero
 t "fleet health: a problem keeps its wording and gains its host"       case_fleet_health_problem_is_attributed_to_its_host
 t "fleet health: an unreachable host is a problem, never a pass"       case_fleet_health_unreachable_host_is_a_problem_never_a_silent_pass
@@ -14824,7 +14895,7 @@ case_ghr125_a_background_action_is_on_the_mutating_budget() {
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_DELAY="build-1:900:restart" RUNNERCTL_STUB_KEYS='Ry-q' \
     RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
   expect_rc 0
-  expect_out_count "^example\.slot-1 on build-1: restart failed — timed out after 900s — the command may still be running on that host; 'runnerctl fleet status' shows where it got to\$" 2
+  expect_out_count "^example\.slot-1 on build-1: restart failed — timed out after 900s — the command may still be running on that host; 'runnerctl fleet status --host build-1' shows where it got to\$" 2
   expect_cfg "$WRITES/fleet.log" "${GHR125_LOG}124\$"
 }
 
@@ -15670,8 +15741,8 @@ case_ghr86_a_read_runs_at_once_into_the_pager() {
     RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
   expect_rc 0
   expect_no_out '^runs: '
-  # status takes no --host: it is run on the scope's hosts, and the line says so
-  expect_out_count '^ran: runnerctl fleet status --stall-after 60 \(on build-1\)$' 1
+  # status takes --host like every other command (GHR-93): the line says so
+  expect_out_count '^ran: runnerctl fleet status --stall-after 60 --host build-1$' 1
   expect_out_count '^ran: runnerctl fleet status --stall-after 60$' 1
   expect_log_count '^probe:page$' 2
   expect_log_count '^probe:ssh_run build-1 -- runnerctl status --color never --stall-after 60 --with-json$' 2
