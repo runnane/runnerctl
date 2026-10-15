@@ -11122,46 +11122,83 @@ fleet_watch_upgrade_key() {
     return 0
   fi
   ! fleet_watch_act_refuse "$host" || return 0
-  fleet_watch_upgrade_check "$host" || return 0
-  fleet_priv_cmd
-  FW_ACTION=upgrade FW_ACT_SCOPE=upgrade
-  FW_PROMPT="$host: upgrade $FW_UP_FROM -> $FW_UP_TO? runs on $host: ${FLEET_PRIV[*]} upgrade — the host downloads the release and replaces its runnerctl, then its version is read back  [y/n]"
+  # GHR-136: the check is a background read (it downloads the release on the
+  # host), holding the host's one action slot; the confirm is raised when it
+  # lands (fleet_watch_upgrade_landed), not here.
+  fleet_watch_act_start "$host" "$host" upgrade-check "" "$(fleet_mutate_budget upgrade 1)" upgrade --check || true
 }
 
 # HOST's `upgrade --check`: 0 with FW_UP_FROM / FW_UP_TO when it says an update
 # is available with two X.Y.Z versions; 1 with FW_NOTICE saying why not (each
-# ending `nothing issued`). U on the cursor's host and U over the marked rows
-# (GHR-129) both decide on this.
+# ending `nothing issued`). The marked-rows U (GHR-129) decides on this, in the
+# foreground; the cursor's own U runs the same call as a background read
+# (GHR-136) and parses its answer with the same function.
 fleet_watch_upgrade_check() { # HOST
-  local host="$1" rc=0 budget cur avail
+  local host="$1" rc=0 budget
   budget="$(fleet_mutate_budget upgrade 1)"
   (FLEET_CALL_TIMEOUT="$budget" ssh_run "$host" "$FLEET_RUNNERCTL" upgrade --check) >"$FW_TMP/up" 2>"$FW_TMP/err" || rc=$?
   relay_file "$FW_TMP/up"
   relay_file "$FW_TMP/err"
+  if fleet_watch_upgrade_parse "$host" "$rc" "$FW_TMP/up" "$FW_TMP/err" "$budget"; then
+    FW_UP_FROM="$UPC_FROM" FW_UP_TO="$UPC_TO"
+    return 0
+  fi
+  FW_NOTICE="$UPC_NOTICE"
+  return 1
+}
+
+# What an `upgrade --check` answered, whoever ran it: 0 with UPC_FROM / UPC_TO
+# when an update is available with two X.Y.Z versions; 1 with UPC_NOTICE saying
+# why not. Pure: it reads the two files and sets nothing the watch draws.
+UPC_FROM="" UPC_TO="" UPC_NOTICE=""
+fleet_watch_upgrade_parse() { # HOST RC UP-FILE ERR-FILE BUDGET
+  local host="$1" rc="$2" up="$3" err="$4" budget="$5" cur avail
+  UPC_FROM="" UPC_TO="" UPC_NOTICE=""
   if [ "$rc" != 0 ]; then
-    FW_NOTICE="$host: could not check for an upgrade — $(fleet_error_text "$rc" "$FW_TMP/err" "$budget"); nothing issued"
+    UPC_NOTICE="$host: could not check for an upgrade — $(fleet_error_text "$rc" "$err" "$budget"); nothing issued"
     return 1
   fi
-  cur="$(fleet_upgrade_field_of "$FW_TMP/up" installed)"
-  avail="$(fleet_upgrade_field_of "$FW_TMP/up" available)"
-  if grep -q '^Update available\.' "$FW_TMP/up"; then
+  cur="$(fleet_upgrade_field_of "$up" installed)"
+  avail="$(fleet_upgrade_field_of "$up" available)"
+  if grep -q '^Update available\.' "$up"; then
     if ! fleet_watch_version_ok "$cur" || ! fleet_watch_version_ok "$avail"; then
-      FW_NOTICE="$host: upgrade --check named a version that is not X.Y.Z — nothing issued"
+      UPC_NOTICE="$host: upgrade --check named a version that is not X.Y.Z — nothing issued"
       return 1
     fi
-    FW_UP_FROM="$cur" FW_UP_TO="$avail"
+    UPC_FROM="$cur" UPC_TO="$avail"
     return 0
-  elif grep -q '^Already up to date\.' "$FW_TMP/up"; then
+  elif grep -q '^Already up to date\.' "$up"; then
     fleet_ver "$cur"
-    FW_NOTICE="$host: already current ($FLEET_VER) — nothing to upgrade, nothing issued"
-  elif grep -q 'not downgrading' "$FW_TMP/up"; then
+    UPC_NOTICE="$host: already current ($FLEET_VER) — nothing to upgrade, nothing issued"
+  elif grep -q 'not downgrading' "$up"; then
     fleet_ver "$cur"
-    FW_NOTICE="$host: runs $FLEET_VER, ahead of the source — left alone, nothing issued"
+    UPC_NOTICE="$host: runs $FLEET_VER, ahead of the source — left alone, nothing issued"
   else
-    fleet_watch_act_last "$FW_TMP/up" plain
-    FW_NOTICE="$host: upgrade --check answered something unrecognised (${ACT_LAST:-nothing}) — nothing issued"
+    fleet_watch_act_last "$up" plain
+    UPC_NOTICE="$host: upgrade --check answered something unrecognised (${ACT_LAST:-nothing}) — nothing issued"
   fi
   return 1
+}
+
+# The cursor's U check has landed (GHR-136), for the host at index I. Its slot
+# is free again by now. The confirm line rises only if the cursor is still on
+# the host that asked and nothing else is up (a confirm, a pane, the filter
+# text); otherwise the result is a notice and nothing is asked or issued.
+fleet_watch_upgrade_landed() { # INDEX RC DIR
+  local i="$1" host="${FLEET_HOSTS[$1]}"
+  if ! fleet_watch_upgrade_parse "$host" "$2" "$3/out" "$3/err" "${FW_ACT_BUDGET[$i]}"; then
+    fleet_watch_act_notice "$UPC_NOTICE"
+    return 0
+  fi
+  if [ "$FW_HOST" != "$host" ] || [ -n "$FW_PROMPT" ] || [ -n "$FW_MODE" ]; then
+    fleet_watch_act_notice "$host: upgrade available ($UPC_FROM -> $UPC_TO) — the cursor moved on, so nothing is asked and nothing issued"
+    return 0
+  fi
+  FW_UP_FROM="$UPC_FROM" FW_UP_TO="$UPC_TO"
+  FW_NOTICE="" FW_ACT_HOST="$host" FW_ACT_NAME="" FW_ACT_SLOTS=()
+  fleet_priv_cmd
+  FW_ACTION=upgrade FW_ACT_SCOPE=upgrade
+  FW_PROMPT="$host: upgrade $FW_UP_FROM -> $FW_UP_TO? runs on $host: ${FLEET_PRIV[*]} upgrade — the host downloads the release and replaces its runnerctl, then its version is read back  [y/n]"
 }
 
 # Whether TEXT is a version this watch may draw: X.Y.Z, and short.
@@ -11318,7 +11355,15 @@ fleet_watch_act_start() { # HOST LABEL VERB LOG-TEXT BUDGET REMOTE-ARGS...
 fleet_watch_act_job() { # INDEX BUDGET REMOTE-ARGS...
   local i="$1" d="$FW_TMP/act.$1" s
   shift
-  if [ "${#FW_ACT_EACH[@]}" -eq 0 ]; then
+  if fleet_watch_act_is_read "${FW_ACT_VERB[$i]}"; then
+    # GHR-136: a read (U's `upgrade --check`) runs as the login, on its budget,
+    # with no sudo and no origin — as the foreground call it replaces did.
+    local rrc=0
+    (FLEET_CALL_TIMEOUT="$1" ssh_run "${FLEET_HOSTS[$i]}" "$FLEET_RUNNERCTL" "${@:2}") >"$d/out" 2>"$d/err" || rrc=$?
+    relay_file "$d/out"
+    relay_file "$d/err"
+    FLEET_CALL_RC="$rrc"
+  elif [ "${#FW_ACT_EACH[@]}" -eq 0 ]; then
     fleet_call_mutating "${FLEET_HOSTS[$i]}" "$d/out" "$d/err" "$@"
   else
     # GHR-127: one call per slot (E, X), in turn, each slot's name after the
@@ -11339,6 +11384,12 @@ fleet_watch_act_job() { # INDEX BUDGET REMOTE-ARGS...
   fi
   echo "$FLEET_CALL_RC" >"$d/rc.new"
   mv -f "$d/rc.new" "$d/rc"
+}
+
+# Whether VERB is a read the runner runs without the mutating path (GHR-136):
+# no FLEET_LOG line, no refresh round, no `busy` left behind.
+fleet_watch_act_is_read() { # VERB
+  [ "$1" = upgrade-check ]
 }
 
 # Whether any action is out / any is still being watched (not detached).
@@ -11374,6 +11425,7 @@ fleet_watch_act_progress() { # INDEX
   fleet_watch_act_last "$FW_TMP/act.$i/out" plain
   [ -n "$ACT_LAST" ] || fleet_watch_act_last "$FW_TMP/act.$i/err" plain
   s="${FW_ACT_LABEL[$i]}: ${FW_ACT_VERB[$i]} running${ACT_LAST:+ — $ACT_LAST}"
+  if [ "${FW_ACT_VERB[$i]}" = upgrade-check ]; then s="checking ${FW_ACT_LABEL[$i]} …"; fi
   [ "$s" = "${FW_ACT_SHOWN[$i]:-}" ] || FW_ACT_SHOWN[i]="$s" FW_ACT_DRAW=true
 }
 
@@ -11406,6 +11458,19 @@ fleet_watch_act_collect() {
     fi
     rc="$(cat "$d/rc" 2>/dev/null || echo 255)"
     logrc="$rc"
+    if fleet_watch_act_is_read "${FW_ACT_VERB[$i]}"; then
+      # GHR-136: a read. Its slot is free before the confirm is raised; it
+      # writes no record and asks for no refresh round, only a redraw. A
+      # detached one is followed no further, and says nothing.
+      if [ -z "${FW_ACT_DETACHED[$i]}" ]; then
+        FW_ACT_PID[i]="" FW_ACT_SHOWN[i]=""
+        fleet_watch_upgrade_landed "$i" "$rc" "$d"
+      fi
+      FW_ACT_PID[i]="" FW_ACT_SHOWN[i]="" FW_ACT_DETACHED[i]=""
+      rm -rf "$d"
+      FW_ACT_DRAW=true
+      continue
+    fi
     if [ "$rc" = 0 ] && [ "${FW_ACT_VERB[$i]}" = upgrade ]; then
       fleet_watch_upgrade_notice "$i" "$d"
       n="${FW_ACT_LABEL[$i]}: $UP_NOTICE" logrc="$UP_RC"
@@ -11476,6 +11541,11 @@ fleet_watch_act_quit() {
     pid="${FW_ACT_PID[$i]}" host="${FLEET_HOSTS[$i]}"
     [ -n "$pid" ] || continue
     FW_ACT_PID[i]=""
+    if fleet_watch_act_is_read "${FW_ACT_VERB[$i]}"; then
+      # GHR-136: a read has no command to leave running and no record.
+      [ "$(proc_ppid "$pid")" != "$$" ] || proc_tree_kill "$pid"
+      continue
+    fi
     printf "%s: %s was still running when the watch ended — the watch stopped following it and did not cancel it; 'runnerctl fleet status --host %s' shows where it got to\n" \
       "${FW_ACT_LABEL[$i]}" "${FW_ACT_VERB[$i]}" "$host"
     fleet_log_write "${FW_ACT_LOG[$i]}" "$host=detached"
