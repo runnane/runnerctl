@@ -17234,13 +17234,49 @@ not verified: https://example.invalid/runnerctl is not a release asset, so no di
   expect_log '^probe:hold_no_ticker$'
 }
 
-t "GHR-149: a long restart prints a heartbeat at most N s apart"                  case_ghr149_a_long_restart_prints_a_heartbeat_at_most_n_apart
+# A ticker stopped in the middle of a "$(…)" leaves that child behind, and the
+# child's write then meets a pipe nobody reads. Where SIGPIPE is IGNORED — as
+# this harness's agent shells and the GitHub runner both start the gate —
+# that write fails with `echo: write error: Broken pipe` on the stderr the
+# child inherited: the command's own. That is the line that turned the cut
+# case red in CI one run in a few, the kill having landed inside the stub's
+# now_epoch. Here it lands there every time:
+#   * the snippet ignores PIPE itself, so the gate's own disposition does not
+#     decide the outcome;
+#   * its now_epoch, in the ticker's first "$(…)", says it has started
+#     (.in), then waits until the ticker has been killed (.killed) before
+#     it writes (.after once the write is done).
+# The ticker's stderr is /dev/null, so nothing reaches the command's.
+# shellcheck disable=SC2016  # the snippet's child expands it
+GHR149_ORPHAN='trap "" PIPE; HEARTBEAT=1; W="$RUNNERCTL_TEST_WRITES"
+  now_epoch() {
+    if [ "$BASHPID" != "$MAIN" ]; then
+      : >"$W/.in"
+      local n=0; while [ ! -e "$W/.killed" ] && [ "$n" -lt 500 ]; do sleep 0.01; n=$((n + 1)); done
+      echo 1000000720; : >"$W/.after"; return 0
+    fi
+    echo 1000000720
+  }
+  MAIN="$BASHPID"
+  waitfor() { local n=0; while [ ! -e "$W/$1" ] && [ "$n" -lt 500 ]; do sleep 0.01; n=$((n + 1)); done; [ -e "$W/$1" ] && echo "saw $1"; }
+  hb_start probe; waitfor .in; hb_stop; : >"$W/.killed"; waitfor .after'
+case_ghr149_a_stopped_ticker_leaves_nothing_on_stderr() {
+  rm -rf "$WRITES"; mkdir -p "$WRITES"
+  run_snippet "$STUB" "$GHR149_ORPHAN"
+  expect_rc 0
+  expect_text "the stop, in order" "saw .in
+saw .after" "$OUT"
+  expect_text "stderr" "" "$ERR"
+}
+
+t "GHR-149: a long restart prints a heartbeat at most N s apart"                 case_ghr149_a_long_restart_prints_a_heartbeat_at_most_n_apart
 t "GHR-149: without --heartbeat the output is unchanged, byte for byte"           case_ghr149_without_the_flag_the_output_is_unchanged
 t "GHR-149: wait_idle, drain and kill's wait say so at most N s apart"            case_ghr149_wait_idle_and_drain_say_so_at_most_n_apart
 t "GHR-149: a malformed --heartbeat is refused before anything is done"           case_ghr149_a_malformed_heartbeat_is_refused
 t "GHR-149: heartbeats survive the GHR-91 relays and a cut reader"                case_ghr149_heartbeats_survive_the_relays_and_a_cut_reader
 t "GHR-149: a signal mid-call still interrupts and records (GHR-119)"             case_ghr149_a_signal_mid_call_still_interrupts_and_records
-t "GHR-149: upgrade's download has a heartbeat"                                   case_ghr149_upgrades_download_has_a_heartbeat
+t "GHR-149: a ticker stopped mid-\$(…) leaves nothing on stderr (SIGPIPE ignored)" case_ghr149_a_stopped_ticker_leaves_nothing_on_stderr
+t "GHR-149: upgrade's download has a heartbeat"                                  case_ghr149_upgrades_download_has_a_heartbeat
 
 # --- Summary ------------------------------------------------------------------
 echo

@@ -2700,7 +2700,13 @@ hb_ticker() { # LABEL PARENT
 hb_start() { # LABEL
   [ -n "$HEARTBEAT" ] || return 0
   hb_stop
-  hb_ticker "$1" "$BASHPID" &
+  # Its stderr is /dev/null: the SIGKILL can land while it is inside a
+  # "$(…)", and the orphaned child then writes into a pipe nobody reads.
+  # Where SIGPIPE is ignored (an agent harness, a CI runner, some service
+  # managers) that write fails with a `write error: Broken pipe` on the
+  # stderr it inherited — the command's own, through its relay. The ticker
+  # has nothing to say on stderr, so nothing it leaves behind can either.
+  hb_ticker "$1" "$BASHPID" 2>/dev/null &
   HB_PID=$! HB_OWNER="$BASHPID"
 }
 # Stop this process's ticker, if it has one, and reap it.

@@ -489,6 +489,19 @@ Traps:
   pipe open, and the run sits out `RUN_TIMEOUT` (124). A poll loop (wait_idle,
   kill's wait) has no ticker: it prints between its polls, so a case
   counts its lines and its `probe:pause` sizes.
+
+  The ticker's SIGKILL can land inside a `"$(…)"`, and the child left behind
+  then writes into a pipe with no reader. With SIGPIPE IGNORED, that write
+  prints `write error: Broken pipe` on the stderr the child inherited. This
+  turned PR #156's cut case red in CI. It fails with PIPE ignored and never
+  with PIPE at default, and it did fail in CI, so the GitHub runner very
+  likely starts the gate with SIGPIPE ignored too. That is inferred, not
+  measured.
+  - The ticker runs with stderr on /dev/null for this reason.
+  - `case_ghr149_a_stopped_ticker_leaves_nothing_on_stderr` pins the
+    behaviour. It ignores PIPE itself and makes the kill land inside the
+    `"$(…)"` every time, using files to order the steps rather than
+    timing.
 - **`relay_safe` clobbers `BASH_REMATCH`** (it matches regexes of its own).
   Take every capture you need into a variable BEFORE calling it — the first
   `history` parser read the time after relaying the message and died
