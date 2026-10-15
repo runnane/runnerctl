@@ -467,6 +467,28 @@ Traps:
   left in place, where it breaks those pinned lines. A host named
   `*preorigin*` refuses it as main refuses an unknown command (exit 1, does
   nothing) — the older-host retry; the claim is `$ME@stub-host-1`.
+- **A `--heartbeat` ticker (GHR-149) runs on the stub clock, never on wall
+  time.** `RUNNERCTL_STUB_SYSTEMCTL_SECS="SECS:ERE"` gives the systemctl call
+  matching ERE a duration of SECS seconds, but only with
+  `RUNNERCTL_STUB_CLOCK=1`. The stub's `stub_hb_hold` moves the clock one
+  second at a time. At each second it waits for the process's ticker
+  (`HB_PID`) to print every line due by then. The ticker's `hb_wait` hook
+  writes the instant it waits for into `$WRITES/.hb.<pid>`, which is how the
+  hold knows. So a `heartbeat: … (Ns)` line carries the clock's elapsed time,
+  and the same run prints the same lines every time.
+  - The log holds `probe:hold SECS from T` and `probe:hold_end T`.
+  - `probe:hold_no_ticker` means there was no ticker to wait for: no flag, or
+    a mutant that dropped it.
+  - `probe:hold_gave_up T` means a ticker did not catch up within 5 s.
+
+  A snippet can call `stub_hb_hold` from a stand-in of its own, as the
+  download case's `curl` does. The clock file is now written beside itself
+  and renamed over it (`stub_clock_write`), because a ticker reads it from
+  another process. A plain `>` write would let the ticker read it empty.
+  A ticker left running past a guarded command's exit holds the relays'
+  pipe open, and the run sits out `RUN_TIMEOUT` (124). A poll loop (wait_idle,
+  kill's wait) has no ticker: it prints between its polls, so a case
+  counts its lines and its `probe:pause` sizes.
 - **`relay_safe` clobbers `BASH_REMATCH`** (it matches regexes of its own).
   Take every capture you need into a variable BEFORE calling it — the first
   `history` parser read the time after relaying the message and died

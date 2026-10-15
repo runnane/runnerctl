@@ -24,7 +24,7 @@
 # so this runs on any runner host. Privileged operations re-exec via sudo.
 #
 # Usage:
-#   runnerctl [--config PATH] [--origin OPERATOR@HOST] <command> [args]
+#   runnerctl [--config PATH] [--origin OPERATOR@HOST] [--heartbeat N] <command> [args]
 #
 #   runnerctl provision N [--url URL] [--token TOK | --pat TOK] [--labels a,b] \
 #                         [--name-prefix P] [--runner-user U] [--runner-root DIR] \
@@ -417,6 +417,13 @@
 # FLEET_LOG, one line per fleet command or `fleet watch` action key with each
 # host's exit code, and `fleet history` merges every host's journal lines by
 # time. A record that cannot be written changes nothing about the command.
+#
+# `--heartbeat N` (1..3600 s, GHR-149) makes every phase of a command that can
+# block — a systemctl start/stop/restart/reload, a --when-idle or drain wait,
+# kill's wait, upgrade's download — print a line at least every N seconds
+# (`heartbeat: … (Ns)`, or the wait's own `waiting for …` line), so a caller
+# reading the output can tell a working host from a silent one. Without it
+# the output is what it always was.
 #
 # Recommended baselines:
 #   New host:     runnerctl provision 2 --url https://github.com/<org>
@@ -873,6 +880,8 @@ trap() {
 }
 exit_run() {
   local rc=$?
+  # GHR-149: a heartbeat ticker still running holds the relays' pipe open.
+  hb_stop
   # GHR-91: first, so the record knows whether the caller was still there.
   caller_guard_end
   audit_finish "$rc"
@@ -983,6 +992,7 @@ audit_signal() { # INT|TERM|HUP|PIPE
   # A command that ignores the signal goes on: nothing was interrupted.
   [ -n "$owner" ] || return 0
   AUDIT_SIGNAL="SIG$1"
+  hb_stop
   audit_finish 0
   if [ "$owner" != - ]; then
     eval "$owner"
@@ -2600,21 +2610,115 @@ job_desc() {
 #   0  idle (possibly immediately)
 #   1  still busy after TIMEOUT seconds
 #   2  (no access): refused without waiting
+#
+# GHR-149: under --heartbeat=N the line comes at least every min(60, N) s
+# (EVERY), and no pause is longer than that — a poll interval above it is cut
+# down to it (STEP) — so the line is due before any pause that would leave
+# more than EVERY since the last one. Without the flag, the cadence is the
+# 60 s it always was.
 wait_idle() { # UNIT TIMEOUT
-  local u="$1" timeout="$2" waited=0 last_said=-60 short
+  local u="$1" timeout="$2" waited=0 last_said=-60 short step="$POLL_SEC" every=60
   # A zero or junk interval would never advance the clock: refuse it.
   [[ "$POLL_SEC" =~ ^[1-9][0-9]*$ ]] || die "POLL_SEC must be a positive integer (config sets '$POLL_SEC')"
+  if [ -n "$HEARTBEAT" ]; then
+    [ "$HEARTBEAT" -ge "$every" ] || every="$HEARTBEAT"
+    [ "$step" -le "$every" ] || step="$every"
+  fi
   short="$(short_name "$u")"
   while ! slot_is_idle "$u"; do
     [ "$SLOT_JOB" != "(no access)" ] || return 2
     [ "$waited" -lt "$timeout" ] || return 1
-    if [ $((waited - last_said)) -ge 60 ]; then
+    if { [ -z "$HEARTBEAT" ] && [ $((waited - last_said)) -ge 60 ]; } \
+       || { [ -n "$HEARTBEAT" ] && [ $((waited + step - last_said)) -gt "$every" ]; }; then
       echo "waiting for $short ($(job_desc "$SLOT_JOB")) …"
       last_said=$waited
     fi
-    pause "$POLL_SEC"
-    waited=$((waited + POLL_SEC))
+    pause "$step"
+    waited=$((waited + step))
   done
+}
+
+# --- A heartbeat for the central node (GHR-149) ---------------------------------
+# `--heartbeat=N`, a global flag read beside --origin: every phase of a command
+# that can block prints a line at most N seconds apart, so the central node
+# can tell a host that is working from one that has gone silent (GHR-150 cuts
+# a call off on that silence instead of on a total budget). An older host
+# refuses the flag the way main refuses any unknown word — `unknown command
+# '--heartbeat…'`, exit 1, nothing done — which is what the central node's
+# optional-word mechanism (fleet_optional_rejects) reads. Without the flag
+# nothing changes: no ticker, no extra line, wait_idle's cadence is its own.
+#
+# Two shapes:
+#   * a poll loop says so itself between polls — wait_idle (and so `drain` and
+#     every --when-idle) at min(60, N), kill's wait after its SIGKILL at N —
+#     pausing no longer than that, so the lines are as deterministic as the
+#     polls;
+#   * one call that blocks — every privileged systemctl that starts, stops or
+#     reloads (a stop sits out TimeoutStopSec saying nothing) and upgrade's
+#     download — runs with a TICKER beside it: a background child of this
+#     process printing `heartbeat: LABEL (Ns)` every N s until hb_stop.
+# A ticker never outlives its phase and never decides anything:
+#   * hb_stop kills it with SIGKILL — which nothing can ignore or defer, not
+#     even under an inherited signal mask — and reaps it before the call's
+#     status is looked at; the status is the call's;
+#   * exit_run and audit_signal stop it first, so no way out leaves it running
+#     — in particular, the relays a guarded command waits for on its way out
+#     (GHR-91) are not held open by it, and a record (GHR-88/119/131) is
+#     written with the command's own outcome;
+#   * it checks every second that the process that started it is still there,
+#     for the one way out no trap sees (a SIGKILL of that process);
+#   * it writes to this process's stdout — the relay's pipe under caller_guard,
+#     so a reader that has gone costs it nothing, and SIGINT does not reach it
+#     (a background job of a script ignores it): an operator's Ctrl-C ends the
+#     command, and the command's way out ends the ticker.
+# Between two phases there is no ticker, so a silence that spans a boundary
+# can be up to one phase's cadence plus the next one's N.
+HEARTBEAT="" HB_PID="" HB_OWNER=""
+# The global flag's value: whole seconds, 1..3600.
+heartbeat_valid() { [[ "${1-}" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$1" -le 3600 ]; }
+# Until the clock reaches EPOCH; 1 at once if PARENT has gone. A hook, so the
+# sim can model the wait on its stub clock (tests/stub.config).
+hb_wait() { # EPOCH PARENT
+  while [ "$(now_epoch)" -lt "$1" ]; do
+    kill -0 "$2" 2>/dev/null || return 1
+    sleep 1 >/dev/null 2>&1
+  done
+}
+# The ticker itself (in the background): one line every HEARTBEAT seconds,
+# saying how long the phase has been running.
+hb_ticker() { # LABEL PARENT
+  local t0 now next
+  t0="$(now_epoch)"; next=$((t0 + HEARTBEAT))
+  while hb_wait "$next" "$2"; do
+    now="$(now_epoch)"
+    printf 'heartbeat: %s (%ss)\n' "$1" "$((now - t0))"
+    next=$((now + HEARTBEAT))
+  done
+}
+# Start a ticker for LABEL (under --heartbeat only), replacing any of this
+# process's own.
+hb_start() { # LABEL
+  [ -n "$HEARTBEAT" ] || return 0
+  hb_stop
+  hb_ticker "$1" "$BASHPID" &
+  HB_PID=$! HB_OWNER="$BASHPID"
+}
+# Stop this process's ticker, if it has one, and reap it.
+hb_stop() {
+  [ -n "$HB_PID" ] && [ "$HB_OWNER" = "$BASHPID" ] || return 0
+  kill -KILL "$HB_PID" 2>/dev/null || true
+  wait "$HB_PID" 2>/dev/null || true
+  HB_PID=""
+}
+# `run_priv systemctl ARGS…`, with a ticker under --heartbeat. Its status is
+# systemctl's; without the flag it is exactly that one call.
+hb_systemctl() { # ARGS...
+  [ -n "$HEARTBEAT" ] || { run_priv systemctl "$@"; return; }
+  local rc=0
+  hb_start "systemctl $*"
+  run_priv systemctl "$@" || rc=$?
+  hb_stop
+  return "$rc"
 }
 
 # wait_idle failed for UNIT with RC: say why, what was already done (HANDLED,
@@ -4229,7 +4333,7 @@ cmd_apply() {
   audit_slots "${#TARGETS[@]}" "${units[@]}"
   caller_guard
   for u in "${units[@]}"; do apply_to "$u"; echo "  wrote drop-in for $u"; done
-  run_priv systemctl daemon-reload
+  hb_systemctl daemon-reload
   if [ "${#TARGETS[@]}" -gt 0 ]; then
     for u in "${units[@]}"; do
       t="${u#actions.runner.}"; t="${t%.service}"
@@ -4245,7 +4349,7 @@ cmd_apply() {
     for i in "${!units[@]}"; do
       u="${units[$i]}"
       idle_gate "$u" restarted "${units[*]:0:$i}" "${units[*]:$((i+1))}"
-      run_priv systemctl restart "$u"
+      hb_systemctl restart "$u"
     done
     if [ "${#TARGETS[@]}" -gt 0 ]; then
       echo "Restarted ${#units[@]} slot(s) (config active now)."
@@ -4279,18 +4383,18 @@ cmd_scale() {
   for i in "${!units[@]}"; do
     [ "$i" -lt "$n" ] && apply_to "${units[$i]}"
   done
-  run_priv systemctl daemon-reload
+  hb_systemctl daemon-reload
   local rc failed=()
   for i in "${!units[@]}"; do
     u="${units[$i]}"
     if [ "$i" -lt "$n" ]; then
-      rc=0; run_priv systemctl enable --now "$u" || rc=$?
+      rc=0; hb_systemctl enable --now "$u" || rc=$?
       if [ "$rc" -eq 0 ]; then echo "  [active] $u"; else echo "  [FAILED] $u"; failed+=("$u"); fi
     else
       # --when-idle: a slot leaving the pool is stopped only once its job is
       # done (the ones staying are enabled regardless — that never kills a job).
       idle_gate "$u" stopped "${units[*]:$n:$((i - n))}" "${units[*]:$((i + 1))}"
-      rc=0; run_priv systemctl disable --now "$u" || rc=$?
+      rc=0; hb_systemctl disable --now "$u" || rc=$?
       if [ "$rc" -eq 0 ]; then echo "  [stopped] $u"; else echo "  [FAILED] $u"; failed+=("$u"); fi
     fi
   done
@@ -4307,7 +4411,7 @@ cmd_scale() {
     for i in "${!units[@]}"; do
       [ "$i" -lt "$n" ] || break
       idle_gate "${units[$i]}" restarted "${units[*]:0:$i}" "${units[*]:$((i + 1)):$((n - i - 1))}"
-      run_priv systemctl restart "${units[$i]}"
+      hb_systemctl restart "${units[$i]}"
     done
     echo "Restarted $n active slot(s) (config active now)."
   else
@@ -4383,7 +4487,7 @@ cmd_ctl() { # start|stop|restart [--when-idle] [--timeout N] [--if-stalled] [--s
     else
       idle_gate "$u" "$verb" "${units[*]:0:$i}" "${units[*]:$((i + 1))}"
     fi
-    run_priv systemctl "$action" "$u"
+    hb_systemctl "$action" "$u"
   done
   if $if_stalled && [ "$acted" -eq 0 ]; then
     echo "no stalled slot — nothing $verb."
@@ -4410,7 +4514,7 @@ cmd_toggle() { # enable|disable <target> [target ...]
   audit_slots "${#units[@]}" "${units[@]}"
   caller_guard # GHR-137
   for u in "${units[@]}"; do
-    run_priv systemctl "$action" --now "$u"
+    hb_systemctl "$action" --now "$u"
   done
   echo "$action done."
 }
@@ -5618,7 +5722,7 @@ cmd_remove_limits() {
     run_priv rm -f "$SYSTEMD_DIR/$u.d/$DROPIN_NAME"
     echo "  removed drop-in for $u"
   done
-  run_priv systemctl daemon-reload
+  hb_systemctl daemon-reload
   if [ "${#TARGETS[@]}" -gt 0 ]; then
     for u in "${units[@]}"; do
       t="${u#actions.runner.}"; t="${t%.service}"
@@ -6442,12 +6546,12 @@ cmd_compose_reap_timer() { # install|status [--brief]|remove
       audit_begin "compose-reap-timer install"
       render_compose_reap_service "$self" | run_priv tee "$SYSTEMD_DIR/$COMPOSE_REAP_UNIT.service" >/dev/null
       render_compose_reap_timer | run_priv tee "$SYSTEMD_DIR/$COMPOSE_REAP_UNIT.timer" >/dev/null
-      run_priv systemctl daemon-reload
+      hb_systemctl daemon-reload
       echo "Installed $COMPOSE_REAP_UNIT.{service,timer}. What the first run would do:"
       # In a subshell: a daemon that does not answer yet is the dry run's
       # `die` (GHR-87), and the timer is still worth enabling for it.
       (cmd_compose_reap) || true
-      run_priv systemctl enable --now "$COMPOSE_REAP_UNIT.timer"
+      hb_systemctl enable --now "$COMPOSE_REAP_UNIT.timer"
       echo "Timer enabled (hourly, compose-reap --apply). Check it with: runnerctl compose-reap-timer status"
       ;;
     status)
@@ -6460,9 +6564,9 @@ cmd_compose_reap_timer() { # install|status [--brief]|remove
       ;;
     remove)
       audit_begin "compose-reap-timer remove"
-      run_priv systemctl disable --now "$COMPOSE_REAP_UNIT.timer" || true
+      hb_systemctl disable --now "$COMPOSE_REAP_UNIT.timer" || true
       run_priv rm -f "$SYSTEMD_DIR/$COMPOSE_REAP_UNIT.service" "$SYSTEMD_DIR/$COMPOSE_REAP_UNIT.timer"
-      run_priv systemctl daemon-reload
+      hb_systemctl daemon-reload
       echo "Removed $COMPOSE_REAP_UNIT.{service,timer}."
       ;;
     *) die "unknown compose-reap-timer command '$sub' (install status remove)" ;;
@@ -6509,9 +6613,17 @@ kill_slot() { # UNIT SHORT DRY-RUN
   # Listener that is wedged too is escalated rather than left behind a line
   # claiming success.
   [[ "$POLL_SEC" =~ ^[1-9][0-9]*$ ]] || die "POLL_SEC must be a positive integer (config sets '$POLL_SEC')"
+  # GHR-149: under --heartbeat a line at least every N s of this wait, and no
+  # pause longer than N. Without it the wait says nothing until it ends.
+  local step="$POLL_SEC" said=0
+  [ -z "$HEARTBEAT" ] || [ "$step" -le "$HEARTBEAT" ] || step="$HEARTBEAT"
   while :; do
-    pause "$POLL_SEC"
-    waited=$((waited + POLL_SEC))
+    if [ -n "$HEARTBEAT" ] && [ $((waited + step - said)) -gt "$HEARTBEAT" ]; then
+      echo "$short: waiting for the job to end after SIGKILL (${waited}s) …"
+      said=$waited
+    fi
+    pause "$step"
+    waited=$((waited + step))
     # Under `watch` the journal read is memoised per tick; this poll has to
     # see the new lines, not the ones the frame was drawn from.
     [ -z "$JOURNAL_MEMO_DIR" ] || rm -f -- "$JOURNAL_MEMO_DIR/$u".*
@@ -6533,7 +6645,7 @@ kill_unit() { # UNIT SHORT DRY-RUN WHY
     return 0
   fi
   echo "$short: $why — killing the whole unit"
-  run_priv systemctl kill -s KILL "$u"
+  hb_systemctl kill -s KILL "$u"
   echo "$short: SIGKILLed the unit's cgroup — Restart=always brings the slot back"
 }
 
@@ -6639,7 +6751,7 @@ cmd_health() { # [--quiet] [--json] [--max-restarts N] [--stall-after N] [--rest
         # exit status, which is 1 whenever there was a problem to report.
         audit_begin health --restart-stalled "$short"
         caller_guard # GHR-137
-        if run_priv systemctl restart "$u"; then
+        if hb_systemctl restart "$u"; then
           line+=" — restarted"; h_ok=$((h_ok + 1))
         else
           line+=" — restart FAILED"; h_bad=$((h_bad + 1))
@@ -13542,8 +13654,8 @@ runner_unit_install() { # UNIT DIR USER
   run_priv install -m 0644 -o root -g root /dev/null "$path" || return 1
   printf '%s\n' "$text" | run_priv tee "$path" >/dev/null || return 1
   runner_exec "$dir" "$user" install -m 0755 ./bin/runsvc.sh ./runsvc.sh || return 1
-  run_priv systemctl daemon-reload || return 1
-  run_priv systemctl enable "$unit" || return 1
+  hb_systemctl daemon-reload || return 1
+  hb_systemctl enable "$unit" || return 1
   # SC2016: the $1 belongs to the inner bash, which takes the unit name as an
   # argument rather than having it pasted into the string.
   # shellcheck disable=SC2016
@@ -13904,14 +14016,14 @@ cmd_provision() {
     if ! runner_unit_install "${slot_unit[$s]}" "$dir" "$user"; then
       failed+=("$name"); echo "  [FAILED] installing ${slot_unit[$s]}"; continue
     fi
-    if ! run_priv systemctl start "${slot_unit[$s]}"; then
+    if ! hb_systemctl start "${slot_unit[$s]}"; then
       failed+=("$name"); echo "  [FAILED] systemctl start ${slot_unit[$s]}"; continue
     fi
     made+=("$name")
     echo "  [ok] $name"
   done
 
-  run_priv systemctl daemon-reload
+  hb_systemctl daemon-reload
   echo
   if [ "${#made[@]}" -gt 0 ]; then
     echo "Provisioned ${#made[@]} runner(s): ${made[*]}"
@@ -14164,10 +14276,10 @@ cmd_deprovision() {
     echo "[$short] stopping and removing the service"
     # svc.sh stop + uninstall, done here (GHR-110): its unit file is removed
     # by name whoever wrote it, so a unit svc.sh installed goes the same way.
-    if ! run_priv systemctl stop "$u"; then
+    if ! hb_systemctl stop "$u"; then
       failed+=("$short"); echo "  [FAILED] systemctl stop — left in place"; continue
     fi
-    if ! run_priv systemctl disable "$u"; then
+    if ! hb_systemctl disable "$u"; then
       failed+=("$short"); echo "  [FAILED] systemctl disable — left in place"; continue
     fi
     if ! run_priv rm -f -- "$SYSTEMD_DIR/$u"; then
@@ -14203,7 +14315,7 @@ cmd_deprovision() {
     echo "  [ok] $short"
   done
 
-  run_priv systemctl daemon-reload
+  hb_systemctl daemon-reload
   echo
   [ "${#made[@]}" -eq 0 ] || echo "Deprovisioned ${#made[@]} runner slot(s): ${made[*]}"
   if [ "${#unconfirmed[@]}" -gt 0 ]; then
@@ -14851,7 +14963,9 @@ fetch_digest() { # URL FILE
   local url="$1" f="$2" code="" rc=0 line=""
   SCRIPT_DIGEST="" SCRIPT_DIGEST_ERR=""
   # No -f: a 404 has to come back as a status to tell apart from the rest.
+  hb_start "download digest" # GHR-149
   code="$(curl -sSL --max-time 30 -w '%{http_code}' -o "$f" "$url" 2>/dev/null)" || rc=$?
+  hb_stop
   if [ "$rc" -eq 0 ] && [ "$code" = 404 ]; then return 2; fi
   if [ "$rc" -eq 37 ] && [[ "$url" == file://* ]]; then return 2; fi
   if [ "$rc" -ne 0 ]; then
@@ -14882,7 +14996,11 @@ script_sha256() { # FILE
 fetch_script() { # URL DEST [PIN]
   local url="$1" dest="$2" pin="${3:-}" durl="" want="" from="" got dtmp rc=0
   command -v curl >/dev/null || die "curl is required to download from $url"
-  curl -fsSL --max-time 30 "$url" -o "$dest" || die "download failed: $url"
+  # GHR-149: up to 30 s of silence; a ticker beside it under --heartbeat.
+  hb_start "download runnerctl"
+  curl -fsSL --max-time 30 "$url" -o "$dest" || rc=$?
+  hb_stop
+  [ "$rc" -eq 0 ] || die "download failed: $url"
   bash -n "$dest" || die "downloaded script does not parse — not installing"
   [ -n "$(remote_version "$dest")" ] || die "downloaded file carries no RUNNERCTL_VERSION — not installing"
   if [ -n "$pin" ]; then
@@ -15589,12 +15707,28 @@ main() {
   # origin_valid once the environment is settled, written into the record, and
   # reaches no path, config, command or decision. Under the narrow sudo
   # contract it is therefore taken as given (README, the per-flag table).
-  local origin_arg="" have_origin=false
-  if [[ "${1:-}" == --origin=* ]]; then set -- --origin "${1#--origin=}" "${@:2}"; fi
-  if [ "${1:-}" = --origin ]; then
-    need_val "$@"
-    origin_arg="$2" have_origin=true; shift 2
-  fi
+  #
+  # GHR-149: `--heartbeat N` beside it, in either order — the cadence every
+  # phase that can block keeps (A heartbeat for the central node, above).
+  # Refused at once when it is not whole seconds 1..3600, before anything is
+  # done; set once the config is loaded, so a config cannot override it.
+  local origin_arg="" have_origin=false hb_arg="" have_hb=false
+  while :; do
+    case "${1:-}" in
+      --origin=*)    set -- --origin "${1#--origin=}" "${@:2}" ;;
+      --heartbeat=*) set -- --heartbeat "${1#--heartbeat=}" "${@:2}" ;;
+      --origin)
+        ! $have_origin || break
+        need_val "$@"
+        origin_arg="$2" have_origin=true; shift 2 ;;
+      --heartbeat)
+        ! $have_hb || break
+        need_val "$@"
+        heartbeat_valid "$2" || die "--heartbeat needs whole seconds, 1 to 3600 (got '$2')"
+        hb_arg="$2" have_hb=true; shift 2 ;;
+      *) break ;;
+    esac
+  done
   # GHR-89: before the config is looked at — even whether it exists, which
   # under sudo would answer for a path the caller cannot see.
   # The environment is pinned under every sudo (harmless where the caller is
@@ -15608,6 +15742,7 @@ main() {
   ! $cfg_flag || [ -f "$CONFIG_FILE" ] || die "config file $CONFIG_FILE not found"
   load_config
   ! $have_origin || audit_origin_take "$origin_arg"
+  if $have_hb; then HEARTBEAT="$hb_arg"; else HEARTBEAT=""; fi
   local cmd="${1:-status}"; shift || true
   if is_piped; then
     case "$cmd" in

@@ -17010,6 +17010,238 @@ t "GHR-115: fleet watch waits for a CPU sample on the first tick only"          
 t "GHR-115: a host too old for --cpu-prev waits as before, asked with it once"    case_ghr115_a_host_too_old_for_the_flag_waits_as_before
 t "GHR-115: a CPU counter backwards between fleet watch ticks is —"               case_ghr115_a_counter_backwards_between_ticks_is_a_dash
 
+# --- GHR-149: the remote `--heartbeat=N` global flag ------------------------------
+# Every phase that can block prints a line at most N s apart. Everything is
+# read off the STUB clock, never wall time: RUNNERCTL_STUB_SYSTEMCTL_SECS
+# gives one systemctl call a duration on it, and the stub's hb_wait /
+# stub_hb_hold step the ticker through it a second at a time (see
+# tests/stub.config), so each `heartbeat: … (Ns)` line carries the clock's
+# own elapsed time and the same run always prints the same lines.
+GHR149_RESTART="12:^systemctl restart $U1\$"
+# The `(Ns)` stamps of OUT's heartbeat lines for LABEL, as `0 5 10 … END`, must
+# step by at most N: from the call's start (0), line to line, and from the
+# last line to the call's end (END, the hold's seconds).
+expect_hb_gaps() { # LABEL N END
+  _expect
+  local prev=0 t gaps="" l
+  while IFS= read -r l; do
+    [[ "$l" =~ ^heartbeat:\ $1\ \(([0-9]+)s\)$ ]] || continue
+    t="${BASH_REMATCH[1]}"
+    [ $((t - prev)) -le "$2" ] || gaps+=" ${prev}s->${t}s"
+    prev="$t"
+  done <<<"$OUT"
+  [ $(($3 - prev)) -le "$2" ] || gaps+=" ${prev}s->${3}s(end)"
+  [ -z "$gaps" ] || FAILS+=("heartbeat of '$1': a silence longer than $2 s:$gaps")
+}
+
+# Acceptance (a): a restart that takes 12 s of the clock, under
+# --heartbeat=5, says so at 5 s and 10 s, before `restart done.` — through
+# the GHR-91 relays, since restart is a guarded command — and records `ok`.
+# Under --heartbeat=4 the stamps follow (4 8 12). The call's start and end are
+# in the log, around the stub's own hold.
+case_ghr149_a_long_restart_prints_a_heartbeat_at_most_n_apart() {
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_SYSTEMCTL_SECS="$GHR149_RESTART" run --heartbeat=5 restart 0
+  expect_rc 0
+  expect_text "restart under --heartbeat=5" "heartbeat: systemctl restart $U1 (5s)
+heartbeat: systemctl restart $U1 (10s)
+restart done." "$OUT"
+  expect_hb_gaps "systemctl restart $U1" 5 12
+  expect_log_order "^systemctl restart $U1\$" '^probe:hold 12 from 0$' '^probe:hold_end 12$' '^probe:audit '
+  expect_no_log '^probe:hold_(no_ticker|gave_up)'
+  expect_one_record "restart example\\.slot-1 by $ME — ok"
+  expect_no_err .
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_SYSTEMCTL_SECS="$GHR149_RESTART" run --heartbeat 4 restart 0
+  expect_rc 0
+  expect_out_count '^heartbeat: ' 3
+  expect_out "^heartbeat: systemctl restart $U1 \\(12s\\)\$"
+  expect_hb_gaps "systemctl restart $U1" 4 12
+  # with --origin, in either order: both taken, the record says so
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_SYSTEMCTL_SECS="$GHR149_RESTART" run --heartbeat=5 --origin=alice@central-1 restart 0
+  expect_rc 0
+  expect_out_count '^heartbeat: ' 2
+  expect_one_record "restart example\\.slot-1 by $ME via fleet from alice@central-1 — ok"
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_SYSTEMCTL_SECS="$GHR149_RESTART" run --origin=alice@central-1 --heartbeat=5 restart 0
+  expect_rc 0
+  expect_out_count '^heartbeat: ' 2
+  expect_one_record "restart example\\.slot-1 by $ME via fleet from alice@central-1 — ok"
+}
+
+# Acceptance (a), the other half: WITHOUT the flag nothing changes, byte for
+# byte — the same 12 s restart prints exactly what a restart always printed,
+# no ticker is started (the hold finds none), and a drain's `waiting for`
+# lines keep their 60 s cadence (3 over 30 polls, as GHR-91's case pins).
+case_ghr149_without_the_flag_the_output_is_unchanged() {
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_SYSTEMCTL_SECS="$GHR149_RESTART" run restart 0
+  expect_rc 0
+  expect_text "restart without the flag" "restart done." "$OUT"
+  expect_no_err .
+  expect_log '^probe:hold_no_ticker$'
+  expect_log '^probe:hold_end 12$'
+  # (the clock stands still here, so the job's age in the line does too)
+  RUNNERCTL_STUB_BUSY_POLLS=30 RUNNERCTL_STUB_SYSTEMCTL_SECS="70:^systemctl stop $U1\$" run drain
+  expect_rc 0
+  expect_text "drain without the flag" "waiting for example.slot-1 (my-app:test, 12m) …
+waiting for example.slot-1 (my-app:test, 12m) …
+waiting for example.slot-1 (my-app:test, 12m) …
+stop done." "$OUT"
+  expect_log_count '^probe:pause 5$' 30
+  expect_no_log '^probe:pause [^5]'
+  expect_no_err .
+  RUNNERCTL_STUB_CGROUP_READABLE=1 run kill 0
+  expect_rc 0
+  expect_no_out 'waiting|heartbeat'
+  expect_log_count '^probe:pause 5$' 2
+}
+
+# Acceptance (b): under --heartbeat=N a --when-idle wait — and so `drain` —
+# says `waiting for` at least every min(60, N) s and never pauses longer than
+# that. slot-1 is busy for 6 polls (30 s at POLL_SEC=5): N=10 keeps the 5 s
+# polls and says it at 0, 10 and 20 s (three lines, where 60 s would say one);
+# N=3 cuts the polls to 3 s and says it before each. The stop that follows is
+# a phase of its own, with its own ticker. The cadence is min(60, N): N=120
+# is the 60 s it always was.
+case_ghr149_wait_idle_and_drain_say_so_at_most_n_apart() {
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_BUSY_POLLS=6 run --heartbeat=10 drain
+  expect_rc 0
+  expect_out_count '^waiting for example\.slot-1 ' 3
+  expect_log_count '^probe:pause 5$' 6
+  expect_no_log '^probe:pause [^5]'
+  expect_one_record "drain all by $ME — ok"
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_BUSY_POLLS=6 RUNNERCTL_STUB_SYSTEMCTL_SECS="7:^systemctl stop $U1\$" run --heartbeat=3 drain
+  expect_rc 0
+  expect_text "drain under --heartbeat=3" "waiting for example.slot-1 (my-app:test, 12m) …
+waiting for example.slot-1 (my-app:test, 12m) …
+waiting for example.slot-1 (my-app:test, 12m) …
+waiting for example.slot-1 (my-app:test, 12m) …
+waiting for example.slot-1 (my-app:test, 12m) …
+waiting for example.slot-1 (my-app:test, 12m) …
+heartbeat: systemctl stop $U1 (3s)
+heartbeat: systemctl stop $U1 (6s)
+stop done." "$OUT"
+  expect_log_count '^probe:pause 3$' 6
+  expect_no_log '^probe:pause [^3]'
+  expect_hb_gaps "systemctl stop $U1" 3 7
+  expect_log_order '^probe:hold 7 from 18$' '^probe:hold_end 25$' "^systemctl stop $U2\$" "^systemctl stop $U3\$"
+  expect_one_record "drain all by $ME — ok"
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_BUSY_POLLS=30 run --heartbeat=120 drain
+  expect_rc 0
+  expect_out_count '^waiting for example\.slot-1 ' 3
+  expect_log_count '^probe:pause 5$' 30
+  # kill's wait after its SIGKILL: the job outlives KILL_GRACE_SEC (10 s), so
+  # under --heartbeat=3 it polls every 3 s and says so at 3, 6 and 9 s.
+  RUNNERCTL_STUB_CGROUP_READABLE=1 run --heartbeat=3 kill 0
+  expect_rc 0
+  expect_text "kill under --heartbeat=3" "example.slot-1: waiting for the job to end after SIGKILL (3s) …
+example.slot-1: waiting for the job to end after SIGKILL (6s) …
+example.slot-1: waiting for the job to end after SIGKILL (9s) …
+example.slot-1: job still running 12s after SIGKILL — the runner is wedged too — killing the whole unit
+example.slot-1: SIGKILLed the unit's cgroup — Restart=always brings the slot back" "$OUT"
+  expect_log_count '^probe:pause 3$' 4
+}
+
+# Acceptance (c): a malformed value is refused before anything is done —
+# not a number, zero, a leading zero, past 3600, a fraction, no value — and a
+# second --heartbeat is the unknown command it always was.
+case_ghr149_a_malformed_heartbeat_is_refused() {
+  local v
+  for v in abc 0 05 3601 1.5 -3 ''; do
+    run "--heartbeat=$v" restart 0
+    expect_rc 1
+    expect_err "^runnerctl: --heartbeat needs whole seconds, 1 to 3600 \\(got '$v'\\)\$"
+    expect_no_out .
+    expect_no_log .
+  done
+  run --heartbeat
+  expect_rc 1
+  expect_err '^runnerctl: --heartbeat needs a value$'
+  run --heartbeat=5 --heartbeat=5 restart 0
+  expect_rc 1
+  expect_err "^runnerctl: unknown command '--heartbeat' "
+  expect_no_log .
+  # the edges are taken
+  run --heartbeat=1 version
+  expect_rc 0
+  run --heartbeat=3600 restart 0
+  expect_rc 0
+  expect_out '^restart done\.$'
+}
+
+# Acceptance (d): the ticker's lines go through the GHR-91 relays (every case
+# above is a guarded command), and a reader that goes away costs it nothing.
+# The reader is cut before the restart acts, so both heartbeats and `restart
+# done.` meet a closed reader: the ticker still prints every line it owes (the
+# hold never gave up waiting for it), the restart ends 0 and the record says it
+# ran to the end. A drain cut after its first line keeps going the same way,
+# through its waits and the heartbeat of its first stop. A ticker left behind
+# would hold the relay's pipe open and the run would sit out RUN_TIMEOUT (124).
+case_ghr149_heartbeats_survive_the_relays_and_a_cut_reader() {
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_SYSTEMCTL_SECS="$GHR149_RESTART" RUNNERCTL_STUB_CUT_ON="^systemctl restart $U1\$" \
+    run_cut 0 --heartbeat=5 restart 0
+  expect_rc 0
+  expect_text "restart, reader cut" "" "$OUT"
+  expect_log_order '^probe:cut_seen on$' '^probe:hold 12 from 0$' '^probe:hold_end 12$'
+  expect_no_log '^probe:hold_(no_ticker|gave_up)'
+  expect_one_record "restart example\\.slot-1 by $ME — ok \\(caller gone, ran to the end\\)"
+  expect_no_err .
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_BUSY_POLLS=6 RUNNERCTL_STUB_SYSTEMCTL_SECS="7:^systemctl stop $U1\$" RUNNERCTL_STUB_CUT_AT=1 \
+    run_cut 1 --heartbeat=3 drain
+  expect_rc 0
+  expect_out_count '^waiting for example\.slot-1 ' 1
+  expect_log_order '^probe:cut_seen 1$' '^probe:hold 7 from 18$' '^probe:hold_end 25$' "^systemctl stop $U2\$" "^systemctl stop $U3\$"
+  expect_no_log '^probe:hold_(no_ticker|gave_up)'
+  expect_one_record "drain all by $ME — ok \\(caller gone, ran to the end\\)"
+  expect_no_err .
+}
+
+# Composition with GHR-119: a TERM while a ticker runs still records
+# `interrupted (SIGTERM)` once and kills the process BY the signal — the
+# ticker is stopped on that way out and changes neither. The pid alone is
+# signalled, so the trap runs once the blocked call's 2 s are over.
+case_ghr149_a_signal_mid_call_still_interrupts_and_records() {
+  if ! $HAVE_PERL; then
+    skip "GHR-149: no perl, so no waitpid to tell death by signal from an exit"
+    run --heartbeat=5 restart 0
+    expect_rc 0
+    return 0
+  fi
+  RUNNERCTL_STUB_BLOCK_SECS=2 run_signalled TERM pid "^systemctl restart $U1\$" --heartbeat=1 restart 0
+  expect_rc 143
+  expect_signalled 15
+  expect_one_record "restart example\\.slot-1 by $ME — interrupted \\(SIGTERM\\)"
+  expect_no_out .
+}
+
+# upgrade's download (fetch_script, which install shares) runs with a ticker:
+# a download that takes 5 s of the clock says so at 2 and 4 s under
+# --heartbeat=2, then goes on exactly as before; without the flag it says
+# nothing more than it did.
+# shellcheck disable=SC2016  # the snippet's child expands it
+GHR149_DL='curl() { stub_hb_hold 5; cat "$RUNNERCTL_SELF" >"${*: -1}"; }; RUNNERCTL_SELF=./runnerctl'
+case_ghr149_upgrades_download_has_a_heartbeat() {
+  mkdir -p "$WRITES"
+  # shellcheck disable=SC2016  # the snippet's child expands it
+  RUNNERCTL_STUB_CLOCK=1 run_snippet "$STUB" "$GHR149_DL"'; HEARTBEAT=2; fetch_script https://example.invalid/runnerctl "$RUNNERCTL_TEST_WRITES/dl"'
+  expect_rc 0
+  expect_text "download under --heartbeat=2" "heartbeat: download runnerctl (2s)
+heartbeat: download runnerctl (4s)
+not verified: https://example.invalid/runnerctl is not a release asset, so no digest is published for it (pass --sha256 SUM to pin one)" "$OUT"
+  expect_hb_gaps "download runnerctl" 2 5
+  expect_no_log '^probe:hold_(no_ticker|gave_up)'
+  # shellcheck disable=SC2016  # the snippet's child expands it
+  RUNNERCTL_STUB_CLOCK=1 run_snippet "$STUB" "$GHR149_DL"'; fetch_script https://example.invalid/runnerctl "$RUNNERCTL_TEST_WRITES/dl"'
+  expect_rc 0
+  expect_text "download without the flag" "not verified: https://example.invalid/runnerctl is not a release asset, so no digest is published for it (pass --sha256 SUM to pin one)" "$OUT"
+  expect_log '^probe:hold_no_ticker$'
+}
+
+t "GHR-149: a long restart prints a heartbeat at most N s apart"                  case_ghr149_a_long_restart_prints_a_heartbeat_at_most_n_apart
+t "GHR-149: without --heartbeat the output is unchanged, byte for byte"           case_ghr149_without_the_flag_the_output_is_unchanged
+t "GHR-149: wait_idle, drain and kill's wait say so at most N s apart"            case_ghr149_wait_idle_and_drain_say_so_at_most_n_apart
+t "GHR-149: a malformed --heartbeat is refused before anything is done"           case_ghr149_a_malformed_heartbeat_is_refused
+t "GHR-149: heartbeats survive the GHR-91 relays and a cut reader"                case_ghr149_heartbeats_survive_the_relays_and_a_cut_reader
+t "GHR-149: a signal mid-call still interrupts and records (GHR-119)"             case_ghr149_a_signal_mid_call_still_interrupts_and_records
+t "GHR-149: upgrade's download has a heartbeat"                                   case_ghr149_upgrades_download_has_a_heartbeat
+
 # --- Summary ------------------------------------------------------------------
 echo
 echo "sim:$npass ok, $nxfail xfail (${XFAIL_KEYS# }), $nfail failed"
