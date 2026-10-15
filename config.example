@@ -179,6 +179,16 @@
 # slot on the host.
 #FLEET_MUTATE_TIMEOUT="900"
 
+# A host whose runnerctl takes --heartbeat is not held to that total: such a
+# call is cut once the host has printed no line for FLEET_MUTATE_IDLE seconds
+# (it is asked for one at least every FLEET_MUTATE_IDLE/4 s; 0 = off, every
+# host on FLEET_MUTATE_TIMEOUT), and a call that keeps printing is cut at
+# FLEET_MUTATE_MAX seconds, or at the total above where that is longer. An
+# older host is on FLEET_MUTATE_TIMEOUT as before. IDLE: 0 or 10 and up;
+# MAX: more than IDLE.
+#FLEET_MUTATE_IDLE="120"
+#FLEET_MUTATE_MAX="7200"
+
 # The remote command, for hosts where runnerctl is not on the ssh user's PATH.
 #FLEET_RUNNERCTL="runnerctl"
 

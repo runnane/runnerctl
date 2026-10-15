@@ -4004,8 +4004,13 @@ case_fleet_drain_outlasts_the_read_only_budget() {
 # known": `timeout` kills the local ssh, and the remote carries on. The budget
 # in the message is the one the call was actually given, and it is exactly
 # FLEET_MUTATE_TIMEOUT — one second less and the call completes.
+#
+# GHR-150: only a host that refuses --heartbeat is still on this total, so
+# the GHR-81 budget cases run against such hosts (RUNNERCTL_STUB_FLEET_NOHB).
+GHR150_OLD_HOSTS="build-1 build-2"
 case_fleet_mutating_timeout_says_it_may_still_be_running() {
   local cfg="$TMP/ghr81.config"
+  local -x RUNNERCTL_STUB_FLEET_NOHB="$GHR150_OLD_HOSTS"
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" RUNNERCTL_STUB_FLEET_DELAY="build-1:900:restart" \
     run fleet restart
   expect_rc 1
@@ -4037,6 +4042,7 @@ case_fleet_mutating_timeout_says_it_may_still_be_running() {
 # budget is the host's slot count times the wait, plus the action's own
 # budget. The stub's hosts have three slots: 3 x 60 + 900 = 1080.
 case_fleet_when_idle_budget_is_the_wait_per_slot_plus_the_action() {
+  local -x RUNNERCTL_STUB_FLEET_NOHB="$GHR150_OLD_HOSTS"
   RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_FLEET_DELAY="build-1:1079:restart" \
     run fleet restart --when-idle --timeout 60
   expect_rc 0
@@ -4089,6 +4095,7 @@ case_fleet_mutate_budget_arithmetic() {
 # The budget walk makes one remote call per SLOT, so each gets one slot's
 # budget — and the status re-reads between them stay on FLEET_TIMEOUT.
 case_fleet_budget_walk_gives_each_slot_the_mutating_budget() {
+  local -x RUNNERCTL_STUB_FLEET_NOHB="$GHR150_OLD_HOSTS"
   RUNNERCTL_STUB_FLEET_SLOTS=2 RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" \
     RUNNERCTL_STUB_FLEET_DELAY="build-1:45:restart" run fleet restart --max-unavailable 1
   expect_rc 0
@@ -4134,6 +4141,7 @@ case_fleet_budget_walk_gives_each_slot_the_mutating_budget() {
 # `fleet watch`'s action keys, `fleet upgrade` and `fleet health
 # --restart-stalled` are the other mutating callers of ssh_run.
 case_fleet_other_mutating_callers_are_on_the_mutating_budget() {
+  local -x RUNNERCTL_STUB_FLEET_NOHB="$GHR150_OLD_HOSTS"
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jRy-q' RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
     RUNNERCTL_STUB_FLEET_DELAY="build-1:45:restart" run fleet watch --color never
   expect_rc 0
@@ -13876,7 +13884,10 @@ arg=restart example.slot-2 by $ME via fleet from alice@central-1 — ok" "$(cat 
 }
 
 # Acceptance: a fleet action carries the origin, and a host too old for it
-# still acts — asked again without it, once, and remembered.
+# still acts — asked again without it, once, and remembered. GHR-150: such a
+# host predates --heartbeat too, so it refuses that on the retry and is asked
+# a third time, with neither (each word refused once per run; the heartbeat
+# rode on the first call too, which the origin's refusal ended first).
 case_ghr88_fleet_carries_the_origin_and_older_hosts_still_act() {
   RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-preorigin" run fleet restart
   expect_rc 0
@@ -13886,27 +13897,29 @@ case_ghr88_fleet_carries_the_origin_and_older_hosts_still_act() {
   expect_log_count "^probe:ssh_origin build-1 $GHR88_ORIGIN\$" 1
   expect_log_count "^probe:ssh_origin gw-preorigin $GHR88_ORIGIN\$" 1
   expect_log_count '^probe:ssh_run build-1 -- runnerctl restart$' 1
-  expect_log_count '^probe:ssh_run gw-preorigin -- runnerctl restart$' 2
+  expect_log_count '^probe:ssh_run gw-preorigin -- runnerctl restart$' 3
   expect_log_order "^probe:ssh_origin gw-preorigin " '^probe:ssh_run gw-preorigin -- runnerctl restart$' \
+                   '^probe:ssh_heartbeat gw-preorigin ' '^probe:ssh_run gw-preorigin -- runnerctl restart$' \
                    '^probe:ssh_run gw-preorigin -- runnerctl restart$'
+  expect_log_count '^probe:ssh_heartbeat gw-preorigin ' 2
   # FLEET_SUDO=1: the origin after `sudo -n runnerctl`, before the verb
   RUNNERCTL_STUB_FLEET_SUDO=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-preorigin" run fleet restart
   expect_rc 0
   expect_log_count "^probe:ssh_origin build-1 $GHR88_ORIGIN\$" 1
-  expect_log_count '^probe:ssh_run gw-preorigin -- sudo -n runnerctl restart$' 2
+  expect_log_count '^probe:ssh_run gw-preorigin -- sudo -n runnerctl restart$' 3
   # a budget walk: per slot, and the older host asked with it only once
   RUNNERCTL_STUB_FLEET_SLOTS=2 RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-preorigin" run fleet restart --max-unavailable 1
   expect_rc 0
   expect_out '^fleet restart: 4 slot\(s\) done, 0 failed$'
   expect_log_count "^probe:ssh_origin build-1 $GHR88_ORIGIN\$" 2
   expect_log_count "^probe:ssh_origin gw-preorigin $GHR88_ORIGIN\$" 1
-  expect_log_count '^probe:ssh_run gw-preorigin -- runnerctl restart [01]$' 3
+  expect_log_count '^probe:ssh_run gw-preorigin -- runnerctl restart [01]$' 4
   # a fleet watch key
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='jRy-q' RUNNERCTL_STUB_FLEET_HOSTS="gw-preorigin" run fleet watch --color never
   expect_rc 0
   expect_out '^example\.slot-2 on gw-preorigin: restart done\.$'
   expect_log_count "^probe:ssh_origin gw-preorigin $GHR88_ORIGIN\$" 1
-  expect_log_count '^probe:ssh_run gw-preorigin -- runnerctl restart example\.slot-2$' 2
+  expect_log_count '^probe:ssh_run gw-preorigin -- runnerctl restart example\.slot-2$' 3
   # upgrade, and health --restart-stalled, whose remote runs real code and so
   # records the claim it was handed
   RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" run fleet upgrade
@@ -15153,6 +15166,7 @@ case_ghr125_progress_line_is_relayed() {
 # takes 45 s — past FLEET_WATCH_TIMEOUT's 10 — completes, and one that
 # outlasts FLEET_MUTATE_TIMEOUT is a notice in GHR-81's words, recorded 124.
 case_ghr125_a_background_action_is_on_the_mutating_budget() {
+  local -x RUNNERCTL_STUB_FLEET_NOHB="$GHR150_OLD_HOSTS"
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_DELAY="build-1:45:restart" RUNNERCTL_STUB_KEYS='Ry-q' \
     RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
   expect_rc 0
@@ -15315,6 +15329,7 @@ case_ghr126_w_runs_in_the_background() {
 # abrupt call's FLEET_MUTATE_TIMEOUT (900) and is a timeout for y, but w gets
 # WAIT_TIMEOUT (1800) on top and completes.
 case_ghr126_w_is_on_the_when_idle_budget() {
+  local -x RUNNERCTL_STUB_FLEET_NOHB="$GHR150_OLD_HOSTS"
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_DELAY="build-1:1500:restart" RUNNERCTL_STUB_KEYS='Ry-q' \
     RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet watch --color never
   expect_rc 0
@@ -17277,6 +17292,176 @@ t "GHR-149: heartbeats survive the GHR-91 relays and a cut reader"              
 t "GHR-149: a signal mid-call still interrupts and records (GHR-119)"             case_ghr149_a_signal_mid_call_still_interrupts_and_records
 t "GHR-149: a ticker stopped mid-\$(…) leaves nothing on stderr (SIGPIPE ignored)" case_ghr149_a_stopped_ticker_leaves_nothing_on_stderr
 t "GHR-149: upgrade's download has a heartbeat"                                  case_ghr149_upgrades_download_has_a_heartbeat
+
+# --- GHR-150: a host that heartbeats is cut on silence, under a ceiling ----------
+# Every mutating call asks for --heartbeat=IDLE/4. A host that takes it is cut
+# once it has printed nothing for FLEET_MUTATE_IDLE seconds, and at
+# FLEET_MUTATE_MAX however much it prints; a host that refuses it is on
+# GHR-81's total, as before. Small limits keep the stub clock's timelines
+# short: a total of 30 s, an IDLE of 12 (so --heartbeat=3, and the timelines
+# print every 2 s — N-1), a MAX of 60. Each call is answered by a timeline on
+# the stub clock (RUNNERCTL_STUB_FLEET_LINES, tests/stub.config), so where a
+# cut lands is read from the clock and the log, never from wall time:
+#   LIVE    a line every 2 s for 50 s — past the 30 s total — then done;
+#   QUIET   lines up to 10 s, then nothing: cut at 22 (10 + IDLE);
+#   FOREVER a line every 2 s for 200 s: cut at the 60 s ceiling.
+GHR150_CFG="$TMP/ghr150.config"
+GHR150_LIVE='build-1:2:50:50:restart'
+GHR150_QUIET='build-1:2:10:50:restart'
+GHR150_FOREVER='build-1:2:200:200:restart'
+GHR150_STILL="the command may still be running on that host; 'runnerctl fleet status --host build-1' shows where it got to"
+GHR150_IDLE_TEXT="timed out — no line from it for 12s \\(FLEET_MUTATE_IDLE\\) — $GHR150_STILL"
+GHR150_MAX_TEXT="timed out after 60s, the FLEET_MUTATE_MAX ceiling — $GHR150_STILL"
+ghr150_config() {
+  save_config "$GHR150_CFG" <<'CFG'
+FLEET_MUTATE_TIMEOUT=30
+FLEET_MUTATE_IDLE=12
+FLEET_MUTATE_MAX=60
+CFG
+}
+# The stub clock's seconds since the run began.
+ghr150_clock() { cat "$LOG.clock" 2>/dev/null || echo 0; }
+
+# (1), (2) and (4) on the streamed fan-out — `fleet restart`.
+case_ghr150_fanout_cuts_on_silence_under_a_ceiling() {
+  ghr150_config
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_LINES="$GHR150_LIVE" RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run_cfg "$GHR150_CFG" fleet restart
+  expect_rc 0
+  expect_log_count '^probe:ssh_heartbeat build-1 3$' 1
+  expect_log '^probe:timeline build-1 every=2 last=50 end=50 budget=60$'
+  expect_log '^probe:timeline_end build-1 50$'
+  expect_out '^build-1: restart done\.$'
+  expect_out '^fleet restart: 1 host\(s\) ok, 0 failed$'
+  # a heartbeat is a sign of life, not output
+  expect_no_out 'heartbeat'
+  expect_no_out 'timed out'
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_LINES="$GHR150_QUIET" RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run_cfg "$GHR150_CFG" fleet restart
+  expect_rc 1
+  expect_out "^build-1: $GHR150_IDLE_TEXT\$"
+  expect_out '^fleet restart: 0 host\(s\) ok, 1 failed$'
+  expect_text "the clock at the cut" 22 "$(ghr150_clock)"
+  expect_no_log '^probe:timeline_(end|timeout) '
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_LINES="$GHR150_FOREVER" RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run_cfg "$GHR150_CFG" fleet restart
+  expect_rc 1
+  expect_out "^build-1: $GHR150_MAX_TEXT\$"
+  expect_log '^probe:timeline_timeout build-1 60$'
+  expect_text "the clock at the ceiling" 60 "$(ghr150_clock)"
+  expect_cfg "$WRITES/fleet.log" ' — build-1=124$'
+}
+
+# (3): a host whose runnerctl predates the flag refuses it, is asked once more
+# without it, and is on GHR-81's total — the same timeline that a capable host
+# beside it in the same run finishes is cut at 30 s, in GHR-81's words. A
+# budget walk asks it once per run, though it makes two slot calls.
+case_ghr150_an_older_host_stays_on_the_total_budget() {
+  ghr150_config
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_LINES="$GHR150_LIVE gw-preheartbeat:2:50:50:restart" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-preheartbeat" run_cfg "$GHR150_CFG" fleet restart
+  expect_rc 1
+  expect_out '^build-1: restart done\.$'
+  expect_out "^gw-preheartbeat: timed out after 30s — the command may still be running on that host; 'runnerctl fleet status --host gw-preheartbeat' shows where it got to\$"
+  expect_no_out 'FLEET_MUTATE_(IDLE|MAX)'
+  expect_log_count '^probe:ssh_heartbeat gw-preheartbeat 3$' 1
+  expect_log_count '^probe:ssh_run gw-preheartbeat -- runnerctl restart$' 2
+  expect_log_order '^probe:ssh_heartbeat gw-preheartbeat 3$' '^probe:ssh_run gw-preheartbeat -- runnerctl restart$' \
+                   '^probe:ssh_run gw-preheartbeat -- runnerctl restart$'
+  expect_no_log '^probe:timeline gw-preheartbeat '
+  RUNNERCTL_STUB_FLEET_SLOTS=2 RUNNERCTL_STUB_FLEET_HOSTS="gw-preheartbeat" \
+    run_cfg "$GHR150_CFG" fleet restart --max-unavailable 1
+  expect_rc 0
+  expect_out '^fleet restart: 2 slot\(s\) done, 0 failed$'
+  expect_log_count '^probe:ssh_heartbeat gw-preheartbeat ' 1
+  expect_log_count '^probe:ssh_run gw-preheartbeat -- runnerctl restart [01]$' 3
+}
+
+# (5): the budget walk's slot calls, streamed one slot at a time.
+case_ghr150_the_budget_walk_cuts_on_silence_under_a_ceiling() {
+  ghr150_config
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_SLOTS=1 RUNNERCTL_STUB_FLEET_LINES="$GHR150_LIVE" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet restart --max-unavailable 1
+  expect_rc 0
+  expect_out '^build-1 slot 0: restart done\.$'
+  expect_out '^build-1 slot 0: restart ok$'
+  expect_log '^probe:timeline_end build-1 50$'
+  expect_no_out 'heartbeat'
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_SLOTS=1 RUNNERCTL_STUB_FLEET_LINES="$GHR150_QUIET" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet restart --max-unavailable 1
+  expect_rc 1
+  expect_out "^build-1 slot 0: restart FAILED \\($GHR150_IDLE_TEXT\\)\$"
+  expect_text "the clock at the cut" 22 "$(ghr150_clock)"
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_SLOTS=1 RUNNERCTL_STUB_FLEET_LINES="$GHR150_FOREVER" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet restart --max-unavailable 1
+  expect_rc 1
+  expect_out "^build-1 slot 0: restart FAILED \\($GHR150_MAX_TEXT\\)\$"
+  expect_log '^probe:timeline_timeout build-1 60$'
+}
+
+# (5): `fleet watch`'s background action (GHR-125), buffered rather than
+# streamed — its notice in the same words, its FLEET_LOG line 124. And an
+# older host is asked once per watch session, though two keys act on it.
+case_ghr150_a_watch_action_cuts_on_silence_under_a_ceiling() {
+  ghr150_config
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_LINES="$GHR150_LIVE" RUNNERCTL_STUB_KEYS='Ry-q' \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet watch --color never
+  expect_rc 0
+  expect_out_count "^${GHR125_DONE}\$" 2
+  expect_log '^probe:timeline_end build-1 50$'
+  expect_no_out 'timed out|heartbeat:'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_LINES="$GHR150_QUIET" RUNNERCTL_STUB_KEYS='Ry-q' \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet watch --color never
+  expect_rc 0
+  expect_out "^example\\.slot-1 on build-1: restart failed — $GHR150_IDLE_TEXT\$"
+  expect_cfg "$WRITES/fleet.log" "${GHR125_LOG}124\$"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_LINES="$GHR150_FOREVER" RUNNERCTL_STUB_KEYS='Ry-q' \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet watch --color never
+  expect_rc 0
+  expect_out "^example\\.slot-1 on build-1: restart failed — $GHR150_MAX_TEXT\$"
+  expect_log '^probe:timeline_timeout build-1 60$'
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS='Ry-jRy-q' RUNNERCTL_STUB_FLEET_HOSTS="gw-preheartbeat" \
+    run_cfg "$GHR150_CFG" fleet watch --color never
+  expect_rc 0
+  expect_out '^example\.slot-1 on gw-preheartbeat: restart done\.$'
+  expect_out '^example\.slot-2 on gw-preheartbeat: restart done\.$'
+  expect_log_count '^probe:ssh_heartbeat gw-preheartbeat ' 1
+  expect_log_count '^probe:ssh_run gw-preheartbeat -- runnerctl restart example\.slot-[12]$' 3
+}
+
+# The two settings are validated before anything is dialled.
+case_ghr150_the_limits_are_validated() {
+  local cfg="$TMP/ghr150-bad.config" v
+  for v in 'FLEET_MUTATE_IDLE=9' 'FLEET_MUTATE_IDLE=2m' 'FLEET_MUTATE_IDLE=-1'; do
+    save_config "$cfg" <<<"$v"
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$cfg" fleet restart
+    expect_rc 1
+    expect_err "FLEET_MUTATE_IDLE '${v#*=}' set in .* is invalid — want 0 \\(off\\) or a whole number of seconds, 10 or more"
+    expect_no_log '^probe:ssh_run '
+  done
+  printf 'FLEET_MUTATE_IDLE=120\nFLEET_MUTATE_MAX=120\n' | save_config "$cfg"
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$cfg" fleet restart
+  expect_rc 1
+  expect_err "FLEET_MUTATE_MAX '120' set in .* is invalid — want a whole number of seconds, more than FLEET_MUTATE_IDLE \\(120\\)"
+  expect_no_log '^probe:ssh_run '
+  # 0 turns it off: no heartbeat asked for, every host on the total
+  save_config "$cfg" <<<'FLEET_MUTATE_IDLE=0'
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_FLEET_DELAY="build-1:900:restart" run_cfg "$cfg" fleet restart
+  expect_rc 1
+  expect_out "^build-1: timed out after 900s — $GHR150_STILL\$"
+  expect_no_log '^probe:ssh_heartbeat '
+  # the defaults: 120 s, so --heartbeat=30, and a 7200 s ceiling
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run fleet restart
+  expect_rc 0
+  expect_log_count '^probe:ssh_heartbeat build-1 30$' 1
+  rm -f "$cfg"
+}
+
+t "GHR-150: the fan-out cuts on silence, under a ceiling"                         case_ghr150_fanout_cuts_on_silence_under_a_ceiling
+t "GHR-150: an older host stays on GHR-81's total, asked once per run"            case_ghr150_an_older_host_stays_on_the_total_budget
+t "GHR-150: the budget walk cuts on silence, under a ceiling"                     case_ghr150_the_budget_walk_cuts_on_silence_under_a_ceiling
+t "GHR-150: a watch action cuts on silence, under a ceiling"                      case_ghr150_a_watch_action_cuts_on_silence_under_a_ceiling
+t "GHR-150: FLEET_MUTATE_IDLE and FLEET_MUTATE_MAX are validated"                 case_ghr150_the_limits_are_validated
 
 # --- Summary ------------------------------------------------------------------
 echo

@@ -502,6 +502,31 @@ Traps:
     behaviour. It ignores PIPE itself and makes the kill land inside the
     `"$(…)"` every time, using files to order the steps rather than
     timing.
+- **A mutating fleet call now carries `--heartbeat=N` and runs on a watchdog
+  (GHR-150).** The stub takes `--heartbeat=…` off beside `--origin=…` and logs
+  `probe:ssh_heartbeat HOST N` on its own line, so pinned `probe:ssh_run`
+  lines read as before. A `*preheartbeat*` host refuses it (exit 1, nothing
+  done), and so does a `*preorigin*` one on its retry, so a preorigin host
+  costs one more `probe:ssh_run` than it used to. A host that takes the flag
+  is no longer on GHR-81's total: a `RUNNERCTL_STUB_FLEET_DELAY` past
+  `FLEET_MUTATE_TIMEOUT` on such a host COMPLETES (it is only silence, and
+  the instant model holds it to `FLEET_MUTATE_MAX`). A case about the total
+  budget names its hosts in `RUNNERCTL_STUB_FLEET_NOHB="host…"`, which makes
+  them refuse the flag — the GHR-81 cases do.
+  - A call on the watchdog is answered by a TIMELINE when
+    `RUNNERCTL_STUB_CLOCK=1`: `RUNNERCTL_STUB_FLEET_LINES="host:EVERY:LAST:END[:SUB-ERE]"`
+    prints a heartbeat line every EVERY s up to LAST and ends the call at END;
+    a delay on the same call is that many silent seconds. The timeline steps
+    the clock one second at a time and waits at each for the tap to stamp
+    its line and for the watchdog (its `fleet_idle_wait` hook) to have looked,
+    so a cut lands on the exact second: assert it with `$LOG.clock`.
+    `timeout` is modelled at the call's budget (`probe:timeline_timeout`).
+  - Without the clock a timeline is GHR-81's instant model (124 at once when
+    END reaches the budget), and a call with no timeline is never cut: its
+    watchdog's hook waits for steps that never come, until the call ends.
+  - `probe:timeline_gave_up T` means no watchdog looked at second T (a
+    mutant that dropped it), `probe:timeline_unseen T` that no tap stamped the
+    line printed then.
 - **`relay_safe` clobbers `BASH_REMATCH`** (it matches regexes of its own).
   Take every capture you need into a variable BEFORE calling it — the first
   `history` parser read the time after relaying the message and died
