@@ -4532,8 +4532,11 @@ WATCH_HELP="watch — keys
           act on the slot
   K R S T P L   kill job, restart, stop, start, reap, logs; each asks to confirm
   O     print the run URL of the cursor's job — nothing is opened
-  q ?   quit, this list; any key closes it (and is spent doing so)"
+  q ?   quit, this list; any key but ↑ ↓ PgUp PgDn g G closes it (and is spent)"
 WATCH_HELP_ON=false
+# GHR-99: under either list. The keys scroll it where the terminal cuts it —
+# the window is VIEW_TOP, as in a pane — and every other key closes it.
+HELP_FOOT="scroll: ↑ ↓ PgUp PgDn g G · any other key closes this list"
 
 # The cursor row: reverse video over the whole line, re-applied after every
 # reset a painted cell ends with, so a coloured cell does not cut it short.
@@ -5326,8 +5329,12 @@ watch_handle_key() { # KEY UNITS...
     return 0
   fi
   WATCH_NOTICE=""
-  # GHR-105: any key closes the list, and is spent doing it.
-  if $WATCH_HELP_ON; then WATCH_HELP_ON=false; return 0; fi
+  # GHR-105: any key closes the list, and is spent doing it. GHR-99: but the
+  # keys of the marker on a list the terminal cuts scroll it instead.
+  if $WATCH_HELP_ON; then
+    pane_scroll "$key" || { WATCH_HELP_ON=false; pane_leave; }
+    return 0
+  fi
   # GHR-76: with the pane up every key is the pane's — `q` goes back to the
   # table rather than quitting, and no key moves a cursor nobody can see.
   if [ -n "$WATCH_PANE" ]; then watch_pane_key "$key"; return 0; fi
@@ -5354,7 +5361,7 @@ watch_handle_key() { # KEY UNITS...
     K|R|S|T|P|L|O) watch_key_action "$key" "$WATCH_CURSOR" ;;
     # GHR-76: the cursor's slot in full, in place of the table.
     enter) if [ -n "$WATCH_CURSOR" ]; then WATCH_PANE=slot; pane_enter; fi ;;
-    '?')   WATCH_HELP_ON=true ;;
+    '?')   WATCH_HELP_ON=true; pane_enter ;;
   esac
   return 0
 }
@@ -5422,7 +5429,7 @@ cmd_watch() { # [--interval N] [--iterations N] [--color WHEN] [--stall-after N]
     fi
     mapfile -t units < <(discover)
     if $WATCH_HELP_ON; then
-      viewport_draw "$header" "$WATCH_HELP" $'\n'"$(paint "$C_DIM" "any key closes this list")"$'\n' 0 0 0
+      viewport_draw "$header" "$WATCH_HELP" $'\n'"$(paint "$C_DIM" "$HELP_FOOT")"$'\n' 0 0 0
       if viewport_read_key "$interval"; then
         watch_handle_key "$KEY" "${units[@]}" || break
       else
@@ -12363,7 +12370,10 @@ fleet_watch_cmd_exec() { # read|mutate|refused
 # while the / text is being typed every key belongs to it.
 fleet_watch_handle_key() { # KEY
   local n="${#FW_ROWS[@]}"
-  if [ "$FW_MODE" = help ]; then FW_MODE=""; return 0; fi
+  if [ "$FW_MODE" = help ]; then
+    pane_scroll "$1" || { FW_MODE=""; pane_leave; }
+    return 0
+  fi
   if [ "$FW_MODE" = search ]; then fleet_watch_search_key "$1"; return 0; fi
   if [ -n "$FW_ACTION" ]; then
     FW_ACT_NOTICE=false
@@ -12429,7 +12439,7 @@ fleet_watch_handle_key() { # KEY
     c)     fleet_watch_fold_key c ;;
     enter) fleet_watch_enter ;;
     /)   FW_MODE=search FW_SEARCH_WAS="$FW_SEARCH" ;;
-    '?') FW_MODE=help ;;
+    '?') FW_MODE=help; pane_enter ;;
     # GHR-86: a fleet command, typed.
     :)   fleet_watch_cmd_key ;;
   esac
@@ -12621,7 +12631,7 @@ cmd_fleet_watch() { # [--interval N] [--iterations N] [--host H] [--color WHEN] 
       # the fetches go on behind it and the next draw shows what they brought.
       draw=false
       viewport_draw "$head"$'\n'"$summary" "$FLEET_WATCH_HELP" \
-        $'\n'"$FW_ACT_FOOT$(paint "$C_DIM" "any key closes this list")"$'\n' 0 0 0
+        $'\n'"$FW_ACT_FOOT$(paint "$C_DIM" "$HELP_FOOT")"$'\n' 0 0 0
     elif $draw && ! $launched; then
       draw=false
       fleet_watch_view "$frame"
