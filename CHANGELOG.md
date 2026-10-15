@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.25.1](https://github.com/runnane/runnerctl/compare/v0.25.0...v0.25.1) (2026-10-15)
+
+
+### Bug Fixes
+
+* a config write's write_as refusal advises a root-only config directory, and a config written as its owner says root will not load it (GHR-139) ([#152](https://github.com/runnane/runnerctl/issues/152)) ([eeae37d](https://github.com/runnane/runnerctl/commit/eeae37d045df5664363ec7adf86525a816349dd8))
+* a mutating call cut off by the ssh keepalive says the connection was lost and the host may have acted, not unreachable (GHR-138) ([#151](https://github.com/runnane/runnerctl/issues/151)) ([0c2f67a](https://github.com/runnane/runnerctl/commit/0c2f67ac47c4967fc636ac591c1ec8c04ad853a7))
+* fleet watch runs a confirmed : command in the background, holding every host it targets (GHR-144) ([#154](https://github.com/runnane/runnerctl/issues/154)) ([9c12ab0](https://github.com/runnane/runnerctl/commit/9c12ab0516173cb944c785a479c78dc5daf2c500))
+* fleet watch runs U's upgrade --check as a background read, so the view no longer freezes while the host downloads (GHR-136) ([#148](https://github.com/runnane/runnerctl/issues/148)) ([a9f965f](https://github.com/runnane/runnerctl/commit/a9f965f0b63d188a3819e005a6bc354c4aeefb6f))
+* fleet watch's legend states give way to their hints and keep ? keys, so every variant fits 80 columns (GHR-141) ([#153](https://github.com/runnane/runnerctl/issues/153)) ([a711b8d](https://github.com/runnane/runnerctl/commit/a711b8d289070eea304e31a2e8b528c769e7428b))
+* the rest of the mutating commands finish what they started when their caller goes (GHR-137) ([#150](https://github.com/runnane/runnerctl/issues/150)) ([023d4c4](https://github.com/runnane/runnerctl/commit/023d4c4434212247166ce4faa32f5ae0368c0cae))
+
 ## [0.25.0](https://github.com/runnane/runnerctl/compare/v0.24.0...v0.25.0) (2026-10-15)
 
 
