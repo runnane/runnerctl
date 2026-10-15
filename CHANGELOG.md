@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.23.0](https://github.com/runnane/runnerctl/compare/v0.22.0...v0.23.0) (2026-10-15)
+
+
+### Features
+
+* a host's drain, stop, restart, apply and scale run to the end when their caller goes, and fleet ssh drops a vanished host in about a minute (GHR-91) ([#126](https://github.com/runnane/runnerctl/issues/126)) ([b3b61e7](https://github.com/runnane/runnerctl/commit/b3b61e71d82dbe400fcb89807c4526ce1cfa0757))
+* fleet watch has a : prompt that runs any fleet command on the cursor's host, the marked rows' hosts or with % every watched host (GHR-86) ([#138](https://github.com/runnane/runnerctl/issues/138)) ([852ba67](https://github.com/runnane/runnerctl/commit/852ba67344f4d984152fe742c39b7cd4db975df7))
+* fleet watch marks rows with space or * (every row the view shows), and an action key then acts on the marked set after one confirm listing every target (GHR-129) ([#125](https://github.com/runnane/runnerctl/issues/125)) ([dc84176](https://github.com/runnane/runnerctl/commit/dc84176d21187c3f330e822409e944fd639b277f))
+* fleet watch's legend names ? keys, in a line of its own that fits 80 columns (GHR-98) ([#133](https://github.com/runnane/runnerctl/issues/133)) ([2daec29](https://github.com/runnane/runnerctl/commit/2daec29a68c2b985cc2531c3049dd3bea67655d3))
+* fleet watch's U upgrades the cursor's host after an upgrade --check, the confirm names FROM -&gt; TO, and the version is read back before it says upgraded (GHR-128) ([#123](https://github.com/runnane/runnerctl/issues/123)) ([1ba2851](https://github.com/runnane/runnerctl/commit/1ba2851f8fd7b54a740862d9a1d9bd97cf5f5da2))
+* watch has a ? key list naming Enter and O, and its legend points to it (GHR-105) ([#135](https://github.com/runnane/runnerctl/issues/135)) ([f5800fa](https://github.com/runnane/runnerctl/commit/f5800faddabb04b6f437049642c9775bf0a27fc1))
+
+
+### Bug Fixes
+
+* a command ended by SIGHUP or SIGPIPE while its record is armed records interrupted and still dies by the signal, except where caller_guard runs it to the end (GHR-131) ([#132](https://github.com/runnane/runnerctl/issues/132)) ([47e6308](https://github.com/runnane/runnerctl/commit/47e630825572bcfbe67cfb6802724b87cc8b68ab))
+* a config or env directory created under sudo gets an explicit mode, so root's umask cannot leave it 0700 (GHR-140) ([#134](https://github.com/runnane/runnerctl/issues/134)) ([7a760b9](https://github.com/runnane/runnerctl/commit/7a760b9aefb7d9906cf17844340e6afefb844cde))
+* a journal with no job line yet reads as no jobs, not as no journal access (GHR-65) ([#129](https://github.com/runnane/runnerctl/issues/129)) ([972127d](https://github.com/runnane/runnerctl/commit/972127ddd6e573313172e89cb5bfe712d1ead89f))
+* apply and scale --save write the config through write_as, so no run of root calls acts on names a user can swap (GHR-135) ([#128](https://github.com/runnane/runnerctl/issues/128)) ([7b50d13](https://github.com/runnane/runnerctl/commit/7b50d13f1a8e2525995a291f7a379fc34ee3f3a7))
+* apply writes a slot's drop-in directory 755 and its file 644, so root's umask cannot hide the profile from an unprivileged status (GHR-142) ([#137](https://github.com/runnane/runnerctl/issues/137)) ([2bbd53b](https://github.com/runnane/runnerctl/commit/2bbd53bdd560d0a620e035fed308b1b107e8ba6d))
+* cgroup walks read cgroup.procs in one go, so a process exiting mid-walk can no longer hide a live pid from reap, kill or the GHR-100 case (GHR-120) ([#136](https://github.com/runnane/runnerctl/issues/136)) ([0eb563f](https://github.com/runnane/runnerctl/commit/0eb563f0740939123be1aa31fb971bb2e340a970))
+* enable and disable take several targets, resolving all before acting on any (GHR-134) ([#127](https://github.com/runnane/runnerctl/issues/127)) ([35ea0d3](https://github.com/runnane/runnerctl/commit/35ea0d322172956ba20448990ee9b8e250bd89be))
+* fleet upgrade counts a host that only said Update available as still behind, not upgraded, and exits non-zero (GHR-97) ([#131](https://github.com/runnane/runnerctl/issues/131)) ([582d31c](https://github.com/runnane/runnerctl/commit/582d31cdbed3a679a1b5a79cc329003d62dd95a0))
+* the exit-trap wrapper parses trap exactly, so -p, --, - and '' forms keep the audit record (GHR-123) ([#130](https://github.com/runnane/runnerctl/issues/130)) ([3b71084](https://github.com/runnane/runnerctl/commit/3b7108447274563b84779c57fe64264034214de0))
+
 ## [0.22.0](https://github.com/runnane/runnerctl/compare/v0.21.0...v0.22.0) (2026-10-14)
 
 
