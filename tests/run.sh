@@ -7178,6 +7178,54 @@ case_ghr135_save_in_a_root_owned_directory_is_root_s_write_as_before() {
   expect_cfg "$c" "^  MEM_HIGH='29G'$"
 }
 
+# GHR-139: write_as's two messages on a config write. The refusal advises a
+# config under a root-only directory (not the binary's /usr/local/bin; the
+# install refusal in the GHR-117 case is the control that still does), and a
+# config written AS the directory's owner says so, because a later run as root
+# refuses to source it (config_trust_problem). A root-owned directory's write
+# prints no such note.
+case_ghr139_config_write_refusal_and_owner_notice() {
+  local d="$TMP/ghr139" ov="$TMP/ghr139.sh" u r c
+  rm -rf "$d"; mkdir -p "$d/shared" "$d/home/cfg" "$d/sys"
+  ghr117_overrides "$ov" "$d"
+  u="$(id -u)"; r="$(ere_quote "$d")"
+  c="$d/shared/config"
+  ghr135_config "$c" "$ov" </dev/null
+  # (a) --save into a world-writable directory.
+  GHR117_TABLE="$d/shared 0 777" RUNNERCTL_STUB_AS_ROOT=1 run_cfg "$c" apply --profile ci --high infinity --save
+  expect_rc 1
+  expect_err "\\(GHR-117\\)\\. Keep the config in a directory only root can write, such as /etc/runnerctl/, or run this as the user who owns $r/shared, without sudo\$"
+  expect_no_err '/usr/local/bin'
+  # (b) migrate's config write into the same directory.
+  GHR117_TABLE="$d/shared 0 777" RUNNERCTL_STUB_AS_ROOT=1 run_cfg "$c" migrate --from tests/fixtures/runnerctl-legacy --output "$d/shared/out"
+  expect_rc 1
+  expect_err "^runnerctl: refusing to write $r/shared/out as root: .*Keep the config in a directory only root can write, such as /etc/runnerctl/, or run this as the user who owns $r/shared, without sudo\$"
+  expect_no_err '/usr/local/bin'
+  # (c) migrate in a user's directory is written as that user, and says so.
+  local tbl="$d/home $u 755
+$d/home/cfg $u 755"
+  GHR117_TABLE="$tbl" RUNNERCTL_STUB_AS_ROOT=1 run_cfg "$c" migrate --from tests/fixtures/runnerctl-legacy --output "$d/home/cfg/out"
+  expect_rc 0
+  expect_out "^note: $r/home/cfg/out now belongs to [^ ]+, and a run as root \\(sudo\\) will refuse to source it — run runnerctl against it without sudo as [^ ]+, or keep the config in a root-owned directory such as /etc/runnerctl/ "
+  # (d) --save of a new config in a user's directory: same note.
+  local n="$d/home/cfg/new" nq
+  nq="$(ere_quote "$n")"
+  GHR117_TABLE="$tbl" RUNNERCTL_STUB_AS_ROOT=1 run_snippet "$n" \
+    "$(printf '. %q; PROFILE=ci; load_profile; MEM_HIGH=infinity; save_profile apply' "$ov")"
+  expect_rc 0
+  expect_out "^Created $nq with profile 'ci'\\.$"
+  expect_out "^note: $nq now belongs to [^ ]+, and a run as root "
+  # (e) control: a root-owned directory is root's write, no note.
+  RUNNERCTL_STUB_AS_ROOT=1 run_cfg "$c" migrate --from tests/fixtures/runnerctl-legacy --output "$d/sys/out"
+  expect_rc 0
+  expect_out "^Wrote $r/sys/out\$"
+  expect_no_out '^note: '
+  RUNNERCTL_STUB_AS_ROOT=1 run_snippet "$d/sys/new" \
+    "$(printf '. %q; PROFILE=ci; load_profile; MEM_HIGH=infinity; save_profile apply' "$ov")"
+  expect_rc 0
+  expect_no_out '^note: '
+}
+
 # --- compose-reap: compose stacks whose job is gone -----------------------------
 # The fixture in tests/stub.config holds one project per verdict path; these
 # pin each verdict, the removal order and scope, and the two refusals.
@@ -10545,6 +10593,7 @@ t "GHR-117: the real chain owner over /tmp"                              case_gh
 t "GHR-135: --save in a user's directory is written as that user"       case_ghr135_save_in_a_user_s_directory_is_written_as_that_user
 t "GHR-135: --save refuses a directory others can write, before a call" case_ghr135_save_refuses_a_directory_others_can_write
 t "GHR-135: --save in a root-owned directory is root's write, as before" case_ghr135_save_in_a_root_owned_directory_is_root_s_write_as_before
+t "GHR-139: a config write refusal advises a config, a user-owned one says so" case_ghr139_config_write_refusal_and_owner_notice
 t "GHR-140: created config and env directories are 755 under umask 077" case_ghr140_created_config_and_env_directories_are_755_under_umask_077
 t "GHR-142: apply makes the drop-in directory 755 and the file 644 under umask 077" case_ghr142_apply_makes_the_dropin_directory_755_and_the_file_644_under_umask_077
 
