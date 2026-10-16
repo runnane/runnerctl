@@ -4931,12 +4931,20 @@ term_lines() {
 # bookkeeping. Without a terminal on stdin the loop is view-only and this is
 # a plain `pause`, so a closed or redirected stdin cannot spin the redraw.
 # Behind a function so a test config can feed keys (RUNNERCTL_STUB_KEYS).
+#
+# GHR-167: into REPLY, with no `IFS=` on the read. Read into a name, a lone
+# space or tab would be stripped as IFS whitespace; REPLY keeps it whole, as
+# the prefix did. But the prefix is still in effect when bash runs a trap
+# from inside the read, which is where the watches take a signal: their
+# WINCH redraw, and an INT/TERM's `exit` with the EXIT cleanup after it.
+# There, with IFS empty, proc_ppid split nothing, and fleet_watch_reap left
+# every fetch running.
 tty_read_char() { # TIMEOUT
-  local rc=0
+  local rc=0 REPLY=""
   KEY_CHAR=""
   if [ -t 0 ]; then
-    IFS= read -rsn1 -t "$1" KEY_CHAR || rc=$?
-    [ "$rc" -ne 0 ] || return 0
+    read -rsn1 -t "$1" || rc=$?
+    [ "$rc" -ne 0 ] || { KEY_CHAR="$REPLY"; return 0; }
     [ "$rc" -le 128 ] || return 1 # timed out: the interval has elapsed
   fi
   pause "$1"
