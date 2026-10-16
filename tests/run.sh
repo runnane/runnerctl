@@ -9460,6 +9460,17 @@ _ghr74_expect_dead() { # PIDS
   done
   [ -z "$alive" ] || FAILS+=("still running after the watch exited:$alive")
 }
+# GHR-124: hung.pids names two different processes, the blocked call and the
+# fetch job above it. The line that wrote it once recorded the call's pid
+# twice, so the cleanup cases only ever checked one process.
+_ghr124_expect_two_pids() { # FILE
+  _expect
+  local a b
+  read -r a b <"$1" 2>/dev/null || true
+  if [ -z "$a" ] || [ -z "$b" ] || [ "$a" = "$b" ]; then
+    FAILS+=("$1 should hold the blocked call's pid and its fetch job's, two different ones: ${a:-?} ${b:-?}")
+  fi
+}
 _ghr74_expect_empty() { # DIR
   _expect
   local left
@@ -9540,6 +9551,7 @@ case_fleet_watch_exit_ends_its_fetches_and_removes_its_files() {
       RUNNERCTL_STUB_FLEET_HANG="slow-1" run fleet watch --color never
     expect_rc 0
     expect_cfg "$WRITES/remote/slow-1.hung.pids" '^[0-9]+ [0-9]+$'
+    _ghr124_expect_two_pids "$WRITES/remote/slow-1.hung.pids"
     _ghr74_expect_dead "$(cat "$WRITES/remote/slow-1.hung.pids" 2>/dev/null; true)"
     _ghr74_expect_empty "$d"
     expect_no_log '^probe:ssh_run_done slow-1$'
@@ -15363,6 +15375,7 @@ case_ghr80_stream_ends_cleanly_when_the_reader_goes() {
   expect_text "the stream's exit status after its reader went" 0 "$rc"
   expect_text "its stderr" "" "$ERR"
   expect_cfg "$WRITES/remote/slow-1.hung.pids" '^[0-9]+ [0-9]+$'
+  _ghr124_expect_two_pids "$WRITES/remote/slow-1.hung.pids"
   _ghr74_expect_dead "$(cat "$WRITES/remote/slow-1.hung.pids" 2>/dev/null; true)"
   _ghr74_expect_empty "$d"
   expect_log_order '^probe:ssh_control build-1 exit$' '^probe:ssh_control slow-1 exit$'
@@ -15391,6 +15404,7 @@ case_ghr80_stream_ends_cleanly_on_sigterm() {
   expect_text "the stream's exit status after SIGTERM" 0 "$rc"
   expect_text "its stderr" "" "$ERR"
   expect_cfg "$WRITES/remote/slow-1.hung.pids" '^[0-9]+ [0-9]+$'
+  _ghr124_expect_two_pids "$WRITES/remote/slow-1.hung.pids"
   _ghr74_expect_dead "$(cat "$WRITES/remote/slow-1.hung.pids" 2>/dev/null; true)"
   _ghr74_expect_empty "$d"
   expect_log_order '^probe:ssh_control build-1 exit$' '^probe:ssh_control slow-1 exit$'
