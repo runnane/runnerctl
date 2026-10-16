@@ -4255,10 +4255,20 @@ host_disk_rows() {
 # journal with exit 0), which exits 0 on an empty window too, and the search
 # itself is then allowed to "fail". Behind a function so a test config can
 # pin it.
+#
+# The search carries no `--system` (GHR-152, as GHR-148 did for the job-line
+# search). journald's default SplitMode=uid files a regular-user unit's
+# messages (uid >= 1000, the runner service itself) in user-<uid>.journal,
+# and `--system` opens only the system journal files, so a runner's own
+# "No space left on device" line was never reported. The kernel OOM lines are
+# still found: without `--system` the system journal is opened too. The probe
+# keeps `--system`, because without it a user outside systemd-journal gets
+# their own user journal and exit 0 — it could no longer tell no-access from
+# no-match.
 HOST_EVENTS_PATTERN='Out of memory: Kill(ed)? process|Memory cgroup out of memory|No space left on device'
 journal_host_events() { # SINCE-EPOCH
   journalctl --system -q --no-pager -n 1 >/dev/null 2>&1 || return 1
-  journalctl --system -q --no-pager -o short-unix --since "@$1" -g "$HOST_EVENTS_PATTERN" 2>/dev/null || true
+  journalctl -q --no-pager -o short-unix --since "@$1" -g "$HOST_EVENTS_PATTERN" 2>/dev/null || true
 }
 
 # journal_host_events, memoised under `watch` like journal_job_lines_cached:
