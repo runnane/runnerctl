@@ -233,18 +233,22 @@ Traps:
   ignores SIGHUP. Since GHR-137 the same is true of `upgrade` (and
   `--rollback`), `deprovision` (after its prompt), `kill`, `reap`,
   `enable`/`disable`, `remove-limits`, `env-init`, `compose-reap --apply` and
-  `health --restart-stalled`. `provision`, `install`, `migrate` and
-  `compose-reap-timer` are not guarded (GHR-153). That is why the GHR-131
-  HUP/PIPE cases signal `compose-reap-timer remove`, not env-init: a case
-  that wants an armed command which is not guarded has to pick one from that
-  list. So a cut reader or a hangup no longer ends them, and
+  `health --restart-stalled`, and since GHR-153 `provision`, `install`,
+  `migrate` and `compose-reap-timer install|remove` too — every command
+  that arms a record. So no command is left that is armed and not guarded,
+  and the GHR-131 HUP/PIPE cases arm a record directly instead
+  (`run_fn_signalled`: GHR-119's perl driver on a `RUNNERCTL_NO_MAIN=1`
+  bash whose body calls `audit_begin`, touches `$GHR131_FLAG` and sleeps
+  in the foreground for the signal to land in). A new case that wants the
+  unguarded rule uses that, not a command. So a cut reader or a hangup no longer ends them, and
   `exit_run` waits for the relays before it writes the record. A case that
   closes the reader part-way uses `run_cut N` with `RUNNERCTL_STUB_CUT_AT=K`.
   The reader keeps N lines, closes its end, and only then touches
   `$WRITES/.cut`. The stub's K-th `pause` waits for that file
   (`probe:cut_seen K`), so every later write meets a closed reader at a known
   point. A command that never pauses (env-init, `disable`, `remove-limits`,
-  `health --restart-stalled`, `compose-reap --apply`) is cut with
+  `health --restart-stalled`, `compose-reap --apply`, `provision`,
+  `compose-reap-timer install|remove`) is cut with
   `RUNNERCTL_STUB_CUT_ON=ERE` instead: the first `run_priv` or `compose_rm`
   line that matches waits the same way (`probe:cut_seen on`), after the
   call is logged and before it acts. N must be exactly the number of lines
@@ -252,7 +256,12 @@ Traps:
   guard meets the closed reader and ends the run unguarded. More, and the
   reader never closes and the wait gives up (`probe:cut_gave_up`). `upgrade`
   runs for real in `tests/upgrade-test.sh` (case 16), where a fake `mv`
-  first on PATH is the cut point. `RC` is the command's own status, not the
+  first on PATH is the cut point; `install` likewise in
+  `tests/install-test.sh` (case 16, the `bash FILE --origin=… --heartbeat=N
+  install` shape `fleet upgrade --push` runs) and `migrate` in
+  `tests/migrate-test.sh` (case 6, a fake `tee` at the config write). `compose-reap-timer
+  remove` prints nothing until its last line, so without the guard every
+  step still runs: its case is told apart by the record alone. `RC` is the command's own status, not the
   pipeline's. Without
   `RUNNERCTL_STUB_BUSY_POLLS`, the stub's slot-1 is busy for ever, so a
   `drain` case sits out the whole `WAIT_TIMEOUT` in polls. For a signal the

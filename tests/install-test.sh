@@ -281,4 +281,52 @@ RUNNERCTL_CONFIG="$tmp/dirkeep/etc/config" ./runnerctl install --prefix "$tmp/di
   || fail "existing-prefix install exited $? — $(cat "$tmp/out20")"
 [ "$(stat -c '%a' "$tmp/dirkeep/bin")" = 700 ] || fail "existing prefix mode was changed: $(stat -c '%a' "$tmp/dirkeep/bin")"
 
+# 16. GHR-153: an install whose caller goes finishes what it started. The
+#     shape is what `fleet upgrade --push` runs on a host (case 3b), with the
+#     --origin and --heartbeat it carries: `bash FILE … install`. The central
+#     node's ssh ending is the reader of its stdout closing part-way: the
+#     reader keeps N lines, closes its end and only then touches CUT, and a
+#     fake `mv` first on PATH waits (5 s at most) for CUT before its first real
+#     rename — the one that places the new file. A versioned copy in ~/bin
+#     (case 13) is retired by a second rename after that. Without caller_guard
+#     the `Installed` line after the first rename ends the run there: SIGPIPE,
+#     or a failed write under `set -e` where PIPE is ignored (an agent
+#     harness) — the new file placed and the home copy left beside it. With it
+#     the run retires the copy, exits 0 and records `(caller gone, ran to the
+#     end)`.
+mkdir -p "$tmp/cutbin"
+cat >"$tmp/cutbin/mv" <<'EOF'
+#!/bin/sh
+if [ -n "${CUT:-}" ] && [ ! -e "$CUT.armed" ]; then
+  : >"$CUT.armed"
+  w=0
+  while [ ! -e "$CUT" ] && [ "$w" -lt 250 ]; do sleep 0.02; w=$((w + 1)); done
+  if [ -e "$CUT" ]; then echo "cut_seen mv $*" >>"$CUT.log"; else echo "cut_gave_up mv $*" >>"$CUT.log"; fi
+fi
+exec "$REAL_MV" "$@"
+EOF
+chmod +x "$tmp/cutbin/mv"
+real_mv="$(command -v mv)"
+sed 's/^RUNNERCTL_VERSION=.*/RUNNERCTL_VERSION="0.0.1"/' runnerctl >"$HOME/bin/runnerctl"
+pf16="$(mktemp "$tmp/tmp.XXXXXX")"; cat runnerctl >"$pf16"
+cut16="$tmp/cut16"; : >"$tmp/o16"; : >"$tmp/logger.calls"
+{ c=0
+  PATH="$tmp/cutbin:$tmp/nocurl:$PATH" CUT="$cut16" REAL_MV="$real_mv" RUNNERCTL_CONFIG="$tmp/home/etc/config" \
+    bash "$pf16" --origin=alice@central-1 --heartbeat=1 install --prefix "$tmp/ulb16" 2>"$tmp/e16" || c=$?
+  echo "$c" >"$tmp/rc16"; } \
+  | { i=0
+      while [ "$i" -lt 4 ] && IFS= read -r l; do printf '%s\n' "$l" >>"$tmp/o16"; i=$((i + 1)); done
+      exec 0<&-
+      : >"$cut16"; }
+grep -q '^cut_seen mv ' "$cut16.log" 2>/dev/null || fail "16: the cut was never seen at a rename: $(cat "$cut16.log" 2>/dev/null)"
+[ "$(cat "$tmp/rc16")" = 0 ] || fail "16: an install cut off part-way exited $(cat "$tmp/rc16") — kept: $(cat "$tmp/o16"); stderr: $(cat "$tmp/e16")"
+grep -q "^move: 0.0.1 at $HOME/bin/runnerctl -> $ver at $tmp/ulb16/runnerctl" "$tmp/o16" || fail "16: the reader did not get the lines before the cut: $(cat "$tmp/o16")"
+cmp -s runnerctl "$tmp/ulb16/runnerctl" || fail "16: an install cut off part-way did not place the new file"
+[ ! -e "$HOME/bin/runnerctl" ] || fail "16: an install cut off part-way left the home copy beside the new file"
+grep -q '^RUNNERCTL_VERSION="0.0.1"' "$HOME/bin/runnerctl.retired" || fail "16: the home copy was not retired as .retired"
+[ "$(grep -cE "^-t runnerctl -- install $ver by [^ ]+ via fleet from alice@central-1 — ok \(caller gone, ran to the end\)\$" "$tmp/logger.calls" || true)" = 1 ] \
+  || fail "16: want one install record that ran to the end: $(cat "$tmp/logger.calls")"
+[ ! -s "$tmp/e16" ] || fail "16: stderr: $(cat "$tmp/e16")"
+rm -f "$HOME/bin/runnerctl.retired"
+
 echo "install-test ok"

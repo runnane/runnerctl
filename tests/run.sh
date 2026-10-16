@@ -14645,41 +14645,66 @@ t "GHR-91: ssh_run and ssh_run_stdin carry a keepalive a site can override" case
 # --- GHR-131: a hangup or a cut pipe is an interruption too -------------------
 # Outside a caller guard, HUP and PIPE do what GHR-119 made INT and TERM do:
 # the record says `interrupted (SIGHUP|SIGPIPE)`, once, and the process still
-# dies BY the signal. Before GHR-131 both records said `ok`. `compose-reap-timer
-# remove` is armed and not guarded (GHR-153; it was env-init until GHR-137
-# guarded that); the signal goes to the group, as a closed terminal's HUP
-# does. The guarded side — a drain hung up mid-way records its own `ok` and
-# finishes — is case_ghr91_a_hangup_does_not_stop_a_drain.
-GHR131_BLOCK='^systemctl disable --now runnerctl-compose-reap\.timer$'
+# dies BY the signal. Before GHR-131 both records said `ok`. Since GHR-153
+# every command that arms a record is guarded from that point (it was
+# env-init until GHR-137, then `compose-reap-timer remove`), so no command
+# reaches the rule any more. It stays pinned on a record armed directly,
+# through the script's own functions (run_fn_signalled): audit_begin and no
+# caller_guard, then a foreground sleep the signal lands in — sent to the
+# group, as a closed terminal's HUP is. The guarded side — a drain hung up
+# mid-way records its own `ok` and finishes — is
+# case_ghr91_a_hangup_does_not_stop_a_drain.
+# shellcheck disable=SC2016  # the child bash expands them
+GHR131_BODY='audit_logger() { printf "%s\n" "$1" >>"$GHR119_REC"; }
+audit_begin armed-unguarded
+: >"$GHR131_FLAG"
+sleep 30
+echo "went on"'
+# run_signalled's driver, on a run_fn-style child: RUNNERCTL_NO_MAIN=1 bash
+# sourcing the script and running BODY, which touches GHR131_FLAG once it is
+# at the point the signal is for.
+run_fn_signalled() { # HUP|PIPE BODY
+  local sig="$1" how
+  _log_reset; rm -rf "$WRITES"; mkdir -p "$WRITES"
+  rm -f "$GHR119_REC"
+  RC=0 SIGNALLED=""
+  how="$(RUNNERCTL_NO_MAIN=1 GHR119_REC="$GHR119_REC" GHR131_FLAG="$WRITES/.blocked" \
+         perl -e "$GHR119_PERL" "$sig" group "$WRITES/.blocked" "$TMP/sig.out" "$TMP/err" \
+         bash -c '. "$0" && eval "$1"' "$RUNNERCTL" "$2")" || how="perl failed"
+  OUT="$(cat "$TMP/sig.out" 2>/dev/null; true)"
+  ERR="$(cat "$TMP/err" 2>/dev/null; true)"
+  case "$how" in
+    "signal "*) SIGNALLED="${how#signal }"; RC=$((128 + SIGNALLED)) ;;
+    "exit "*)   RC="${how#exit }" ;;
+    survived)   RC=-1 SIGNALLED=survived ;;
+    *)          RC=-1; ERRS+=("run_fn_signalled: $how") ;;
+  esac
+}
 case_ghr131_a_hangup_interrupts_an_armed_command() {
   if ! $HAVE_PERL; then
     skip "GHR-131: no perl, so no waitpid to tell death by signal from an exit"
-    run_fn eval "audit_logger() { :; }; audit_begin env-init; builtin trap -p HUP"
+    run_fn eval "audit_logger() { :; }; audit_begin armed-unguarded; builtin trap -p HUP"
     expect_out "^trap -- 'audit_signal HUP' SIGHUP\$"
     return 0
   fi
-  run_signalled HUP group "$GHR131_BLOCK" compose-reap-timer remove
+  run_fn_signalled HUP "$GHR131_BODY"
   expect_rc 129
   expect_signalled 1
-  expect_one_record "compose-reap-timer remove by $ME — interrupted \\(SIGHUP\\)"
-  expect_log_order '^probe:blocked systemctl disable --now runnerctl-compose-reap\.timer$' '^probe:audit '
-  expect_no_log '^rm -f '
+  expect_text "its record" "armed-unguarded by $ME — interrupted (SIGHUP)" "$(cat "$GHR119_REC" 2>/dev/null; true)"
+  expect_no_out 'went on'
 }
 case_ghr131_a_cut_pipe_interrupts_an_armed_command() {
   if ! $HAVE_PERL; then
     # (the gate's own PIPE may be ignored, which no trap can change — so no
     # run_fn fallback either: only perl can hand bash a default PIPE)
     skip "GHR-131: no perl, so no waitpid to tell death by signal from an exit"
-    run compose-reap-timer remove
-    expect_one_record "compose-reap-timer remove by $ME — ok"
     return 0
   fi
-  run_signalled PIPE group "$GHR131_BLOCK" compose-reap-timer remove
+  run_fn_signalled PIPE "$GHR131_BODY"
   expect_rc 141
   expect_signalled 13
-  expect_one_record "compose-reap-timer remove by $ME — interrupted \\(SIGPIPE\\)"
-  expect_log_order '^probe:blocked systemctl disable --now runnerctl-compose-reap\.timer$' '^probe:audit '
-  expect_no_log '^rm -f '
+  expect_text "its record" "armed-unguarded by $ME — interrupted (SIGPIPE)" "$(cat "$GHR119_REC" 2>/dev/null; true)"
+  expect_no_out 'went on'
 }
 
 # The dispositions themselves, through the script's own functions. Armed and
@@ -14854,6 +14879,49 @@ t "GHR-137: kill cut off in its wait still escalates to the unit"           case
 t "GHR-137: compose-reap --apply cut off part-way removes every project"    case_ghr137_compose_reap_apply_cut_off_finishes
 t "GHR-137: health --restart-stalled cut off still records its restart"     case_ghr137_health_restart_stalled_cut_off_finishes
 t "GHR-137: deprovision cut off in its idle wait still removes the slot"    case_ghr137_deprovision_cut_off_finishes
+
+# --- GHR-153: the last armed commands finish what they started too ------------
+# The same shape as GHR-137's cases, for the commands GHR-153 guarded.
+# `install` and `migrate` are cut in tests/install-test.sh (case 16, the
+# `fleet upgrade --push` shape) and tests/migrate-test.sh (case 6), which run
+# the real placement and the real config write.
+case_ghr153_provision_cut_off_finishes() {
+  # the 6 plan lines are read; the cut lands at the first privileged call,
+  # creating the runner group, and `user: … (created)` is the first write after
+  RUNNERCTL_STUB_NO_UNITS=1 RUNNERCTL_STUB_CUT_ON='^groupadd --system ' \
+    run_cut 6 provision 2 --url "$PROV_URL" --name-prefix slot --token "$PROV_TOKEN"
+  expect_rc 0
+  expect_out_count '.' 6
+  expect_log_order '^probe:cut_seen on$' '\./config\.sh --unattended .* --name slot-1 ' \
+                   '^systemctl start actions\.runner\.acme\.slot-1\.service$' \
+                   '\./config\.sh --unattended .* --name slot-2 ' \
+                   '^systemctl start actions\.runner\.acme\.slot-2\.service$' '^probe:audit '
+  expect_one_record "provision slot-1 slot-2 by $ME — ok \\(caller gone, ran to the end\\)"
+  expect_no_err .
+}
+case_ghr153_compose_reap_timer_install_cut_off_finishes() {
+  # cut once both unit files are written, at the reload: `Installed …` is the
+  # first write after, and the timer is enabled only after that
+  RUNNERCTL_STUB_ROOT_EXEC_OK=1 RUNNERCTL_STUB_CUT_ON='^systemctl daemon-reload$' run_cut 0 compose-reap-timer install
+  expect_rc 0
+  expect_log_order '^probe:cut_seen on$' '^systemctl enable --now runnerctl-compose-reap\.timer$' '^probe:audit '
+  expect_one_record "compose-reap-timer install by $ME — ok \\(caller gone, ran to the end\\)"
+  expect_no_err .
+}
+case_ghr153_compose_reap_timer_remove_cut_off_finishes() {
+  # nothing is written until `Removed …` at the end, so without the guard
+  # every step still runs and the record is what tells: it would be
+  # `interrupted (SIGPIPE)` or `failed`, never this one
+  RUNNERCTL_STUB_CUT_ON='^systemctl disable --now runnerctl-compose-reap\.timer$' run_cut 0 compose-reap-timer remove
+  expect_rc 0
+  expect_log_order '^probe:cut_seen on$' '^rm -f .*/runnerctl-compose-reap\.service ' '^systemctl daemon-reload$' '^probe:audit '
+  expect_one_record "compose-reap-timer remove by $ME — ok \\(caller gone, ran to the end\\)"
+  expect_no_err .
+}
+
+t "GHR-153: provision cut off part-way still registers and starts every slot" case_ghr153_provision_cut_off_finishes
+t "GHR-153: compose-reap-timer install cut off still enables the timer"     case_ghr153_compose_reap_timer_install_cut_off_finishes
+t "GHR-153: compose-reap-timer remove cut off records that it ran to the end" case_ghr153_compose_reap_timer_remove_cut_off_finishes
 
 # --- GHR-80: fleet JSON for a UI — the envelope, the stream, health --json ----
 # `fleet status --json` gains `generated_at`, `runnerctl`, `summary` and, per
