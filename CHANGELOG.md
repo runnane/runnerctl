@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.27.0](https://github.com/runnane/runnerctl/compare/v0.26.0...v0.27.0) (2026-10-16)
+
+
+### Features
+
+* fleet profiles fans profiles out and flags a profile that differs between hosts (GHR-145) ([#174](https://github.com/runnane/runnerctl/issues/174)) ([c7a61fe](https://github.com/runnane/runnerctl/commit/c7a61fe05f11de1823322e10498d04e7dddbc6b2))
+* fleet upgrade (incl. --push) and fleet health --restart-stalled are cut on silence under the FLEET_MUTATE_MAX ceiling (GHR-156) ([#162](https://github.com/runnane/runnerctl/issues/162)) ([85bc124](https://github.com/runnane/runnerctl/commit/85bc124a61c084d9300324a16032e2515b741e7e))
+* status, status --json and fleet keep a job's run facts between steps in a private per-slot store (GHR-132) ([#178](https://github.com/runnane/runnerctl/issues/178)) ([be04e4c](https://github.com/runnane/runnerctl/commit/be04e4cfb680533c2223624ac5224561c13b4910))
+* the detail pane shows the slot's CPU rate and pressure and the host's load (GHR-114) ([#172](https://github.com/runnane/runnerctl/issues/172)) ([dbd759b](https://github.com/runnane/runnerctl/commit/dbd759b6471d6335842f45d2c6e601f5d333b928))
+
+
+### Bug Fixes
+
+* an interrupted fleet fan-out ends the ssh calls it started (GHR-96) ([#167](https://github.com/runnane/runnerctl/issues/167)) ([99fd7df](https://github.com/runnane/runnerctl/commit/99fd7dfa4de934b6666d83be29b11aa6a6912af0))
+* an interrupted fleet fan-out records interrupted and the hosts it dialled (GHR-161) ([#168](https://github.com/runnane/runnerctl/issues/168)) ([3e4d695](https://github.com/runnane/runnerctl/commit/3e4d6959cda432d02b343971dc358e2089abf369))
+* an interrupted fleet status ends the summary pass's second call (GHR-163) ([#171](https://github.com/runnane/runnerctl/issues/171)) ([460c02f](https://github.com/runnane/runnerctl/commit/460c02f4590216ab3f56ab8e4278f91453ae4358))
+* compose-reap's dry run counts the images that would really go (GHR-147) ([#169](https://github.com/runnane/runnerctl/issues/169)) ([3f53425](https://github.com/runnane/runnerctl/commit/3f5342554a25adf8d7c844bd1688161f7b765a97))
+* every background job sets its own SIGINT/SIGQUIT, pinned from SigIgn (GHR-162) ([#170](https://github.com/runnane/runnerctl/issues/170)) ([af5edbc](https://github.com/runnane/runnerctl/commit/af5edbc4f8e75168532b2b54089a249c677e0245))
+* fleet upgrade --push no longer cuts a slow script transfer as silence (GHR-158) ([#166](https://github.com/runnane/runnerctl/issues/166)) ([e14a656](https://github.com/runnane/runnerctl/commit/e14a656a0a551b3a62d25d4e81cdc2ad7fad1838))
+* job_cell's ROOM fit and status_row's cell padding measure display columns, so a wide cell neither wraps nor misaligns the row (GHR-159) ([#175](https://github.com/runnane/runnerctl/issues/175)) ([70cc27d](https://github.com/runnane/runnerctl/commit/70cc27d3d5b4c379a5770b28f30c35d55b2b0809))
+* provision, install, migrate and compose-reap-timer finish what they started when their caller goes (GHR-153) ([#165](https://github.com/runnane/runnerctl/issues/165)) ([0f6d20d](https://github.com/runnane/runnerctl/commit/0f6d20d67282b1c52f2f0fad04f144c22927308c))
+* watch measures a line's width in terminal columns, not characters (GHR-94) ([#164](https://github.com/runnane/runnerctl/issues/164)) ([d04bd7e](https://github.com/runnane/runnerctl/commit/d04bd7e59bbadde4c9bc61a43cc5754a2544373c))
+
 ## [0.26.0](https://github.com/runnane/runnerctl/compare/v0.25.1...v0.26.0) (2026-10-15)
 
 
