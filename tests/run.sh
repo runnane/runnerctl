@@ -9569,6 +9569,129 @@ case_fleet_watch_exit_ends_its_fetches_and_removes_its_files() {
   rm -rf "$d"
 }
 
+# GHR-167: the cases above take their signal inside the stub's key read. The
+# watch spends its time in the REAL one, `read -rsn1 -t` on a terminal, and
+# bash runs a trap from inside a read. Any temporary assignment on that read
+# (an `IFS=` prefix) is still in effect in the handler, and in the EXIT trap
+# its `exit` runs. With IFS empty, proc_ppid split nothing and answered
+# nothing, so fleet_watch_reap skipped every fetch, and the hung call outlived
+# the watch.
+#
+# So these run the script's own key read on a real terminal, with script(1)
+# as the terminal. _ghr167_term waits for the read to be entered (the stub's
+# `probe:tty_read_char_real` line, then the kernel's wchan for the process
+# when it can be read), sends SIGTERM, and waits for the command to end.
+# RUNNERCTL_STUB_REAL_KEYS makes that read 30 s long, so the signal cannot
+# land between two poll steps instead.
+#
+# Two details decide whether the check means anything:
+#   * The terminal's session must outlive the command. When the session ends,
+#     the kernel hangs up the terminal and SIGHUPs what is left in it, the
+#     hung call included. A check made after that passes with no reap at all
+#     (measured: green with fleet_watch_reap's call deleted). So the shell
+#     script(1) runs writes the command's status to a file and then blocks on
+#     a FIFO. The case checks the pids while it is blocked, and
+#     _ghr167_release lets it end.
+#   * script's stdin is a FIFO that this process holds open and writes
+#     nothing more to. With EOF on it, script would hand the terminal a ^D,
+#     which a raw read takes as a key.
+_ghr167_have_script() {
+  command -v script >/dev/null 2>&1 && script --help 2>&1 | grep -q -- '--return'
+}
+GHR167_SPID=""
+_ghr167_term() { # CMD-STRING [KEYS]: CMD-STRING under script(1); sets RC
+  local fifo="$TMP/ghr167.in" rel="$TMP/ghr167.rel" rcf="$TMP/ghr167.rc" pid="" n=0 w="" body
+  rm -f "$fifo" "$rel" "$rcf"; mkfifo "$fifo" "$rel"
+  exec 8<>"$fifo"
+  # KEYS are typed before the first read: the terminal holds them until the
+  # read's raw mode makes them readable, as it would a fast typist's.
+  [ -z "${2-}" ] || printf '%s' "$2" >&8
+  printf -v body '%s; echo "$?" >%q; read -r _ <%q' "$1" "$rcf" "$rel"
+  SHELL=/bin/sh script -qfec "$body" /dev/null <&8 >"$TMP/ghr167.tty" 2>&1 &
+  GHR167_SPID=$!
+  while ! grep -q '^probe:tty_read_char_real ' "$LOG" 2>/dev/null && [ "$n" -lt 500 ]; do sleep 0.02; n=$((n + 1)); done
+  pid="$(cat "$WRITES/watch.pid" 2>/dev/null || true)"
+  # In the read once the kernel says it waits in poll/select. Where wchan is
+  # unreadable (or 0, hidden) a fifth of a second, well inside a 30 s read.
+  n=0
+  while [ -n "$pid" ] && [ "$n" -lt 100 ]; do
+    w="$(cat "/proc/$pid/wchan" 2>/dev/null || true)"
+    case "$w" in
+      *poll*|*select*) break ;;
+      ""|0) [ "$n" -lt 10 ] || break ;;
+    esac
+    sleep 0.02; n=$((n + 1))
+  done
+  if [ -n "$pid" ]; then kill -TERM "$pid" 2>/dev/null || true
+  else FAILS+=("the command never entered the real key read (no $WRITES/watch.pid)")
+  fi
+  n=0
+  while [ ! -s "$rcf" ] && [ "$n" -lt 500 ]; do sleep 0.02; n=$((n + 1)); done
+  RC="$(cat "$rcf" 2>/dev/null || true)"
+  if [ -z "$RC" ]; then
+    FAILS+=("the command did not end within 10 s of its SIGTERM")
+    if [ -n "$pid" ]; then kill -KILL "$pid" 2>/dev/null || true; else kill -KILL "$GHR167_SPID" 2>/dev/null || true; fi
+  fi
+}
+# Let the terminal's session end, and wait for it.
+# Opened read-write, so the write cannot block on a reader already gone.
+_ghr167_release() {
+  exec 7<>"$TMP/ghr167.rel"
+  printf 'go\n' >&7
+  wait "$GHR167_SPID" 2>/dev/null || true
+  exec 7>&- 8>&-
+  rm -f "$TMP/ghr167.in" "$TMP/ghr167.rel" "$TMP/ghr167.rc"
+  GHR167_SPID=""
+}
+case_ghr167_fleet_watch_term_in_the_real_key_read_ends_its_fetches() {
+  local d="$TMP/ghr167-tmp" cmd
+  if ! _ghr167_have_script; then skip "script(1) with --return not on PATH: no terminal to read a key from"; return 0; fi
+  rm -rf "$d"; mkdir -p "$d"
+  _log_reset; rm -f "$LOG.clock"; rm -rf "$WRITES"; mkdir -p "$WRITES"
+  printf -v cmd 'env TMPDIR=%q RUNNERCTL_STUB_REAL_KEYS=30 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOSTS=%q RUNNERCTL_STUB_FLEET_HANG=slow-1 RUNNERCTL_CONFIG=%q RUNNERCTL_TEST_LOG=%q RUNNERCTL_TEST_WRITES=%q %q fleet watch --color never' \
+    "$d" "build-1 slow-1" "$STUB" "$LOG" "$WRITES" "$RUNNERCTL"
+  _ghr167_term "$cmd"
+  # checked with the terminal still up: its hangup would end the call anyway
+  expect_text "the watch's exit status after a SIGTERM in its key read" 0 "$RC"
+  expect_log '^probe:tty_read_char_real 0\.2$'
+  expect_cfg "$WRITES/remote/slow-1.hung.pids" '^[0-9]+ [0-9]+$'
+  _ghr124_expect_two_pids "$WRITES/remote/slow-1.hung.pids"
+  _ghr74_expect_dead "$(cat "$WRITES/remote/slow-1.hung.pids" 2>/dev/null; true)"
+  _ghr74_expect_empty "$d"
+  expect_log_order '^probe:term_cursor show$' '^probe:ssh_control build-1 exit$' '^probe:ssh_control slow-1 exit$'
+  _ghr167_release
+  rm -rf "$d"
+}
+# The read itself, on a real terminal: a space, a tab, Enter and a letter each
+# come back as themselves (Enter as nothing, which read_key calls `enter`).
+# That is what the `IFS=` prefix was there for: a plain `read -n1` into a
+# name drops a blank. And a trap run inside the read sees the default IFS:
+# the last read is ended by a SIGTERM whose handler splits "x y z" into
+# three names.
+case_ghr167_tty_read_char_keeps_blanks_and_a_trap_in_it_sees_the_default_ifs() {
+  local inner="$TMP/ghr167-inner.sh" res="$TMP/ghr167-res" cmd
+  if ! _ghr167_have_script; then skip "script(1) with --return not on PATH: no terminal to read a key from"; return 0; fi
+  _log_reset; rm -rf "$WRITES"; mkdir -p "$WRITES"; rm -f "$res"
+  cat >"$inner" <<'EOF'
+. "$1" || exit 3
+res="$2"
+for _ in 1 2 3 4; do
+  if tty_read_char 5; then printf 'key %q\n' "$KEY_CHAR" >>"$res"; else printf 'key timeout\n' >>"$res"; fi
+done
+trap 'read -r a b c <<<"x y z"; printf "trap b=[%s] c=[%s]\n" "$b" "$c" >>"$res"; exit 0' TERM
+echo "$$" >"$3/watch.pid"
+printf 'probe:tty_read_char_real 30\n' >>"$4"
+tty_read_char 30
+printf 'read returned\n' >>"$res"
+EOF
+  printf -v cmd 'env RUNNERCTL_NO_MAIN=1 bash %q %q %q %q %q' "$inner" "$RUNNERCTL" "$res" "$WRITES" "$LOG"
+  _ghr167_term "$cmd" $' \t\nq'
+  _ghr167_release
+  expect_text "the session's exit status" 0 "$RC"
+  expect_text "what the four reads and the trap saw" \
+    "key \\ "$'\n'"key \$'\\t'"$'\n'"key ''"$'\n'"key q"$'\n'"trap b=[y] c=[z]" "$(cat "$res" 2>/dev/null)"
+}
+
 # The other acceptance case: a host that answered and then cannot be reached
 # keeps its rows, under a line that says how old they are, when it was last
 # seen and why — not one bare error row. build-2 is down for ticks 2 and 3 and
@@ -10837,6 +10960,8 @@ t "term_lines: the real one reads tput; failing, garbage or absent is 0"  case_t
 t "fleet watch: a hung host holds up neither the frame nor a key"         case_fleet_watch_a_hung_host_holds_up_neither_the_frame_nor_a_key
 t "fleet watch: the first frame, before any host has answered"            case_fleet_watch_first_frame_before_any_host_has_answered
 t "fleet watch: q, Ctrl-C and --iterations leave no job and no file"      case_fleet_watch_exit_ends_its_fetches_and_removes_its_files
+t "GHR-167: a SIGTERM in the real key read still ends the watch's fetches" case_ghr167_fleet_watch_term_in_the_real_key_read_ends_its_fetches
+t "GHR-167: the real key read keeps blanks; a trap in it sees default IFS" case_ghr167_tty_read_char_keeps_blanks_and_a_trap_in_it_sees_the_default_ifs
 t "fleet watch: a host that stops answering keeps its rows, with an age"  case_fleet_watch_a_host_that_stops_answering_keeps_its_rows_with_an_age
 t "fleet watch: a call still out at the next tick is late, not before"    case_fleet_watch_a_call_still_out_at_the_next_tick_is_late
 t "fleet watch: S's floor counts nothing for a host with kept rows"       case_fleet_watch_floor_counts_nothing_for_a_host_with_kept_rows

@@ -287,7 +287,15 @@ Traps:
   A related trap, on 5.2 and 5.3.20 alike: a handler run inside `IFS= read`
   keeps that read's `IFS=`,
   and so does the EXIT cleanup it exits to, where every `read -r a b` then
-  splits nothing. That is why the relay reads into `REPLY`.
+  splits nothing. That is why the relay reads into `REPLY`, and so does
+  `tty_read_char` (GHR-167), where both watches take their signals. (Not
+  `read -e`: measured on 5.3.20, a TERM handler run inside `IFS= read -e`
+  sees the default IFS.) The stub shadows `tty_read_char`, so a case about a
+  signal in the REAL key read sets `RUNNERCTL_STUB_REAL_KEYS=SECS` and runs
+  the watch under `script(1)` (`_ghr167_term`). Check the hung pids **before**
+  the terminal's session ends. The hangup SIGHUPs what is left in it, so a
+  check made after it is green even with `fleet_watch_reap` deleted
+  (measured).
 - **`fleet watch` fetches each host in a background job (GHR-74), and the
   stub models the loop's poll step rather than sleeping through it.** While a
   fetch is out the loop's key read has `FW_POLL` (0.2) as its timeout; the
