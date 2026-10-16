@@ -18421,6 +18421,20 @@ case_ghr158_push_transfer_is_not_silence() {
   expect_log '^probe:timeline_timeout build-1 60$'
   expect_no_log '^probe:timeline_received '
   expect_no_log '^probe:remote_push_sudo '
+  # GHR-160: an ssh warning on stderr at 10 s of the 30 s transfer is a line,
+  # and not the arming one: the silence is still counted from 30, so the
+  # install's silence is cut at 42 and nothing is cut at 22 (10 + IDLE).
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_PUSH_TRANSFER="build-1:30" \
+    RUNNERCTL_STUB_PUSH_STDERR="build-1:10:Warning: Permanently added build-1 to the list of known hosts." \
+    RUNNERCTL_STUB_FLEET_LINES="build-1:0:0:50:push-install" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet upgrade --push
+  expect_rc 1
+  expect_out "^build-1 +0\\.0\\.1 -> ${v//./\\.} +$(ghr156_idle_text build-1) — Warning: Permanently added build-1 to the list of known hosts\\.\$"
+  expect_log '^probe:timeline_stderr build-1 10$'
+  expect_no_log '^probe:timeline_stderr_unseen '
+  expect_log '^probe:timeline_received build-1 30$'
+  expect_text "the clock at the cut after a stderr line mid-transfer" 42 "$(ghr150_clock)"
+  expect_no_log '^probe:remote_push_sudo '
   # Off (FLEET_MUTATE_IDLE=0) the install asks for no heartbeat and says
   # nothing extra: no arming line in its text.
   RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet upgrade --push
