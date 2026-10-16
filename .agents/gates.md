@@ -213,6 +213,11 @@ Traps:
   `completed fan-out` assertion has to model pid reuse (`proc_ppid` shadowed
   to answer "ours"). Against the real one, a reaped pid is skipped whether or
   not the list was cleared, so dropping the clear would go unnoticed.
+  **The interrupted central record (GHR-161)** is tested the same way: the
+  `fleet` command arms no INT handler, so it dies by the signal and the record
+  is written by `exit_run` from `$?` (130) and from the per-host `.dialled` /
+  `.rc` files in `FLEET_DIR`, which `fleet_cleanup` has not yet removed. The
+  mutation that goes red is `fleet_log_interrupted` returning its input.
   **The `fleet start` half depends on the bash version.** The case is only
   red on bash 5.2 (CI's ubuntu-24.04, Debian 12) if the explicit
   `trap '' INT QUIT` at the top of `fleet_fanout_one` is missing. Under 5.2 a
