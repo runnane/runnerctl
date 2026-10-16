@@ -7684,6 +7684,31 @@ case_compose_reap_standalone_dry_run_verdicts() {
   expect_out ' reap=2 keep=4 removed=0 failed=0 slots=3 standalone=6 images-removed=0 '
   expect_no_log '^docker rm'
   expect_no_log '^probe:image_in_use'
+  # GHR-147: the in-use check runs here too, read-only: verify:shared is still
+  # held by keeper (which stays), verify:1 only by verify-old (which goes).
+  expect_out '^would remove image verify:1$'
+  expect_out '^keep image verify:shared reason=in-use$'
+  expect_out_count '^(would remove|keep) image ' 2
+  expect_log '^probe:image_users sha-shared$'
+  expect_log '^probe:image_users sha-v1$'
+}
+
+# GHR-147: the fleet total's image count is exact when every host says which
+# images it would remove, and only an upper bound ("up to") for a host that
+# says nothing of images (an older runnerctl) while it has candidates.
+case_ghr147_fleet_total_images_exact_or_bounded() {
+  local d="$TMP/ghr147"; rm -rf "$d"; mkdir -p "$d"
+  printf 'reap container a reason=age idle=1200m image=x:1\nreap container b reason=age idle=1200m image=x:2\nwould remove image x:1\nkeep image x:2 reason=in-use\n' >"$d/0.out"
+  printf 'reap container c reason=age idle=1200m image=y:1\nreap container e reason=age idle=1200m image=y:2\n' >"$d/1.out"
+  : >"$d/0.err"; : >"$d/1.err"; echo 0 >"$d/0.rc"; echo 0 >"$d/1.rc"
+  # shellcheck disable=SC2016  # the child expands these
+  G147_DIR="$d" run_fn eval 'FLEET_DIR="$G147_DIR"; FLEET_HOSTS=(new old); fleet_compose_reap_report'
+  expect_rc 0
+  expect_out '— 4 container\(s\), 0 network\(s\), 0 volume\(s\), up to 3 image\(s\) — on 2 host\(s\)$'
+  # shellcheck disable=SC2016  # the child expands these
+  G147_DIR="$d" run_fn eval 'FLEET_DIR="$G147_DIR"; FLEET_HOSTS=(new); fleet_compose_reap_report'
+  expect_rc 0
+  expect_out '— 2 container\(s\), 0 network\(s\), 0 volume\(s\), 1 image\(s\) — on 1 host\(s\)$'
 }
 
 case_compose_reap_standalone_apply_removes_unused_images_only() {
@@ -16745,7 +16770,7 @@ case_ghr87_the_dry_run_fans_out_read_only_with_a_fleet_total() {
   expect_out_count '^build-2: reap stale reason=age idle=240m containers=1 networks=1 volumes=1$' 1
   expect_out_count '^build-[12]: compose-reap: mode=dry-run projects=12 reap=6 keep=6 removed=0 ' 2
   expect_out_count "$GHR87_TOTAL_RE" 1
-  expect_out '^fleet compose-reap \(dry run, nothing removed\): would reap 12 stack\(s\) — 10 container\(s\), 6 network\(s\), 2 volume\(s\), up to 0 image\(s\) — on 2 host\(s\)$'
+  expect_out '^fleet compose-reap \(dry run, nothing removed\): would reap 12 stack\(s\) — 10 container\(s\), 6 network\(s\), 2 volume\(s\), 0 image\(s\) — on 2 host\(s\)$'
   # the flags reach the host, the values checked here first; --host narrows
   RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_STANDALONE=1 RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
     run fleet compose-reap --host build-2 --standalone --project stale --grace-minutes 5
@@ -16753,10 +16778,15 @@ case_ghr87_the_dry_run_fans_out_read_only_with_a_fleet_total() {
   expect_log_count '^probe:ssh_run build-2 -- runnerctl compose-reap --standalone --project stale --grace-minutes 5$' 1
   expect_log_count '^probe:ssh_run ' 1
   expect_no_log "$GHR87_NOT_A_PROBE"
-  expect_out '^fleet compose-reap \(dry run, nothing removed\): would reap 1 stack\(s\) — 1 container\(s\), 1 network\(s\), 1 volume\(s\), up to 0 image\(s\) — on 1 host\(s\)$'
+  expect_out '^fleet compose-reap \(dry run, nothing removed\): would reap 1 stack\(s\) — 1 container\(s\), 1 network\(s\), 1 volume\(s\), 0 image\(s\) — on 1 host\(s\)$'
   RUNNERCTL_STUB_COMPOSE=1 RUNNERCTL_STUB_STANDALONE=1 RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet compose-reap --host build-1 --standalone
   expect_rc 0
-  expect_out '— 7 container\(s\), 3 network\(s\), 1 volume\(s\), up to 2 image\(s\) — on 1 host\(s\)$'
+  expect_out '— 7 container\(s\), 3 network\(s\), 1 volume\(s\), 1 image\(s\) — on 1 host\(s\)$'
+  # GHR-147: verify:shared is held by a container that stays, so it is not counted
+  expect_out '^build-1: would remove image verify:1$'
+  expect_out '^build-1: keep image verify:shared reason=in-use$'
+  expect_no_out 'up to'
+  expect_no_log '^docker rm'
   RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet compose-reap --max-age-hours soon
   expect_rc 1
   expect_err "max-age-hours must be a whole number of hours, got 'soon'"
@@ -16907,6 +16937,7 @@ case_ghr87_the_prompt_reads_compose_reap_and_asks_for_apply() {
 }
 
 t "GHR-87: the dry run fans out read-only and prints a fleet total"             case_ghr87_the_dry_run_fans_out_read_only_with_a_fleet_total
+t "GHR-147: the fleet total's image count is exact, or bounded for a host that cannot say" case_ghr147_fleet_total_images_exact_or_bounded
 t "GHR-87: --apply --host H acts on H only"                                       case_ghr87_apply_acts_on_the_named_host_only
 t "GHR-87: no docker is information; a refused login is a failed row with the fix" case_ghr87_no_docker_is_information_a_refused_login_is_a_failure
 t "GHR-87: timer status says installed, not installed or unreachable per host"    case_ghr87_timer_status_installed_not_installed_unreachable
