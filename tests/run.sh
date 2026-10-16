@@ -16769,6 +16769,46 @@ t "GHR-144: q with a :command out leaves no local process"                   cas
 t "GHR-144: Esc detaches a :command, cancels nothing, and it completes"      case_ghr144_esc_detaches_and_the_command_completes
 t "GHR-144: a :command holds every host it targets; another host is free"    case_ghr144_a_colon_command_holds_its_hosts
 
+# GHR-155: the `:` command ends while a confirm line is up. `:scale 3` is out on
+# build-1 (held); jjj and R put build-2's restart confirm up, and the release
+# lets the command end under it. The pager must not take the keys from the
+# confirm: no page until n answers it, then exactly one, before the next key.
+# (Ordered by the log: `frames` puts the pager's output in the previous frame.)
+case_ghr155_a_colon_command_ending_under_a_confirm_pages_after_it() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD=build-1 RUNNERCTL_STUB_KEYS=":yjjjR${REL}nkq" \
+    RUNNERCTL_STUB_PROMPT_IN='scale 3' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_out '^Restart example\.slot-1 on build-2\? '
+  expect_log_order '^probe:tty_read_char 5 y$' '^probe:ssh_run build-1 -- runnerctl scale 3$' '^probe:remote_held build-1$' \
+                   '^probe:release$' '^probe:remote_released build-1$' \
+                   '^probe:tty_read_char 5 n$' '^probe:page$' '^probe:tty_read_char 5 k$'
+  expect_log_count '^probe:page$' 1
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl restart ' 0
+  expect_cfg_count "$WRITES/fleet.log" '.' 1
+  expect_cfg "$WRITES/fleet.log" "$GHR144_LOG"
+}
+
+# The host-level keys reach the same refusal as R: D and U on build-1, which the
+# running `:` command holds, say it is busy, naming the command, and issue
+# nothing — no confirm is raised, nothing is run on build-1 for them.
+case_ghr155_host_keys_are_refused_while_a_colon_command_holds_the_host() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD=build-1 RUNNERCTL_STUB_KEYS=":yDU${REL}q" \
+    RUNNERCTL_STUB_PROMPT_IN='scale 3' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  frames
+  expect_frame 3 "^build-1: busy — 'fleet scale 3 --host build-1' \\(from :\\) is still running there; one action per host at a time, nothing issued\$"
+  expect_no_frame 3 '\[y/n\]'
+  expect_no_frame 4 '\[y/n\]'
+  expect_out_count '\? runs on build-1: ' 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl (drain|upgrade)' 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl scale 3$' 1
+  expect_log_count "$GHR86_REMOTE_MUTATING" 1
+  expect_cfg_count "$WRITES/fleet.log" '.' 1
+}
+
+t "GHR-155: a :command that ends under a confirm pages once it is answered"  case_ghr155_a_colon_command_ending_under_a_confirm_pages_after_it
+t "GHR-155: D and U are refused as busy on a host a :command holds"          case_ghr155_host_keys_are_refused_while_a_colon_command_holds_the_host
+
 # --- GHR-87: fleet compose-reap and compose-reap-timer ------------------------
 # The stub's hosts answer compose-reap with the real command over the shared
 # docker model (RUNNERCTL_STUB_COMPOSE=1); per host, *nodocker*, *dockerdenied*
