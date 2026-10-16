@@ -113,6 +113,12 @@ export PATH="$TMP/bin:$PATH"
 # FLEET_LOG into each run's writes tree, and a run past the stub that falls
 # back to the default path lands under this temp directory instead.
 export XDG_STATE_HOME="$TMP/xdg-state"
+# GHR-132: nor to this box's runtime directory. A run past the stub (run_fn,
+# no config) would keep a job's run facts under $XDG_RUNTIME_DIR/runnerctl;
+# here that names a directory that does not exist, so nothing is kept, and
+# run_fn pins RUN_FACTS_DIR off besides (RUN_FN_FACTS_DIR for a case that
+# wants a store of its own).
+export XDG_RUNTIME_DIR="$TMP/xdg-runtime"
 
 # --- Harness state -----------------------------------------------------------
 OUT="" ERR="" RC=0
@@ -187,7 +193,7 @@ seed_dropin() {
 run_fn() {
   _log_reset; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
   RC=0
-  OUT="$(RUNNERCTL_NO_MAIN=1 bash -c '. "$0" && "$@"' "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
+  OUT="$(RUNNERCTL_NO_MAIN=1 bash -c '. "$0" && RUN_FACTS_DIR="${RUN_FN_FACTS_DIR:-off}" && "$@"' "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
   ERR="$(cat "$TMP/err")"
 }
 
@@ -11435,6 +11441,209 @@ EOF
   expect_out '^0$'
 }
 
+# GHR-132: a one-shot read keeps a job's run facts too, in RUN_FACTS_DIR —
+# which the stub puts under the run's writes tree, so `run_keep` carries the
+# store into the next read and `run` empties it. RUNNERCTL_STUB_ENV_ONCE=1
+# answers slot-1's environment once per writes tree, so a second read is a
+# read between two steps. Slot-1's job is keyed by its InvocationID and the
+# journal's start (the stub's clock less 12m).
+GHR132_UNIT="actions.runner.example.slot-1.service"
+GHR132_KEY="runnerctl-run-facts 1 1111aaaa1111aaaa1111aaaa1111aaaa 1000000000"
+GHR132_LONG='^0 +example\.slot-1 .* my-app:CI / test @main \(12m\)'
+GHR132_SHORT='^0 +example\.slot-1 .* test \(12m\)'
+GHR132_OLD=$'GITHUB_REPOSITORY=example/old-app\nGITHUB_JOB=test\nGITHUB_WORKFLOW=Old\nGITHUB_RUN_ID=111\nGITHUB_SERVER_URL=https://github.com\n'
+GHR132_OLD_CELL='^0 +example\.slot-1 .* old-app:Old / test \(12m\)'
+# A fresh writes tree whose store holds BODY for slot-1, made as the script
+# makes it (0700, 0600), and slot-1's step environment already gone.
+ghr132_seed() { # BODY
+  rm -rf "$WRITES"; mkdir -p "$WRITES/run-facts"; chmod 700 "$WRITES/run-facts"
+  printf '%s' "$1" >"$WRITES/run-facts/$GHR132_UNIT"; chmod 600 "$WRITES/run-facts/$GHR132_UNIT"
+  : >"$WRITES/.env-once"
+}
+ghr132_status() { # [ARGS...]
+  RUNNERCTL_STUB_ENV_ONCE=1 RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run_keep status "$@"
+}
+
+case_status_remembers_a_jobs_run_between_steps() {
+  RUNNERCTL_STUB_ENV_ONCE=1 RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run status
+  expect_rc 0
+  expect_out "$GHR132_LONG"
+  local first="$OUT"
+  expect_text "the stored key" "$GHR132_KEY" "$(head -n1 "$WRITES/run-facts/$GHR132_UNIT")"
+  # between two steps: the environment is asked for again and answers nothing
+  ghr132_status
+  expect_rc 0
+  expect_log '^probe:proc_job_env .*slot-1'
+  expect_out "$GHR132_LONG"
+  expect_no_out "$GHR132_SHORT"
+  expect_no_log "$READ_ONLY_LOG"
+  expect_text "the table of the read that saw the step" "$first" "$OUT"
+  RUNNERCTL_STUB_ENV_ONCE=1 RUNNERCTL_STUB_RUN=1 run_keep status --json
+  expect_rc 0
+  expect_out "\"url\":\"$RUN_URL1\""
+  expect_out '"workflow":"CI","run_id":1234567890,"run_attempt":2,"run_number":57,"ref":"main"'
+  if $HAVE_PYTHON3; then
+    expect_json 'd["slots"][0]["job"]["sha"] == "0123456789abcdef0123456789abcdef01234567" and d["slots"][0]["job"]["actor"] == "octocat" and d["slots"][0]["job"]["event"] == "push"'
+  else
+    skip "python3 not installed: the --json sha/actor/event checks"
+  fi
+  # the control: with no store the second read is today's — the short cell
+  RUNNERCTL_STUB_RUN_FACTS_DIR=off RUNNERCTL_STUB_ENV_ONCE=1 RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run status
+  expect_out "$GHR132_LONG"
+  RUNNERCTL_STUB_RUN_FACTS_DIR=off ghr132_status
+  expect_rc 0
+  expect_out "$GHR132_SHORT"
+  expect_no_out 'CI / test'
+  expect_text "off keeps nothing" "no" "$([ -e "$WRITES/run-facts" ] && echo yes || echo no)"
+}
+
+# Whatever the umask, the store is the caller's alone: 0700 and 0600, and no
+# temp file is left beside the one it wrote.
+case_status_run_facts_are_private_whatever_the_umask() {
+  local old
+  old="$(umask)"
+  umask 000
+  RUNNERCTL_STUB_RUN=1 run status
+  umask "$old"
+  expect_rc 0
+  expect_text "modes" "700 600" "$(stat -c %a "$WRITES/run-facts" 2>&1) $(stat -c %a "$WRITES/run-facts/$GHR132_UNIT" 2>&1)"
+  expect_text "what the store holds" "$GHR132_UNIT" "$(ls -A "$WRITES/run-facts" 2>&1)"
+  # owned and writable by the effective uid alone
+  run_fn run_facts_private "$EUID 700"
+  expect_rc 0
+  run_fn run_facts_private "$EUID 600"
+  expect_rc 0
+  run_fn run_facts_private "$EUID 720"
+  expect_rc 1
+  run_fn run_facts_private "$EUID 702"
+  expect_rc 1
+  run_fn run_facts_private "$((EUID + 1)) 700"
+  expect_rc 1
+}
+
+# The key is the job: another start (past the 2 s of slack) or another
+# InvocationID is shown nothing of what the store holds, and the next read
+# that sees a step replaces it.
+case_status_a_new_job_is_shown_nothing_of_the_last_runs_facts() {
+  # the positive control: the old run's facts under this job's key are drawn
+  ghr132_seed "$GHR132_KEY"$'\n'"$GHR132_OLD"
+  ghr132_status
+  expect_rc 0
+  expect_out "$GHR132_OLD_CELL"
+  ghr132_seed "runnerctl-run-facts 1 1111aaaa1111aaaa1111aaaa1111aaaa 1000000002"$'\n'"$GHR132_OLD"
+  ghr132_status
+  expect_out "$GHR132_OLD_CELL"
+  # a later start: a new job on the slot
+  ghr132_seed "runnerctl-run-facts 1 1111aaaa1111aaaa1111aaaa1111aaaa 1000000003"$'\n'"$GHR132_OLD"
+  ghr132_status
+  expect_rc 0
+  expect_out "$GHR132_SHORT"
+  expect_no_out 'old-app'
+  ghr132_status --json
+  expect_no_out 'old-app'
+  expect_out '"url":null'
+  # a restarted unit: another InvocationID, the same start
+  ghr132_seed "runnerctl-run-facts 1 2222bbbb2222bbbb2222bbbb2222bbbb 1000000000"$'\n'"$GHR132_OLD"
+  ghr132_status
+  expect_rc 0
+  expect_out "$GHR132_SHORT"
+  expect_no_out 'old-app'
+  # the new job's first readable step replaces the file
+  ghr132_seed "runnerctl-run-facts 1 2222bbbb2222bbbb2222bbbb2222bbbb 1000000000"$'\n'"$GHR132_OLD"
+  rm -f "$WRITES/.env-once"
+  ghr132_status
+  expect_out "$GHR132_LONG"
+  expect_text "the new key" "$GHR132_KEY" "$(head -n1 "$WRITES/run-facts/$GHR132_UNIT")"
+  expect_file_lacks "$WRITES/run-facts/$GHR132_UNIT" 'old-app'
+}
+
+# The store is read as hostile input. Under this job's key, what is drawn is
+# what job_env_facts would keep of an environment saying the same — numbers
+# that are not, a sha that is not hex, a "server" that is not one are null, no
+# control byte reaches the terminal — and a file or a directory that fails a
+# check is not read at all.
+case_status_a_hostile_run_facts_file_is_not_believed() {
+  local body
+  body="$GHR132_KEY"$'\n'$'GITHUB_REPOSITORY=example/my-app\nGITHUB_WORKFLOW=C\e[2JI\x07\nGITHUB_REF_NAME=ma\e]0;pwned\x07in\nGITHUB_RUN_ID=12ab\nGITHUB_RUN_ATTEMPT=2\nGITHUB_RUN_NUMBER=0057\nGITHUB_SHA=nothex\nGITHUB_EVENT_NAME=Push;rm\nGITHUB_ACTOR=octo\x9bcat\nGITHUB_SERVER_URL=javascript:alert(1)//\nJOB_URL=https://evil.example/x\nnot a fact\n'
+  ghr132_seed "$body"
+  ghr132_status
+  expect_rc 0
+  expect_out "$GHR132_LONG"
+  expect_no_out $'\e'
+  expect_no_out $'\x07'
+  expect_no_out 'pwned'
+  ghr132_status --json
+  expect_rc 0
+  expect_no_out $'\e'
+  expect_no_out 'evil|javascript|12ab|nothex|Push'
+  expect_out '"run_id":null,"run_attempt":2,"run_number":null'
+  if $HAVE_PYTHON3; then
+    expect_json 'd["slots"][0]["job"]["url"] is None and d["slots"][0]["job"]["sha"] is None and d["slots"][0]["job"]["event"] is None and d["slots"][0]["job"]["actor"] == "octo?cat"'
+  else
+    skip "python3 not installed: the --json null checks"
+  fi
+  local good="$GHR132_KEY"$'\n'"$GHR132_OLD" f="$WRITES/run-facts/$GHR132_UNIT"
+  # no header, another format's header, a header for no job
+  ghr132_seed "$GHR132_OLD"
+  ghr132_status; expect_rc 0; expect_out "$GHR132_SHORT"; expect_no_out 'old-app'
+  ghr132_seed "runnerctl-run-facts 2 1111aaaa1111aaaa1111aaaa1111aaaa 1000000000"$'\n'"$GHR132_OLD"
+  ghr132_status; expect_rc 0; expect_out "$GHR132_SHORT"; expect_no_out 'old-app'
+  ghr132_seed "$GHR132_KEY"
+  ghr132_status; expect_rc 0; expect_out "$GHR132_SHORT"
+  # a file others can write
+  ghr132_seed "$good"; chmod 666 "$f"
+  ghr132_status; expect_rc 0; expect_out "$GHR132_SHORT"; expect_no_out 'old-app'
+  # a symlink to a file that would pass
+  ghr132_seed "$good"; mv "$f" "$WRITES/elsewhere"; ln -s "$WRITES/elsewhere" "$f"
+  ghr132_status; expect_rc 0; expect_out "$GHR132_SHORT"; expect_no_out 'old-app'
+  # more than RUN_FACTS_MAX bytes
+  ghr132_seed "$good$(printf 'GITHUB_X=%04096d\n' 0)"
+  ghr132_status; expect_rc 0; expect_out "$GHR132_SHORT"; expect_no_out 'old-app'
+  # a directory others can write
+  ghr132_seed "$good"; chmod 770 "$WRITES/run-facts"
+  ghr132_status; expect_rc 0; expect_out "$GHR132_SHORT"; expect_no_out 'old-app'
+  # a symlinked directory
+  ghr132_seed "$good"; mv "$WRITES/run-facts" "$WRITES/real-facts"; ln -s "$WRITES/real-facts" "$WRITES/run-facts"
+  ghr132_status; expect_rc 0; expect_out "$GHR132_SHORT"; expect_no_out 'old-app'
+}
+
+# A store that cannot be used changes nothing: the output, stderr and exit
+# code are those of RUN_FACTS_DIR=off, for a read that has something to keep
+# and for one between two steps; and a read that has nothing to keep makes no
+# directory.
+case_status_an_unusable_run_facts_dir_changes_nothing() {
+  local want_out want_err want_rc want2_out want2_err want2_rc d
+  RUNNERCTL_STUB_RUN_FACTS_DIR=off RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run status
+  want_out="$OUT" want_err="$ERR" want_rc="$RC"
+  : >"$WRITES/.env-once"
+  RUNNERCTL_STUB_RUN_FACTS_DIR=off ghr132_status
+  want2_out="$OUT" want2_err="$ERR" want2_rc="$RC"
+  mkdir -p "$TMP/ghr132"
+  mkdir -m 500 "$TMP/ghr132/read-only"
+  mkdir -m 770 "$TMP/ghr132/shared"
+  : >"$TMP/ghr132/a-file"
+  for d in "$TMP/ghr132/missing/run-facts" "$TMP/ghr132/read-only" "$TMP/ghr132/shared" "$TMP/ghr132/a-file"; do
+    RUNNERCTL_STUB_RUN_FACTS_DIR="$d" RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=300 run status
+    expect_text "status with $d" "$want_out" "$OUT"
+    expect_text "stderr with $d" "$want_err" "$ERR"
+    expect_text "exit with $d" "$want_rc" "$RC"
+    : >"$WRITES/.env-once"
+    RUNNERCTL_STUB_RUN_FACTS_DIR="$d" ghr132_status
+    expect_text "the next read with $d" "$want2_out" "$OUT"
+    expect_text "its stderr with $d" "$want2_err" "$ERR"
+    expect_text "its exit with $d" "$want2_rc" "$RC"
+  done
+  expect_text "nothing written" "" "$(find "$TMP/ghr132/read-only" "$TMP/ghr132/shared" -mindepth 1 2>&1)"
+  expect_text "nothing made" "no" "$([ -e "$TMP/ghr132/missing" ] && echo yes || echo no)"
+  # nothing to keep (the step is already gone): no directory is made
+  rm -rf "$WRITES"; mkdir -p "$WRITES"; : >"$WRITES/.env-once"
+  ghr132_status
+  expect_rc 0
+  expect_out "$GHR132_SHORT"
+  expect_text "no store made" "no" "$([ -e "$WRITES/run-facts" ] && echo yes || echo no)"
+  chmod 700 "$TMP/ghr132/read-only"; rm -rf "$TMP/ghr132"
+}
+
 # O in `fleet watch`: the same, for the (host, slot) the cursor is on, from
 # the payload the tick already brought — the key asks no host anything, so the
 # only ssh calls are the first frame's four (a table and a --json per host).
@@ -11557,6 +11766,11 @@ t "watch: O prints the run URL of the cursor's job"                         case
 t "GHR-102: watch keeps a job's run facts while the same job runs"          case_watch_remembers_a_jobs_run_between_reads
 t "GHR-102: a new job on the slot inherits nothing of the last one's run"   case_watch_a_new_job_inherits_nothing_of_the_last_ones_run
 t "GHR-102: a remembered value is drawn safe, and only kept facts are kept" case_watch_a_remembered_value_is_drawn_safe
+t "GHR-132: a one-shot status between two steps draws the run facts an earlier read kept" case_status_remembers_a_jobs_run_between_steps
+t "GHR-132: the run-facts store is 0700/0600 whatever the umask"                         case_status_run_facts_are_private_whatever_the_umask
+t "GHR-132: a new job or a restarted unit is shown nothing of the stored run"            case_status_a_new_job_is_shown_nothing_of_the_last_runs_facts
+t "GHR-132: a hostile or failing run-facts file is not believed"                         case_status_a_hostile_run_facts_file_is_not_believed
+t "GHR-132: an unusable run-facts dir leaves status exactly as with none"                case_status_an_unusable_run_facts_dir_changes_nothing
 t "fleet watch: O prints the cursor's run URL and asks no host"             case_fleet_watch_O_prints_the_cursors_run_url
 t "fleet watch: O prints nothing that is not a run page's address"          case_fleet_watch_run_url_trusts_no_remote_string
 t "status --json: a job's text cannot forge the slot line its readers parse" case_run_facts_cannot_forge_the_slot_line

@@ -423,6 +423,22 @@ facts come from the same step environment as the repository, so they have its
 access needs (the runner's user or root) and its gap: between two steps, and
 for a container job, there is no step process to read them from.
 
+That gap is bridged by remembering them. Whatever a read of a running job
+kept is written to one small file per slot under `RUN_FACTS_DIR` —
+`/run/runnerctl` for root, `$XDG_RUNTIME_DIR/runnerctl` for anyone else —
+and a later `status`, `status --json`, `watch` or `fleet` read of the **same
+job** that finds no step process draws it from there. The file is keyed to
+the job (the unit's InvocationID and the job's start), so a new job on the
+slot, or a restarted unit, is shown nothing of the last one's run, and the
+next readable step replaces it. It is created `0600` in a `0700` directory
+the reader owns, by the user who could read the environment, and readable by
+that user alone: a user who cannot read a job's environment sees what it
+always saw. Both default directories are emptied at reboot. A file is read
+back as hostile input, under the same rules as an environment (below); one
+that fails them, or a directory that is missing, someone else's, or writable
+by others, is silence — the output and the exit code are what they are with
+`RUN_FACTS_DIR="off"`.
+
 Those values — a branch name, a workflow's name, the repository, the job id —
 are text somebody outside the host chose, and any process in the slot can put
 what it likes in its own environment. The cell, and the `watch` lines that
@@ -619,7 +635,7 @@ and the result becomes the status line under the legend:
 | `S` / `T` | stop / start the slot (stop carries the same warning while a job runs) | `systemctl stop\|start <unit>` |
 | `P` | reap the `+N leaked` processes on an idle slot, exactly as `reap <IDX>` does | `kill -TERM …`, then `kill -KILL` for what survives |
 | `L` | show `logs <slot> -n 50` in `$PAGER` (`less`; `q` returns to the table). No confirm — it changes nothing | `journalctl -u <unit> -n 50` |
-| `O` | print the URL of the running job's run on the status line — `https://github.com/<owner>/<repo>/actions/runs/<id>/attempts/<n>` — to copy or click. It is printed, never opened: the node you watch from is usually a terminal with no browser. Says so when no job is running, or when the job's environment could not be read (between steps, a container job, no access to the slot's processes) | nothing |
+| `O` | print the URL of the running job's run on the status line — `https://github.com/<owner>/<repo>/actions/runs/<id>/attempts/<n>` — to copy or click. It is printed, never opened: the node you watch from is usually a terminal with no browser. Says so when no job is running, or when the job's environment could not be read and nothing was remembered for that job (no access to the slot's processes, or no step read yet — see `RUN_FACTS_DIR`) | nothing |
 | `Enter` | show the selected slot in full, in place of the table — [below](#the-slot-in-full-enter) | nothing |
 | `?` | list every key `watch` reads, in place of the table, as [`fleet watch`](#a-live-fleet-view-fleet-watch)'s `?` does; ↑ ↓ PgUp PgDn g G scroll it where the terminal cuts it, and any other key closes it, and is spent doing so. The legend under the table names it: `? keys` | nothing |
 | `PgUp` / `PgDn` | move the cursor a page (a window less one row, so the row you left is still on screen) | |
