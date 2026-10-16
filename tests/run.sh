@@ -17849,9 +17849,62 @@ case_ghr156_fleet_health_restart_stalled_cuts_on_silence() {
   expect_no_log '^probe:ssh_heartbeat '
 }
 
+# --- GHR-158: fleet upgrade --push's transfer is not silence -------------------
+# The install's first stretch is the script going over ssh's stdin, and
+# nothing can print while it does. The watchdog counts silence from the host's
+# FLEET_PUSH_RECEIVED line instead, and holds the transfer to the ceiling.
+# GHR-150's limits again: IDLE 12, MAX 60 (the push's ceiling: its GHR-81
+# total is 30). Each transfer takes 30 s — past IDLE — before the install:
+#   LIVE    a line every 2 s up to 50, done at 50: upgraded;
+#   SILENT  no line after the transfer: cut at 42 (30 + IDLE), in GHR-150's
+#           words, before the install ran;
+#   FOREVER a transfer of 70 s: cut at the ceiling, 60.
+case_ghr158_push_transfer_is_not_silence() {
+  local v
+  v="$(push_ver)"
+  ghr150_config
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_PUSH_TRANSFER="build-1:30" \
+    RUNNERCTL_STUB_FLEET_LINES="build-1:2:50:50:push-install" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet upgrade --push
+  expect_rc 0
+  expect_out "^build-1 +0\\.0\\.1 -> ${v//./\\.} +upgraded\$"
+  expect_same_file "$(push_dir build-1)/bin/runnerctl" "$RUNNERCTL"
+  expect_log '^probe:timeline_received build-1 30$'
+  expect_log '^probe:timeline_end build-1 50$'
+  expect_no_log '^probe:timeline_(unseen|gave_up) '
+  expect_no_out 'heartbeat|timed out|received runnerctl'
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_PUSH_TRANSFER="build-1:30" \
+    RUNNERCTL_STUB_FLEET_LINES="build-1:0:0:50:push-install" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet upgrade --push
+  expect_rc 1
+  expect_out "^build-1 +0\\.0\\.1 -> ${v//./\\.} +$(ghr156_idle_text build-1)\$"
+  expect_text "the clock at the silent install's cut" 42 "$(ghr150_clock)"
+  expect_log '^probe:timeline_received build-1 30$'
+  expect_no_log '^probe:remote_push_sudo '
+  expect_same_file "$(push_dir build-1)/bin/runnerctl" "$(push_dir build-1)/before"
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_PUSH_TRANSFER="build-1:70" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet upgrade --push
+  expect_rc 1
+  expect_out "^build-1 +0\\.0\\.1 -> ${v//./\\.} +timed out after 60s, the FLEET_MUTATE_MAX ceiling — $(ghr156_still build-1)\$"
+  expect_log '^probe:timeline_timeout build-1 60$'
+  expect_no_log '^probe:timeline_received '
+  expect_no_log '^probe:remote_push_sudo '
+  # Off (FLEET_MUTATE_IDLE=0) the install asks for no heartbeat and says
+  # nothing extra: no arming line in its text.
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet upgrade --push
+  expect_log "^probe:ssh_run_stdin build-1 -- .*echo \"heartbeat: received runnerctl \\(0s\\)\";"
+  save_config "$GHR150_CFG" <<'CFG'
+FLEET_MUTATE_IDLE=0
+CFG
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_cfg "$GHR150_CFG" fleet upgrade --push
+  expect_rc 0
+  expect_no_log 'received runnerctl'
+}
+
 t "GHR-156: fleet upgrade cuts on silence; an older host stays on the total"       case_ghr156_fleet_upgrade_cuts_on_silence
 t "GHR-156: fleet upgrade --push's install cuts on silence, the flag inline"       case_ghr156_fleet_upgrade_push_cuts_on_silence
 t "GHR-156: fleet health --restart-stalled cuts on silence; an older host doesn't" case_ghr156_fleet_health_restart_stalled_cuts_on_silence
+t "GHR-158: fleet upgrade --push's transfer is not silence; the install still is" case_ghr158_push_transfer_is_not_silence
 
 # --- Summary ------------------------------------------------------------------
 echo

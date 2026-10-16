@@ -2235,8 +2235,13 @@ again without it — once per run, and once per `fleet watch` session — and
 stays on the total above. `fleet upgrade --push` is the exception that has no
 older host: the flag rides inside the install command, where the script being
 pushed — this node's own — reads it, so every pushed host is on the two limits,
-whatever runnerctl it had before. `fleet upgrade --check` is a read and is
-not asked.
+whatever runnerctl it had before. Its silence is counted from the moment the
+host says it has received the script, not from the start of the call: the
+script goes over ssh's stdin first, and nothing can print while it does, so a
+slow link is not cut as silent. That transfer is held to the ceiling alone
+(`FLEET_MUTATE_MAX`, or the total above where that is longer), and the install
+after it to both limits.
+`fleet upgrade --check` is a read and is not asked.
 
 **What the host does once its caller has gone.** The same happens when you
 press Ctrl-C on the central node, quit `fleet watch` with an action still
