@@ -1,9 +1,15 @@
 SHELL := bash
 SHELLCHECK ?= shellcheck
 
-.PHONY: gates lint example-drift version-drift smoke sim migrate-test install-test upgrade-test
+.PHONY: refuse-sim-only gates lint example-drift version-drift smoke sim migrate-test install-test upgrade-test
 
-gates: lint example-drift version-drift smoke sim migrate-test install-test upgrade-test
+gates: refuse-sim-only lint example-drift version-drift smoke sim migrate-test install-test upgrade-test
+
+# GHR-164: SIM_ONLY=<ERE> filters tests/run.sh to the cases whose name matches.
+# The gate always runs everything, so it refuses rather than quietly ignoring
+# a filter its caller believes applied. Filtered runs: bash tests/run.sh.
+refuse-sim-only:
+	@test -z "$$SIM_ONLY" || { echo "refusing: SIM_ONLY is set ('$$SIM_ONLY'); the gate runs every case. Unset it, or run 'SIM_ONLY=... bash tests/run.sh' directly for a filtered run." >&2; exit 2; }
 
 # tests/stub.config has no shebang (it is sourced), hence -s bash for the set.
 lint:
@@ -38,7 +44,7 @@ smoke:
 
 # Everything that touches units, run against tests/stub.config (systemd
 # replaced by a call log). See tests/run.sh for how to add a case.
-sim:
+sim: refuse-sim-only
 	@bash tests/run.sh
 
 # `migrate` against the sanitised legacy fixture and a fixture drop-in tree;

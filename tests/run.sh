@@ -120,6 +120,16 @@ FAILS=()       # failed expectations of the current case
 ERRS=()        # harness errors of the current case (fail even under xfail)
 NEXPECT=0      # expectations made by the current case
 npass=0 nfail=0 nxfail=0
+# GHR-164: SIM_ONLY='<ERE>' runs only the cases whose NAME matches, so one case
+# can be iterated on without a scratch copy of this file. `make gates` and
+# `make sim` refuse while it is set; the summary line says `filtered`.
+SIM_ONLY="${SIM_ONLY:-}"
+nfiltered=0    # cases skipped by SIM_ONLY (never run, never counted as ok)
+if [ -n "$SIM_ONLY" ]; then
+  re_probe() { [[ "" =~ $1 ]]; }   # rc 2 = not an ERE; 0/1 = it compiled
+  rc_=0; re_probe "$SIM_ONLY" 2>/dev/null || rc_=$?
+  if [ "$rc_" -gt 1 ]; then echo "sim: SIM_ONLY is not a valid ERE: $SIM_ONLY" >&2; exit 2; fi
+fi
 FAILED=()      # names of failed cases, for the summary
 XFAIL_KEYS=""  # issue keys of the xfail cases that failed as expected
 
@@ -401,6 +411,9 @@ skip() { echo "skip  $*"; }
 # --- Case runner --------------------------------------------------------------
 _case() {
   local key="$1" name="$2" fn="$3"
+  if [ -n "$SIM_ONLY" ] && ! [[ "$name" =~ $SIM_ONLY ]]; then
+    nfiltered=$((nfiltered + 1)); return 0
+  fi
   FAILS=(); ERRS=(); NEXPECT=0
   OUT=""; ERR=""; RC=0; : >"$LOG"; rm -f "$LOG.leaks"
   "$fn"
@@ -18574,9 +18587,58 @@ t "GHR-162: a mutating call's job, taps and watchdog; the walk's call takes INT"
 t "GHR-162: a heartbeat ticker and the caller guard's relays ignore INT and QUIT" case_ghr162_a_ticker_and_the_relays_ignore_int_and_quit
 t "GHR-162: fleet watch's fetch, action, H, U and : jobs ignore INT and QUIT"   case_ghr162_fleet_watch_jobs_ignore_int_and_quit
 
+# GHR-164: SIM_ONLY filters registration. The harness runs itself with a filter
+# that matches one known case (and not these, so it cannot recurse).
+ghr164_inner() { OUT="$(env SIM_ONLY="$1" bash tests/run.sh 2>&1)" && RC=0 || RC=$?; }
+
+case_ghr164_sim_only_filters_by_case_name() {
+  ghr164_inner '^resolve_url: no ref leaves'
+  expect_rc 0
+  expect_out '^ok    resolve_url: no ref leaves UPGRADE_URL unchanged$'
+  expect_out_count '^(ok|xfail|FAIL) ' 1
+  expect_out '^sim\(filtered: \^resolve_url: no ref leaves\): 1 ok, 0 xfail \(\), 0 failed, [0-9]+ skipped by the filter'
+  expect_no_out '^sim:'
+}
+
+case_ghr164_sim_only_matching_nothing_is_not_success() {
+  ghr164_inner 'no-such-case-zzz-164'
+  expect_rc 1
+  expect_out 'sim\(filtered: no-such-case-zzz-164\): 0 ok, 0 xfail \(\), 0 failed'
+  expect_out 'no case name matched'
+  expect_out_count '^(ok|xfail|FAIL) ' 0
+  ghr164_inner '('
+  expect_rc 2
+  expect_out 'not a valid ERE'
+}
+
+case_ghr164_make_gates_and_sim_refuse_sim_only() {
+  # SHELLCHECK=false: were the refusal gone, gates would die at lint at once
+  # instead of running the whole suite, and the message check would go red.
+  OUT="$(SIM_ONLY=x make gates SHELLCHECK=false 2>&1)" && RC=0 || RC=$?
+  expect_rc 2
+  expect_out 'SIM_ONLY'
+  expect_out 'refusing'
+  OUT="$(SIM_ONLY=x make sim 2>&1)" && RC=0 || RC=$?
+  expect_rc 2
+  expect_out 'SIM_ONLY'
+  expect_out_count '^sim' 0
+}
+
+t "GHR-164: SIM_ONLY runs only the matching case and the summary says filtered" case_ghr164_sim_only_filters_by_case_name
+t "GHR-164: SIM_ONLY matching nothing runs nothing and fails"                   case_ghr164_sim_only_matching_nothing_is_not_success
+t "GHR-164: make gates and make sim refuse while SIM_ONLY is set"                case_ghr164_make_gates_and_sim_refuse_sim_only
+
 # --- Summary ------------------------------------------------------------------
 echo
-echo "sim:$npass ok, $nxfail xfail (${XFAIL_KEYS# }), $nfail failed"
+if [ -n "$SIM_ONLY" ]; then
+  echo "sim(filtered: $SIM_ONLY): $npass ok, $nxfail xfail (${XFAIL_KEYS# }), $nfail failed, $nfiltered skipped by the filter — NOT the gate"
+  if [ $((npass + nxfail + nfail)) -eq 0 ]; then
+    echo "sim(filtered: $SIM_ONLY): no case name matched — nothing ran" >&2
+    exit 1
+  fi
+else
+  echo "sim:$npass ok, $nxfail xfail (${XFAIL_KEYS# }), $nfail failed"
+fi
 if [ "$nfail" -gt 0 ]; then
   printf '  FAIL %s\n' "${FAILED[@]}"
   exit 1
