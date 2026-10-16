@@ -6272,6 +6272,14 @@ compose_image_in_use() { # IMAGE-ID
   [ -n "$(docker ps -aq --filter "ancestor=$1" 2>/dev/null)" ]
 }
 
+# GHR-147: the full ids of every container, in any state, made from IMAGE-ID —
+# one per line, as `docker ps` prints them, so no field is ever split. A read.
+# The dry run takes the ids it would remove out of this answer: what is left is
+# what would still hold the image once the run is over.
+compose_image_users() { # IMAGE-ID
+  docker ps -aq --no-trunc --filter "ancestor=$1" 2>/dev/null
+}
+
 compose_rm() { # container|network|volume|image ID
   case "$1" in
     container) docker rm -f -v "$2" >/dev/null 2>&1 ;;
@@ -6358,7 +6366,7 @@ cmd_compose_reap() { # [--apply] [--standalone] [--project NAME] [--max-age-hour
   # compose_record; one object that fails takes its whole project out of this
   # run (`unparseable`), because a stack is reaped together or not at all.
   local -A containers=() networks=() volumes=() last=() net_last=() vol_last=() workdir=() keep=()
-  local -A unparseable=() n_unparseable=()
+  local -A unparseable=() n_unparseable=() reap_ids=()
   local projects=() project id k t line kind n_skipped=0
   compose_add_project() {
     [ -n "$1" ] || return 1
@@ -6458,6 +6466,9 @@ cmd_compose_reap() { # [--apply] [--standalone] [--project NAME] [--max-age-hour
       "$(wc -w <<<"${containers[$p]:-}")" "$(wc -w <<<"${networks[$p]:-}")" "$(wc -w <<<"${volumes[$p]:-}")"
     if [ "$action" != reap ]; then kept=$((kept + 1)); continue; fi
     reaped=$((reaped + 1))
+    # GHR-147: what this run removes, so the dry run can ask what is left.
+    # shellcheck disable=SC2086  # the id list is space-separated by construction
+    for id in ${containers[$p]:-}; do reap_ids[$id]=1; done
     $apply || continue
     # GHR-88: a timer runs this hourly, so the record is armed by the first
     # removal, not by --apply: an hour with nothing to reap writes nothing.
@@ -6517,6 +6528,9 @@ cmd_compose_reap() { # [--apply] [--standalone] [--project NAME] [--max-age-hour
       printf '%s container %s reason=%s idle=%sm image=%s\n' "$action" "$name" "$reason" "$(( (now - seen) / 60 ))" "$image"
       if [ "$action" != reap ]; then kept=$((kept + 1)); continue; fi
       reaped=$((reaped + 1))
+      reap_ids[$cid]=1
+      # GHR-147: the dry run's candidate images, as --apply's are.
+      $apply || freed_images[$img]="$image"
       $apply || continue
       audit_begin compose-reap --apply --standalone
       caller_guard # GHR-137
@@ -6527,7 +6541,21 @@ cmd_compose_reap() { # [--apply] [--standalone] [--project NAME] [--max-age-hour
       fi
     done < <(compose_standalone)
     for img in "${!freed_images[@]}"; do
-      if compose_image_in_use "$img"; then
+      if ! $apply; then
+        # GHR-147: the same question --apply asks once its containers are gone,
+        # asked before anything is: is any container left that this run does
+        # not remove? Read-only, so the count is the one --apply would reach.
+        local user held=false
+        while IFS= read -r user; do
+          [ -n "$user" ] || continue
+          [ -n "${reap_ids[$user]+x}" ] || { held=true; break; }
+        done < <(compose_image_users "$img")
+        if $held; then
+          echo "keep image ${freed_images[$img]} reason=in-use"
+        else
+          echo "would remove image ${freed_images[$img]}"
+        fi
+      elif compose_image_in_use "$img"; then
         echo "keep image ${freed_images[$img]} reason=in-use"
       elif compose_rm image "$img"; then
         n_images=$((n_images + 1)); echo "removed image ${freed_images[$img]}"
@@ -10307,13 +10335,20 @@ cmd_fleet_compose_reap() { # [--host H]... [--apply] [--standalone] [--project N
 
 # Each host's lines, prefixed, then the fleet total of what WOULD be reaped:
 # stacks (projects) with their containers, networks and volumes, plus the
-# --standalone containers, and "up to" the images those free — whether an
-# image is still used by something else is only asked by --apply. Read off the
-# host's own per-project lines, the counts through num_int (GHR-104).
+# --standalone containers, and the images those free. GHR-147: each host's dry
+# run asks, read-only, whether anything it would not remove still uses a
+# candidate image, and says so line by line (`would remove image` / `keep image
+# ... reason=in-use`), so the count is exact. A host on an older runnerctl says
+# nothing of images: its candidates are counted from the container lines, and
+# the total then reads "up to". Read off the host's own per-project lines, the
+# counts through num_int (GHR-104).
 FLEET_CR_PROJECT_RE='^reap .* containers=([0-9]+) networks=([0-9]+) volumes=([0-9]+)$'
+FLEET_CR_IMAGE_RE='^would remove image '
+FLEET_CR_IMAGE_KEPT_RE='^keep image .* reason=in-use$'
 FLEET_CR_STANDALONE_RE='^reap container [A-Za-z0-9][A-Za-z0-9_.-]* reason=[^ ]+ idle=[0-9]+m image=(.*)$'
 fleet_compose_reap_report() {
   local i host rc line answered=0 nodocker=0 bad=0 stacks=0 ctr=0 net=0 vol=0 img=0 tail="" nc nn nv
+  local upto="" verdicts would
   local -A imgs=()
   for i in "${!FLEET_HOSTS[@]}"; do
     host="${FLEET_HOSTS[$i]}"
@@ -10323,12 +10358,16 @@ fleet_compose_reap_report() {
       printf '%s: %s\n' "$host" "$FLEET_NO_DOCKER_ROW"
       continue
     fi
-    imgs=()
+    imgs=() verdicts=0 would=0
     while IFS= read -r line || [ -n "$line" ]; do
       [ -n "$line" ] || continue
       printf '%s: %s\n' "$host" "$line"
       [ "$rc" = 0 ] || continue
-      if [[ "$line" =~ $FLEET_CR_STANDALONE_RE ]]; then
+      if [[ "$line" =~ $FLEET_CR_IMAGE_RE ]]; then
+        would=$((would + 1)); verdicts=1
+      elif [[ "$line" =~ $FLEET_CR_IMAGE_KEPT_RE ]]; then
+        verdicts=1
+      elif [[ "$line" =~ $FLEET_CR_STANDALONE_RE ]]; then
         ctr=$((ctr + 1))
         imgs["${BASH_REMATCH[1]}"]=1
       elif [[ "$line" =~ $FLEET_CR_PROJECT_RE ]]; then
@@ -10342,7 +10381,12 @@ fleet_compose_reap_report() {
     done <"$FLEET_DIR/$i.out"
     if [ "$rc" = 0 ]; then
       answered=$((answered + 1))
-      img=$((img + ${#imgs[@]}))
+      if [ "$verdicts" = 1 ]; then
+        img=$((img + would))
+      else
+        img=$((img + ${#imgs[@]}))
+        [ "${#imgs[@]}" -eq 0 ] || upto="up to "
+      fi
     else
       bad=$((bad + 1))
       printf '%s: %s\n' "$host" "$(fleet_error_text "$rc" "$FLEET_DIR/$i.err")"
@@ -10350,7 +10394,7 @@ fleet_compose_reap_report() {
   done
   [ "$nodocker" -eq 0 ] || tail+="; $nodocker host(s) without docker"
   [ "$bad" -eq 0 ] || tail+="; $bad host(s) failed"
-  echo "fleet compose-reap (dry run, nothing removed): would reap $stacks stack(s) — $ctr container(s), $net network(s), $vol volume(s), up to $img image(s) — on $answered host(s)$tail"
+  echo "fleet compose-reap (dry run, nothing removed): would reap $stacks stack(s) — $ctr container(s), $net network(s), $vol volume(s), ${upto}$img image(s) — on $answered host(s)$tail"
   [ "$bad" -eq 0 ]
 }
 
