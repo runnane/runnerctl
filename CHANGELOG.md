@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.27.1](https://github.com/runnane/runnerctl/compare/v0.27.0...v0.27.1) (2026-10-16)
+
+
+### Bug Fixes
+
+* a SIGTERM taken in the watches' key read no longer runs the cleanup with IFS empty, so fleet watch reaps its fetches (GHR-167) ([#183](https://github.com/runnane/runnerctl/issues/183)) ([8ce08da](https://github.com/runnane/runnerctl/commit/8ce08da3d217a479a4d334a2376e65069d465c3a))
+* fleet status --json --watch takes SIGTERM on bash 5.2, where a trap run inside a $( re-parse was lost (GHR-165) ([#180](https://github.com/runnane/runnerctl/issues/180)) ([80a11bf](https://github.com/runnane/runnerctl/commit/80a11bf0bd34c6ee609ac564fd975bba160921b3))
+* the host-events journal search drops --system, so a regular-user runner's disk-full lines are reported (GHR-152) ([#182](https://github.com/runnane/runnerctl/issues/182)) ([b7b09fc](https://github.com/runnane/runnerctl/commit/b7b09fc886ec6ba70f1af5dc8473f89338d573d0))
+
+
+### Documentation
+
+* on bash 5.2 a signal pending at a $( parse ends watch, fleet watch and an armed record with exit 2, cleanup intact; documented and pinned (GHR-166) ([#184](https://github.com/runnane/runnerctl/issues/184)) ([5be3b9a](https://github.com/runnane/runnerctl/commit/5be3b9adbc72f1e387ff93fe02b5fcf7e3cfa109))
+
 ## [0.27.0](https://github.com/runnane/runnerctl/compare/v0.26.0...v0.27.0) (2026-10-16)
 
 
