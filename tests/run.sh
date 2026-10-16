@@ -18152,6 +18152,166 @@ t "GHR-96: an interrupted fleet status or start leaves no ssh (real timeout)"  c
 t "GHR-96: S in fleet watch, interrupted during its floor read, leaves no ssh"  case_ghr96_an_interrupted_watch_floor_read_leaves_no_ssh
 t "GHR-96: a completed fan-out signals nothing; a pid not ours is let be"      case_ghr96_a_completed_fanout_signals_nothing
 
+# --- GHR-162: every async process sets its own SIGINT/SIGQUIT -------------------
+# Bash 5.2 (CI's ubuntu-24.04, Debian 12) starts a `&` job of a script with
+# SIGINT at its default — or the parent's INT trap — and a `>(…)` with SIGINT
+# and SIGQUIT both at their default; bash 5.3 ignores both in either. So each
+# of the script's async processes sets its own at its top, and these cases pin
+# what each one has, from /proc/<pid>/status's SigIgn (the stub's
+# RUNNERCTL_STUB_SIGIGN=1 logs `probe:sigign NAME int=… quit=…`, once per
+# process). A job is read through a command it runs (what its `timeout` and
+# ssh get); a `>(…)` tap or relay, and a `:` command's job, from outside, where
+# the QUIT bit is bash's own and always 1. On a 5.3 box a job that lost its
+# trap still reads 1 1: the pin is only discriminating under 5.2, which is what
+# CI runs (.agents/gates.md has the debian:12 command for running it locally).
+#
+# run_sigdfl starts the command with INT and QUIT at their default (perl, as
+# GHR-119's driver does): a gate started in the background ignores both, every
+# job would inherit that whatever the script sets, and the pin would read 1 1
+# for nothing. The `main` line is that control, read when the stub is sourced.
+run_sigdfl() { # CONFIG ARGS...
+  local cfg="$1"; shift
+  _log_reset; rm -f "$LOG.cols" "$LOG.lines" "$LOG.clock"
+  rm -rf "$WRITES"; mkdir -p "$WRITES"
+  RC=0
+  if $HAVE_PERL; then
+    # shellcheck disable=SC2016  # perl's own variables
+    OUT="$(RUNNERCTL_CONFIG="$cfg" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" RUNNERCTL_STUB_SIGIGN=1 \
+           perl -e '$SIG{$_} = "DEFAULT" for qw(INT QUIT); exec @ARGV or exit 127' \
+           timeout "$RUN_TIMEOUT" "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
+  else
+    OUT="$(RUNNERCTL_CONFIG="$cfg" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" RUNNERCTL_STUB_SIGIGN=1 \
+           timeout "$RUN_TIMEOUT" "$RUNNERCTL" "$@" 2>"$TMP/err")" || RC=$?
+  fi
+  ERR="$(cat "$TMP/err")"
+}
+# At least one process NAME was logged, and every one of them ignores SIGINT
+# as INT says and SIGQUIT as QUIT says (1 ignored, 0 not).
+expect_sigign() { # NAME INT QUIT
+  _expect
+  local n bad
+  n="$(grep -c "^probe:sigign $1 " "$LOG"; true)"
+  bad="$(grep "^probe:sigign $1 " "$LOG" | grep -v " int=$2 quit=$3\$" | head -n 1; true)"
+  if [ "$n" -eq 0 ]; then
+    FAILS+=("no probe:sigign line for $1 — the case never reached it")
+  elif [ -n "$bad" ]; then
+    FAILS+=("$1 wants int=$2 quit=$3 (1 = ignored), got: $bad")
+  fi
+}
+# The control: the command itself started with both at their default — or the
+# gate's ignore would be all a job pin reads. Without perl it may not be.
+ghr162_control() {
+  if $HAVE_PERL; then
+    expect_sigign main 0 0
+  else
+    skip "GHR-162: no perl, so the command may start with SIGINT ignored and the pins are not discriminating"
+  fi
+}
+
+# `fleet status`: the table's fan-out jobs and, for a host too old for
+# --with-json, the summary's second-call job.
+case_ghr162_fleet_status_jobs_ignore_int_and_quit() {
+  RUNNERCTL_STUB_FLEET_NOWITHJSON="build-1" RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2" run_sigdfl "$STUB" fleet status
+  expect_rc 0
+  ghr162_control
+  expect_sigign fleet_fanout_one 1 1
+  expect_sigign fleet_summary_fetch_one 1 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json' 1
+}
+
+# A call that changes hosts. On the watchdog (GHR-150): the fan-out job, the
+# call's own job (fleet_idle_run, which takes its CALLER's — here the fan-out
+# job's ignore), its two taps and the watchdog. Without the heartbeat (an
+# older host, asked again without it) the streamed taps. And the budget walk,
+# whose call is made from the command's own process: there fleet_idle_run
+# takes the command's default INT and QUIT — the one async process meant to
+# take an operator's Ctrl-C.
+case_ghr162_a_mutating_calls_processes() {
+  ghr150_config
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_LINES="$GHR150_LIVE" RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run_sigdfl "$GHR150_CFG" fleet restart
+  expect_rc 0
+  ghr162_control
+  expect_sigign fleet_fanout_one 1 1
+  expect_sigign fleet_idle_run 1 1
+  expect_sigign fleet_idle_watch 1 1
+  expect_sigign fleet_idle_lines 1 1
+  expect_log_count '^probe:sigign fleet_idle_lines ' 2
+  RUNNERCTL_STUB_FLEET_HOSTS="gw-preheartbeat" run_sigdfl "$GHR150_CFG" fleet restart
+  expect_rc 0
+  expect_out '^gw-preheartbeat: restart done\.$'
+  ghr162_control
+  expect_sigign fleet_stream_lines 1 1
+  expect_log_count '^probe:sigign fleet_stream_lines ' 2
+  # …and the same taps under the command's own process (the budget walk, the
+  # older host asked again without the heartbeat): a fan-out job's ignore is
+  # inherited by its taps, the command's default INT is not.
+  RUNNERCTL_STUB_FLEET_SLOTS=1 RUNNERCTL_STUB_FLEET_HOSTS="gw-preheartbeat" \
+    run_sigdfl "$GHR150_CFG" fleet restart --max-unavailable 1
+  expect_rc 0
+  ghr162_control
+  expect_sigign fleet_stream_lines 1 1
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_SLOTS=1 RUNNERCTL_STUB_FLEET_LINES="$GHR150_LIVE" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_sigdfl "$GHR150_CFG" fleet restart --max-unavailable 1
+  expect_rc 0
+  ghr162_control
+  if $HAVE_PERL; then expect_sigign fleet_idle_run 0 0; fi
+  expect_sigign fleet_idle_watch 1 1
+  expect_sigign fleet_idle_lines 1 1
+}
+
+# A guarded local command under --heartbeat: the ticker and the two relays.
+case_ghr162_a_ticker_and_the_relays_ignore_int_and_quit() {
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_SYSTEMCTL_SECS="$GHR149_RESTART" run_sigdfl "$STUB" --heartbeat=5 restart 0
+  expect_rc 0
+  expect_out '^restart done\.$'
+  ghr162_control
+  expect_sigign hb_ticker 1 1
+  expect_sigign caller_relay 1 1
+  expect_log_count '^probe:sigign caller_relay ' 2
+}
+
+# `fleet watch`: a tick's fetch, an action key's job (on the watchdog), H's
+# read, U's check and a `:` command's job.
+case_ghr162_fleet_watch_jobs_ignore_int_and_quit() {
+  ghr150_config
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_LINES="$GHR150_LIVE" RUNNERCTL_STUB_KEYS='Ry-q' \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" run_sigdfl "$GHR150_CFG" fleet watch --color never
+  expect_rc 0
+  expect_out_count "^${GHR125_DONE}\$" 2
+  ghr162_control
+  expect_sigign fleet_watch_fetch_one 1 1
+  expect_sigign fleet_watch_act_job 1 1
+  expect_sigign fleet_idle_run 1 1
+  expect_sigign fleet_idle_watch 1 1
+  expect_sigign fleet_idle_lines 1 1
+  ghr118_fixture
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_HISTORY="$GHR88_HIST" RUNNERCTL_STUB_KEYS='jjjHHqq' RUNNERCTL_STUB_FLEET_HOSTS="$FW2" \
+    run_sigdfl "$STUB" fleet watch --color never
+  expect_rc 0
+  expect_log_count '^probe:ssh_run [^ ]+ -- runnerctl history ' 3
+  ghr162_control
+  # (fleet_watch_hist_one inherits fleet_watch_hist_job's: this pins the job)
+  expect_sigign fleet_watch_hist_one 1 1
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD_CHECK=build-2-oldver RUNNERCTL_STUB_KEYS="Uj${REL}yq" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-2-oldver" run_sigdfl "$STUB" fleet watch --color never
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-2-oldver -- runnerctl upgrade --check$' 1
+  ghr162_control
+  expect_sigign fleet_watch_act_job 1 1
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_FLEET_HOLD=build-1 RUNNERCTL_STUB_KEYS=":yj${REL}kq" RUNNERCTL_STUB_PROMPT_IN='scale 3' \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run_sigdfl "$STUB" fleet watch --color never
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl scale 3$' 1
+  ghr162_control
+  expect_sigign fleet_watch_cmd_job 1 1
+}
+
+t "GHR-162: fleet status's fan-out and summary jobs ignore INT and QUIT"       case_ghr162_fleet_status_jobs_ignore_int_and_quit
+t "GHR-162: a mutating call's job, taps and watchdog; the walk's call takes INT" case_ghr162_a_mutating_calls_processes
+t "GHR-162: a heartbeat ticker and the caller guard's relays ignore INT and QUIT" case_ghr162_a_ticker_and_the_relays_ignore_int_and_quit
+t "GHR-162: fleet watch's fetch, action, H, U and : jobs ignore INT and QUIT"   case_ghr162_fleet_watch_jobs_ignore_int_and_quit
+
 # --- Summary ------------------------------------------------------------------
 echo
 echo "sim:$npass ok, $nxfail xfail (${XFAIL_KEYS# }), $nfail failed"

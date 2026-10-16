@@ -224,7 +224,41 @@ Traps:
   background job keeps its parent's INT trap; 5.3 ignores INT in the job
   anyway, so on a 5.3 box that guard cannot fail. To check it locally, run the
   case in `debian:12`, as uid 1000 with `/etc/passwd` mounted, because
-  `id -un` must resolve.
+  `id -un` must resolve (the GHR-162 bullet below has the command).
+- **Every async process sets its own SIGINT/SIGQUIT, and the sim pins them
+  from SigIgn (GHR-162).** Measured in `debian:12` (bash 5.2.15) against
+  bash 5.3: a `&` job of a script, and a `>(…)`, keep INT at its default (or
+  the parent's INT TRAP) on 5.2 and hand INT and QUIT at their default to
+  every command they run; 5.3 ignores both. A bash process also ignores QUIT
+  in itself on both versions, whatever its trap, and gives a command it execs
+  the default back — so a process's own QUIT bit says nothing. So:
+  - each `&` job and `>(…)` in `runnerctl` starts with `builtin trap '' INT
+    QUIT` (or, for `fleet_watch_hist_one`, a comment saying it inherits its
+    job's), and `fleet_idle_run` alone sets its caller's both ways;
+  - `RUNNERCTL_STUB_SIGIGN=1` makes the stub log `probe:sigign NAME int=…
+    quit=…` once per process. A job is read through a command it runs (`sed`
+    on `/proc/self/status`, from a hook inside it), which is what its
+    `timeout` and ssh get; a tap, a relay and a `:` command's job are read
+    from outside. `main` is the control;
+  - the cases start the command through `run_sigdfl` (perl resets INT and
+    QUIT), because a backgrounded gate ignores both and every job would then
+    read `1 1` whatever it set. Without perl they `skip` the control;
+  - **on a 5.3 box a job that lost its trap still reads `1 1`**, so the pins
+    go red only on 5.2. (A behaviour case was tried and dropped: a fetch job
+    holding `fleet status --json --watch`'s inherited `exit 0` trap runs it
+    only once its foreground `timeout` returns, so the reap still found it
+    and it stayed green with the trap removed.) Run them where they can
+    fail, from the checkout (or worktree) root:
+
+    ```
+    docker run --rm -u 1000 -v /etc/passwd:/etc/passwd:ro -v "$PWD":/w -w /w debian:12 bash tests/run.sh
+    ```
+
+    Three `fleet status --json …` cases fail in that bare image with `case
+    makes no assertions`: the image has no python3, they assert only through
+    it, and CI's ubuntu has it (not a bash difference). Every other red
+    there is real. A new `&` job or `>(…)` gets its trap, its name in the stub's
+    `STUB_SIGIGN_JOBS` (or a read from outside) and an `expect_sigign`.
 - **`fleet watch` fetches each host in a background job (GHR-74), and the
   stub models the loop's poll step rather than sleeping through it.** While a
   fetch is out the loop's key read has `FW_POLL` (0.2) as its timeout; the

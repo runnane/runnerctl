@@ -1080,7 +1080,10 @@ CALLER_GUARD_P1="" CALLER_GUARD_P2="" CALLER_GONE=false
 # One stream, on stdin, to stdout: each line passed on until a write fails,
 # then read and dropped to the end. Exit 3 when something could not be passed.
 caller_relay() {
-  builtin trap '' INT TERM HUP PIPE
+  # GHR-162: QUIT stated beside INT, as every async process states both (bash
+  # ignores QUIT in its own process anyway; the explicit one would reach what
+  # it ran). A `>(…)` keeps INT at its default on bash 5.2, not on 5.3.
+  builtin trap '' INT QUIT TERM HUP PIPE
   local line nl=$'\n' gone=false
   while IFS= read -r line || { [ -n "$line" ] && nl=""; }; do
     $gone || printf '%s%s' "$line" "$nl" 2>/dev/null || gone=true
@@ -2729,9 +2732,10 @@ wait_idle() { # UNIT TIMEOUT
 #   * it checks every second that the process that started it is still there,
 #     for the one way out no trap sees (a SIGKILL of that process);
 #   * it writes to this process's stdout — the relay's pipe under caller_guard,
-#     so a reader that has gone costs it nothing, and SIGINT does not reach it
-#     (a background job of a script ignores it): an operator's Ctrl-C ends the
-#     command, and the command's way out ends the ticker.
+#     so a reader that has gone costs it nothing, and it ignores SIGINT and
+#     SIGQUIT, explicitly (GHR-162: bash 5.2 would hand it the record's trap):
+#     an operator's Ctrl-C ends the command, and the command's way out ends
+#     the ticker.
 # Between two phases there is no ticker, so a silence that spans a boundary
 # can be up to one phase's cadence plus the next one's N.
 HEARTBEAT="" HB_PID="" HB_OWNER=""
@@ -2749,6 +2753,8 @@ hb_wait() { # EPOCH PARENT
 # saying how long the phase has been running.
 hb_ticker() { # LABEL PARENT
   local t0 now next
+  # GHR-162: a worker — hb_stop (or its dead parent) ends it, never a Ctrl-C.
+  builtin trap '' INT QUIT
   t0="$(now_epoch)"; next=$((t0 + HEARTBEAT))
   while hb_wait "$next" "$2"; do
     now="$(now_epoch)"
@@ -7515,6 +7521,11 @@ fleet_fanout_one() { # INDEX REMOTE-ARGS...
   # ignores the signal outlives its call until the reap ends both, and a call
   # on the watchdog takes the job's dispositions (fleet_sig_ignored) on every
   # bash alike.
+  # GHR-162 made that the rule for every async process the script starts — a
+  # `&` job and a `>(…)` alike, which bash 5.2 leaves at INT and QUIT's
+  # default (or the parent's INT trap) where 5.3 ignores both: each sets its
+  # own at its top, ignored for a worker its owner ends, and only
+  # fleet_idle_run takes its caller's. tests/run.sh pins them from SigIgn.
   builtin trap '' INT QUIT
   host="${FLEET_HOSTS[$i]}"
   local -a args=()
@@ -7595,6 +7606,8 @@ FLEET_STREAM_LABEL=""
 # as the buffered report has never shown one.
 fleet_stream_lines() { # LABEL FILE out|err
   local label="$1" fh line
+  # GHR-162: a `>(…)` tap drains to the call's EOF; a Ctrl-C is not its to take.
+  builtin trap '' INT QUIT
   exec {fh}>"$2"
   while IFS= read -r line || [ -n "$line" ]; do
     relay_safe "$line"
@@ -7658,8 +7671,9 @@ fleet_into() { # STREAM LABEL OUT ERR COMMAND...
 #     `idle SECS` into ERR.cut and ends the call's whole process tree
 #     (proc_tree_kill: `timeout` puts ssh in a group of its own);
 #   * the CALL — in the background, so the watchdog has a pid to end, with
-#     the caller's own SIGINT/SIGQUIT (an async command would otherwise ignore
-#     them, and a budget walk's ssh has always taken an operator's Ctrl-C).
+#     the caller's own SIGINT/SIGQUIT, set explicitly (bash 5.3 would ignore
+#     them in a `&` job and 5.2 hand it the caller's INT trap — GHR-162 — and
+#     a budget walk's ssh has always taken an operator's Ctrl-C).
 # ERR.cut says `armed CEILING [max]` from the start (`max` when the ceiling is
 # FLEET_MUTATE_MAX rather than a longer GHR-81 total), so a 124 without an
 # `idle` is the ceiling's, and fleet_error_text words each.
@@ -7723,6 +7737,8 @@ fleet_sig_ignored() {
 # COMMAND with the dispositions IGNORED names (fleet_sig_ignored) and every
 # other one of SIGINT/SIGQUIT back at its default.
 fleet_idle_run() { # IGNORED COMMAND...
+  # GHR-162: the one job that takes its caller's INT/QUIT, set here both ways,
+  # so a budget walk's ssh still takes a Ctrl-C on bash 5.2 and 5.3 alike.
   [[ "$1" == *int* ]] || builtin trap - INT
   [[ "$1" == *quit* ]] || builtin trap - QUIT
   shift
@@ -7738,6 +7754,8 @@ fleet_idle_run() { # IGNORED COMMAND...
 # tap read FIRST, or STAMP no longer says `first` (the other tap read it).
 fleet_idle_lines() { # STREAM LABEL FILE out|err STAMP [FIRST]
   local stream="$1" label="$2" stamp="$5" first="${6:-}" fh line nl
+  # GHR-162: a `>(…)` tap drains to the call's EOF; a Ctrl-C is not its to take.
+  builtin trap '' INT QUIT
   exec {fh}>"$3"
   while :; do
     nl=true
@@ -7775,6 +7793,8 @@ fleet_idle_lines() { # STREAM LABEL FILE out|err STAMP [FIRST]
 # it looks again a second later, until the arming line is stamped.
 fleet_idle_watch() { # CPID IDLE STAMP MARK
   local last now
+  # GHR-162: a worker — fleet_into_idle KILLs it, and it returns once CPID has.
+  builtin trap '' INT QUIT
   while :; do
     last="$(cat "$3" 2>/dev/null || true)"
     if [ "$last" = first ]; then
@@ -8470,6 +8490,8 @@ fleet_summary_fetch() { # STATUS-ARGS...
 fleet_summary_fetch_one() { # INDEX STATUS-ARGS...
   local i="$1" hrc=0
   shift
+  # GHR-162: a worker, as fleet_fanout_one is.
+  builtin trap '' INT QUIT
   ssh_run "${FLEET_HOSTS[$i]}" "$FLEET_RUNNERCTL" status --json "$@" >"$FLEET_DIR/$i.json" 2>/dev/null || hrc=$?
   echo "$hrc" >"$FLEET_DIR/$i.jrc"
 }
@@ -10623,6 +10645,9 @@ FW_PID=() FW_AGAIN=() FW_TABLE_ARGS=() FW_JSON_ARGS=()
 fleet_watch_fetch_one() { # INDEX
   local i="$1" host d a hrc=0 t0 refused round cpu_prev=""
   local -a args=() table=("${FW_TABLE_ARGS[@]}")
+  # GHR-162: a worker — fleet_watch_reap ends it with its ssh; on bash 5.2 it
+  # would otherwise hold the watch's `exit 0` INT trap.
+  builtin trap '' INT QUIT
   host="${FLEET_HOSTS[$i]}" d="$FW_STATE/$i.new"
   rm -rf "$d"
   mkdir "$d"
@@ -11706,6 +11731,9 @@ fleet_watch_hist_out() { [ -n "$FW_HIST_PID" ]; }
 # One host's call into DIR/K.{out,err,rc}.
 fleet_watch_hist_one() { # DIR K HOST N
   local rc=0
+  # GHR-162: INT and QUIT inherited, deliberately: only ever a job of
+  # fleet_watch_hist_job, which ignores both, and an ignore a parent set is
+  # passed to its jobs on every bash (tests/run.sh pins the job through this).
   (FLEET_CALL_TIMEOUT="$FLEET_WATCH_TIMEOUT" ssh_run "$3" "$FLEET_RUNNERCTL" history -n "$4") >"$1/$2.out" 2>"$1/$2.err" || rc=$?
   relay_file "$1/$2.out"
   relay_file "$1/$2.err"
@@ -11718,6 +11746,8 @@ fleet_watch_hist_one() { # DIR K HOST N
 fleet_watch_hist_job() { # DIR SCOPE HOST N
   local d="$1" n="$4" k rc line running=0
   local -a hs=() pids=()
+  # GHR-162: a worker — fleet_watch_hist_stop ends it with its tree.
+  builtin trap '' INT QUIT
   if [ "$2" = host ]; then hs=("$3"); else hs=("${FLEET_HOSTS[@]}"); fi
   for k in "${!hs[@]}"; do
     fleet_watch_hist_one "$d" "$k" "${hs[$k]}" "$n" &
@@ -12086,6 +12116,8 @@ fleet_watch_act_start() { # HOST LABEL VERB LOG-TEXT BUDGET REMOTE-ARGS...
 fleet_watch_act_job() { # INDEX BUDGET REMOTE-ARGS...
   local i="$1" d="$FW_TMP/act.$1" s
   shift
+  # GHR-162: a worker — q and Ctrl-C end it with its ssh (fleet_watch_act_quit).
+  builtin trap '' INT QUIT
   if fleet_watch_act_is_read "${FW_ACT_VERB[$i]}"; then
     # GHR-136: a read (U's `upgrade --check`) runs as the login, on its budget,
     # with no sudo and no origin — as the foreground call it replaces did.
@@ -13576,6 +13608,8 @@ fleet_watch_cmd_start() {
 }
 fleet_watch_cmd_job() { # DIR
   local rc=0
+  # GHR-162: a worker, ended as an action's job is.
+  builtin trap '' INT QUIT
   fleet_watch_cmd_sub >"$1/out" 2>&1 || rc=$?
   # GHR-150: as an action's job (fleet_watch_act_job) does.
   echo "$FLEET_OPTIONAL_REJECTED" >"$1/rejected"
