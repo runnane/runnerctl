@@ -3262,6 +3262,52 @@ SGR_STRIPPED=""
 strip_sgr() { # TEXT
   SGR_STRIPPED="${1//$'\e['*([0-9;])m/}"
 }
+# The columns a line of visible text takes on a terminal (GHR-94), into
+# DISPLAY_WIDTH. ${#text} counts characters, and a wide character (CJK, most
+# emoji) takes two columns while a combining mark or a variation selector
+# takes none; the text that can carry them is whatever the host does not
+# control (a job name, a repo name, a path). watch_table_width and
+# viewport_rows both measure through this, so they cannot disagree.
+#
+# Pure bash, no subprocess and no `wc -L`: that needs GNU wc and a UTF-8
+# locale, and the result must not depend on either. The work is done on BYTES
+# under a function-local LC_ALL=C, decoding UTF-8 by its lead and continuation
+# bytes, so the answer is the same whatever the caller's locale. A line of
+# ASCII only is ${#text} and nothing else. A line with a byte >= 0x80 pays for
+# one substitution (its characters); only one with a lead byte that can start a
+# wide or zero-width character reaches the range table, and DISPLAY_WIDTH_SLOW
+# counts those, so the sim can pin that an ordinary frame (the table's `—`, `·`
+# and `↻` included) never does.
+#
+# APPROXIMATED, by a small range table rather than a full wcwidth: wide is
+# Hangul Jamo (U+1100-115F), U+3000-9FFF, Yi and Hangul syllables
+# (U+A000-A4CF, U+AC00-D7FF), fullwidth forms (U+FF00-FF60, U+FFE0-FFE6),
+# emoji U+1F300-1F6FF and U+1F900-1F9FF, and U+20000-3FFFF; zero is U+0300-036F,
+# U+200B-200F, U+20D0-20FF and U+FE00-FE0F. Everything else non-ASCII counts 1,
+# so a BMP symbol that a terminal draws as emoji (U+2600 block) is still short.
+# Invalid UTF-8 is not diagnosed: stray continuation bytes count for nothing.
+DISPLAY_WIDTH=0 DISPLAY_WIDTH_SLOW=0
+display_width() { # TEXT
+  local LC_ALL=C s="$1" t c n
+  c=[$'\x80'-$'\xbf']
+  DISPLAY_WIDTH=${#s}
+  [[ "$s" == *[$'\x80'-$'\xff']* ]] || return 0
+  t="${s//$c/}"; DISPLAY_WIDTH=${#t}
+  # Most non-ASCII a table carries (— · ↻ é) is neither wide nor zero-width: a
+  # line with no lead byte that can start one is its character count.
+  [[ "$s" == *[$'\xcc'-$'\xcd'$'\xe1'$'\xe3'-$'\xff']* || "$s" == *$'\xe2\x80'[$'\x8b'-$'\x8f']* || "$s" == *$'\xe2\x83'* ]] || return 0
+  DISPLAY_WIDTH_SLOW=$((DISPLAY_WIDTH_SLOW + 1))
+  # Three-byte wide characters, then four-byte ones, one extra column each.
+  t="${s//@([$'\xe3'-$'\xe9']$c|$'\xea'[$'\x80'-$'\x93']|$'\xea'[$'\xb0'-$'\xbf']|[$'\xeb'-$'\xec']$c|$'\xed'[$'\x80'-$'\x9f']|$'\xe1\x84'|$'\xe1\x85'[$'\x80'-$'\x9f']|$'\xef\xbc'|$'\xef\xbd'[$'\x80'-$'\xa0']|$'\xef\xbf'[$'\xa0'-$'\xa6'])$c/}"
+  n=$(((${#s} - ${#t}) / 3))
+  t="${s//@($'\xf0\x9f'[$'\x8c'-$'\x9b']|$'\xf0\x9f'[$'\xa4'-$'\xa7']|$'\xf0'[$'\xa0'-$'\xbf']$c)$c/}"
+  DISPLAY_WIDTH=$((DISPLAY_WIDTH + n + (${#s} - ${#t}) / 4))
+  # Zero-width: two-byte combining marks, then three-byte ones.
+  t="${s//@($'\xcc'$c|$'\xcd'[$'\x80'-$'\xaf'])/}"
+  n=$(((${#s} - ${#t}) / 2))
+  t="${s//@($'\xe2\x80'[$'\x8b'-$'\x8f']|$'\xe2\x83'[$'\x90'-$'\xbf']|$'\xef\xb8'[$'\x80'-$'\x8f'])/}"
+  DISPLAY_WIDTH=$((DISPLAY_WIDTH - n - (${#s} - ${#t}) / 3))
+}
 # Options `status` and `watch` share: --color WHEN and --stall-after N. Sets
 # VIEW_SHIFT to the argv words consumed, 0 when $1 is neither.
 VIEW_SHIFT=0
@@ -4809,7 +4855,7 @@ watch_highlight() { # TABLE NAME
     fi
   done <<<"$1"
 }
-# The widest table row (header or slot row) in TABLE, in characters with the
+# The widest table row (header or slot row) in TABLE, in display columns (GHR-94) with the
 # SGR sequences stripped — the note lines are long by design and do not count.
 # PREFIX is a regex for what comes before the IDX cell: nothing for the local
 # table, the HOST cell for the fleet one (GHR-56) — whose error rows (`build-3
@@ -4820,7 +4866,9 @@ watch_table_width() { # TABLE [PREFIX-RE]
   while IFS= read -r line; do
     strip_sgr "$line"; n="$SGR_STRIPPED"
     [[ "$n" != note:* ]] || continue
-    ! [[ "$n" =~ $re ]] || [ "${#n}" -le "$w" ] || w="${#n}"
+    [[ "$n" =~ $re ]] || continue
+    display_width "$n"
+    [ "$DISPLAY_WIDTH" -le "$w" ] || w="$DISPLAY_WIDTH"
   done <<<"$1"
   echo "$w"
 }
@@ -4923,7 +4971,8 @@ viewport_rows() { # LINE COLS
   strip_sgr "$1"
   VIEW_ROWS=1
   [ "$2" -gt 0 ] || return 0
-  [ "${#SGR_STRIPPED}" -le "$2" ] || VIEW_ROWS=$(((${#SGR_STRIPPED} + $2 - 1) / $2))
+  display_width "$SGR_STRIPPED"
+  [ "$DISPLAY_WIDTH" -le "$2" ] || VIEW_ROWS=$(((DISPLAY_WIDTH + $2 - 1) / $2))
 }
 # The last body line (0-based, into VIEW_BOT) a window starting at TOP reaches
 # in AVAIL rows, of N lines whose scrolling part starts at FIRST. A marker row
