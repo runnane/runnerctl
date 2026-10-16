@@ -1201,6 +1201,16 @@ so the table keeps refreshing. A host too old for `history` says so, and a
 login that cannot read other users' records gets the note `history` prints
 instead of an empty list.
 
+**Profiles across the fleet.** `runnerctl fleet profiles [--host H]...` asks
+every host for its `profiles` (a read: `FLEET_TIMEOUT`, no sudo, in parallel)
+and prints each host's lines with the host's name in front. Under them, one
+line per profile defined differently on two hosts of those that answered
+(`fleet profiles: 'ci' is defined differently on: build-1 | build-2`, the
+hosts grouped by the definition they share) and nothing when they agree. A
+host that does not answer is a line and makes the exit status 1; one that
+does not know the command says so. `--host` narrows it as for `fleet status`.
+In `fleet watch`, `:profiles` runs it with no confirm.
+
 ### Several hosts from one place: `fleet status`
 
 Everything above is one host. `fleet` runs the same tool from a central node
@@ -1793,7 +1803,7 @@ watch already holds:
   `--all-hosts` you type yourself is the scope as typed. `fleet status` and
   `fleet health` take no `--host`, so they are run on the scope's hosts and the
   line says which: `runnerctl fleet health (on build-1)`.
-- **Reads run at once** — `status`, `health`, `history`, `upgrade --check`,
+- **Reads run at once** — `status`, `health`, `history`, `profiles`, `upgrade --check`,
   `reap --dry-run`, `compose-reap` without `--apply`, `compose-reap-timer
   status` — and their output opens in your `$PAGER`, as `L`'s does,
   under a first line naming the command that ran.

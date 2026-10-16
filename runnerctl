@@ -60,6 +60,7 @@
 #   runnerctl health [--quiet|--json] [--max-restarts N] [--stall-after N] [--restart-stalled]
 #   runnerctl history [-n N]
 #   runnerctl fleet history [-n N] [--host H]...
+#   runnerctl fleet profiles [--host H]...
 #   runnerctl fleet status [--host H]... [--json] [--color auto|always|never] \
 #                          [--stall-after N] [--narrow]
 #   runnerctl fleet status --json --watch [--interval N] [--stall-after N]
@@ -8843,6 +8844,7 @@ cmd_fleet() {
     watch)   cmd_fleet_watch "$@" ;;
     health)  cmd_fleet_health "$@" ;;
     history) cmd_fleet_history "$@" ;;
+    profiles) cmd_fleet_profiles "$@" ;;
     upgrade) cmd_fleet_upgrade "$@" ;;
     apply|scale|start|stop|restart|drain|kill|reap|remove-limits|enable|disable)
              cmd_fleet_run "$sub" "$@" ;;
@@ -8871,7 +8873,7 @@ cmd_fleet() {
              die "fleet deprovision is not supported: it takes a removal token (fanning it out copies a credential to every host), it is irreversible, and a slot index or name means a different runner on each host. Run 'runnerctl deprovision <slot>' on the host." ;;
     logs)
              die "fleet logs is not supported: logs streams from one journal and only makes sense against one host. In 'runnerctl fleet watch', L on a slot pages its recent journal from its host; or ssh to the host." ;;
-    *)       die "unknown fleet command '$sub' (status watch health history upgrade apply scale start stop restart drain kill reap remove-limits enable disable compose-reap compose-reap-timer)" ;;
+    *)       die "unknown fleet command '$sub' (status watch health history profiles upgrade apply scale start stop restart drain kill reap remove-limits enable disable compose-reap compose-reap-timer)" ;;
   esac
 }
 
@@ -10344,6 +10346,72 @@ cmd_fleet_history() { # [-n N] [--host H]...
     [ "$(fleet_rc "$i")" != 0 ] || continue
     rc=1
     printf '%s: %s\n' "$host" "$(fleet_history_failure "$(fleet_rc "$i")" "$FLEET_DIR/$i.err")"
+  done
+  fleet_cleanup
+  return "$rc"
+}
+
+# `fleet profiles` (GHR-145): every host's `profiles`, each line prefixed with
+# the host, then one line per profile whose printed definition differs between
+# the hosts that answered. A read, as `fleet history` is: FLEET_TIMEOUT,
+# FLEET_PARALLEL, no sudo. `profiles` has been in runnerctl since its first
+# release, so a host that does not know it is only a stub's or a fork's — it is
+# still an information row, in `fleet history`'s wording, and not a failure.
+# A host that did not answer is a line under the rest and the exit status is 1.
+FLEET_PROFILES_PREDATES="its runnerctl predates profiles — 'runnerctl fleet upgrade' brings it up to date"
+cmd_fleet_profiles() { # [--host H]...
+  local rc=0 i host line key rest p g dkey
+  local -a hosts=() order=() groups=()
+  local -A pseen=() def=() members=() bydef=()
+  while [ $# -gt 0 ]; do
+    case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
+    case "$1" in
+      --host) need_val "$@"; hosts+=("$2"); shift 2 ;;
+      *) die "unknown option for fleet profiles: $1" ;;
+    esac
+  done
+  require_fleet
+  [ "${#hosts[@]}" -eq 0 ] || fleet_select_hosts "${hosts[@]}"
+  fleet_fanout "$FLEET_RUNNERCTL" profiles
+  for i in "${!FLEET_HOSTS[@]}"; do
+    host="${FLEET_HOSTS[$i]}"
+    if [ "$(fleet_rc "$i")" != 0 ]; then
+      rc=1
+      if grep -qF "unknown command 'profiles'" "$FLEET_DIR/$i.err" 2>/dev/null; then
+        printf '%s: %s\n' "$host" "$FLEET_PROFILES_PREDATES"
+      else
+        printf '%s: %s\n' "$host" "$(fleet_error_text "$(fleet_rc "$i")" "$FLEET_DIR/$i.err")"
+      fi
+      continue
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+      [ -n "$line" ] || continue
+      printf '%s: %s\n' "$host" "$line"
+      # A profile row: not the Config line, the header or the legend. Its name
+      # carries the default's `*`, which is part of the definition compared.
+      case "$line" in "Config:"*|"PROFILE "*|"* ="*) continue ;; esac
+      read -r key rest <<<"$line"
+      [ -n "$key" ] || continue
+      p="${key%\*}"
+      [ -n "${pseen[$p]:-}" ] || { pseen[$p]=1; order+=("$p"); }
+      def["$p|$host"]="$key $rest"
+      members["$p"]+="$host "
+    done <"$FLEET_DIR/$i.out"
+  done
+  # One line per profile defined differently on two hosts, the hosts grouped by
+  # the definition they share: `ci: build-1 | build-2 build-3`.
+  for p in ${order[@]+"${order[@]}"}; do
+    groups=() bydef=()
+    for host in ${members[$p]}; do
+      dkey="${def["$p|$host"]}"
+      if [ -z "${bydef[$dkey]:-}" ]; then groups+=("$dkey"); fi
+      bydef["$dkey"]+="${bydef[$dkey]:+ }$host"
+    done
+    if [ "${#groups[@]}" -gt 1 ]; then
+      g=""
+      for dkey in "${groups[@]}"; do g+="${g:+ | }${bydef[$dkey]}"; done
+      printf "fleet profiles: '%s' is defined differently on: %s\n" "$p" "$g"
+    fi
   done
   fleet_cleanup
   return "$rc"
@@ -13491,7 +13559,7 @@ fleet_watch_page() { # KEY
 #     --all-hosts typed in the line is the scope as typed. `fleet status` and
 #     `fleet health` take no --host: they are run on the scope's hosts, and the
 #     line says which.
-#   * A READ — status, health, history, upgrade --check, reap --dry-run — runs
+#   * A READ — status, health, history, profiles, upgrade --check, reap --dry-run — runs
 #     at once and its output opens in the pager, as L's does. Anything else
 #     asks first: `runs: runnerctl fleet scale 3 --host build-1  [y/n]`, the
 #     command fully expanded, and only `y` runs it.
@@ -13536,7 +13604,7 @@ fleet_watch_cmd_reads() { # SUBCOMMAND [WORD...]
   local sub="$1" a check=false
   shift
   case "$sub" in
-    status|history) return 0 ;;
+    status|history|profiles) return 0 ;;
     health)
       for a in "$@"; do [ "$a" != --restart-stalled ] || return 1; done
       return 0 ;;
@@ -13586,7 +13654,7 @@ fleet_watch_cmd_key() {
     watch)
       FW_NOTICE=":watch — this is fleet watch already; nothing run"
       return 0 ;;
-    status|health|history|upgrade|apply|scale|start|stop|restart|drain|kill|reap|remove-limits|enable|disable|compose-reap|compose-reap-timer) ;;
+    status|health|history|profiles|upgrade|apply|scale|start|stop|restart|drain|kill|reap|remove-limits|enable|disable|compose-reap|compose-reap-timer) ;;
     *)
       # A command no host is asked to run: one fleet mode excludes for good
       # (env-init, provision, deprovision, logs) or a word it does not know.

@@ -18628,6 +18628,73 @@ t "GHR-164: SIM_ONLY runs only the matching case and the summary says filtered" 
 t "GHR-164: SIM_ONLY matching nothing runs nothing and fails"                   case_ghr164_sim_only_matching_nothing_is_not_success
 t "GHR-164: make gates and make sim refuse while SIM_ONLY is set"                case_ghr164_make_gates_and_sim_refuse_sim_only
 
+# --- GHR-145: fleet profiles ---------------------------------------------------
+# `fleet profiles` fans `profiles` out as a read — no sudo, no mutating call —
+# prefixing each host's lines, and names a profile defined differently on two
+# hosts. --host dials only the named host; an unknown one dies naming it before
+# anything is dialled; a host that does not know the command is a row.
+case_ghr145_fleet_profiles_reads_and_prefixes() {
+  RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet profiles
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-[12] -- runnerctl profiles$' 2
+  expect_no_log "$GHR86_REMOTE_MUTATING"
+  expect_no_log ' -- sudo'
+  expect_no_log '^probe:ssh_origin '
+  expect_out_count '^build-1: ' 5
+  expect_out_count '^build-2: ' 5
+  expect_out '^build-1: ci +config +8G '
+  expect_out '^build-2: deploy\* +builtin '
+  # identical definitions: no flag
+  expect_no_out '^fleet profiles: '
+  # --host dials only that host
+  RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet profiles --host build-2
+  expect_rc 0
+  expect_log_count '^probe:ssh_run build-2 -- runnerctl profiles$' 1
+  expect_log_count '^probe:ssh_run build-1 ' 0
+  expect_out_count '^build-1: ' 0
+  # an unknown host dies naming it, dialling nothing
+  RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet profiles --host build-9
+  expect_rc 1
+  expect_err "--host 'build-9' is not in FLEET_HOSTS"
+  expect_log_count '^probe:ssh_run ' 0
+  # a host that does not know the command is a row, a host that is down a failure
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 box-oldprofiles gw-unreachable" RUNNERCTL_STUB_FLEET_NOPROFILES=box-oldprofiles run fleet profiles
+  expect_rc 1
+  expect_out "^box-oldprofiles: its runnerctl predates profiles — 'runnerctl fleet upgrade' brings it up to date\$"
+  expect_out '^gw-unreachable: unreachable — '
+}
+
+case_ghr145_fleet_profiles_flags_a_profile_that_differs() {
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 build-2 build-3" RUNNERCTL_STUB_FLEET_PROFILE_MAX="build-2:16G" run fleet profiles
+  expect_rc 0
+  expect_out_count '^fleet profiles: ' 1
+  expect_out "^fleet profiles: 'ci' is defined differently on: build-1 build-3 \\| build-2\$"
+  # the profile every host agrees on is not named
+  expect_no_out "^fleet profiles: 'deploy'"
+  RUNNERCTL_STUB_FLEET_HOSTS="$FW2" RUNNERCTL_STUB_FLEET_PROFILE_MAX="build-2:16G" run fleet profiles
+  expect_out "^fleet profiles: 'ci' is defined differently on: build-1 \\| build-2\$"
+  # a host that did not answer is not compared
+  RUNNERCTL_STUB_FLEET_HOSTS="build-1 gw-unreachable" RUNNERCTL_STUB_FLEET_PROFILE_MAX="build-1:16G" run fleet profiles
+  expect_no_out '^fleet profiles: '
+}
+
+# `:profiles` is a read: no confirm, the pager, the cursor's host.
+case_ghr145_profiles_at_the_colon_prompt_is_a_read() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=':q' RUNNERCTL_STUB_PROMPT_IN=$'profiles\n' \
+    RUNNERCTL_STUB_FLEET_HOSTS="$FW2" run fleet watch --color never
+  expect_rc 0
+  expect_no_out '^runs: '
+  expect_no_out 'unknown fleet command'
+  expect_out_count '^ran: runnerctl fleet profiles --host build-1$' 1
+  expect_log_count '^probe:page$' 1
+  expect_log_count '^probe:ssh_run build-1 -- runnerctl profiles$' 1
+  expect_no_log "$GHR86_REMOTE_MUTATING"
+}
+
+t "GHR-145: fleet profiles is a prefixed read, --host narrows it"            case_ghr145_fleet_profiles_reads_and_prefixes
+t "GHR-145: fleet profiles flags a profile defined differently on two hosts"  case_ghr145_fleet_profiles_flags_a_profile_that_differs
+t "GHR-145: :profiles in fleet watch runs at once into the pager"             case_ghr145_profiles_at_the_colon_prompt_is_a_read
+
 # --- Summary ------------------------------------------------------------------
 echo
 if [ -n "$SIM_ONLY" ]; then
