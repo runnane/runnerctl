@@ -571,6 +571,15 @@ Traps:
     `probe:ssh_heartbeat`. A push call's timeline is keyed by the SUB-ERE
     `push-install` or `push-probe`. Without the watchdog, it follows the
     instant model there too.
+  - A push install's watchdog counts nothing until the host's
+    `FLEET_PUSH_RECEIVED` line (GHR-158). The stub prints that line at
+    second 0 of the timeline, or at SECS with
+    `RUNNERCTL_STUB_PUSH_TRANSFER="host:SECS"` (`probe:timeline_received
+    HOST T`), and only when the install text carries it. No timeline
+    heartbeat is due before it. A mutant whose install never arms the
+    watchdog makes every later heartbeat `timeline_unseen`, at 5 s of real
+    time each, so a LIVE case runs into the harness's RUN_TIMEOUT (124):
+    that is the mutant's cost, not a flake.
 - **`relay_safe` clobbers `BASH_REMATCH`** (it matches regexes of its own).
   Take every capture you need into a variable BEFORE calling it — the first
   `history` parser read the time after relaying the message and died

@@ -7541,6 +7541,14 @@ fleet_into() { # STREAM LABEL OUT ERR COMMAND...
 # The remote is not signalled — as for GHR-81's timeout, only the local ssh
 # ends — so the wording says it may still be running.
 FLEET_HB_LINE_RE='^heartbeat: .* \([0-9]+s\)$'
+# GHR-158: a call whose first stretch CANNOT print — `fleet upgrade --push`,
+# whose script goes over ssh's stdin before anything runs — names here the
+# line that ends it. Until that line, STAMP says `first` rather than an
+# instant: the watchdog cuts nothing and the call is held to its ceiling
+# (FLEET_CALL_TIMEOUT) alone; from it, silence is counted as for any call.
+# Only that line arms it, so an ssh warning on stderr during the transfer
+# does not start the clock early. Empty (every other call) arms it at once.
+FLEET_IDLE_FIRST=""
 fleet_idle_note() { # FILE TEXT
   printf '%s\n' "$2" >"$1.$BASHPID"
   mv -f -- "$1.$BASHPID" "$1"
@@ -7554,10 +7562,14 @@ fleet_into_idle() { # STREAM LABEL OUT ERR COMMAND...
   else
     fleet_idle_note "$err.cut" "armed $FLEET_CALL_TIMEOUT"
   fi
-  fleet_idle_note "$FLEET_IDLE_STAMP" "$(now_epoch)"
+  if [ -n "$FLEET_IDLE_FIRST" ]; then
+    fleet_idle_note "$FLEET_IDLE_STAMP" first
+  else
+    fleet_idle_note "$FLEET_IDLE_STAMP" "$(now_epoch)"
+  fi
   ign="$(fleet_sig_ignored)"
-  exec {ofd}> >(fleet_idle_lines "$stream" "$label" "$out" out "$FLEET_IDLE_STAMP"); p1=$!
-  exec {efd}> >(fleet_idle_lines "$stream" "$label" "$err" err "$FLEET_IDLE_STAMP"); p2=$!
+  exec {ofd}> >(fleet_idle_lines "$stream" "$label" "$out" out "$FLEET_IDLE_STAMP" "$FLEET_IDLE_FIRST"); p1=$!
+  exec {efd}> >(fleet_idle_lines "$stream" "$label" "$err" err "$FLEET_IDLE_STAMP" "$FLEET_IDLE_FIRST"); p2=$!
   fleet_idle_run "$ign" "$@" >&"$ofd" 2>&"$efd" {ofd}>&- {efd}>&- &
   cpid=$!
   fleet_idle_watch "$cpid" "$FLEET_IDLE_ARM" "$FLEET_IDLE_STAMP" "$err.cut" </dev/null >/dev/null 2>&1 {ofd}>&- {efd}>&- &
@@ -7595,8 +7607,11 @@ fleet_idle_run() { # IGNORED COMMAND...
 # STREAM = true as fleet_stream_lines does (made safe, kept in FILE, shown as
 # `LABEL: line`), else into FILE as it came, a last line without its newline
 # included (relay_file makes it safe once the call is over).
-fleet_idle_lines() { # STREAM LABEL FILE out|err STAMP
-  local stream="$1" label="$2" stamp="$5" fh line nl
+#
+# GHR-158: with FIRST, a line is stamped only once the call is armed — this
+# tap read FIRST, or STAMP no longer says `first` (the other tap read it).
+fleet_idle_lines() { # STREAM LABEL FILE out|err STAMP [FIRST]
+  local stream="$1" label="$2" stamp="$5" first="${6:-}" fh line nl
   exec {fh}>"$3"
   while :; do
     nl=true
@@ -7604,7 +7619,12 @@ fleet_idle_lines() { # STREAM LABEL FILE out|err STAMP
       [ -n "$line" ] || break
       nl=false
     fi
-    fleet_idle_note "$stamp" "$(now_epoch)"
+    if [ -n "$first" ] && [ "$line" != "$first" ] && [ "$(cat "$stamp" 2>/dev/null || true)" = first ]; then
+      :
+    else
+      first=""
+      fleet_idle_note "$stamp" "$(now_epoch)"
+    fi
     [[ ! "$line" =~ $FLEET_HB_LINE_RE ]] || continue
     if [ "$stream" != true ]; then
       if $nl; then printf '%s\n' "$line" >&"$fh"; else printf '%s' "$line" >&"$fh"; fi
@@ -7624,10 +7644,17 @@ fleet_idle_lines() { # STREAM LABEL FILE out|err STAMP
 # The watchdog: until the last line in STAMP is IDLE seconds old, then (CPID
 # still running) `idle SECS` into MARK and CPID's tree ended. Returns as soon
 # as CPID is gone; fleet_into_idle ends it once the call has.
+#
+# GHR-158: while STAMP says `first` (FLEET_IDLE_FIRST) nothing is counted:
+# it looks again a second later, until the arming line is stamped.
 fleet_idle_watch() { # CPID IDLE STAMP MARK
   local last now
   while :; do
     last="$(cat "$3" 2>/dev/null || true)"
+    if [ "$last" = first ]; then
+      fleet_idle_wait $(($(now_epoch) + 1)) "$1" "$3" || return 0
+      continue
+    fi
     [[ "$last" =~ ^[0-9]+$ ]] || return 0
     fleet_idle_wait $((last + $2)) "$1" "$3" || return 0
     now="$(now_epoch)"
@@ -9645,13 +9672,19 @@ fleet_push_probe_cmd() {
 # FLEET_RUNNERCTL named runnerctl is installed where it points (--prefix);
 # anything else lands where `install` decides, and the read-back says whether
 # the fleet path then runs it.
+#
+# GHR-158: with HB-WORD it also says, on stdout, the moment the bytes are in
+# (FLEET_PUSH_RECEIVED) — the line the central node's watchdog waits for
+# before it counts silence (FLEET_IDLE_FIRST, fleet_into_idle). Shaped as a
+# heartbeat line, so the tap drops it like any other.
+FLEET_PUSH_RECEIVED='heartbeat: received runnerctl (0s)'
 fleet_push_install_cmd() { # [ORIGIN-WORD] [HB-WORD]
-  local s extra="" prefix=""
+  local s extra="" prefix="" got=""
   [ -z "${1:-}" ] || extra=" $1"
-  [ -z "${2:-}" ] || extra+=" $2"
+  [ -z "${2:-}" ] || { extra+=" $2"; got=' echo "'"$FLEET_PUSH_RECEIVED"'";'; }
   case "$FLEET_RUNNERCTL" in /*/runnerctl) prefix=" --prefix ${FLEET_RUNNERCTL%/runnerctl}" ;; esac
   # shellcheck disable=SC2016  # the remote shell expands these, not this one
-  s='t=$(mktemp) || exit 3; trap "rm -f -- \"\$t\"" EXIT; trap "exit 129" HUP INT TERM; cat >"$t" || exit 3; s=$(sha256sum <"$t") || exit 3; s=${s%% *}; if [ "$s" != "'"$FLEET_PUSH_SHA"'" ]; then echo "runnerctl push: the bytes received have sha256 $s, not '"$FLEET_PUSH_SHA"' - refusing to install them" >&2; exit 4; fi; sudo -n bash "$t"'"$extra"' install'"$prefix"
+  s='t=$(mktemp) || exit 3; trap "rm -f -- \"\$t\"" EXIT; trap "exit 129" HUP INT TERM; cat >"$t" || exit 3;'"$got"' s=$(sha256sum <"$t") || exit 3; s=${s%% *}; if [ "$s" != "'"$FLEET_PUSH_SHA"'" ]; then echo "runnerctl push: the bytes received have sha256 $s, not '"$FLEET_PUSH_SHA"' - refusing to install them" >&2; exit 4; fi; sudo -n bash "$t"'"$extra"' install'"$prefix"
   printf "exec /bin/sh -c '%s'\n" "$s"
 }
 
@@ -9714,9 +9747,13 @@ fleet_push_stage() { # CHECK INDEX...
     hword="$FLEET_HB_WORD"
     # GHR-88: the record says this was a push, and of which bytes.
     fleet_log_begin "$(fleet_log_argv) (push sha256 $FLEET_PUSH_SHA)"
-    FLEET_STDIN_FILE="$FLEET_PUSH_SRC" FLEET_HB_INLINE=true
+    # GHR-158: but not from its first byte. The call opens with the script
+    # itself going over ssh's stdin, and nothing can print while it does —
+    # so the silence is counted from the host's FLEET_PUSH_RECEIVED line,
+    # and the transfer before it is held to the call's ceiling alone.
+    FLEET_STDIN_FILE="$FLEET_PUSH_SRC" FLEET_HB_INLINE=true FLEET_IDLE_FIRST="$FLEET_PUSH_RECEIVED"
     fleet_fanout_stream "$(fleet_push_install_cmd "$oword" "$hword")"
-    FLEET_STDIN_FILE="" FLEET_HB_INLINE=false
+    FLEET_STDIN_FILE="" FLEET_HB_INLINE=false FLEET_IDLE_FIRST=""
     FLEET_HB=() FLEET_HB_WORD=""
     fleet_log_results
     for j in "${!send[@]}"; do
