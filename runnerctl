@@ -933,6 +933,10 @@ exit_run() {
 # TERM sent to runnerctl's pid alone — not its process group, as a terminal's
 # Ctrl-C, systemd and `timeout` do — waits for the step in progress (a
 # download, a sleep in a --when-idle wait) before the process ends.
+# Another cost is bash 5.2's (GHR-166, accepted): a signal pending at a `$(`
+# parse inside one simple command has its trap text fail to parse. Under
+# `set -e` the process then exits 2 without running audit_signal, so the
+# record says `failed (exit 2)`. The watches' `exit 0` hits the same window.
 #
 # GHR-131: HUP (a terminal, or an ssh session with a tty, closed under it) and
 # PIPE (its stdout's reader gone) are the record's in the same way, with one

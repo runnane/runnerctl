@@ -618,6 +618,14 @@ keep the `journalctl` cost down — a job start or end shows up within
 10 × interval seconds. It needs a terminal: with stdout redirected it exits 1
 and points at `status`; `status --once` is the plain one-shot table.
 
+> **On bash 5.2** (Debian 12, Ubuntu 24.04), a Ctrl-C or SIGTERM can
+> occasionally be mishandled by bash itself, in `watch` and in `fleet watch`.
+> This happens when the signal lands in a short window while a frame is
+> being built. The view still quits and restores the terminal, but it exits
+> with status 2 instead of 0, and bash prints a line such as
+> ``trap: line 2: unexpected EOF while looking for matching `)'``. Nothing is
+> left running. Bash 5.3 does not do this.
+
 The view is interactive, so a stalled or leaking slot can be dealt with from
 the screen you are already looking at instead of leaving `watch`, reading
 the IDX and typing a second command. `↑`/`↓` (or `j`/`k`) move a highlighted
@@ -1145,7 +1153,13 @@ keeps (`health --restart-stalled`: `restarted 2, 1 failed`; `compose-reap
   the signal's handler only once the step in progress has ended, so a
   SIGTERM sent to runnerctl's process alone (rather than its process group,
   as Ctrl-C, systemd and `timeout` signal it) waits for that step — a
-  download, or one sleep of a `--when-idle` wait.
+  download, or one sleep of a `--when-idle` wait. On bash 5.2 (Debian 12,
+  Ubuntu 24.04) a signal can occasionally land in a short window where bash
+  mishandles it. The command still stops there, but with exit status 2
+  instead of dying by the signal, and its record says `failed (exit 2)`
+  rather than `interrupted (…)`. Bash also prints a line such as
+  ``trap: line 2: unexpected EOF while looking for matching `)'``. Bash 5.3
+  does not do this.
 - **Never a secret.** The line is built from chosen parts, never the command
   line, so a token or PAT handed to `provision` or `deprovision` — as a flag
   or in the environment — has no way in. Every part is cleaned of control
