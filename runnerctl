@@ -894,6 +894,7 @@ exit_run() {
   # GHR-91: first, so the record knows whether the caller was still there.
   caller_guard_end
   audit_finish "$rc"
+  FLEET_LOG_EXIT_RC="$rc"
   fleet_log_finish
   if [ "$EXIT_PID" = "$BASHPID" ] && [ -n "$EXIT_CMD" ] && [ "$EXIT_CMD" != - ]; then
     eval "$EXIT_CMD"
@@ -1133,7 +1134,7 @@ caller_guard_end() {
 # created 0600 in a directory created 0700: it says who did what where. A log
 # that cannot be written is silence — the fleet command's outcome is the
 # hosts', not this file's.
-FLEET_LOG_CMD="" FLEET_LOG_RESULTS="" FLEET_LOG_PID=""
+FLEET_LOG_CMD="" FLEET_LOG_RESULTS="" FLEET_LOG_PID="" FLEET_LOG_EXIT_RC=""
 FLEET_ARGV=()
 fleet_log_path() {
   local base
@@ -1161,10 +1162,49 @@ fleet_log_result() { # HOST[/SLOT] RC
   [ -n "$FLEET_LOG_CMD" ] || return 0
   FLEET_LOG_RESULTS+="${FLEET_LOG_RESULTS:+ }$1=$2"
 }
+# GHR-161: the record of a command interrupted while a fan-out was out. A host
+# dialled and not heard back from is not a host that "did not answer": its
+# command may have started, and is caller-guarded to finish (GHR-137, GHR-153),
+# so the line says INTERRUPTED and names those hosts, then the hosts that did
+# answer as HOST=RC. Reads FLEET_DIR, which the EXIT trap has not yet removed
+# (fleet_cleanup runs after the record). `.dialled` is fleet_fanout_one's mark.
+fleet_log_interrupted() { # RESULTS-SO-FAR
+  local i host pending="" answered="" out sig
+  if [ -n "$FLEET_DIR" ] && [ -d "$FLEET_DIR" ]; then
+    for i in "${!FLEET_HOSTS[@]}"; do
+      host="${FLEET_HOSTS[$i]}"
+      [ -e "$FLEET_DIR/$i.dialled" ] || continue
+      if [ -e "$FLEET_DIR/$i.rc" ]; then
+        # already in the record (the walk logs HOST/SLOT, the rest HOST)
+        [[ " $1 " != *" $host="* && " $1 " != *" $host/"* ]] || continue
+        answered+="${answered:+ }$host=$(fleet_rc "$i")"
+      else
+        pending+="${pending:+ }$host"
+      fi
+    done
+  fi
+  [ -z "$1" ] || answered="$1${answered:+ }$answered"
+  # A host dialled and unanswered is what makes this an interrupted record
+  # (a command that ran to its end has an answer for every host it dialled);
+  # nothing dialled, or no pending host, leaves the record as it was — an
+  # empty list is `no host answered` (fleet_log_write), which is then true.
+  if [ -z "$pending" ]; then printf '%s\n' "$1"; return 0; fi
+  # The central `fleet` command arms no signal handler, so it dies BY the
+  # signal and its EXIT trap sees 128+N: that names it.
+  sig="$AUDIT_SIGNAL"
+  if [ -z "$sig" ]; then
+    case "${FLEET_LOG_EXIT_RC:-}" in 129) sig=SIGHUP ;; 130) sig=SIGINT ;; 143) sig=SIGTERM ;; esac
+  fi
+  out="interrupted${sig:+ ($sig)}"
+  [ -z "$pending" ] || out+="; dialled, no answer yet: $pending"
+  [ -z "$answered" ] || out+="; $answered"
+  printf '%s\n' "$out"
+}
 fleet_log_finish() {
   local cmd="$FLEET_LOG_CMD" results="$FLEET_LOG_RESULTS"
   [ -n "$FLEET_LOG_CMD" ] && [ "$FLEET_LOG_PID" = "$BASHPID" ] || return 0
   FLEET_LOG_CMD="" FLEET_LOG_RESULTS=""
+  results="$(fleet_log_interrupted "$results")"
   fleet_log_write "$cmd" "$results"
 }
 # One line, now, with nothing armed: `fleet watch`'s background actions
@@ -7456,7 +7496,10 @@ fleet_fanout_one() { # INDEX REMOTE-ARGS...
   done
   # GHR-90: a payload left by this host's earlier try in the same fan-out (one
   # it refused a flag on) is not this call's answer.
-  rm -f "$FLEET_DIR/$i.json" "$FLEET_DIR/$i.jrc"
+  rm -f "$FLEET_DIR/$i.json" "$FLEET_DIR/$i.jrc" "$FLEET_DIR/$i.rc"
+  # GHR-161: this host is being dialled; the record of an interrupt names it
+  # until its .rc says it answered.
+  : >"$FLEET_DIR/$i.dialled"
   # `|| hrc=$?` rather than a bare call plus `echo $?`: under `set -e` a
   # non-zero ssh_run kills this subshell before the status can be
   # recorded, so every failure would read as the missing-file fallback

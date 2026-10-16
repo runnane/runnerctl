@@ -17925,6 +17925,7 @@ echo "$*" >>"$GHR96_DIR/calls"
 while [ "$1" != "--" ]; do shift; done
 case "$2" in
   hang-*) echo "$$" >"$GHR96_DIR/ssh.pid.new"; mv "$GHR96_DIR/ssh.pid.new" "$GHR96_DIR/ssh.pid"; exec sleep 30 ;;
+  down-*) exit 255 ;;
 esac
 sleep 0.1
 printf '{"runnerctl":"1.0.0"}\n'
@@ -18061,6 +18062,61 @@ case_ghr96_a_completed_fanout_signals_nothing() {
   rm -rf "$d"
 }
 
+# --- GHR-161: an interrupted mutating fan-out's central record -----------------
+# `fleet start` over (ok-1 hang-1), one host at a time: ok-1 answers, hang-1 is
+# dialled and held when INT arrives. The record must say it was interrupted and
+# name hang-1, never `no host answered` — hang-1's command is caller-guarded and
+# finishes on its own. Same real ssh_run/timeout and driver as GHR-96. The
+# controls: a fan-out of unreachable hosts records each as =255 (they were
+# dialled and did not answer, in the record's own form), and an interrupt
+# before any host was dialled still says `no host answered`.
+case_ghr161_an_interrupted_fanout_record_names_the_dialled_host() {
+  local d how cfg
+  if ! $HAVE_PERL; then
+    skip "GHR-161: no perl, so no driver to interrupt the fan-out with"
+    return 0
+  fi
+  d="$(mktemp -d "$TMP/ghr161.XXXXXX")"
+  ghr96_setup "$d"
+  cfg="$d/config"
+  printf 'FLEET_HOSTS=(ok-1 hang-1)\nFLEET_LOG=%s/fleet.log\n' "$d" >"$cfg"
+  how="$(GHR96_DIR="$d" PATH="$d/bin:$PATH" RUNNERCTL_CONFIG="$cfg" \
+         perl -e "$GHR119_PERL" INT group "$d/ssh.pid" "$d/out" "$d/err" "$RUNNERCTL" fleet start)" || how="perl failed"
+  expect_text "how the interrupted fleet start ended" "signal 2" "$how"
+  expect_text "the hang-1 ssh after the interrupt" gone "$(ghr96_ssh_after "$d")"
+  expect_cfg_count "$d/fleet.log" '.' 1
+  expect_cfg "$d/fleet.log" ' fleet start — interrupted \(SIGINT\); dialled, no answer yet: hang-1; ok-1=0$'
+  expect_cfg_lacks "$d/fleet.log" 'no host answered'
+  # control: every host unreachable, not interrupted
+  rm -f "$d/fleet.log" "$d/ssh.pid"
+  printf 'FLEET_HOSTS=(down-1 down-2)\nFLEET_LOG=%s/fleet.log\n' "$d" >"$cfg"
+  GHR96_DIR="$d" PATH="$d/bin:$PATH" RUNNERCTL_CONFIG="$cfg" "$RUNNERCTL" fleet start >"$d/out" 2>"$d/err" || true
+  expect_cfg_count "$d/fleet.log" '.' 1
+  expect_cfg "$d/fleet.log" ' fleet start — down-1=255 down-2=255$'
+  rm -rf "$d"
+}
+case_ghr161_an_interrupt_before_any_dial_says_no_host_answered() {
+  local d
+  d="$(mktemp -d "$TMP/ghr161.XXXXXX")"
+  # shellcheck disable=SC2016
+  GHR96_DIR="$d" run_fn eval '
+    FLEET_HOSTS=(ok-1 hang-1) FLEET_LOG="$GHR96_DIR/fleet.log" FLEET_DIR="$GHR96_DIR"
+    AUDIT_SIGNAL=SIGINT
+    echo "none:[$(fleet_log_interrupted "")]"
+    : >"$FLEET_DIR/1.dialled"
+    echo "held:[$(fleet_log_interrupted "")]"
+    : >"$FLEET_DIR/0.dialled"; echo 0 >"$FLEET_DIR/0.rc"
+    echo "both:[$(fleet_log_interrupted "")]"
+  '
+  expect_rc 0
+  expect_out '^none:\[\]$'
+  expect_out '^held:\[interrupted \(SIGINT\); dialled, no answer yet: hang-1\]$'
+  expect_out '^both:\[interrupted \(SIGINT\); dialled, no answer yet: hang-1; ok-1=0\]$'
+  rm -rf "$d"
+}
+
+t "GHR-161: an interrupted fleet start records interrupted and the held host"  case_ghr161_an_interrupted_fanout_record_names_the_dialled_host
+t "GHR-161: an interrupt before any dial keeps no host answered"               case_ghr161_an_interrupt_before_any_dial_says_no_host_answered
 t "GHR-96: an interrupted fleet status or start leaves no ssh (real timeout)"  case_ghr96_an_interrupted_fanout_leaves_no_ssh
 t "GHR-96: S in fleet watch, interrupted during its floor read, leaves no ssh"  case_ghr96_an_interrupted_watch_floor_read_leaves_no_ssh
 t "GHR-96: a completed fan-out signals nothing; a pid not ours is let be"      case_ghr96_a_completed_fanout_signals_nothing
