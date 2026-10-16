@@ -18093,6 +18093,82 @@ case_ghr96_a_completed_fanout_signals_nothing() {
   rm -rf "$d"
 }
 
+# --- GHR-163: an interrupted summary pass ends its second call ------------------
+# `fleet status` asks each host once for the table WITH the summary payload
+# (--with-json, GHR-90), and a host too old for the flag is asked again, `status
+# --json`, by fleet_summary_fetch. Those jobs ignore INT (GHR-162), so only the
+# reap ends them: it must know them. The fake ssh models an old host: old-*
+# refuses --with-json the way an old runnerctl does and answers the table call;
+# old-hang-* then holds the `status --json` call (ssh.pid, as GHR-96's hang-*).
+ghr163_setup() { # DIR
+  mkdir "$1/bin"
+  cat >"$1/bin/ssh" <<'EOF'
+#!/bin/sh
+echo "$*" >>"$GHR163_DIR/calls"
+while [ "$1" != "--" ]; do shift; done
+shift
+host="$1"
+case "$host" in
+  old-*)
+    case " $* " in
+      *" --with-json "*) echo "runnerctl: unknown option: --with-json" >&2; exit 1 ;;
+      *" --json "*)
+        case "$host" in
+          old-hang-*) echo "$$" >"$GHR163_DIR/ssh.pid.new"; mv "$GHR163_DIR/ssh.pid.new" "$GHR163_DIR/ssh.pid"; exec sleep 30 ;;
+        esac
+        printf '{"runnerctl":"0.1.0"}\n'; exit 0 ;;
+    esac
+    echo "table"; exit 0 ;;
+esac
+sleep 0.1
+printf '{"runnerctl":"1.0.0"}\n'
+EOF
+  chmod +x "$1/bin/ssh"
+}
+case_ghr163_an_interrupted_summary_pass_leaves_no_ssh() {
+  local d how cfg
+  if ! $HAVE_PERL; then
+    skip "GHR-163: no perl, so no driver to interrupt the summary pass with"
+    return 0
+  fi
+  d="$(mktemp -d "$TMP/ghr163.XXXXXX")"
+  ghr163_setup "$d"
+  cfg="$d/config"
+  printf 'FLEET_HOSTS=(ok-1 old-hang-1)\nFLEET_LOG=%s/fleet.log\n' "$d" >"$cfg"
+  how="$(GHR163_DIR="$d" PATH="$d/bin:$PATH" RUNNERCTL_CONFIG="$cfg" \
+         perl -e "$GHR119_PERL" INT group "$d/ssh.pid" "$d/out" "$d/err" "$RUNNERCTL" fleet status)" || how="perl failed"
+  expect_text "how runnerctl ended" "signal 2" "$how"
+  expect_text "the old host's summary ssh after the interrupt" gone "$(ghr96_ssh_after "$d")"
+  # it was the summary's second call that was held
+  expect_cfg "$d/calls" ' -- old-hang-1 runnerctl status --json$'
+  rm -rf "$d"
+}
+# A summary pass that ran to the end signals nothing at its cleanup: its
+# recorded pids are let go once its wait returns, under the model of the hazard
+# itself (proc_ppid answering "this process's child" for every pid).
+case_ghr163_a_completed_summary_pass_signals_nothing() {
+  local d
+  d="$(mktemp -d "$TMP/ghr163.XXXXXX")"
+  ghr163_setup "$d"
+  # shellcheck disable=SC2016
+  GHR163_DIR="$d" PATH="$d/bin:$PATH" run_fn eval '
+    FLEET_HOSTS=(old-1 old-2) FLEET_LOG="$GHR163_DIR/fleet.log"
+    FLEET_DIR="$(mktemp -d)"
+    echo 0 >"$FLEET_DIR/0.rc"; echo 0 >"$FLEET_DIR/1.rc"
+    fleet_summary_fetch
+    echo "read: recorded=${#FLEET_FANOUT_PIDS[@]} jrc=$(cat "$FLEET_DIR/0.jrc")$(cat "$FLEET_DIR/1.jrc")"
+    proc_ppid() { echo "$$"; }
+    proc_tree_kill() { echo "signalled $1"; }
+    fleet_cleanup
+    echo "cleanup done"
+  '
+  expect_rc 0
+  expect_out '^read: recorded=0 jrc=00$'
+  expect_no_out '^signalled '
+  expect_out '^cleanup done$'
+  rm -rf "$d"
+}
+
 # --- GHR-161: an interrupted mutating fan-out's central record -----------------
 # `fleet start` over (ok-1 hang-1), one host at a time: ok-1 answers, hang-1 is
 # dialled and held when INT arrives. The record must say it was interrupted and
@@ -18146,6 +18222,8 @@ case_ghr161_an_interrupt_before_any_dial_says_no_host_answered() {
   rm -rf "$d"
 }
 
+t "GHR-163: an interrupted summary pass leaves no ssh (real timeout)"           case_ghr163_an_interrupted_summary_pass_leaves_no_ssh
+t "GHR-163: a completed summary pass signals nothing"                          case_ghr163_a_completed_summary_pass_signals_nothing
 t "GHR-161: an interrupted fleet start records interrupted and the held host"  case_ghr161_an_interrupted_fanout_record_names_the_dialled_host
 t "GHR-161: an interrupt before any dial keeps no host answered"               case_ghr161_an_interrupt_before_any_dial_says_no_host_answered
 t "GHR-96: an interrupted fleet status or start leaves no ssh (real timeout)"  case_ghr96_an_interrupted_fanout_leaves_no_ssh
