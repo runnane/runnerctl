@@ -2243,12 +2243,11 @@ press Ctrl-C on the central node, quit `fleet watch` with an action still
 running, or lose the network: only the local side ends. The host's `drain`,
 `start`, `stop`, `restart`, `apply`, `scale`, `upgrade` (and `upgrade
 --rollback`), `deprovision`, `kill`, `reap`, `enable`, `disable`,
-`remove-limits`, `env-init`, `compose-reap --apply` and `health
---restart-stalled` **finish what they started** rather than stopping
-part-way. `deprovision` does this only once its `y/N` question has been
-answered. `provision`, `install`, `migrate` and `compose-reap-timer` do not: cut off,
-they stop at their next line of output and record `interrupted (SIGPIPE)` or
-`interrupted (SIGHUP)`. Once a command that finishes has begun changing things, a closed
+`remove-limits`, `env-init`, `compose-reap --apply`, `health
+--restart-stalled`, `provision`, `install` (what `fleet upgrade --push` runs
+on each host), `migrate` and `compose-reap-timer install`/`remove` **finish
+what they started** rather than stopping part-way. `deprovision` does this
+only once its `y/N` question has been answered. Once a command that finishes has begun changing things, a closed
 connection does not end it: its output is passed on while there is someone to
 read it and dropped after that, and a hangup (SIGHUP) is ignored. It goes on
 slot by slot, waiting for idle as it was asked to, and each wait is still

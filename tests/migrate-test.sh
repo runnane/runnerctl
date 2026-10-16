@@ -74,4 +74,42 @@ sed "s|^SYSTEMD_DIR=.*|SYSTEMD_DIR=\"$tmp/systemd\"|" "$cfg" >"$tmp/alt.config"
   && fail "conflicting live drop-ins should fail the render check"
 grep -q "1 unit(s) differ" "$tmp/out6" || fail "render check did not report the differing unit: $(cat "$tmp/out6")"
 
+# 6. GHR-153: a migrate whose caller goes finishes what it started — the
+#    config written AND checked against the live drop-ins. The reader of its
+#    stdout keeps the 4 lines printed before the write, closes its end and
+#    only then touches CUT; a fake `tee` first on PATH waits (5 s at most) for
+#    CUT before it writes the config. Without caller_guard the `Wrote` line
+#    after it ends the run there (SIGPIPE, or a failed write under `set -e`
+#    where PIPE is ignored), before the render check: the record is then
+#    `interrupted (SIGPIPE)` or `failed`, never this one.
+mkdir -p "$tmp/cutbin"
+cat >"$tmp/cutbin/tee" <<'EOF'
+#!/bin/sh
+if [ -n "${CUT:-}" ] && [ ! -e "$CUT.armed" ]; then
+  : >"$CUT.armed"
+  w=0
+  while [ ! -e "$CUT" ] && [ "$w" -lt 250 ]; do sleep 0.02; w=$((w + 1)); done
+  if [ -e "$CUT" ]; then echo "cut_seen tee $*" >>"$CUT.log"; else echo "cut_gave_up tee $*" >>"$CUT.log"; fi
+fi
+exec "$REAL_TEE" "$@"
+EOF
+chmod +x "$tmp/cutbin/tee"
+real_tee="$(command -v tee)"
+cut6="$tmp/cut6"; : >"$tmp/o6"; : >"$tmp/logger.calls"
+{ c=0
+  PATH="$tmp/cutbin:$PATH" CUT="$cut6" REAL_TEE="$real_tee" \
+    ./runnerctl --config "$cfg" migrate --from "$legacy" --output "$tmp/cut/config" 2>"$tmp/e6" || c=$?
+  echo "$c" >"$tmp/rc6"; } \
+  | { i=0
+      while [ "$i" -lt 4 ] && IFS= read -r l; do printf '%s\n' "$l" >>"$tmp/o6"; i=$((i + 1)); done
+      exec 0<&-
+      : >"$cut6"; }
+grep -q '^cut_seen tee ' "$cut6.log" 2>/dev/null || fail "6: the cut was never seen at the write: $(cat "$cut6.log" 2>/dev/null)"
+[ "$(cat "$tmp/rc6")" = 0 ] || fail "6: a migrate cut off part-way exited $(cat "$tmp/rc6") — kept: $(cat "$tmp/o6"); stderr: $(cat "$tmp/e6")"
+grep -q "WARNING: 20-other.conf also sets" "$tmp/o6" || fail "6: the reader did not get the lines before the cut: $(cat "$tmp/o6")"
+[ "$(stat -c %a "$tmp/cut/config")" = 644 ] || fail "6: a migrate cut off part-way did not finish its write"
+[ "$(grep -cE "^-t runnerctl -- migrate $tmp/cut/config by [^ ]+ — ok \(caller gone, ran to the end\)\$" "$tmp/logger.calls" || true)" = 1 ] \
+  || fail "6: want one migrate record that ran to the end: $(cat "$tmp/logger.calls")"
+[ ! -s "$tmp/e6" ] || fail "6: stderr: $(cat "$tmp/e6")"
+
 echo "migrate-test ok"

@@ -1063,13 +1063,17 @@ audit_signal() { # INT|TERM|HUP|PIPE
 # never before), `kill` (and --if-stalled), `reap`, `enable`/`disable`,
 # `remove-limits`, `env-init`, `compose-reap --apply` and `health
 # --restart-stalled`. Each is a sequence whose middle is a worse host than
-# either end. `provision`, `install`, `migrate` and `compose-reap-timer` are
-# not guarded (GHR-153) and keep the GHR-131 rule below.
+# either end. GHR-153 moved the last ones in: `provision`, `install` (what
+# `fleet upgrade --push` runs remotely), `migrate` (install's own guard when
+# install reaches it) and `compose-reap-timer install|remove`. So every
+# command that arms a record is guarded from that point.
 #
 # So for a command guarded here, SIGHUP and SIGPIPE are not interruptions:
 # HUP is ignored and PIPE cannot arise, and the record carries the command's
-# own outcome. Every other armed command records both as `interrupted
-# (SIGHUP|SIGPIPE)` and dies by them, as GHR-119 does for INT and TERM (GHR-131).
+# own outcome. A record armed without a guard records both as `interrupted
+# (SIGHUP|SIGPIPE)` and dies by them, as GHR-119 does for INT and TERM
+# (GHR-131). No command does that today; the rule stays for the next one that
+# arms a record, and tests/run.sh pins it on a record armed directly.
 CALLER_GUARD_PID="" CALLER_GUARD_OUT="" CALLER_GUARD_ERR=""
 CALLER_GUARD_P1="" CALLER_GUARD_P2="" CALLER_GONE=false
 # One stream, on stdin, to stdout: each line passed on until a write fails,
@@ -6653,6 +6657,9 @@ cmd_compose_reap_timer() { # install|status [--brief]|remove
       problem="$(root_exec_problem "$self")"
       [ -z "$problem" ] || die "refusing to install a root timer that runs $self: $problem. Install runnerctl system-wide first ('runnerctl install'), then run compose-reap-timer install from that copy."
       audit_begin "compose-reap-timer install"
+      # GHR-153: unit files written and the timer not enabled is a worse host
+      # than either end.
+      caller_guard
       render_compose_reap_service "$self" | run_priv tee "$SYSTEMD_DIR/$COMPOSE_REAP_UNIT.service" >/dev/null
       render_compose_reap_timer | run_priv tee "$SYSTEMD_DIR/$COMPOSE_REAP_UNIT.timer" >/dev/null
       hb_systemctl daemon-reload
@@ -6673,6 +6680,7 @@ cmd_compose_reap_timer() { # install|status [--brief]|remove
       ;;
     remove)
       audit_begin "compose-reap-timer remove"
+      caller_guard # GHR-153, as install
       hb_systemctl disable --now "$COMPOSE_REAP_UNIT.timer" || true
       run_priv rm -f "$SYSTEMD_DIR/$COMPOSE_REAP_UNIT.service" "$SYSTEMD_DIR/$COMPOSE_REAP_UNIT.timer"
       hb_systemctl daemon-reload
@@ -14410,6 +14418,10 @@ cmd_provision() {
     return 0
   fi
   audit_begin provision "${slots[@]/#/$prefix-}" "$($replace && echo --replace)" # GHR-88: names only — never a token
+  # GHR-153: a slot unpacked and registered with GitHub but with no unit, or
+  # a unit not started, is a worse host than either end — and the per-slot
+  # loop is long. Nothing after this asks the operator anything.
+  caller_guard
 
   # Only now, with everything resolved, is a credential needed — a dry run and
   # every refusal above get there without one.
@@ -15150,7 +15162,13 @@ cmd_migrate() {
   [ -n "$out" ] || out="$CONFIG_FILE"
   # GHR-88: it writes a config. Reached from `install` too, whose record this
   # already is.
-  $dry_run || [ -n "$AUDIT_VERB" ] || audit_begin migrate "$out"
+  # GHR-153: guarded from there — a config written and never checked against
+  # the live drop-ins is a worse host than either end. Under `install` this is
+  # install's guard already (one per process).
+  if ! $dry_run; then
+    [ -n "$AUDIT_VERB" ] || audit_begin migrate "$out"
+    caller_guard
+  fi
 
   # 1. What the old script says.
   declare -A DESC MAX HIGH RS ENV
@@ -16028,7 +16046,16 @@ cmd_install() {
     echo "source: $url"
   fi
   new_ver="$(remote_version "$src")"
-  $dry_run || audit_begin install "$new_ver" "${ref:+--ref $ref}" "$($migrate || echo --no-migrate)"
+  # GHR-153: what `fleet upgrade --push` runs remotely. Cut off between the
+  # migrate and the placement, or between placing the new file and retiring a
+  # home copy, the host is left half-moved. The download (and its heartbeat
+  # ticker) is over by here; the relays are this process's own children, so
+  # the pushed file or the pipe it was read from going away does not touch
+  # them, and nothing after this asks the operator anything.
+  if ! $dry_run; then
+    audit_begin install "$new_ver" "${ref:+--ref $ref}" "$($migrate || echo --no-migrate)"
+    caller_guard
+  fi
 
   # Target: where runnerctl already is, else /usr/local/bin. A copy in the
   # invoking user's home that PATH does not reach never moves the target —
