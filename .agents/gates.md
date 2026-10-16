@@ -131,6 +131,16 @@ changed call order, a new refusal. A case is a function calling `run <args>`
 then `expect_*` helpers (listed at the top of `tests/run.sh`), registered at
 the bottom with `t "<name>" <fn>`. A case with no assertions fails.
 
+**Run one case or a few: `SIM_ONLY='<ERE>' bash tests/run.sh`** (GHR-164). The
+ERE is matched against the case NAME (the quoted string in `t "<name>" <fn>`,
+so a key like `GHR-96` works). Non-matching cases never run, so they cannot
+trip the no-assertion rule, and a filtered-out `xfail` is not an XPASS. The
+summary reads `sim(filtered: <ERE>): N ok, ..., K skipped by the filter — NOT
+the gate`; unfiltered it is still `sim:N ok, ...`. A filter matching nothing
+exits 1; an invalid ERE exits 2. `make gates` and `make sim` REFUSE (exit 2,
+naming `SIM_ONLY`) while it is set, so the gate always runs everything. Do not
+build a scratch copy of `tests/run.sh` to iterate on a case; use this.
+
 **xfail convention.** A case that documents a known bug is registered with
 `xfail <ISSUE-KEY> "<name>" <fn>` instead of `t`. It prints `xfail` while it
 fails, and the run FAILS if it starts passing — so the PR that fixes the issue
