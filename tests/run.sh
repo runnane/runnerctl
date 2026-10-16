@@ -11516,6 +11516,7 @@ PANE_KEYS_SLOT='q/Esc/Enter back  h host  jk scroll  K R S T P L O this slot  Ct
 PANE_KEYS_HOST='q/Esc/Enter back  h slot  jk scroll  Ctrl-C quits'
 PANE_KEYS_DOWN='q/Esc/Enter back  jk scroll  Ctrl-C quits'
 PANE_HOST_ROWS='  cores         16
+  load          —
   memory        48.0G available of 64.0G
   disk          / [docker,work] 24% (353.9G free)
   events        none in the last 1h'
@@ -11576,6 +11577,9 @@ Memory
   bar           [#+++++++++++++++++++++++++++++++++++++--] 4% of max, peak 96%, high at 85%
   pressure      full avg10 63.2% · avg60 41.0%
   events        high 4 · max 1 · oom_kill 0
+CPU
+  rate          —
+  pressure      —
 Leaks
   leaked        —
 Host
@@ -11779,17 +11783,17 @@ case_watch_pane_is_windowed_and_scrolls() {
     expect_frame_line "$f" 19 "^$PANE_KEYS_SLOT\$"
   done
   expect_frame_line 2 2 '^example\.slot-1 — slot details$'
-  expect_frame_line 2 17 '^↓ 26 more  PgDn/G$'
+  expect_frame_line 2 17 '^↓ 30 more  PgDn/G$'
   expect_frame_count_of 2 '^↑ ' 0
   expect_frame_line 3 2 '^↑ 2 more  PgUp/g$'
   expect_frame_line 3 3 '^  host          stub-host-1$'
-  expect_frame_line 3 17 '^↓ 25 more  PgDn/G$'
-  expect_frame_line 4 2 '^↑ 26 more  PgUp/g$'
+  expect_frame_line 3 17 '^↓ 29 more  PgDn/G$'
+  expect_frame_line 4 2 '^↑ 30 more  PgUp/g$'
   expect_frame_line 4 17 '^  events        none in the last 1h$'
   expect_frame_count_of 4 '^↓ ' 0
   expect_text "g is the top again" "$(frame_from 2 2)" "$(frame_from 5 2)"
   expect_frame_line 6 2 '^↑ 14 more  PgUp/g$'
-  expect_frame_line 6 17 '^↓ 13 more  PgDn/G$'
+  expect_frame_line 6 17 '^↓ 17 more  PgDn/G$'
   # back in the table, which fits: its own window starts where it was
   expect_frame_line 7 5 "$(cursor_row 0 1)"
   RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_LINES=20,20,30 \
@@ -11800,7 +11804,7 @@ case_watch_pane_is_windowed_and_scrolls() {
   expect_frame_lines 2 20
   expect_frame_lines 3 30
   expect_frame_line 3 2 '^example\.slot-1 — slot details$'
-  expect_frame_line 3 27 '^↓ 16 more  PgDn/G$'
+  expect_frame_line 3 27 '^↓ 20 more  PgDn/G$'
   expect_log_count '^probe:winch$' 1
 }
 
@@ -11843,6 +11847,9 @@ Memory
   bar           [#+++++++++++++++++++++++++++++++++++++--] 4% of max, peak 96%, high at 85%
   pressure      full avg10 63.2% · avg60 41.0%
   events        high 4 · max 1 · oom_kill 0
+CPU
+  rate          —
+  pressure      —
 Leaks
   leaked        —
 Host
@@ -11976,6 +11983,7 @@ Host
   host          gw-unreachable
   runnerctl     —
   cores         —
+  load          —
   memory        —
   disk          —
   events        —
@@ -12139,10 +12147,14 @@ Memory
   bar           no MemoryMax or MemoryHigh set — nothing to draw it against
   pressure      —
   events        —
+CPU
+  rate          —
+  pressure      —
 Leaks
   leaked        —
 Host
   cores         8
+  load          —
   memory        —
   disk          —
   events        —
@@ -12181,10 +12193,14 @@ Memory
   bar           —
   pressure      full avg10 — · avg60 5.0%
   events        high 1 · max — · oom_kill 0
+CPU
+  rate          —
+  pressure      —
 Leaks
   leaked        2
 Host
   cores         8
+  load          —
   memory        —
   disk          —
   events        —
@@ -17337,6 +17353,174 @@ t "GHR-115: the --cpu-prev spec is built from held values only"                 
 t "GHR-115: fleet watch waits for a CPU sample on the first tick only"            case_ghr115_fleet_watch_waits_on_the_first_tick_only
 t "GHR-115: a host too old for --cpu-prev waits as before, asked with it once"    case_ghr115_a_host_too_old_for_the_flag_waits_as_before
 t "GHR-115: a CPU counter backwards between fleet watch ticks is —"               case_ghr115_a_counter_backwards_between_ticks_is_a_dash
+
+# --- GHR-114: the detail pane shows the slot's CPU and the host's load --------
+# One renderer, two fillers. Locally the rate is the one render_status's memo
+# gives (the table's last sample against the pane's own); under `fleet watch`
+# it is computed from two payloads of one host, the previous tick's
+# (FW_STATE/<i>.prev.json) and the current one's, with the host's own clock.
+
+# A hand-written `status --json` payload for the pane: payload FILE INV USAGE AT
+# [LOAD]. One slot, `s1`, with the CPU keys given as text (`null` or `-` for
+# a key that is not there at all, which is a host from before it).
+ghr114_payload() { # FILE INV USAGE AT LOAD
+  local f="$1" inv="$2" use="$3" at="$4" load="${5:-}" cpu="" h
+  [ "$use" = - ] || cpu+="\"cpu_usage_usec\":$use,"
+  [ "$at" = - ] || cpu+="\"cpu_usage_at_us\":$at,"
+  [ "$inv" = - ] || cpu+="\"invocation_id\":$inv,"
+  [ "$inv" = - ] || [ "$use" = - ] || cpu+='"cpu_pressure":{"some_avg10":12.50,"some_avg60":8.00,"some_total":5555},'
+  h='{"runnerctl":"0.9.0","host":{"name":"h1","cores":16,"mem_total":null,"mem_available":null'
+  [ -z "$load" ] || h+=",\"load\":$load"
+  {
+    echo "$h},"
+    echo ' "slots":['
+    echo "  {\"idx\":0,\"unit\":\"u1\",\"name\":\"s1\",\"active\":\"active\",\"sub\":\"running\",\"enabled\":\"enabled\",${cpu}\"job\":null,\"idle_since\":null,\"jobs_completed\":null,\"working_on_access\":\"ok\"}"
+    echo ']}'
+  } >"$f"
+}
+GHR114_I1='"1111aaaa1111aaaa1111aaaa1111aaaa"'
+GHR114_I2='"2222bbbb2222bbbb2222bbbb2222bbbb"'
+# The pane's CPU and load rows for the payload pair PREV CUR (files made by
+# ghr114_payload), as `fleet_watch_pane_build` draws them; PREV may be `-`
+# for no previous payload. Colours as `--color always` paints them.
+ghr114_fleet_pane() { # PREV CUR
+  local d="$TMP/ghr114.state"
+  rm -rf "$d"; mkdir -p "$d"
+  [ "$1" = - ] || cp "$1" "$d/0.prev.json"
+  cp "$2" "$d/0.json"
+  echo 0 >"$d/0.jrc"; echo 0 >"$d/0.rc"
+  # shellcheck disable=SC2016
+  GHR114_D="$d" run_fn eval 'now_epoch() { echo 1000000720; }
+    C_RED=$'"'"'\e[31m'"'"' C_GREEN=$'"'"'\e[32m'"'"' C_YELLOW=$'"'"'\e[33m'"'"' C_RESET=$'"'"'\e[0m'"'"'
+    FLEET_HOSTS=(h1); FW_STATE="$GHR114_D" FW_HOST=h1 FW_PANE=slot FW_NAME=s1
+    fleet_watch_pane_build; sed -n "/^CPU\$/,\$p" <<<"$PANE_OUT" | grep -E "^  (rate|pressure|load) "'
+  rm -rf "$d"
+}
+
+# Locally: Enter opens the pane at the clock the table last drew at, so the
+# memo's sample is no older than CPU_SAMPLE_MS and the rate is `—`; a tick a
+# minute later has the table's sample to measure against, and 3.2 cores. The
+# pressure is cpu.pressure's `some` line, the load against the stub's 16
+# cores, with the level in words (40.0 on 16 cores is over 2 x cores).
+case_ghr114_watch_pane_shows_cpu_rate_pressure_and_load() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_CPU="1:3200" RUNNERCTL_STUB_LOAD="40.00 10.50 3.25" \
+    RUNNERCTL_STUB_KEYS=$'\n-q-q' run watch --interval 60 --color never
+  expect_rc 0
+  frames
+  expect_frame_count 5
+  expect_frame 2 '^CPU$'
+  expect_frame 2 '^  rate          —$'
+  expect_frame 2 '^  pressure      some avg10 12\.5% · avg60 8\.0%$'
+  expect_frame 2 '^  load          1m 40\.0 · 5m 10\.5 · 15m 3\.3 — crit$'
+  expect_frame 3 '^  rate          3\.2 cores$'
+  expect_frame 3 '^  pressure      some avg10 12\.5% · avg60 8\.0%$'
+  expect_frame_plain 3
+  # the level paints it: red over crit, yellow over warn, green under
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_CPU="1:3200" RUNNERCTL_STUB_LOAD="40.00 10.50 3.25" \
+    RUNNERCTL_STUB_KEYS=$'\n-q-q' run watch --interval 60 --color always
+  frames
+  expect_frame 2 "^  load          $ESC\\[31m1m 40\\.0 · 5m 10\\.5 · 15m 3\\.3 — crit$ESC\\[0m\$"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_CPU="1:3200" RUNNERCTL_STUB_LOAD="20.00 10.50 3.25" \
+    RUNNERCTL_STUB_KEYS=$'\n-q-q' run watch --interval 60 --color always
+  frames
+  expect_frame 2 "^  load          $ESC\\[33m1m 20\\.0 · 5m 10\\.5 · 15m 3\\.3 — warn$ESC\\[0m\$"
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_CPU="1:3200" RUNNERCTL_STUB_LOAD="9.00 10.50 3.25" \
+    RUNNERCTL_STUB_KEYS=$'\n-q-q' run watch --interval 60 --color always
+  frames
+  expect_frame 2 "^  load          $ESC\\[32m1m 9\\.0 · 5m 10\\.5 · 15m 3\\.3$ESC\\[0m\$"
+  # a slot with no CPU accounting and a host with no readable load: `—`
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_KEYS=$'\n-q-q' run watch --interval 60 --color never
+  frames
+  expect_frame 3 '^  rate          —$'
+  expect_frame 3 '^  pressure      —$'
+  expect_frame 3 '^  load          —$'
+}
+
+# Under fleet watch, over two ticks of the stub's host (its counter advances
+# with the stub clock, 3.2 cores): the first payload has no predecessor, so
+# the pane opened on it says `—`; the second tick's gives 3.2. The previous
+# payload is kept by the collection, not re-fetched: no host is dialled for
+# the pane.
+case_ghr114_fleet_pane_computes_the_rate_over_two_ticks() {
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_CPU="1:3200" RUNNERCTL_STUB_LOAD="20.00 10.50 3.25" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_KEYS=$'\n-q-q' run fleet watch --interval 4 --color never
+  expect_rc 0
+  frames
+  expect_frame 2 '^  rate          —$'
+  expect_frame 3 '^  rate          3\.2 cores$'
+  expect_frame 3 '^  pressure      some avg10 12\.5% · avg60 8\.0%$'
+  expect_frame 3 '^  load          1m 20\.0 · 5m 10\.5 · 15m 3\.3 — warn$'
+  expect_no_log '^probe:ssh_run .* status --json'
+  # a counter that went backwards between the ticks is `—`, never negative
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_CPU="1:3200" RUNNERCTL_STUB_CPU_RESET=1 \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1" RUNNERCTL_STUB_KEYS=$'\n-q-q' run fleet watch --interval 4 --color never
+  expect_rc 0
+  frames
+  expect_frame 3 '^  rate          —$'
+  expect_frame 3 '^  pressure      some avg10 12\.5% · avg60 8\.0%$'
+  expect_no_out '^  rate +-'
+}
+
+# The rule on hand-written payload pairs: the host's own clock and the same
+# invocation, cpu_rate's refusal of a backwards counter, and a payload from
+# before GHR-79 / GHR-115.
+case_ghr114_fleet_pane_cpu_rate_rule() {
+  local p="$TMP/ghr114.prev.json" c="$TMP/ghr114.cur.json" L='[20.00,10.50,3.25]'
+  # 3.2 cores: 3,200,000 usec of CPU in one second of the host's clock
+  ghr114_payload "$p" "$GHR114_I1" 1000000 5000000
+  ghr114_payload "$c" "$GHR114_I1" 4200000 6000000 "$L"
+  ghr114_fleet_pane "$p" "$c"
+  expect_rc 0
+  expect_text "a rate, the pressure and the load, painted by level" "  rate          3.2 cores
+  pressure      ${ESC}[33msome avg10 12.5% · avg60 8.0%${ESC}[0m
+  load          ${ESC}[33m1m 20.0 · 5m 10.5 · 15m 3.3 — warn${ESC}[0m" "$OUT"
+  # backwards counter
+  ghr114_payload "$c" "$GHR114_I1" 900000 6000000 "$L"
+  ghr114_fleet_pane "$p" "$c"
+  expect_out '^  rate          —$'
+  # another invocation: the counter started again, so it is not a rate
+  ghr114_payload "$c" "$GHR114_I2" 4200000 6000000 "$L"
+  ghr114_fleet_pane "$p" "$c"
+  expect_out '^  rate          —$'
+  expect_out '^  pressure      .*some avg10 12\.5%'
+  # no time between the two on the host's clock
+  ghr114_payload "$c" "$GHR114_I1" 4200000 5000000 "$L"
+  ghr114_fleet_pane "$p" "$c"
+  expect_out '^  rate          —$'
+  # a number num_int does not take
+  ghr114_payload "$c" "$GHR114_I1" 04200000 6000000 "$L"
+  ghr114_fleet_pane "$p" "$c"
+  expect_out '^  rate          —$'
+  # no previous payload
+  ghr114_payload "$c" "$GHR114_I1" 4200000 6000000 "$L"
+  ghr114_fleet_pane - "$c"
+  expect_out '^  rate          —$'
+  # a host from before GHR-115 (no clock, no invocation): pressure and load
+  # are drawn, the rate is `—`
+  ghr114_payload "$p" - 1000000 -
+  ghr114_payload "$c" - 4200000 - "$L"
+  sed -i 's/"cpu_usage_usec":4200000,/"cpu_usage_usec":4200000,"cpu_pressure":{"some_avg10":12.50,"some_avg60":8.00,"some_total":5555},/' "$c"
+  ghr114_fleet_pane "$p" "$c"
+  expect_out '^  rate          —$'
+  expect_out '^  pressure      .*some avg10 12\.5% · avg60 8\.0%'
+  expect_out '^  load          .*1m 20\.0 · 5m 10\.5 · 15m 3\.3 — warn'
+  # a host from before GHR-79: no key of any of the three — `—`, never 0
+  ghr114_payload "$p" - - -
+  ghr114_payload "$c" - - -
+  ghr114_fleet_pane "$p" "$c"
+  expect_text "a payload with no CPU or load key" "  rate          —
+  pressure      —
+  load          —" "$OUT"
+  # hostile values for a load and a pressure are `—` too
+  ghr114_payload "$c" "$GHR114_I1" 4200000 6000000 '[1e9,"x",07.5]'
+  ghr114_fleet_pane "$p" "$c"
+  expect_out '^  load          —$'
+  rm -f "$p" "$c"
+}
+
+t "GHR-114: the watch pane shows the slot's CPU rate and pressure and the host's load"  case_ghr114_watch_pane_shows_cpu_rate_pressure_and_load
+t "GHR-114: the fleet watch pane computes the CPU rate over two ticks"                  case_ghr114_fleet_pane_computes_the_rate_over_two_ticks
+t "GHR-114: the fleet pane's rate holds the host's clock, one invocation, no regress"   case_ghr114_fleet_pane_cpu_rate_rule
 
 # --- GHR-149: the remote `--heartbeat=N` global flag ------------------------------
 # Every phase that can block prints a line at most N s apart. Everything is
