@@ -1881,6 +1881,44 @@ case_journal_job_lines_match_passes_through() {
   expect_out '^rc=0$'
 }
 
+# --- GHR-152: the host-events search opens the user journals too --------------
+# The real journal_host_events over a journalctl function. A regular-user
+# unit's disk-full line lives in user-<uid>.journal, which `--system` does not
+# open: the -g search answers it only when `--system` is absent. The -n 1
+# access probe is JC_ACCESS (0 readable, 1 not).
+# shellcheck disable=SC2016  # evaluated by the child shell, not here
+JH_FAKE='journalctl() {
+  case " $* " in
+    *" -g "*)
+      echo "g:$*" >>"$JC_LOG"
+      case " $* " in *" --system "*) return 1 ;; esac
+      echo "1000000050.000000 h runner[7]: write /tmp/x: No space left on device"
+      return 0 ;;
+    *) echo "p:$*" >>"$JC_LOG"; return "$JC_ACCESS" ;;
+  esac
+}'
+
+case_journal_host_events_reads_a_user_journal() {
+  : >"$TMP/jc.log"
+  JC_LOG="$TMP/jc.log" JC_ACCESS=0 run_fn eval "$JH_FAKE
+    rc=0; journal_host_events 1000000000 || rc=\$?; echo rc=\$rc"
+  expect_out '^1000000050\.000000 h runner\[7\]: write /tmp/x: No space left on device$'
+  expect_out '^rc=0$'
+  # the probe stays on --system; the search does not carry it
+  grep -q '^p:--system -q --no-pager -n 1$' "$TMP/jc.log" || FAILS+=("access probe not on --system")
+  grep -q '^g:-q --no-pager -o short-unix --since @1000000000 -g ' "$TMP/jc.log" || FAILS+=("search argv wrong or carries --system")
+}
+
+case_journal_host_events_no_access_fails_without_searching() {
+  : >"$TMP/jc.log"
+  JC_LOG="$TMP/jc.log" JC_ACCESS=1 run_fn eval "$JH_FAKE
+    rc=0; journal_host_events 1000000000 || rc=\$?; echo rc=\$rc"
+  expect_out '^rc=1$'
+  expect_no_out 'No space left'
+  grep -q '^p:--system -q --no-pager -n 1$' "$TMP/jc.log" || FAILS+=("access probe not on --system")
+  if grep -q '^g:' "$TMP/jc.log"; then FAILS+=("searched a journal it could not read"); fi
+}
+
 case_journal_job_args_without_invocation_id() {
   run_fn journal_job_args actions.runner.example.slot-1.service
   expect_rc 0
@@ -10570,6 +10608,8 @@ t "journal_job_args: no invocation id -> no scope argument"             case_jou
 t "journal_job_lines: a -g search with no match is empty success (GHR-65)"  case_journal_job_lines_no_match_is_empty_success
 t "journal_job_lines: no access fails and never searches (GHR-65)"          case_journal_job_lines_no_access_fails_without_searching
 t "journal_job_lines: a matching search passes its lines through (GHR-65)"  case_journal_job_lines_match_passes_through
+t "journal_host_events: a regular-user unit's line from the user journal (GHR-152)"  case_journal_host_events_reads_a_user_journal
+t "journal_host_events: no access fails and never searches (GHR-152)"  case_journal_host_events_no_access_fails_without_searching
 t "status --stall-after 600: a 12m job is STALLED, note once"          case_status_stall_after_flags_slot1
 t "status --stall-after: = form, and the threshold is inclusive"       case_status_stall_after_equals_form_and_boundary
 t "status --stall-after 0: the flag is off"                            case_status_stall_after_zero_disables
