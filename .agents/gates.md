@@ -213,6 +213,13 @@ Traps:
   `completed fan-out` assertion has to model pid reuse (`proc_ppid` shadowed
   to answer "ours"). Against the real one, a reaped pid is skipped whether or
   not the list was cleared, so dropping the clear would go unnoticed.
+  **The `fleet start` half depends on the bash version.** The case is only
+  red on bash 5.2 (CI's ubuntu-24.04, Debian 12) if the explicit
+  `trap '' INT QUIT` at the top of `fleet_fanout_one` is missing. Under 5.2 a
+  background job keeps its parent's INT trap; 5.3 ignores INT in the job
+  anyway, so on a 5.3 box that guard cannot fail. To check it locally, run the
+  case in `debian:12`, as uid 1000 with `/etc/passwd` mounted, because
+  `id -un` must resolve.
 - **`fleet watch` fetches each host in a background job (GHR-74), and the
   stub models the loop's poll step rather than sleeping through it.** While a
   fetch is out the loop's key read has `FW_POLL` (0.2) as its timeout; the

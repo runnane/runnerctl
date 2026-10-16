@@ -7436,6 +7436,18 @@ fleet_optional_rejects() { # ERRFILE WORD
 fleet_fanout_one() { # INDEX REMOTE-ARGS...
   local i="$1" host a hrc=0 t0
   shift
+  # GHR-96: a background job ignores SIGINT and SIGQUIT, stated here rather
+  # than left to bash. Bash 5.3 does that even for a job of a shell whose
+  # own INT is trapped (measured), but bash 5.2 (measured on Debian 12, and
+  # the ubuntu-24.04 CI runner) lets the job keep the trap. A mutating
+  # command's job, with the central record's trap, then ran it on a terminal's
+  # Ctrl-C while it waited for its call (fleet_into_idle) and exited at
+  # once. The call, its `timeout` and the ssh were re-parented to init, out
+  # of fleet_fanout_reap's reach, and ran on to the budget. A job that
+  # ignores the signal outlives its call until the reap ends both, and a call
+  # on the watchdog takes the job's dispositions (fleet_sig_ignored) on every
+  # bash alike.
+  builtin trap '' INT QUIT
   host="${FLEET_HOSTS[$i]}"
   local -a args=()
   for a in "$@"; do
