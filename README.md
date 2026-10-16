@@ -2532,7 +2532,7 @@ build-1: reap harness-123456 reason=gone:pid:123456 idle=120m containers=1 netwo
 build-1: keep harness-4242 reason=live:pid:4242 idle=120m containers=1 networks=0 volumes=0
 build-1: compose-reap: mode=dry-run projects=2 reap=1 keep=1 removed=0 failed=0 …
 box-3: no docker on this host — nothing for compose-reap to inspect (information, not a failure)
-fleet compose-reap (dry run, nothing removed): would reap 1 stack(s) — 1 container(s), 1 network(s), 0 volume(s), up to 0 image(s) — on 1 host(s); 1 host(s) without docker
+fleet compose-reap (dry run, nothing removed): would reap 1 stack(s) — 1 container(s), 1 network(s), 0 volume(s), 0 image(s) — on 1 host(s); 1 host(s) without docker
 ```
 
 It takes `--host H` (repeatable) and forwards `--standalone`, `--project
@@ -2541,9 +2541,13 @@ a read: in parallel like `fleet status`, as the plain ssh login (never through
 `FLEET_SUDO`), and nothing is removed anywhere. Its verdicts are what that
 login can see: a slot whose processes it cannot read counts as idle, as for a
 dry run by hand. The total counts the stacks each host would reap with their
-containers, networks and volumes, plus `--standalone` containers, and *up to*
-the images those free — whether an image is still used elsewhere is only asked
-by `--apply`.
+containers, networks and volumes, plus `--standalone` containers, and the
+images those free. Each host asks the daemon, read-only, whether a container it
+would not remove still uses a candidate image, and prints `would remove image
+X` or `keep image X reason=in-use` for each, so the image count is exact. A
+host on an older runnerctl says nothing of images; while one has candidates the
+total reads *up to* N, counting that host's candidates unchecked, until
+`runnerctl fleet upgrade` brings it up to date.
 
 `--apply` goes through the [mutating fan-out](#changing-things-the-mutating-fan-out)
 — one host at a time, streamed, recorded, `FLEET_SUDO` and the origin as for
