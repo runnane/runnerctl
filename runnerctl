@@ -11125,7 +11125,22 @@ fleet_watch_cleanup() {
 # fetch still out (fleet_watch_reap) and closing the masters. `--iterations N`
 # is the test path, as for `fleet watch`: it waits for each round and stops
 # after N envelopes.
+#
+# GHR-165: the ticks run in a child of their own (fleet_stream_ticks), which
+# traps nothing, and the process holding the traps only relays its lines and
+# waits. bash 5.2 (5.2.15 and 5.2.21 measured; 5.3.20 is fixed) runs a
+# pending trap from inside its parse of a `$(` it is about to expand, with
+# that parse's state still live — so the trap's own text fails to parse
+# (`trap: line 2: unexpected EOF while looking for matching `)'`), the signal
+# is lost and the shell goes on. A tick expands `$(` all the time; the relay
+# loop never does, and its `read` and `wait` are where bash runs a trap
+# safely. The child is ended with its whole tree, fetches included.
+FW_TICKS=""
 fleet_stream_cleanup() {
+  if [ -n "$FW_TICKS" ] && [ "$(proc_ppid "$FW_TICKS")" = "$$" ]; then
+    proc_tree_kill "$FW_TICKS"
+  fi
+  FW_TICKS=""
   fleet_watch_reap
   fleet_cleanup
   [ -z "$FW_STATE" ] || rm -rf "$FW_STATE"
@@ -11135,11 +11150,12 @@ fleet_stream_cleanup() {
 # The stream's wait for a moment: a hook, like pause, so the sim can see it.
 stream_wait() { sleep "$1"; }
 fleet_status_stream() { # INTERVAL ITERATIONS [STATUS-ARGS...]
-  local interval="$1" iterations="$2" tick=0 i env left
+  local interval="$1" iterations="$2" i rc=0
   shift 2
   fleet_ssh_control_open "$((interval + FLEET_TIMEOUT + 30))"
   FW_STATE="$(mktemp -d)"
   FLEET_EXIT_OWNED=true
+  # From here on no `$(` in this process but the cleanup's (GHR-165).
   trap fleet_stream_cleanup EXIT
   trap 'exit 0' INT TERM PIPE
   FW_INTERVAL="$interval" FW_PID=() FW_AGAIN=() FW_JSON_ONLY=true
@@ -11149,6 +11165,26 @@ fleet_status_stream() { # INTERVAL ITERATIONS [STATUS-ARGS...]
     FLEET_BUDGETS[i]="$FLEET_WATCH_TIMEOUT"
     echo late >"$FW_STATE/$i.rc"
   done
+  mkfifo "$FW_STATE/stream"
+  fleet_stream_ticks "$interval" "$iterations" >"$FW_STATE/stream" &
+  FW_TICKS="$!"
+  # Into REPLY, which keeps the line whole with no `IFS=` on the read: a trap
+  # run inside the read (where bash runs one) would see that IFS, and so would
+  # every `read` of the cleanup it exits to.
+  while read -r; do
+    printf '%s\n' "$REPLY" 2>/dev/null || exit 0
+  done <"$FW_STATE/stream"
+  wait "$FW_TICKS" || rc=$?
+  FW_TICKS=""
+  [ "$rc" -eq 0 ] || exit "$rc"
+}
+# The stream's ticks, one envelope per line to stdout, in a child of the
+# stream's that traps nothing (see fleet_stream_cleanup). The child is the
+# fetches' parent, so the rounds' collect, settle and `wait -n` are its own.
+fleet_stream_ticks() { # INTERVAL ITERATIONS
+  local interval="$1" iterations="$2" tick=0 env left
+  # GHR-162: a Ctrl-C is the stream's to take, and ends this child with it.
+  builtin trap '' INT QUIT
   while :; do
     fleet_watch_round tick
     if [ -n "$iterations" ]; then

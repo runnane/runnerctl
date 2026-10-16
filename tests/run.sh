@@ -15413,6 +15413,35 @@ case_ghr80_stream_ends_cleanly_on_sigterm() {
   expect_json 'd["fleet"][0]["reachable"] is True and d["fleet"][1]["reachable"] is False'
 }
 
+# GHR-165: the same SIGTERM, but pending at the moment the stream's code
+# parses a `$(` — sent from inside one, with a second in the same word
+# (RUNNERCTL_STUB_STREAM_TERM). bash 5.2 runs the trap there with the
+# substitution's parser state still live: the trap's own text fails to parse
+# (`trap: line 2: unexpected EOF while looking for matching `)'`), the signal
+# is lost, and the stream goes on. It ends as the plain SIGTERM does instead.
+# timeout is only the bound on a stream that lost the signal: it was never
+# needed if the status is 0, not 124.
+case_ghr165_stream_term_pending_at_a_comsub_parse() {
+  local d="$TMP/ghr165-tmp" rc=0 mark="$TMP/ghr165.sent"
+  rm -rf "$d"; mkdir -p "$d"
+  rm -f "$mark"
+  _log_reset; rm -f "$LOG.clock"; rm -rf "$WRITES"; mkdir -p "$WRITES"
+  TMPDIR="$d" RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_JSON_POLLS=1 RUNNERCTL_STUB_FLEET_HANG="slow-1" \
+    RUNNERCTL_STUB_STREAM_TERM="$mark" \
+    RUNNERCTL_STUB_FLEET_HOSTS="build-1 slow-1" RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" \
+    RUNNERCTL_TEST_WRITES="$WRITES" timeout 10 "$RUNNERCTL" fleet status --json --watch --interval 1 \
+    >"$TMP/ghr165.out" 2>"$TMP/err" || rc=$?
+  ERR="$(cat "$TMP/err")"
+  expect_cfg "$mark" '^sent$'
+  expect_text "the stream's exit status after a SIGTERM pending at a \$( parse" 0 "$rc"
+  expect_text "its stderr" "" "$ERR"
+  expect_cfg "$WRITES/remote/slow-1.hung.pids" '^[0-9]+ [0-9]+$'
+  _ghr74_expect_dead "$(cat "$WRITES/remote/slow-1.hung.pids" 2>/dev/null; true)"
+  _ghr74_expect_empty "$d"
+  expect_log_order '^probe:ssh_control build-1 exit$' '^probe:ssh_control slow-1 exit$'
+  rm -rf "$d"
+}
+
 # The stream is the fleet's only: the one-host `status` still refuses --watch
 # with --json, the table form is `fleet watch`, and the stream's own flags do
 # not reach a one-shot by accident. Nothing is dialled for any of them.
@@ -15561,6 +15590,7 @@ t "GHR-80: the summary counts only the payloads the envelope nests"      case_gh
 t "GHR-80: the stream is one envelope per tick over held connections"     case_ghr80_stream_one_envelope_per_tick_over_held_connections
 t "GHR-80: the stream ends cleanly when its reader goes"                  case_ghr80_stream_ends_cleanly_when_the_reader_goes
 t "GHR-80: the stream ends cleanly on SIGTERM"                            case_ghr80_stream_ends_cleanly_on_sigterm
+t "GHR-165: a SIGTERM pending at a \$( parse ends the stream too"         case_ghr165_stream_term_pending_at_a_comsub_parse
 t "GHR-80: the stream's flags are refused where they mean nothing"        case_ghr80_stream_flags_are_refused_where_they_mean_nothing
 t "GHR-80: health --json kinds, exit codes as the prose form's"           case_ghr80_health_json_kinds_and_exit_codes
 t "GHR-80: health's prose lines are the object's details"                 case_ghr80_health_prose_is_the_objects_details
@@ -18798,6 +18828,18 @@ case_ghr162_fleet_status_jobs_ignore_int_and_quit() {
   expect_log_count '^probe:ssh_run build-1 -- runnerctl status --json' 1
 }
 
+# `fleet status --json --watch`: the child its ticks run in (GHR-165), and a
+# tick's fetch under it.
+case_ghr162_the_streams_ticks_ignore_int_and_quit() {
+  RUNNERCTL_STUB_CLOCK=1 RUNNERCTL_STUB_FLEET_JSON_POLLS=1 RUNNERCTL_STUB_FLEET_HOSTS="build-1" \
+    run_sigdfl "$STUB" fleet status --json --watch --interval 7 --iterations 1
+  expect_rc 0
+  expect_out_count '^\{"fleet":\[' 1
+  ghr162_control
+  expect_sigign fleet_stream_ticks 1 1
+  expect_sigign fleet_watch_fetch_one 1 1
+}
+
 # A call that changes hosts. On the watchdog (GHR-150): the fan-out job, the
 # call's own job (fleet_idle_run, which takes its CALLER's — here the fan-out
 # job's ignore), its two taps and the watchdog. Without the heartbeat (an
@@ -18887,6 +18929,7 @@ case_ghr162_fleet_watch_jobs_ignore_int_and_quit() {
 }
 
 t "GHR-162: fleet status's fan-out and summary jobs ignore INT and QUIT"       case_ghr162_fleet_status_jobs_ignore_int_and_quit
+t "GHR-162: the stream's ticks ignore INT and QUIT"                         case_ghr162_the_streams_ticks_ignore_int_and_quit
 t "GHR-162: a mutating call's job, taps and watchdog; the walk's call takes INT" case_ghr162_a_mutating_calls_processes
 t "GHR-162: a heartbeat ticker and the caller guard's relays ignore INT and QUIT" case_ghr162_a_ticker_and_the_relays_ignore_int_and_quit
 t "GHR-162: fleet watch's fetch, action, H, U and : jobs ignore INT and QUIT"   case_ghr162_fleet_watch_jobs_ignore_int_and_quit

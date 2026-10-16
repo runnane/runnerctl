@@ -270,6 +270,24 @@ Traps:
     it, and CI's ubuntu has it (not a bash difference). Every other red
     there is real. A new `&` job or `>(…)` gets its trap, its name in the stub's
     `STUB_SIGIGN_JOBS` (or a read from outside) and an `expect_sigign`.
+- **On bash 5.2 a trap can be lost at a `$(` (GHR-165).** Every `$(…)` is
+  parsed again where it is expanded (`xparse_dolparen`), and that parse calls
+  `parse_command`, which runs pending traps first, with the substitution's
+  parser state still live. A signal that arrived since the last command
+  therefore has its trap text parsed as the inside of a `$(`. It fails with
+  `trap: line 2: unexpected EOF while looking for matching `)'`, the handler
+  never runs, and the shell goes on. Measured with a standalone script
+  (`trap 'exit 0' TERM; x="$(kill -TERM "$$")$(:)"`): 50/50 on 5.2.15
+  (`debian:12`) and 5.2.21 (`ubuntu:24.04`, CI's), 0/50 on 5.3.20. So a
+  trapped process that also runs ordinary code is exposed. `fleet status
+  --json --watch` keeps its trapped process to a `read`/`printf` relay and a
+  `wait`, with the ticks in a child that traps nothing. The stub's
+  `RUNNERCTL_STUB_STREAM_TERM=FILE` sends the signal inside that window, so it
+  is deterministic and red only on 5.2. Run it in `debian:12` (command above).
+  A related trap, on 5.2 and 5.3.20 alike: a handler run inside `IFS= read`
+  keeps that read's `IFS=`,
+  and so does the EXIT cleanup it exits to, where every `read -r a b` then
+  splits nothing. That is why the relay reads into `REPLY`.
 - **`fleet watch` fetches each host in a background job (GHR-74), and the
   stub models the loop's poll step rather than sleeping through it.** While a
   fetch is out the loop's key read has `FW_POLL` (0.2) as its timeout; the
