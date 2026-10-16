@@ -7256,8 +7256,43 @@ require_fleet() {
 # line from one host inside another's JSON is unparseable.
 FLEET_DIR=""
 fleet_cleanup() {
+  fleet_fanout_reap
   [ -z "$FLEET_DIR" ] || rm -rf "$FLEET_DIR"
   FLEET_DIR=""
+}
+# GHR-96: the calls of a fan-out still out, ended with everything under them
+# when the process that made it is interrupted. Each host's call is a
+# background job, which ignores SIGINT, and the ssh under it sits in
+# `timeout`'s own process group, out of reach of a terminal's Ctrl-C — so
+# without this an interrupted `fleet status` left one ssh per unanswered host
+# running to its budget, writing into a buffer directory already removed.
+#
+# FLEET_FANOUT_PIDS holds this fan-out's jobs only while it waits for them,
+# and is emptied as soon as that wait returns: fleet_cleanup also runs on a
+# NORMAL exit (and after every fleet_slots read), when every job has been
+# reaped and its pid may belong to anything by now. FLEET_FANOUT_OWNER is the
+# process that started them, and a pid is signalled only while it is still
+# that process's child — fleet_watch_reap's rule.
+#
+# A fan-out that CHANGES hosts is reaped the same way, deliberately: what an
+# interrupt does to the HOST is the host's (GHR-91, GHR-137, GHR-153) — a
+# command that has begun changing things there is caller-guarded and finishes
+# what it started once its connection closes — and the README says that a
+# Ctrl-C on the central node ends only the local side. Until this, that
+# local side went on (measured: a `fleet start` call's ssh outlived the
+# interrupted runnerctl), along with its `timeout` and its GHR-150 watchdog.
+# A host on a runnerctl from before the guard stops at its next line of
+# output, as the README says, rather than at its budget.
+FLEET_FANOUT_PIDS=() FLEET_FANOUT_OWNER=""
+fleet_fanout_reap() {
+  local pid
+  if [ -n "$FLEET_FANOUT_OWNER" ] && [ "$FLEET_FANOUT_OWNER" = "$BASHPID" ]; then
+    for pid in ${FLEET_FANOUT_PIDS[@]+"${FLEET_FANOUT_PIDS[@]}"}; do
+      [ "$(proc_ppid "$pid")" = "$BASHPID" ] || continue
+      proc_tree_kill "$pid"
+    done
+  fi
+  FLEET_FANOUT_PIDS=() FLEET_FANOUT_OWNER=""
 }
 
 # Run REMOTE-ARGS on every FLEET_HOSTS entry, at most FLEET_PARALLEL at a
@@ -7299,9 +7334,12 @@ fleet_fanout() { # REMOTE-ARGS...
   local -a retry=() pids=()
   FLEET_DIR="$(mktemp -d)"
   $FLEET_EXIT_OWNED || trap fleet_cleanup EXIT
+  # GHR-96: the jobs, for fleet_cleanup to end on an interrupt.
+  FLEET_FANOUT_PIDS=() FLEET_FANOUT_OWNER="$BASHPID"
   for i in "${!FLEET_HOSTS[@]}"; do
     fleet_fanout_one "$i" "$@" &
     pids+=("$!")
+    FLEET_FANOUT_PIDS+=("$!")
     running=$((running + 1))
     if [ "$running" -ge "$FLEET_PARALLEL" ]; then
       wait -n 2>/dev/null || true
@@ -7312,6 +7350,9 @@ fleet_fanout() { # REMOTE-ARGS...
   # under `fleet watch` a host's background fetch may still be out, and a
   # bare wait would sit through that one's budget as well.
   wait "${pids[@]}" 2>/dev/null || true
+  # GHR-96: every one of them reaped — nothing is left to end, and a pid
+  # kept past this point could be anyone's.
+  FLEET_FANOUT_PIDS=()
   # GHR-88: one optional word per round, since a host can refuse one, be
   # asked again, and only then refuse the next. At most three rounds (GHR-90):
   # the two view flags a status read carries — --narrow, --with-json — or the
@@ -7339,6 +7380,7 @@ fleet_fanout() { # REMOTE-ARGS...
     for i in "${retry[@]}"; do
       fleet_fanout_one "$i" "$@" &
       pids+=("$!")
+      FLEET_FANOUT_PIDS+=("$!")
       running=$((running + 1))
       if [ "$running" -ge "$FLEET_PARALLEL" ]; then
         wait -n 2>/dev/null || true
@@ -7346,6 +7388,7 @@ fleet_fanout() { # REMOTE-ARGS...
       fi
     done
     wait "${pids[@]}" 2>/dev/null || true
+    FLEET_FANOUT_PIDS=()
     : "$round"
   done
 }
@@ -7393,6 +7436,18 @@ fleet_optional_rejects() { # ERRFILE WORD
 fleet_fanout_one() { # INDEX REMOTE-ARGS...
   local i="$1" host a hrc=0 t0
   shift
+  # GHR-96: a background job ignores SIGINT and SIGQUIT, stated here rather
+  # than left to bash. Bash 5.3 does that even for a job of a shell whose
+  # own INT is trapped (measured), but bash 5.2 (measured on Debian 12, and
+  # the ubuntu-24.04 CI runner) lets the job keep the trap. A mutating
+  # command's job, with the central record's trap, then ran it on a terminal's
+  # Ctrl-C while it waited for its call (fleet_into_idle) and exited at
+  # once. The call, its `timeout` and the ssh were re-parented to init, out
+  # of fleet_fanout_reap's reach, and ran on to the budget. A job that
+  # ignores the signal outlives its call until the reap ends both, and a call
+  # on the watchdog takes the job's dispositions (fleet_sig_ignored) on every
+  # bash alike.
+  builtin trap '' INT QUIT
   host="${FLEET_HOSTS[$i]}"
   local -a args=()
   for a in "$@"; do
