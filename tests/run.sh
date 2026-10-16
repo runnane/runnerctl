@@ -15607,6 +15607,97 @@ case_ghr165_stream_term_pending_at_a_comsub_parse() {
   rm -rf "$d"
 }
 
+# GHR-166: the same window in the other trapped processes. They take it as a
+# documented limitation of bash 5.2 (README, .agents/gates.md) rather than a
+# fix. RUNNERCTL_STUB_COMSUB_TERM sends the SIGTERM from inside a `$(`, with
+# a second `$(` in the same word, in a function the trapped process itself
+# calls. GHR166_LOSES says whether the bash on PATH mishandles a trap there;
+# it is probed once with the standalone form. Where it does, each case pins
+# what the docs say: under runnerctl's `set -e`, whatever the call site's
+# context, the process exits 2 with its handler never run. Bash prints its
+# `unexpected EOF` line, and the EXIT trap (cleanup, the record) still runs.
+# Where it does not, the first SIGTERM is taken as it always was. Either way,
+# the stub's fallback second SIGTERM is never needed (no `went_on`).
+# shellcheck disable=SC2016  # the probe's child expands it
+GHR166_PROBE='trap "echo handled; exit 0" TERM; x="$(kill -TERM "$$")$(:)"'
+GHR166_LOSES=true
+[ "$(bash -c "$GHR166_PROBE" 2>/dev/null)" != handled ] || GHR166_LOSES=false
+GHR166_EOF="trap: line [0-9]+: unexpected EOF while looking for matching \`\\)'"
+
+# The local watch, at the pause between --iterations frames: one frame, the
+# cursor restored and the journal/CPU/env memo directories removed.
+case_ghr166_watch_term_pending_at_a_comsub_parse() {
+  local d="$TMP/ghr166-tmp" mark="$TMP/ghr166.sent"
+  rm -rf "$d"; mkdir -p "$d"; rm -f "$mark"
+  TMPDIR="$d" RUN_TIMEOUT=10 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COMSUB_TERM="$mark" \
+    run watch --iterations 3 --interval 1
+  expect_cfg "$mark" '^sent$'
+  expect_log_count '^probe:comsub_term pause$' 1
+  expect_no_log '^probe:comsub_term_went_on '
+  expect_out_count "$FRAME_PREFIX" 1
+  expect_log '^probe:term_cursor show$'
+  _ghr74_expect_empty "$d"
+  if $GHR166_LOSES; then
+    expect_rc 2
+    expect_err "$GHR166_EOF"
+  else
+    expect_rc 0
+    expect_text "its stderr" "" "$ERR"
+  fi
+  rm -rf "$d"
+}
+
+# fleet watch, in the key read, which it calls in a condition: errexit there
+# is suspended and the 5.2 exit happens all the same. The hung host's fetch
+# is reaped and every file removed on that way out too.
+case_ghr166_fleet_watch_term_pending_at_a_comsub_parse() {
+  local d="$TMP/ghr166-tmp" mark="$TMP/ghr166.sent"
+  rm -rf "$d"; mkdir -p "$d"; rm -f "$mark"
+  TMPDIR="$d" RUN_TIMEOUT=10 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COMSUB_TERM="$mark" \
+    RUNNERCTL_STUB_COMSUB_TERM_AT=keys RUNNERCTL_STUB_FLEET_HOSTS="build-1 slow-1" \
+    RUNNERCTL_STUB_FLEET_HANG="slow-1" run fleet watch --color never
+  expect_cfg "$mark" '^sent$'
+  expect_log_count '^probe:comsub_term keys$' 1
+  expect_no_log '^probe:comsub_term_went_on '
+  expect_cfg "$WRITES/remote/slow-1.hung.pids" '^[0-9]+ [0-9]+$'
+  _ghr124_expect_two_pids "$WRITES/remote/slow-1.hung.pids"
+  _ghr74_expect_dead "$(cat "$WRITES/remote/slow-1.hung.pids" 2>/dev/null; true)"
+  _ghr74_expect_empty "$d"
+  expect_log_order '^probe:term_cursor show$' '^probe:ssh_control build-1 exit$' '^probe:ssh_control slow-1 exit$'
+  if $GHR166_LOSES; then
+    expect_rc 2
+    expect_err "$GHR166_EOF"
+  else
+    expect_rc 0
+    expect_text "its stderr" "" "$ERR"
+  fi
+  rm -rf "$d"
+}
+
+# An armed record (GHR-88), at a drain's poll for an idle slot. The drain
+# stops there either way, and the slot after the one it waits for is never
+# touched. Only the record's words differ: on 5.2 it says `failed (exit 2)`,
+# not `interrupted (SIGTERM)`, and the process exits 2 rather than dying by
+# the signal. It is never missing.
+case_ghr166_armed_record_term_pending_at_a_comsub_parse() {
+  local mark="$TMP/ghr166.sent"
+  rm -f "$mark"
+  RUN_TIMEOUT=10 RUNNERCTL_STUB_BUSY_POLLS=1 RUNNERCTL_STUB_COMSUB_TERM="$mark" run drain
+  expect_cfg "$mark" '^sent$'
+  expect_log_count '^probe:comsub_term pause$' 1
+  expect_no_log '^probe:comsub_term_went_on '
+  expect_no_log "^systemctl stop $U3\$"
+  if $GHR166_LOSES; then
+    expect_rc 2
+    expect_err "$GHR166_EOF"
+    expect_one_record "drain all by $ME — failed \\(exit 2\\)"
+  else
+    expect_rc 143
+    expect_no_err 'unexpected EOF'
+    expect_one_record "drain all by $ME — interrupted \\(SIGTERM\\)"
+  fi
+}
+
 # The stream is the fleet's only: the one-host `status` still refuses --watch
 # with --json, the table form is `fleet watch`, and the stream's own flags do
 # not reach a one-shot by accident. Nothing is dialled for any of them.
@@ -15756,6 +15847,9 @@ t "GHR-80: the stream is one envelope per tick over held connections"     case_g
 t "GHR-80: the stream ends cleanly when its reader goes"                  case_ghr80_stream_ends_cleanly_when_the_reader_goes
 t "GHR-80: the stream ends cleanly on SIGTERM"                            case_ghr80_stream_ends_cleanly_on_sigterm
 t "GHR-165: a SIGTERM pending at a \$( parse ends the stream too"         case_ghr165_stream_term_pending_at_a_comsub_parse
+t "GHR-166: watch, a SIGTERM pending at a \$( parse: as documented"     case_ghr166_watch_term_pending_at_a_comsub_parse
+t "GHR-166: fleet watch, a SIGTERM pending at a \$( parse: as documented" case_ghr166_fleet_watch_term_pending_at_a_comsub_parse
+t "GHR-166: an armed record, a SIGTERM pending at a \$( parse: as documented" case_ghr166_armed_record_term_pending_at_a_comsub_parse
 t "GHR-80: the stream's flags are refused where they mean nothing"        case_ghr80_stream_flags_are_refused_where_they_mean_nothing
 t "GHR-80: health --json kinds, exit codes as the prose form's"           case_ghr80_health_json_kinds_and_exit_codes
 t "GHR-80: health's prose lines are the object's details"                 case_ghr80_health_prose_is_the_objects_details

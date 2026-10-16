@@ -284,6 +284,43 @@ Traps:
   `wait`, with the ticks in a child that traps nothing. The stub's
   `RUNNERCTL_STUB_STREAM_TERM=FILE` sends the signal inside that window, so it
   is deterministic and red only on 5.2. Run it in `debian:12` (command above).
+  **The other trapped processes accept the window and document it (GHR-166).**
+  These are the local `watch`, `fleet watch`, and every command with a GHR-88
+  record armed (`audit_signal`). Measured in standalone probes, 20 to 40 runs
+  each, on 5.2.15 and 5.2.21:
+  - the window is narrower than "any `$(`". The pending trap runs safely at
+    every command boundary, and in `sleep`, `read -t` and `wait`. It is
+    mishandled only when it is pending at a `$(` parse **inside one simple
+    command**: the same word, another word, or a second `local` assignment,
+    after a `$(` whose child was running when the signal came. There is also
+    a microsecond gap between a boundary and the next parse: 1 in 30 in a
+    tight loop of one-`$(` statements.
+  - what "mishandled" means depends on errexit. **Under `set -e` (runnerctl's)
+    the process exits 2, whatever the call site's context** (plain, `if`,
+    `||`): the handler never runs, and the EXIT trap does. It goes on past
+    the signal only with errexit off (the "goes on" above is the standalone,
+    no-`-e` form). After that, a second signal is taken.
+  - so on 5.2 a watch quits with status 2 and bash's `unexpected EOF` line,
+    with its EXIT cleanup run (cursor, viewport, fetches reaped, temp files
+    gone). An armed command stops at that point and its record says
+    `failed (exit 2)`, not `interrupted (SIGTERM)`, and it exits rather than
+    dying by the signal. The record is never missing. The slow steps
+    (`pause`, foreground `run_priv`, one-`$(` reads such as `code="$(curl
+    …)"`) are the shapes that are handled.
+  Why not the GHR-165 shape: a watch's trapped process owns the terminal
+  (raw key reads, cursor, viewport, the EXIT restore) and `fleet watch`'s
+  cleanup owns its fetch, action and history jobs and its ssh connections.
+  The mutating commands are ordinary code throughout. A flag-only trap is
+  lost the same way, and no trap text parses both inside a `$(` and outside
+  one. The README says this for operators (under `watch`, and the record's
+  "Interrupted" bullet). The pins are three `GHR-166:` cases on
+  `RUNNERCTL_STUB_COMSUB_TERM=FILE` (`_AT=pause`, the default, or `keys`): the
+  stream hook's TERM, sent in a function the trapped process calls. Each case
+  branches on `GHR166_LOSES`, which probes the standalone form on the `bash`
+  on PATH. On 5.2 it asserts the exit 2, the `unexpected EOF` line, the
+  cleanup and the `failed (exit 2)` record. On 5.3 it asserts the clean
+  handling. A watch that moves to the GHR-165 shape, or a `set +e` in front
+  of the hook, turns the 5.2 branch red, and the docs then change with it.
   A related trap, on 5.2 and 5.3.20 alike: a handler run inside `IFS= read`
   keeps that read's `IFS=`,
   and so does the EXIT cleanup it exits to, where every `read -r a b` then
