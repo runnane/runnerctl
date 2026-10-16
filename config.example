@@ -25,6 +25,17 @@
 # with longer jobs; 0 turns the flag off; --stall-after N overrides per run.
 #STALL_SEC="3600"
 
+# Where status, status --json and watch keep a running job's run facts
+# (repository, workflow, run id, branch, URL) so a read between two steps,
+# during a container step or after the last one still has them. One 0600
+# file per slot, in a 0700 directory, keyed to the job (a later job or a
+# restarted unit is shown none of it), written by whoever could read the
+# job's environment and readable by that user alone. Empty = /run/runnerctl
+# for root, $XDG_RUNTIME_DIR/runnerctl otherwise (nothing kept when that is
+# unset) — both emptied at reboot; off = keep nothing; else an absolute path
+# to a directory only you can write. A store that cannot be used is silence.
+#RUN_FACTS_DIR=""
+
 # `reap`: seconds a leaked process gets after SIGTERM before SIGKILL.
 #REAP_GRACE_SEC="5"
 

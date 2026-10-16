@@ -491,6 +491,13 @@ WAIT_TIMEOUT="1800"
 # long, so past it the runner is wedged, not slow. Raise it in the config
 # for a pool with longer jobs; 0 turns the flag off.
 STALL_SEC="3600"
+# Where status and watch keep a running job's run facts (repository,
+# workflow, run id, URL ...) between two reads of the same job (GHR-132): the
+# step whose environment they come from is gone between steps. Empty =
+# /run/runnerctl for root, $XDG_RUNTIME_DIR/runnerctl otherwise (nothing
+# when that is unset); `off` = keep nothing; else an absolute path, used only
+# when it is a directory the caller owns and nobody else can write.
+RUN_FACTS_DIR=""
 # `reap`: seconds between SIGTERM and SIGKILL for a leaked process (GHR-29).
 REAP_GRACE_SEC="5"
 # `kill`: seconds to give the Listener to notice its Worker died and report
@@ -1482,6 +1489,7 @@ load_config() {
   [ -n "$FLEET_RUNNERCTL" ] || die "FLEET_RUNNERCTL set in $CONFIG_FILE is empty — want the remote command name or an absolute path"
   [[ "$FLEET_SUDO" =~ ^[01]$ ]] || die "FLEET_SUDO '$FLEET_SUDO' set in $CONFIG_FILE is invalid — want 0 or 1"
   [ -z "$FLEET_LOG" ] || [[ "$FLEET_LOG" == /?* ]] || die "FLEET_LOG '$FLEET_LOG' set in $CONFIG_FILE is invalid — want an absolute path (empty = ~/.local/state/runnerctl/fleet.log)"
+  [ -z "$RUN_FACTS_DIR" ] || [ "$RUN_FACTS_DIR" = off ] || [[ "$RUN_FACTS_DIR" == /?* ]] || die "RUN_FACTS_DIR '$RUN_FACTS_DIR' set in $CONFIG_FILE is invalid — want off or an absolute path (empty = /run/runnerctl for root, \$XDG_RUNTIME_DIR/runnerctl otherwise)"
   # Provisioning settings (GHR-45). Checked here so a typo fails before a
   # download, a useradd or a registration — not half way through slot 3.
   [[ "$RUNNER_ROOT" == /* ]] || die "RUNNER_ROOT '$RUNNER_ROOT' set in $CONFIG_FILE is invalid — want an absolute path"
@@ -2393,31 +2401,156 @@ job_env_facts() { # ENV-LINES
 # inherits nothing. JOB_SINCE is derived from an age in whole seconds, so it
 # can move by one between two reads of the same job: JOB_MEMO_SLACK. A read
 # that found anything replaces the memo; only a read that found nothing asks
-# it. Outside `watch` ENV_MEMO_DIR is empty and this does nothing, so a
-# one-shot `status` is exactly what it was (it has no process that outlives it).
+# it. Outside `watch` ENV_MEMO_DIR is empty, and only the run-facts store
+# below (GHR-132) can answer.
 ENV_MEMO_DIR="" JOB_MEMO_SLACK=2
 job_env_memo() { # UNIT [INVOCATION-ID]
-  [ -n "$ENV_MEMO_DIR" ] && [[ "${JOB_SINCE:-}" =~ ^[0-9]+$ ]] || return 0
-  local f="$ENV_MEMO_DIR/$1" inv="${2:-none}" kinv="" ksince="" d
-  local -a memo=()
+  [[ "${JOB_SINCE:-}" =~ ^[0-9]+$ ]] || return 0
+  local inv="${2:-none}" keyed=false
+  [[ "$1" =~ $RUN_FACTS_UNIT_RE && "$inv" =~ $RUN_FACTS_INV_RE ]] && keyed=true
   if [ -n "$JOB_REPO$JOB_REPO_FULL$JOB_ENV_NAME$JOB_WORKFLOW$JOB_RUN_ID$JOB_RUN_ATTEMPT$JOB_RUN_NUMBER$JOB_REF$JOB_SHA$JOB_ACTOR$JOB_EVENT$JOB_URL" ]; then
-    {
-      printf '%s %s\n' "$inv" "$JOB_SINCE"
-      printf '%s\n' "$JOB_REPO" "$JOB_REPO_FULL" "$JOB_ENV_NAME" "$JOB_WORKFLOW" "$JOB_RUN_ID" "$JOB_RUN_ATTEMPT" \
-        "$JOB_RUN_NUMBER" "$JOB_REF" "$JOB_SHA" "$JOB_ACTOR" "$JOB_EVENT" "$JOB_URL"
-    } >"$f"
+    if [ -n "$ENV_MEMO_DIR" ]; then
+      {
+        printf '%s %s\n' "$inv" "$JOB_SINCE"
+        printf '%s\n' "$JOB_REPO" "$JOB_REPO_FULL" "$JOB_ENV_NAME" "$JOB_WORKFLOW" "$JOB_RUN_ID" "$JOB_RUN_ATTEMPT" \
+          "$JOB_RUN_NUMBER" "$JOB_REF" "$JOB_SHA" "$JOB_ACTOR" "$JOB_EVENT" "$JOB_URL"
+      } >"$ENV_MEMO_DIR/$1"
+    fi
+    if $keyed && run_facts_store create; then run_facts_put "$1" "$inv"; fi
     return 0
   fi
-  [ -f "$f" ] || return 0
+  [ -z "$ENV_MEMO_DIR" ] || ! job_env_memo_get "$ENV_MEMO_DIR/$1" "$inv" || return 0
+  if $keyed && run_facts_store; then run_facts_get "$1" "$inv" || true; fi
+}
+# The watch memo's FILE, when it is this job's (INVOCATION-ID and JOB_SINCE),
+# into the JOB_* facts; 1 when it is not.
+job_env_memo_get() { # FILE INVOCATION-ID
+  local kinv="" ksince=""
+  local -a memo=()
+  [ -f "$1" ] || return 1
   {
-    read -r kinv ksince || return 0
+    read -r kinv ksince || return 1
     mapfile -t memo
-  } <"$f"
-  [ "${#memo[@]}" -eq 12 ] && [ "$kinv" = "$inv" ] && [[ "$ksince" =~ ^[0-9]+$ ]] || return 0
-  d=$((JOB_SINCE - ksince)); [ "$d" -ge 0 ] || d=$((-d))
-  [ "$d" -le "$JOB_MEMO_SLACK" ] || return 0
+  } <"$1"
+  [ "${#memo[@]}" -eq 12 ] && [ "$kinv" = "$2" ] && job_since_near "$ksince" || return 1
   JOB_REPO="${memo[0]}" JOB_REPO_FULL="${memo[1]}" JOB_ENV_NAME="${memo[2]}" JOB_WORKFLOW="${memo[3]}" JOB_RUN_ID="${memo[4]}" JOB_RUN_ATTEMPT="${memo[5]}"
   JOB_RUN_NUMBER="${memo[6]}" JOB_REF="${memo[7]}" JOB_SHA="${memo[8]}" JOB_ACTOR="${memo[9]}" JOB_EVENT="${memo[10]}" JOB_URL="${memo[11]}"
+}
+# Whether a stored start (epoch seconds) is this job's JOB_SINCE, within
+# JOB_MEMO_SLACK.
+job_since_near() { # SINCE
+  local d
+  [[ "${1-}" =~ ^[0-9]{1,15}$ ]] || return 1
+  d=$((JOB_SINCE - 10#$1)); [ "$d" -ge 0 ] || d=$((-d))
+  [ "$d" -le "$JOB_MEMO_SLACK" ]
+}
+
+# --- The run-facts store (GHR-132) ---------------------------------------------
+# The watch memo dies with the watch. A one-shot `status` — and so every
+# `fleet` read, which is one on each host — has no process that outlives it,
+# so between two steps, in a container step and after the last one it had
+# nothing to say about the run. The store keeps what job_env_facts KEPT in one
+# small file per unit, keyed exactly like the memo (InvocationID and
+# JOB_SINCE), in RUN_FACTS_DIR:
+#
+#   where     empty (the default) = /run/runnerctl for root (sudo included:
+#             the caller's XDG_RUNTIME_DIR is not root's), otherwise
+#             $XDG_RUNTIME_DIR/runnerctl, and nothing when that is unset or
+#             relative; `off` = nothing; else an absolute path. Both defaults
+#             are tmpfs systemd empties at reboot (the user one also at the
+#             last logout), so no cleanup is needed: a later job — another
+#             start, or a restarted unit's new InvocationID — does not match
+#             the key, is shown none of it, and replaces it at its own first
+#             readable environment.
+#   who       whoever read the environment: the runner's user or root, each
+#             in a directory of its own. So a fact never reaches a user who
+#             could not have read it, and a user who cannot read one sees
+#             what it always saw.
+#   modes     the directory is created 0700, each file written 0600 under
+#             umask 077 to a temp name beside it and renamed into place. Used
+#             only when it is a real directory (no symlink), owned by the
+#             effective uid and writable by neither group nor others; a file
+#             is read only when it is a regular file under the same rules and
+#             RUN_FACTS_MAX bytes at most.
+#   failure   silent. No directory, a check that fails, a write that cannot
+#             be made: the facts are simply not kept, and the output and exit
+#             status are what they were without the store. Never through
+#             run_priv or sudo.
+#   content   a header line, `runnerctl-run-facts 1 <InvocationID> <since>`,
+#             then the kept facts as GITHUB_*=VALUE lines — read back through
+#             job_env_facts itself, so a stored value passes exactly the rules
+#             a step's environment does (and the URL is rebuilt from a server
+#             that passes them). The file is hostile input like any
+#             environment: a header that does not match is no facts at all,
+#             and what is drawn is drawn through term_safe as ever.
+RUN_FACTS_STORE="" RUN_FACTS_MAX=4096
+RUN_FACTS_HEAD="runnerctl-run-facts 1"
+RUN_FACTS_UNIT_RE='^[A-Za-z0-9@_:-][A-Za-z0-9@_.:-]{0,254}$'
+RUN_FACTS_INV_RE='^[A-Za-z0-9-]{1,64}$'
+# Whether there is a store to use, into RUN_FACTS_STORE (`-` once it is
+# known there is none). CREATE (any argument) makes the directory when it is
+# missing — only a read that has something to keep does: a read that has
+# nothing creates nothing, so a missing directory is decided again later.
+run_facts_store() { # [CREATE]
+  [ -z "$RUN_FACTS_STORE" ] || [ "$RUN_FACTS_STORE" != - ] || return 1
+  [ -z "$RUN_FACTS_STORE" ] || return 0
+  local d="$RUN_FACTS_DIR" st
+  if [ -z "$d" ]; then
+    if [ "$EUID" -eq 0 ]; then d=/run/runnerctl
+    elif [[ "${XDG_RUNTIME_DIR:-}" == /?* ]] && ! under_sudo; then d="$XDG_RUNTIME_DIR/runnerctl"
+    else d=off
+    fi
+  fi
+  if [ "$d" = off ]; then RUN_FACTS_STORE=-; return 1; fi
+  if [ ! -e "$d" ] && [ ! -L "$d" ]; then
+    [ -n "${1:-}" ] || return 1
+    mkdir -m 700 -- "$d" 2>/dev/null || { RUN_FACTS_STORE=-; return 1; }
+  fi
+  RUN_FACTS_STORE=-
+  [ -d "$d" ] && [ ! -L "$d" ] || return 1
+  st="$(stat -c '%u %a' -- "$d" 2>/dev/null)" || return 1
+  run_facts_private "$st" || return 1
+  RUN_FACTS_STORE="$d"
+}
+# Whether `UID MODE` (stat's %u %a) is the effective uid's, writable by it alone.
+run_facts_private() { # "UID MODE"
+  local uid="${1%% *}" mode="${1#* }"
+  [ "$uid" = "$EUID" ] && [[ "$mode" =~ ^[0-7]{1,4}$ ]] && (( (8#$mode & 8#022) == 0 ))
+}
+# The JOB_* facts as the store keeps them, for UNIT's job. A write that is
+# the same as the file is not made — a watch reads every slot every tick.
+run_facts_put() { # UNIT INVOCATION-ID
+  local f="$RUN_FACTS_STORE/$1" t="$RUN_FACTS_STORE/.$1.$BASHPID" body old="" server=""
+  [ -z "$JOB_URL" ] || server="${JOB_URL%"/$JOB_REPO_FULL/actions/runs/"*}"
+  body="$RUN_FACTS_HEAD $2 $JOB_SINCE"$'\n'
+  [ -z "$JOB_REPO_FULL" ]   || body+="GITHUB_REPOSITORY=$JOB_REPO_FULL"$'\n'
+  [ -z "$JOB_ENV_NAME" ]    || body+="GITHUB_JOB=$JOB_ENV_NAME"$'\n'
+  [ -z "$JOB_WORKFLOW" ]    || body+="GITHUB_WORKFLOW=$JOB_WORKFLOW"$'\n'
+  [ -z "$JOB_RUN_ID" ]      || body+="GITHUB_RUN_ID=$JOB_RUN_ID"$'\n'
+  [ -z "$JOB_RUN_ATTEMPT" ] || body+="GITHUB_RUN_ATTEMPT=$JOB_RUN_ATTEMPT"$'\n'
+  [ -z "$JOB_RUN_NUMBER" ]  || body+="GITHUB_RUN_NUMBER=$JOB_RUN_NUMBER"$'\n'
+  [ -z "$JOB_REF" ]         || body+="GITHUB_REF_NAME=$JOB_REF"$'\n'
+  [ -z "$JOB_SHA" ]         || body+="GITHUB_SHA=$JOB_SHA"$'\n'
+  [ -z "$JOB_ACTOR" ]       || body+="GITHUB_ACTOR=$JOB_ACTOR"$'\n'
+  [ -z "$JOB_EVENT" ]       || body+="GITHUB_EVENT_NAME=$JOB_EVENT"$'\n'
+  [ -z "$server" ]          || body+="GITHUB_SERVER_URL=$server"$'\n'
+  if [ -f "$f" ] && [ ! -L "$f" ]; then IFS= read -r -d '' old <"$f" 2>/dev/null || true; fi
+  [ "$old" != "$body" ] || return 0
+  ( umask 077; set -C; printf '%s' "$body" >"$t" && mv -fT -- "$t" "$f" ) 2>/dev/null || rm -f -- "$t" 2>/dev/null || true
+}
+# UNIT's stored facts into JOB_*, when they are this job's; 1 (and nothing
+# set) when there are none, they are another job's, or the file fails a check.
+run_facts_get() { # UNIT INVOCATION-ID
+  local LC_ALL=C f="$RUN_FACTS_STORE/$1" st size data="" head
+  [ -f "$f" ] && [ ! -L "$f" ] || return 1
+  st="$(stat -c '%u %a %s' -- "$f" 2>/dev/null)" || return 1
+  size="${st##* }" st="${st% *}"
+  run_facts_private "$st" && [[ "$size" =~ ^[0-9]+$ ]] && [ "$size" -le "$RUN_FACTS_MAX" ] || return 1
+  IFS= read -r -d '' -N "$RUN_FACTS_MAX" data <"$f" 2>/dev/null || true
+  head="${data%%$'\n'*}"
+  [ "$head" != "$data" ] && [[ "$head" == "$RUN_FACTS_HEAD $2 "* ]] || return 1
+  job_since_near "${head#"$RUN_FACTS_HEAD $2 "}" || return 1
+  job_env_facts "${data#*$'\n'}"
 }
 # One free-text fact as it is kept, into UTF8_TEXT. Called under LC_ALL=C, so
 # the cut is in bytes — and where the first byte cut away was a continuation
@@ -15197,6 +15330,17 @@ cmd_config_example() {
 # no job on a build pool legitimately runs that long. Raise it for a pool
 # with longer jobs; 0 turns the flag off; --stall-after N overrides per run.
 #STALL_SEC="3600"
+
+# Where status, status --json and watch keep a running job's run facts
+# (repository, workflow, run id, branch, URL) so a read between two steps,
+# during a container step or after the last one still has them. One 0600
+# file per slot, in a 0700 directory, keyed to the job (a later job or a
+# restarted unit is shown none of it), written by whoever could read the
+# job's environment and readable by that user alone. Empty = /run/runnerctl
+# for root, $XDG_RUNTIME_DIR/runnerctl otherwise (nothing kept when that is
+# unset) — both emptied at reboot; off = keep nothing; else an absolute path
+# to a directory only you can write. A store that cannot be used is silence.
+#RUN_FACTS_DIR=""
 
 # `reap`: seconds a leaked process gets after SIGTERM before SIGKILL.
 #REAP_GRACE_SEC="5"

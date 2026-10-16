@@ -399,7 +399,22 @@ Traps:
   `RUNNERCTL_STUB_ENV_ONCE=1` makes slot-1's environment answer once per run.
   The new-job and term_safe cases call `job_facts` through `run_fn` with the
   `GHR102_HOOKS` string, because the stub's one fixed job start cannot give a
-  second job. A one-shot `status` has no memo directory, so it forgets.
+  second job. A one-shot `status` has no memo directory; since GHR-132 it has
+  the run-facts store instead (next bullet).
+- **The run-facts store (GHR-132) persists between runs, so it is pinned per
+  harness path.** The stub sets `RUN_FACTS_DIR` to `$WRITES/run-facts`: a
+  `run` empties it with the writes tree, a `run_keep` carries it into the next
+  read — so a case that runs `status` twice with `run_keep` now sees the first
+  read's run facts in the second, which is the point and may surprise an older
+  case. `RUNNERCTL_STUB_RUN_FACTS_DIR` overrides it (`off`, or a path the case
+  built). `run_fn` has no config, so it pins `RUN_FACTS_DIR=off` itself
+  (`RUN_FN_FACTS_DIR` for a store of a case's own), and the harness exports
+  `XDG_RUNTIME_DIR` at a directory that does not exist, so nothing sourced
+  past the stub can write the box's real `/run/user/<uid>/runnerctl`. A run as
+  root would default to `/run/runnerctl` — the gate never runs as root. The
+  mode case changes the umask to 000 around one `run`; the foreign-owner
+  check cannot be made as a plain user, so `run_facts_private` is pinned
+  through `run_fn` with a uid that is not `$EUID`.
 - **A remote's table in the fleet stub is `render_status` called directly, not
   `cmd_status`.** So a case about a fleet row does not exercise anything
   `cmd_status` decides before it renders — `STATUS_COLS` (GHR-78: the long
