@@ -17906,6 +17906,165 @@ t "GHR-156: fleet upgrade --push's install cuts on silence, the flag inline"    
 t "GHR-156: fleet health --restart-stalled cuts on silence; an older host doesn't" case_ghr156_fleet_health_restart_stalled_cuts_on_silence
 t "GHR-158: fleet upgrade --push's transfer is not silence; the install still is" case_ghr158_push_transfer_is_not_silence
 
+# --- GHR-96: an interrupted read-only fan-out ends its calls --------------------
+# Against the real ssh_run and the real `timeout`, with a fake ssh first on
+# PATH (as case_fleet_watch_real_fetch_job_and_its_ssh_end_at_cleanup does):
+# hang-* writes its pid to ssh.pid, the flag GHR-119's driver waits for, and
+# sleeps. The driver resets INT to its default before it starts the command
+# (a backgrounded gate's ignored INT would otherwise be inherited, and could
+# be neither trapped nor taken), then sends INT to the process GROUP, as a
+# terminal's Ctrl-C does. Once the command has gone, the driver KILLs that
+# group, which takes every fan-out job with it but not the ssh: that is in
+# `timeout`'s own group, and only the fan-out's reap reaches it. The cases
+# wait for the ssh to go by polling its pid, and kill a survivor by that pid.
+ghr96_setup() { # DIR
+  mkdir "$1/bin"
+  cat >"$1/bin/ssh" <<'EOF'
+#!/bin/sh
+echo "$*" >>"$GHR96_DIR/calls"
+while [ "$1" != "--" ]; do shift; done
+case "$2" in
+  hang-*) echo "$$" >"$GHR96_DIR/ssh.pid.new"; mv "$GHR96_DIR/ssh.pid.new" "$GHR96_DIR/ssh.pid"; exec sleep 30 ;;
+esac
+sleep 0.1
+printf '{"runnerctl":"1.0.0"}\n'
+EOF
+  chmod +x "$1/bin/ssh"
+}
+# Whether the ssh in DIR/ssh.pid is still running once it has had up to 3 s
+# to go: `gone`, or `ALIVE` (and it is then killed, by its pid).
+ghr96_ssh_after() { # DIR
+  local pid n=0
+  pid="$(cat "$1/ssh.pid" 2>/dev/null || true)"
+  [[ "$pid" =~ ^[0-9]+$ ]] || { echo "never started"; return 0; }
+  while pid_alive_t "$pid" && [ "$n" -lt 150 ]; do sleep 0.02; n=$((n + 1)); done
+  if pid_alive_t "$pid"; then echo ALIVE; kill "$pid" 2>/dev/null || true; else echo gone; fi
+}
+# runnerctl's pid_alive, for the test's own process.
+pid_alive_t() { # PID
+  local s
+  s="$(awk '/^State:/{print $2}' "/proc/$1/status" 2>/dev/null)" || return 1
+  [ -n "$s" ] && [ "$s" != Z ]
+}
+# `runnerctl fleet status`, then `fleet start`, each interrupted while hang-1
+# has not answered: it dies by the INT, and the ssh it started for hang-1 goes
+# with it.
+case_ghr96_an_interrupted_fanout_leaves_no_ssh() {
+  local d how cfg
+  if ! $HAVE_PERL; then
+    skip "GHR-96: no perl, so no driver to interrupt the fan-out with"
+    return 0
+  fi
+  d="$(mktemp -d "$TMP/ghr96.XXXXXX")"
+  ghr96_setup "$d"
+  cfg="$d/config"
+  printf 'FLEET_HOSTS=(ok-1 ok-2 hang-1)\nFLEET_LOG=%s/fleet.log\n' "$d" >"$cfg"
+  how="$(GHR96_DIR="$d" PATH="$d/bin:$PATH" RUNNERCTL_CONFIG="$cfg" \
+         perl -e "$GHR119_PERL" INT group "$d/ssh.pid" "$d/out" "$d/err" "$RUNNERCTL" fleet status)" || how="perl failed"
+  expect_text "how runnerctl ended" "signal 2" "$how"
+  expect_text "the hang-1 ssh after the interrupt" gone "$(ghr96_ssh_after "$d")"
+  # and what was dialled is the real ssh_run's command line
+  expect_cfg "$d/calls" '^-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -- hang-1 runnerctl status --color never --with-json$'
+  expect_text "what the interrupted fan-out left on stderr" "" "$(cat "$d/err")"
+  # A fan-out that changes hosts is reaped as well — deliberately: the
+  # host's command is caller-guarded and finishes on its own (GHR-91,
+  # GHR-137, GHR-153), and the README says a Ctrl-C on the central node ends
+  # only the local side. `fleet start` arms the central record and puts the
+  # call on the GHR-150 watchdog (--heartbeat), so the tree reaped here is
+  # the idle path's: the call's job, its taps and watchdog, timeout, ssh.
+  rm -f "$d/ssh.pid" "$d/calls"
+  printf 'FLEET_HOSTS=(hang-1)\nFLEET_LOG=%s/fleet.log\n' "$d" >"$cfg"
+  how="$(GHR96_DIR="$d" PATH="$d/bin:$PATH" RUNNERCTL_CONFIG="$cfg" \
+         perl -e "$GHR119_PERL" INT group "$d/ssh.pid" "$d/out" "$d/err" "$RUNNERCTL" fleet start)" || how="perl failed"
+  expect_text "how the interrupted fleet start ended" "signal 2" "$how"
+  expect_text "the fleet start ssh after the interrupt" gone "$(ghr96_ssh_after "$d")"
+  expect_cfg "$d/calls" ' -- hang-1 runnerctl --origin=[^ ]+ --heartbeat=[0-9]+ start$'
+  rm -rf "$d"
+}
+# `S` in `fleet watch`, interrupted during its capacity-floor read: the watch's
+# own traps (Ctrl-C is `exit 0`, the EXIT trap is the session's — so the
+# floor's fan-out does not arm one, FLEET_EXIT_OWNED), and its teardown ends
+# the floor's ssh through fleet_watch_cleanup -> fleet_cleanup. The session is
+# set up as cmd_fleet_watch sets it, and the key's floor is fleet_watch_floor,
+# what `S` on a running slot calls.
+case_ghr96_an_interrupted_watch_floor_read_leaves_no_ssh() {
+  local d how body
+  if ! $HAVE_PERL; then
+    skip "GHR-96: no perl, so no driver to interrupt the floor read with"
+    return 0
+  fi
+  d="$(mktemp -d "$TMP/ghr96.XXXXXX")"
+  ghr96_setup "$d"
+  # shellcheck disable=SC2016
+  body='
+    FLEET_HOSTS=(ok-1 hang-1) FLEET_BUDGETS=(20 20)
+    FW_TMP="$(mktemp -d)" FW_STATE="$(mktemp -d)" FW_PID=("" "") FW_AGAIN=("" "")
+    echo "$FW_TMP $FW_STATE" >"$GHR96_DIR/dirs"
+    FLEET_EXIT_OWNED=true
+    trap fleet_watch_cleanup EXIT
+    trap "exit 0" INT TERM
+    fleet_watch_floor hang-1 example.slot-1 active || true
+    echo "the floor read returned"
+  '
+  how="$(RUNNERCTL_NO_MAIN=1 GHR96_DIR="$d" PATH="$d/bin:$PATH" \
+         perl -e "$GHR119_PERL" INT group "$d/ssh.pid" "$d/out" "$d/err" \
+         bash -c '. "$0" && eval "$1"' "$RUNNERCTL" "$body")" || how="perl failed"
+  expect_text "how the watch ended" "exit 0" "$how"
+  expect_text "the floor's hang-1 ssh after the interrupt" gone "$(ghr96_ssh_after "$d")"
+  OUT="$(cat "$d/out")"
+  expect_no_out 'the floor read returned'
+  local fw_tmp="" fw_state=""
+  read -r fw_tmp fw_state <"$d/dirs" || true
+  expect_text "the session's directories after its teardown" "" "$(for x in "$fw_tmp" "$fw_state"; do [ -z "$x" ] || [ ! -e "$x" ] || echo "$x"; done)"
+  expect_text "the session's directories were recorded" yes "$([ -n "$fw_state" ] && echo yes || echo no)"
+  expect_cfg "$d/calls" ' -- hang-1 runnerctl status --json$'
+  rm -rf "$d"
+}
+# A fan-out that ran to the end signals nothing at its cleanup. Its recorded
+# pids are let go once its wait returns, and that is the guard pinned here,
+# under a model of the hazard itself: proc_ppid answering "this process's
+# child" for every pid, which is what a pid reused by a later child would
+# look like. The reaped pids being dead is no evidence — the real proc_ppid
+# skips a dead pid whether or not the list was cleared. Then the proc_ppid
+# guard on its own: a recorded pid that is alive but not this process's child
+# is not signalled, while one that is, is.
+case_ghr96_a_completed_fanout_signals_nothing() {
+  local d
+  d="$(mktemp -d "$TMP/ghr96.XXXXXX")"
+  ghr96_setup "$d"
+  # shellcheck disable=SC2016
+  GHR96_DIR="$d" PATH="$d/bin:$PATH" run_fn eval '
+    FLEET_HOSTS=(ok-1 ok-2) FLEET_LOG="$GHR96_DIR/fleet.log"
+    fleet_fanout runnerctl status --json
+    echo "read: recorded=${#FLEET_FANOUT_PIDS[@]} owner=${FLEET_FANOUT_OWNER:+$([ "$FLEET_FANOUT_OWNER" = "$$" ] && echo this || echo other)} rc=$(cat "$FLEET_DIR/0.rc")$(cat "$FLEET_DIR/1.rc")"
+    fleet_cleanup
+    other="$(bash -c "sleep 30 >/dev/null 2>&1 & echo \$!")"
+    sleep 30 >/dev/null 2>&1 &
+    mine=$!
+    FLEET_FANOUT_OWNER="$$" FLEET_FANOUT_PIDS=("$other" "$mine")
+    fleet_fanout_reap
+    n=0
+    while pid_alive "$mine" && [ "$n" -lt 150 ]; do sleep 0.02; n=$((n + 1)); done
+    echo "guard: mine=$(pid_alive "$mine" && echo alive || echo ended) other=$(pid_alive "$other" && echo alive || echo ended)"
+    kill "$other" "$mine" 2>/dev/null || true
+    fleet_fanout runnerctl status --json
+    proc_ppid() { echo "$$"; }
+    proc_tree_kill() { echo "signalled $1"; }
+    fleet_cleanup
+    echo "cleanup done"
+  '
+  expect_rc 0
+  expect_out '^read: recorded=0 owner=this rc=00$'
+  expect_out '^guard: mine=ended other=alive$'
+  expect_no_out '^signalled '
+  expect_out '^cleanup done$'
+  rm -rf "$d"
+}
+
+t "GHR-96: an interrupted fleet status or start leaves no ssh (real timeout)"  case_ghr96_an_interrupted_fanout_leaves_no_ssh
+t "GHR-96: S in fleet watch, interrupted during its floor read, leaves no ssh"  case_ghr96_an_interrupted_watch_floor_read_leaves_no_ssh
+t "GHR-96: a completed fan-out signals nothing; a pid not ours is let be"      case_ghr96_a_completed_fanout_signals_nothing
+
 # --- Summary ------------------------------------------------------------------
 echo
 echo "sim:$npass ok, $nxfail xfail (${XFAIL_KEYS# }), $nfail failed"

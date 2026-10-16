@@ -200,6 +200,19 @@ Traps:
   narrow-table decision does not shorten the row the viewport is being tested
   on. `DISPLAY_WIDTH_SLOW` counts the lines that reached the range table; an
   ordinary frame, `—` `·` `↻` included, must leave it at 0.
+- **An interrupted fan-out is tested without the stub (GHR-96).** The stub
+  shadows `ssh_run`, so a case about what an interrupt leaves running uses a
+  config of its own (`FLEET_HOSTS=…` and a `FLEET_LOG` under the case's
+  directory, never the stub) with a fake `ssh` first on PATH. The real
+  `timeout` then puts that ssh in a group of its own, exactly as in
+  production. GHR-119's perl driver signals the command: it resets INT to the
+  default first, so these cases take a real SIGINT even under a backgrounded
+  gate. After the command has gone the driver KILLs the command's process
+  group, which takes every fan-out job with it but never the ssh, so an `ALIVE`
+  from `ghr96_ssh_after` is a real survivor and not a driver artefact. A
+  `completed fan-out` assertion has to model pid reuse (`proc_ppid` shadowed
+  to answer "ours"). Against the real one, a reaped pid is skipped whether or
+  not the list was cleared, so dropping the clear would go unnoticed.
 - **`fleet watch` fetches each host in a background job (GHR-74), and the
   stub models the loop's poll step rather than sleeping through it.** While a
   fetch is out the loop's key read has `FW_POLL` (0.2) as its timeout; the
