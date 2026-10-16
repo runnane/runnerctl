@@ -2590,7 +2590,9 @@ job_cell() { # [ROOM]
         relay_safe "$JOB_WORKFLOW" plain; wf="$(clip "$RELAY_SAFE" "$JOB_CELL_PART")"
         relay_safe "$JOB_REF" plain; ref="$(clip "$RELAY_SAFE" "$JOB_CELL_PART")"
         long="${repo:+$repo:}${wf:+$wf / }$name${ref:+ @$ref}$rest"
-        if [ "${#long}" -le "$1" ]; then printf '%s\n' "$long"; return 0; fi
+        # columns, not characters (GHR-159): a wide character is two
+        display_width "$long"
+        if [ "$DISPLAY_WIDTH" -le "$1" ]; then printf '%s\n' "$long"; return 0; fi
       fi
       printf '%s%s%s\n' "${repo:+$repo:}" "$name" "$rest" ;;
     idle)         printf 'idle %s (%s job%s)%s\n' "$(fmt_dur "$([ -z "$JOB_IDLE_SINCE" ] || echo $(( $(now_epoch) - JOB_IDLE_SINCE )))")" \
@@ -3452,8 +3454,8 @@ status_row() {
     if [[ " $STATUS_DROP " == *" $c "* ]]; then c=$((c + 1)); continue; fi
     c=$((c + 1))
     out+="$v"
-    strip_sgr "$v"; n="$SGR_STRIPPED"
-    if [ "${#n}" -lt "$w" ]; then printf -v v '%*s' $((w - ${#n})) ''; out+="$v"; fi
+    strip_sgr "$v"; display_width "$SGR_STRIPPED"; n="$DISPLAY_WIDTH"
+    if [ "$n" -lt "$w" ]; then printf -v v '%*s' $((w - n)) ''; out+="$v"; fi
     out+=" "
   done
   printf '%s%s\n' "$out" "$1"
