@@ -201,7 +201,8 @@ Traps:
   fitted frame's height is in terminal ROWS.** A wide character (CJK, most
   emoji) is two columns and a combining mark or variation selector none, so
   `${#text}` is wrong for them; `watch_table_width` and `viewport_rows` both
-  go through the helper. It is pure bash on bytes under a function-local
+  go through the helper, and so do `job_cell`'s ROOM fit and `status_row`'s
+  cell padding (GHR-159). It is pure bash on bytes under a function-local
   `LC_ALL=C` (no `wc -L`, no GNU dependency, the same answer in any locale),
   with a range table, not a full wcwidth: U+2600-block symbols a terminal
   draws as emoji still count 1. A case that wants a wide cell puts it in

@@ -9011,6 +9011,40 @@ case_ghr94_an_ordinary_frame_never_reaches_the_range_table() {
   expect_out '^one wide row 1$'
 }
 
+# GHR-159: job_cell's ROOM fit is columns. This long form is 34 characters and
+# 37 columns ('日日日' is three characters, six columns). 184 columns leave room
+# for 34, so it fits by the character count and not by the columns: the short
+# cell is drawn. At 190 the long one fits.
+case_ghr159_job_cell_fit_is_columns() {
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_WORKFLOW='Bygg 日日日' RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=184 run status
+  expect_rc 0
+  expect_text "184 columns: 34 characters but 37 columns, the short cell" 'my-app:test (12m)' "$(slot1_cell)"
+  RUNNERCTL_STUB_RUN=1 RUNNERCTL_STUB_RUN_WORKFLOW='Bygg 日日日' RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=190 run status
+  expect_rc 0
+  expect_text "190 columns: 37 columns fit" 'my-app:Bygg 日日日 / test @main (12m)' "$(slot1_cell)"
+}
+
+# GHR-159: status_row pads a cell to its column width in terminal columns. A
+# wide cell before other cells was padded as if it took its character count
+# and pushed every later cell right of its column; pinned as row text. Rows of
+# ASCII and of — · ↻ never reach the range table (slow 0); the wide row does.
+case_ghr159_status_row_pads_by_columns() {
+  # shellcheck disable=SC2016  # the child shell expands these, not this one
+  run_snippet "$STUB" '
+    STATUS_WIDTHS=(6 8 4); STATUS_DROP=""
+    status_row "ab" b c tail
+    status_row "—" "·" "↻" tail
+    echo "slow $DISPLAY_WIDTH_SLOW"
+    status_row "日本" b c tail
+    echo "slow $DISPLAY_WIDTH_SLOW"'
+  expect_rc 0
+  expect_text "wide cell: later cells keep their columns, ASCII rows stay off the range table" 'ab     b        c    tail
+—      ·        ↻    tail
+slow 0
+日本   b        c    tail
+slow 1' "$OUT"
+}
+
 # Every frame of a run: exactly HEIGHT lines, one cursor row, and the rows on
 # screen plus the two counts add up to the pool — a marker that is off by one
 # cannot hide behind a frame that happens to be the right length.
@@ -10768,6 +10802,7 @@ t "GHR-94: a double-width row is counted as the two terminal rows it takes" case
 t "GHR-94: watch_table_width measures display columns, not characters"     case_ghr94_watch_table_width_is_display_columns
 t "GHR-94: display_width is columns, in any locale"                        case_ghr94_display_width_is_columns_in_any_locale
 t "GHR-94: an ordinary frame never reaches the range table"                case_ghr94_an_ordinary_frame_never_reaches_the_range_table
+t "GHR-159: status_row pads by display columns"                            case_ghr159_status_row_pads_by_columns
 t "watch: the window scrolls with the cursor; PgUp/PgDn, g/G, Home/End"   case_watch_window_scrolls_with_the_cursor
 t "watch, fleet watch: the last row brings the notes under the table in"  case_watch_last_row_shows_the_notes_under_the_table
 t "watch: heights around the frame — too small, one short, exact, spare"  case_watch_heights_around_the_frame
@@ -10920,6 +10955,7 @@ slot1_cell() {
   l="$(grep -m1 '^0 ' <<<"$OUT" || true)"
   printf '%s\n' "${l##*  }"
 }
+t "GHR-159: job_cell's ROOM fit is display columns"                        case_ghr159_job_cell_fit_is_columns
 # OUT carries no control byte but its newlines. Bytes, so under LC_ALL=C.
 expect_no_control_bytes() {
   _expect
