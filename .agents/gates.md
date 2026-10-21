@@ -762,6 +762,50 @@ Traps:
   no-op there — the first run of GHR-119's composition case was green under
   a plain `make sim` and red under `agent-gate-admit`, with `trap -p` showing
   `trap -- '' SIGINT`.
+  **The driver signals only once the block's `sleep` has been exec-ed**
+  (GHR-143). `run_signalled` and `run_fn_signalled` set `GHR119_STEP=sleep`,
+  and the driver waits for a child with that comm. It used to wait for any
+  child at all. A guarded command's two `caller_guard` relays are children
+  before the block is reached, so that wait passed at once. A signal sent to
+  the group before the `sleep` existed then missed it, bash held its trap
+  until the 30 s sleep ended, and the case read `still alive 10 s after the
+  signal`. A probe that signals the instant `.blocked` appears gets
+  `survived` in 5 of 6 runs. The unguarded GHR-131 body has the same window
+  between its fork and its exec. A run that never reaches the step is
+  `step-never-ran`, which is a failure, not a pass. A new driver user whose
+  block is not a `sleep` child of the signalled process leaves
+  `GHR119_STEP` unset: the fleet ssh cases flag through `ssh.pid` instead.
+- **A case that goes red only under load is a finding, not contention**
+  (GHR-143). Ten concurrent full sims (load average 25 to 54 on 16 cores)
+  turned up five causes, and only one was a budget:
+  - the GHR-119 driver above, an ordering assumption;
+  - `stub_fleet_progress` (GHR-92, the budget walk) logged
+    `remote_wrote_lineN` AFTER it wrote the line. A fast reader could log
+    `central_saw` first, and the case failed on `privileged call order`
+    alone. It now logs first. Measured: a `sleep 0.5` between the write and
+    the log is red in both cases on the old order and green on the new one.
+    The 3 s give-up was not involved: line-to-reader latency was at most
+    0.32 s at load ~33;
+  - `stub_fleet_hold` (GHR-127) created the `.held` marker that the poll
+    step counts BEFORE it logged `remote_held`. So `act_poll … held=1` and
+    the next key could come first. It now logs first;
+  - a `:` command (GHR-144) streams through `cmd_fleet`'s taps, which are
+    processes of their own. So the `.held` marker could be counted, and frame
+    3 drawn, before the host's `draining —` line was in `cmd.job/out`. The
+    stub now counts a `:` job as held only once each held host's line is in
+    that file. Measured: a 0.5 s delay in the taps is red on the marker alone
+    and green with the line check;
+  - `watch: the window scrolls with the cursor` does twelve full redraws of
+    nine slots. That is the most work in any single `run`: about 17 s at
+    load ~13, and 124 at the default `RUN_TIMEOUT=30` after 9 of 12 frames
+    in 10 of 10 sims at load ~40. It has `RUN_TIMEOUT=120`: it took 36 to
+    38 s in ten concurrent sims at load averages up to 54, so the margin is
+    about 3x.
+  The rule that follows: a stub marker a case orders against is written
+  BEFORE the act it records, never after. A wait is on the condition (a file,
+  a comm), never on "something has started". Reproduce a suspected load
+  failure with N full `bash tests/run.sh` at once, each under its own
+  `mktemp` (the harness shares no fixed path), held in ONE admission slot.
 - **HUP and PIPE are the record's too, except under a caller guard**
   (GHR-131). Armed and not guarded, both run `audit_signal` exactly as INT
   and TERM do (`interrupted (SIGHUP|SIGPIPE)`, then death by the signal).
