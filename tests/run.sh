@@ -4309,8 +4309,10 @@ case_ghr138_walk_and_watch_action_name_a_keepalive_cut() {
 }
 
 # --- GHR-92: a mutating host's lines are shown as they are printed ---------------
-# The remote (stub_fleet_progress) writes line 1, records it, waits until the
-# central node's reader has shown line 1, then writes line 2: so the ORDER in
+# The remote (stub_fleet_progress) records line 1 and writes it, waits until the
+# central node's reader has shown line 1, then records and writes line 2 (each
+# recorded BEFORE it is written, GHR-143, so a fast reader cannot log seeing
+# it ahead of the remote's own line): so the ORDER in
 # the log, not a duration, says whether a line was on the screen before the
 # remote returned.
 case_fleet_mutating_streams_a_hosts_lines_before_it_returns() {
@@ -9112,8 +9114,13 @@ _ghr73_every_frame_accounts_for_the_pool() { # FRAMES HEIGHT POOL
 # edge and the window scrolls by exactly as much as brings the row back, the
 # counts saying what went where. Then the paging keys: G and g, PgDn twice
 # and PgUp (a window less one line), and End / Home as their sequences.
+#
+# GHR-143: twelve full redraws of nine slots, each a live read of every slot,
+# is the most work any single `run` does: 17 s at load ~13 and past the
+# default RUN_TIMEOUT of 30 s at load ~40 (exit 124 after 9 of the 12
+# frames, in all ten of ten concurrent sims). It gets a budget of its own.
 case_watch_window_scrolls_with_the_cursor() {
-  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_SLOTS=9 RUNNERCTL_STUB_LINES=11 \
+  RUN_TIMEOUT=120 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_SLOTS=9 RUNNERCTL_STUB_LINES=11 \
     RUNNERCTL_STUB_KEYS=$'jjjGg\e[6~\e[6~\e[5~\e[F\e[1~-q' run watch
   expect_rc 0
   frames
@@ -14778,6 +14785,10 @@ t "GHR-88: fleet history merges the hosts' records by time"                case_
 # Ctrl-C, systemd and `timeout` do, and `pid` signals runnerctl alone. A
 # process that has not died 10 s after the signal is `survived`, and whatever
 # is left of its group (the stub's sleep, under `pid`) is killed either way.
+# GHR119_STEP=sleep (run_signalled, run_fn_signalled) makes the driver wait,
+# after the flag, until the block's `sleep` has been exec-ed as a child of the
+# command (GHR-143): the signal then lands in the foreground step it is meant
+# for. A run that never gets there is `step-never-ran`, a failure.
 HAVE_PERL=false
 perl -MPOSIX -e 1 >/dev/null 2>&1 && HAVE_PERL=true
 SIGNALLED=""
@@ -14800,9 +14811,24 @@ until (-e $flag) {
 }
 # the stub has written the flag; wait for its sleep to be the running step
 my $kids = "/proc/$pid/task/$pid/children";
-# (read, not -s: a /proc file always reports size 0 — GHR-91 found this loop
-# always ran its full 2 s, which a block shorter than that slept through)
-for (1 .. 40) { if (open my $k, "<", $kids) { local $/; my $c = <$k> // ""; last if $c =~ /\d/ } nap 0.05 }
+sub kids { open(my $k, "<", $kids) or return (); local $/; split " ", (<$k> // "") }
+sub comm { open(my $c, "<", "/proc/$_[0]/comm") or return ""; my $n = <$c> // ""; chomp $n; $n }
+if (defined $ENV{GHR119_STEP}) {
+  # GHR-143: wait for a child whose comm is GHR119_STEP (the sleep of the stub
+  # block), so that it has been exec-ed. Any child at all is not enough: the
+  # two relays of a guarded command are its children before the block is
+  # reached, and a signal sent before the sleep exists is held by bash until
+  # that 30 s sleep ends. Bounded, and said when it runs out.
+  $t = 0;
+  until (grep { comm($_) eq $ENV{GHR119_STEP} } kids()) {
+    if (++$t > 200) { kill "KILL", -$pid; waitpid($pid, 0); print "step-never-ran\n"; exit 0 }
+    nap 0.05;
+  }
+} else {
+  # (read, not -s: a /proc file always reports size 0 — GHR-91 found this loop
+  # always ran its full 2 s, which a block shorter than that slept through)
+  for (1 .. 40) { last if kids(); nap 0.05 }
+}
 kill $sig, ($whom eq "group" ? -$pid : $pid);
 $t = 0;
 until (waitpid($pid, WNOHANG) == $pid) {
@@ -14817,7 +14843,7 @@ run_signalled() { # INT|TERM group|pid BLOCK-ERE ARGS...
   shift 3
   _log_reset; rm -rf "$WRITES"; mkdir -p "$WRITES"
   RC=0 SIGNALLED=""
-  how="$(RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" RUNNERCTL_STUB_BLOCK="$block" \
+  how="$(GHR119_STEP=sleep RUNNERCTL_CONFIG="$STUB" RUNNERCTL_TEST_LOG="$LOG" RUNNERCTL_TEST_WRITES="$WRITES" RUNNERCTL_STUB_BLOCK="$block" \
          perl -e "$GHR119_PERL" "$sig" "$whom" "$WRITES/.blocked" "$TMP/sig.out" "$TMP/err" "$RUNNERCTL" "$@")" || how="perl failed"
   OUT="$(cat "$TMP/sig.out" 2>/dev/null; true)"
   ERR="$(cat "$TMP/err" 2>/dev/null; true)"
@@ -15149,7 +15175,7 @@ run_fn_signalled() { # HUP|PIPE BODY
   _log_reset; rm -rf "$WRITES"; mkdir -p "$WRITES"
   rm -f "$GHR119_REC"
   RC=0 SIGNALLED=""
-  how="$(RUNNERCTL_NO_MAIN=1 GHR119_REC="$GHR119_REC" GHR131_FLAG="$WRITES/.blocked" \
+  how="$(GHR119_STEP=sleep RUNNERCTL_NO_MAIN=1 GHR119_REC="$GHR119_REC" GHR131_FLAG="$WRITES/.blocked" \
          perl -e "$GHR119_PERL" "$sig" group "$WRITES/.blocked" "$TMP/sig.out" "$TMP/err" \
          bash -c '. "$0" && eval "$1"' "$RUNNERCTL" "$2")" || how="perl failed"
   OUT="$(cat "$TMP/sig.out" 2>/dev/null; true)"
