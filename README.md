@@ -612,7 +612,7 @@ the redraw and the interval. It is what you keep open while a `drain` or an
 creeps up on its `MemoryHigh`. It is a native loop rather than procps
 `watch`, which is not on every runner host and mangles the `—` cells: each
 frame is rendered first and written in one go, so it does not flicker, and
-the config is loaded once, not per tick. Everything is read live except the
+the config is loaded once, not per tick. Each tick reads everything live except the
 journal-derived `WORKING-ON` cells, which are refreshed every tenth redraw to
 keep the `journalctl` cost down — a job start or end shows up within
 10 × interval seconds. It needs a terminal: with stdout redirected it exits 1
@@ -649,6 +649,16 @@ and the result becomes the status line under the legend:
 | `PgUp` / `PgDn` | move the cursor a page (a window less one row, so the row you left is still on screen) | |
 | `g` / `G`, `Home` / `End` | the first / last slot | |
 | `q` | quit | |
+
+Moving the cursor or the window reads nothing. `↑` `↓` `j` `k`, `PgUp`
+`PgDn`, `g` `G`, `Home` `End`, scrolling the slot pane or the `?` list, and
+opening or closing that list redraw what the last read brought, as `top`
+does, so they answer at once however slow `systemctl` and the journal are on
+the host. That frame is at most an interval old: the next tick reads every
+slot live, and so does a view key that arrives once the last read is an
+interval old, so holding a key down cannot hold the frame still. Every other
+key reads live, and an action key reads its slot again before it asks you
+anything.
 
 #### The slot in full: `Enter`
 
@@ -712,8 +722,8 @@ q/Esc/Enter back  h host  jk scroll  K R S T P L O this slot  Ctrl-C quits
 
 What to know about it:
 
-- **It refreshes like the table**: every `--interval`, and at once on a key. A
-  slot that goes away while its pane is up (a `scale` down) puts the table
+- **It refreshes like the table**: every `--interval`, and at once on a key
+  other than a scroll key, which redraws the last read. A slot that goes away while its pane is up (a `scale` down) puts the table
   back, with a line saying so.
 - **`—` means not known**, on any row: a slot that is not running has no memory
   figures, a job between two steps has no run to name, a busy slot has no
