@@ -197,6 +197,16 @@ Traps:
   frames before the tick's. A `%` in `RUNNERCTL_STUB_KEYS` is a real SIGWINCH
   sent from inside the key read. With the height unknown (the default, 0)
   nothing is fitted and every older case draws what it always drew.
+- **A view key in the local `watch` reads nothing (GHR-169).** The cursor and
+  window keys, a pane's or the `?` list's scroll, and opening or closing that
+  list redraw the last read; a tick and every other key read every slot. So a
+  case counting `probe:unit_props` sees one full read per tick and per
+  non-view key, not one per frame. Count them per key with
+  `_ghr169_reads_per_key` (one number per `probe:tty_read_char` line; an
+  escape-sequence key is one number per character). A view key still reads
+  once the last read is an interval old, measured on `now_ms`; the stub's
+  clock never moves on a key unless `RUNNERCTL_STUB_KEY_MS=N` says each
+  character takes N ms, so every other case is unaffected.
 - **Widths are display columns, measured by `display_width` (GHR-94), and a
   fitted frame's height is in terminal ROWS.** A wide character (CJK, most
   emoji) is two columns and a combining mark or variation selector none, so
@@ -798,9 +808,11 @@ Traps:
   - `watch: the window scrolls with the cursor` does twelve full redraws of
     nine slots. That is the most work in any single `run`: about 17 s at
     load ~13, and 124 at the default `RUN_TIMEOUT=30` after 9 of 12 frames
-    in 10 of 10 sims at load ~40. It has `RUN_TIMEOUT=120`: it took 36 to
-    38 s in ten concurrent sims at load averages up to 54, so the margin is
-    about 3x.
+    in 10 of 10 sims at load ~40. It had `RUN_TIMEOUT=120`: it took 36 to
+    38 s in ten concurrent sims at load averages up to 54. GHR-169 removed
+    the cost rather than the budget: its ten keys now redraw from the last
+    read, so the run is two reads of nine slots, not twelve, and it is back
+    on the default `RUN_TIMEOUT`.
   The rule that follows: a stub marker a case orders against is written
   BEFORE the act it records, never after. A wait is on the condition (a file,
   a comm), never on "something has started". Reproduce a suspected load

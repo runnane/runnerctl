@@ -5892,13 +5892,16 @@ watch_pane_key() { # KEY
       else
         WATCH_NOTICE="$PANE_NO_SLOT_KEYS; h goes back to the slot"
       fi ;;
-    *) pane_scroll "$1" || true ;;
+    *) if pane_scroll "$1"; then WATCH_VIEW_ONLY=true; fi ;;
   esac
 }
 # One key against the watch state. Returns 1 on `q` (quit). The cursor is
 # the unit's name in WATCH_CURSOR, so it stays on the same slot when the
 # pool is scaled and the row numbers shift; UNITS is the current order.
-WATCH_CURSOR="" WATCH_NOTICE="" WATCH_PROMPT="" WATCH_ACTION="" WATCH_UNIT=""
+# GHR-169: a key that moves only the cursor or the window sets WATCH_VIEW_ONLY,
+# and the next frame is drawn from the last read instead of a live one — at
+# most an interval old, as in top. A tick, and every other key, reads live.
+WATCH_CURSOR="" WATCH_NOTICE="" WATCH_PROMPT="" WATCH_ACTION="" WATCH_UNIT="" WATCH_VIEW_ONLY=false
 watch_handle_key() { # KEY UNITS...
   local key="$1" i n; shift
   local units=("$@")
@@ -5915,6 +5918,7 @@ watch_handle_key() { # KEY UNITS...
   # keys of the marker on a list the terminal cuts scroll it instead.
   if $WATCH_HELP_ON; then
     pane_scroll "$key" || { WATCH_HELP_ON=false; pane_leave; }
+    WATCH_VIEW_ONLY=true
     return 0
   fi
   # GHR-76: with the pane up every key is the pane's — `q` goes back to the
@@ -5924,8 +5928,8 @@ watch_handle_key() { # KEY UNITS...
   for i in "${!units[@]}"; do [ "${units[$i]}" != "$WATCH_CURSOR" ] || break; done
   case "$key" in
     q|Q)      return 1 ;;
-    down|j)   [ "$i" -ge $((n - 1)) ] || WATCH_CURSOR="${units[$((i + 1))]}" ;;
-    up|k)     [ "$i" -le 0 ] || WATCH_CURSOR="${units[$((i - 1))]}" ;;
+    down|j)   [ "$i" -ge $((n - 1)) ] || WATCH_CURSOR="${units[$((i + 1))]}"; WATCH_VIEW_ONLY=true ;;
+    up|k)     [ "$i" -le 0 ] || WATCH_CURSOR="${units[$((i - 1))]}"; WATCH_VIEW_ONLY=true ;;
     # GHR-73: a page at a time, and the two ends. The slot rows are one line
     # each, so a step in lines is a step in units.
     pgdn|pgup|g|G|home|end)
@@ -5939,11 +5943,11 @@ watch_handle_key() { # KEY UNITS...
       esac
       [ "$i" -lt "$n" ] || i=$((n - 1))
       [ "$i" -ge 0 ] || i=0
-      WATCH_CURSOR="${units[$i]}" ;;
+      WATCH_CURSOR="${units[$i]}" WATCH_VIEW_ONLY=true ;;
     K|R|S|T|P|L|O) watch_key_action "$key" "$WATCH_CURSOR" ;;
     # GHR-76: the cursor's slot in full, in place of the table.
     enter) if [ -n "$WATCH_CURSOR" ]; then WATCH_PANE=slot; pane_enter; fi ;;
-    '?')   WATCH_HELP_ON=true; pane_enter ;;
+    '?')   WATCH_HELP_ON=true WATCH_VIEW_ONLY=true; pane_enter ;;
   esac
   return 0
 }
@@ -5959,9 +5963,14 @@ watch_handle_key() { # KEY UNITS...
 # Interactively (GHR-33) each frame ends with the key legend and a status
 # line (a notice, or the pending confirm), and the wait between redraws is
 # a key read with the interval as its timeout: a key redraws at once, a
-# timeout is a tick. The journal memo counts ticks, not keys.
+# timeout is a tick. The journal memo counts ticks, not keys. GHR-169: a key
+# that moves only the cursor or the window redraws from the last read (`fresh`
+# false) — the slots, the units and the header's time are the frame before's;
+# a tick and every other key read everything again, and so does a view key
+# once the last read is an interval old: a held `j` resets the key read's
+# timeout every time, and would otherwise never let a tick through.
 cmd_watch() { # [--interval N] [--iterations N] [--color WHEN] [--stall-after N] [--narrow]
-  local interval=2 iterations="" tick=0 refreshed=-1 out header units=() status short cur tail idx i legend
+  local interval=2 iterations="" tick=0 refreshed=-1 out header units=() status short cur tail idx i legend fresh read_ms=0
   while [ $# -gt 0 ]; do
     case "$1" in --*=*) set -- "${1%%=*}" "${1#*=}" "${@:2}" ;; esac
     view_opt "$@"
@@ -5999,9 +6008,15 @@ cmd_watch() { # [--interval N] [--iterations N] [--color WHEN] [--stall-after N]
       rm -f -- "$JOURNAL_MEMO_DIR"/*
       refreshed="$tick"
     fi
-    header="$(paint "$C_BOLD" "runnerctl watch — ${HOSTNAME:-$(uname -n)} — $(date +%H:%M:%S) — every ${interval}s (Ctrl-C to quit)")"
-    # GHR-76: with the pane up the table is not drawn, so it is not rendered.
-    [ -n "$WATCH_PANE" ] || watch_table
+    fresh=true
+    if $WATCH_VIEW_ONLY && [ $(($(now_ms) - read_ms)) -lt $((interval * 1000)) ]; then fresh=false; fi
+    WATCH_VIEW_ONLY=false
+    if $fresh; then
+      read_ms="$(now_ms)"
+      header="$(paint "$C_BOLD" "runnerctl watch — ${HOSTNAME:-$(uname -n)} — $(date +%H:%M:%S) — every ${interval}s (Ctrl-C to quit)")"
+      # GHR-76: with the pane up the table is not drawn, so it is not rendered.
+      [ -n "$WATCH_PANE" ] || watch_table
+    fi
     if [ -n "$iterations" ]; then
       printf '\033[H\033[2J%s\n%s\n' "$header" "$WATCH_TABLE"
       pause "$interval"
@@ -6009,7 +6024,7 @@ cmd_watch() { # [--interval N] [--iterations N] [--color WHEN] [--stall-after N]
       [ "$tick" -lt "$iterations" ] || break
       continue
     fi
-    mapfile -t units < <(discover)
+    ! $fresh || mapfile -t units < <(discover)
     if $WATCH_HELP_ON; then
       viewport_draw "$header" "$WATCH_HELP" $'\n'"$(paint "$C_DIM" "$HELP_FOOT")"$'\n' 0 0 0
       if viewport_read_key "$interval"; then
@@ -6029,7 +6044,7 @@ cmd_watch() { # [--interval N] [--iterations N] [--color WHEN] [--stall-after N]
         if [ "${units[$i]}" = "$WATCH_CURSOR" ]; then idx="$i"; break; fi
       done
       if [ "$idx" -ge 0 ]; then
-        watch_pane_build "$WATCH_CURSOR" "$idx"
+        ! $fresh || watch_pane_build "$WATCH_CURSOR" "$idx"
         legend="$PANE_LEGEND_SLOT"
         [ "$WATCH_PANE" = slot ] || legend="$PANE_LEGEND_HOST"
         viewport_draw "$header" "$PANE_OUT" $'\n'"$(paint "$C_DIM" "$legend")"$'\n'"${WATCH_PROMPT:-$WATCH_NOTICE}" 0 0 0

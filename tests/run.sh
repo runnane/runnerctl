@@ -2375,7 +2375,9 @@ case_watch_non_tty_refusal_reads_no_keys() {
 # WORKING-ON, whose idle duration is what an action is decided on — and a
 # wide (or unknown-width) one keeps every column. `status` is untouched.
 case_watch_narrow_terminal_drops_max_high_envfile() {
-  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=140 RUNNERCTL_STUB_KEYS='jq' run watch
+  # a tick, not a `j`, between the frames: since GHR-169 a cursor key redraws
+  # the last read, and the second frame has to be a read for the count below
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_COLS=140 RUNNERCTL_STUB_KEYS='-q' run watch
   expect_rc 0
   expect_out_count '^IDX +RUNNER +PROFILE +ACTIVE +SINCE +ENABLED +USED +PRESS +RESTART +WORKING-ON$' 2
   expect_no_out 'MAX|HIGH|ENVFILE'
@@ -8830,8 +8832,9 @@ case_watch_unknown_height_draws_the_frame_of_before() {
   expect_text "watch at unknown height" "$want" "$(out_without_clock)"
   # the height was asked for (the frame went through the viewport) and the
   # width, which only a known height needs, was asked for by watch_table alone
+  # — once: the `j` frame is drawn from the first one's read (GHR-169)
   expect_cfg "$LOG.lines" '^2$'
-  expect_cfg "$LOG.cols" '^2$'
+  expect_cfg "$LOG.cols" '^1$'
 }
 
 # GHR-105: the local watch's legend is the fleet's default one and says `? keys`
@@ -9115,14 +9118,15 @@ _ghr73_every_frame_accounts_for_the_pool() { # FRAMES HEIGHT POOL
 # counts saying what went where. Then the paging keys: G and g, PgDn twice
 # and PgUp (a window less one line), and End / Home as their sequences.
 #
-# GHR-143: twelve full redraws of nine slots, each a live read of every slot,
-# is the most work any single `run` does: 17 s at load ~13 and past the
-# default RUN_TIMEOUT of 30 s at load ~40 (exit 124 after 9 of the 12
-# frames, in all ten of ten concurrent sims). It gets a budget of its own.
+# GHR-143 gave this case a budget of its own: twelve frames of nine slots,
+# each a live read of every slot, ran past the default RUN_TIMEOUT under
+# load. GHR-169: the ten keys redraw from the last read, so two reads of nine
+# slots — the first frame and the tick — are the whole of it.
 case_watch_window_scrolls_with_the_cursor() {
-  RUN_TIMEOUT=120 RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_SLOTS=9 RUNNERCTL_STUB_LINES=11 \
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_SLOTS=9 RUNNERCTL_STUB_LINES=11 \
     RUNNERCTL_STUB_KEYS=$'jjjGg\e[6~\e[6~\e[5~\e[F\e[1~-q' run watch
   expect_rc 0
+  expect_log_count '^probe:unit_props ' 18
   frames
   expect_frame_count 12
   _ghr73_every_frame_accounts_for_the_pool 11 11 9
@@ -9163,6 +9167,50 @@ case_watch_window_scrolls_with_the_cursor() {
   # the `~` that ends a numbered sequence was read with it, not as a key
   expect_no_log '^probe:tty_read_char 2 \\~$'
   expect_log_count '^probe:tty_read_char 0\.05 \\~$' 4
+}
+
+# GHR-169: the slot reads in the log, counted per key read — the first
+# number is the first frame's, then one per `probe:tty_read_char` line (a key
+# character or a tick), each the reads the frame after it made. A key spelled
+# as an escape sequence is one number per character, its reads on the last.
+# A slot read is its `unit_props`, exactly one per slot per read; the journal
+# and cgroup probes ride along with it, but the journal's are memoised per
+# tick, so their count says when, not whether.
+_ghr169_reads_per_key() {
+  awk '/^probe:tty_read_char / { printf "%d ", n; n = 0; next }
+       /^probe:unit_props /    { n++ }
+       END { printf "%d\n", n }' "$LOG"
+}
+
+# GHR-169: a key that moves only the cursor or the window redraws from the
+# last read — top's convention, staleness of at most an interval — and every
+# other key, and the tick, still reads live. Three slots, one read each:
+#   j k G g PgDn          the table's cursor keys: nothing read
+#   ? j x                 the key list, scrolled and closed: nothing read
+#   Enter                 the slot's pane: the slot read for it
+#   j                     the pane scrolled: nothing read
+#   q                     back to the table: every slot read again
+#   R n                   R reads the slot it asks about, live, and the frame
+#                         with its confirm line reads every slot (1 + 3); the
+#                         `n` that cancels is no view key, so it reads again
+#   -                     the tick: every slot
+# The read counts are the probe lines between two key reads.
+case_ghr169_watch_view_keys_redraw_from_the_last_read() {
+  local want
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEYS=$'jkGg\e[6~?jx\njqRn-q' run watch
+  expect_rc 0
+  # first frame, j k G g, PgDn as \e [ 6 ~, ? j x, Enter, j, q, R, n, tick, q
+  want="3 0 0 0 0 0 0 0 0 0 0 0 1 0 3 4 3 3 0"
+  expect_text "slot reads per key" "$want" "$(_ghr169_reads_per_key)"
+  # the R confirm asked about slot-1 from a read of its own
+  expect_log_order '^probe:tty_read_char 2 R$' '^probe:unit_props actions\.runner\.example\.slot-1\.service$' '^probe:tty_read_char 2 n$'
+  # a view key is drawn from the last read only while that read is under an
+  # interval old: each key here takes a second of the 2 s interval, so the
+  # second j finds the read two seconds old and reads again — a held key
+  # cannot hold the frame still.
+  RUNNERCTL_STUB_TTY=1 RUNNERCTL_STUB_KEY_MS=1000 RUNNERCTL_STUB_KEYS='jjjq' run watch
+  expect_rc 0
+  expect_text "slot reads per key, a second a key" "3 0 3 0 0" "$(_ghr169_reads_per_key)"
 }
 
 # The notes under the table are below the last row, where the cursor cannot
@@ -10992,6 +11040,7 @@ t "GHR-94: display_width is columns, in any locale"                        case_
 t "GHR-94: an ordinary frame never reaches the range table"                case_ghr94_an_ordinary_frame_never_reaches_the_range_table
 t "GHR-159: status_row pads by display columns"                            case_ghr159_status_row_pads_by_columns
 t "watch: the window scrolls with the cursor; PgUp/PgDn, g/G, Home/End"   case_watch_window_scrolls_with_the_cursor
+t "GHR-169: watch view keys redraw from the last read; a tick and action keys read live" case_ghr169_watch_view_keys_redraw_from_the_last_read
 t "watch, fleet watch: the last row brings the notes under the table in"  case_watch_last_row_shows_the_notes_under_the_table
 t "watch: heights around the frame — too small, one short, exact, spare"  case_watch_heights_around_the_frame
 t "watch: a resize redraws the frame in hand at once (SIGWINCH)"           case_watch_resize_redraws_the_frame_in_hand
