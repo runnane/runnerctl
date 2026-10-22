@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.28.0](https://github.com/runnane/runnerctl/compare/v0.27.1...v0.28.0) (2026-10-22)
+
+
+### Features
+
+* watch's cursor and scroll keys redraw from the last read instead of re-reading every slot (GHR-169) ([#187](https://github.com/runnane/runnerctl/issues/187)) ([7094276](https://github.com/runnane/runnerctl/commit/7094276bb29c62190609cf836dc128c518836279))
+
 ## [0.27.1](https://github.com/runnane/runnerctl/compare/v0.27.0...v0.27.1) (2026-10-16)
 
 
